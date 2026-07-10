@@ -1,0 +1,4 @@
+[toolchain]
+# Stable as of 2026-05-26
+channel = "1.96.0"
+components = ["clippy", "rustfmt", "llvm-tools-preview"]

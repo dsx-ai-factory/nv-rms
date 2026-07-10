@@ -1,0 +1,107 @@
+{{- $useRmsPostgres := eq (include "rack-manager.useRmsPostgres" .) "true" }}
+{{- $patchEnabled := index .Values.rmsPostgres.patchForgeCluster "enabled" | default false }}
+{{- if and $useRmsPostgres $patchEnabled }}
+{{- if .Values.createNamespace }}
+---
+# Create namespace first so the patch Job (and its SA) can use it
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ include "rack-manager.namespace" . }}
+  labels:
+    name: {{ include "rack-manager.namespace" . }}
+    {{- with .Values.commonLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  annotations:
+    helm.sh/hook: pre-install
+    helm.sh/hook-weight: "-20"
+    helm.sh/hook-delete-policy: hook-failed
+{{- end }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: rms-postgres-patch
+  namespace: {{ include "rack-manager.namespace" . }}
+  labels:
+    {{- include "rack-manager.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: pre-install
+    helm.sh/hook-weight: "-15"
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: rms-postgres-patch
+  namespace: {{ .Values.rmsPostgres.patchForgeCluster.postgresqlNamespace }}
+  labels:
+    {{- include "rack-manager.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: pre-install
+    helm.sh/hook-weight: "-15"
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+rules:
+  - apiGroups: ["acid.zalan.do"]
+    resources: ["postgresqls"]
+    verbs: ["get", "patch"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: rms-postgres-patch
+  namespace: {{ .Values.rmsPostgres.patchForgeCluster.postgresqlNamespace }}
+  labels:
+    {{- include "rack-manager.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: pre-install
+    helm.sh/hook-weight: "-15"
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: rms-postgres-patch
+subjects:
+  - kind: ServiceAccount
+    name: rms-postgres-patch
+    namespace: {{ include "rack-manager.namespace" . }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: rms-postgres-add-db
+  namespace: {{ include "rack-manager.namespace" . }}
+  labels:
+    {{- include "rack-manager.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: pre-install
+    helm.sh/hook-weight: "-10"
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  ttlSecondsAfterFinished: 300
+  backoffLimit: 3
+  template:
+    metadata:
+      labels:
+        {{- include "rack-manager.labels" . | nindent 8 }}
+    spec:
+      serviceAccountName: rms-postgres-patch
+      restartPolicy: OnFailure
+      containers:
+        - name: patch
+          image: bitnami/kubectl:latest
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+              PATCH='{"spec":{"databases":{"{{ .Values.rmsPostgres.patchForgeCluster.databaseName }}":"{{ .Values.rmsPostgres.patchForgeCluster.userName }}"},"users":{"{{ .Values.rmsPostgres.patchForgeCluster.userName }}":["superuser","createdb"]}}}'
+              kubectl patch postgresql {{ .Values.rmsPostgres.patchForgeCluster.postgresqlName }} \
+                -n {{ .Values.rmsPostgres.patchForgeCluster.postgresqlNamespace }} \
+                --type=merge -p "$PATCH"
+              echo "Patch applied successfully"
+{{- end }}

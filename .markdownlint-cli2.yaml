@@ -1,0 +1,33 @@
+config:
+  # Default state for all rules
+  default: true
+
+  # MD007/ul-indent: Unordered list indentation
+  MD007:
+    indent: 4
+
+  # MD013/line-length: Don't be picky about line length; let line wrapping do its job.
+  MD013: false
+
+  # MD022/blanks-around-headings: Headings should be surrounded by blank lines
+  MD022: true
+
+  # MD032/blanks-around-lists: Lists should be surrounded by blank lines
+  MD032: true
+
+  # MD034/no-bare-urls: Bare URLs should not be used
+  MD034: true
+
+  # MD040/fenced-code-language: Fenced code blocks should have a language specified
+  MD040: true
+
+  # MD060/table-column-style: Table column style
+  MD060: true
+
+  # MD046/code-block-style: Disable consistency checks between fenced/indented code
+  # blocks. Standard code blocks should use fences, while mkdocs admonitions require
+  # 4-space indented blocks.
+  MD046: false
+
+ignores:
+  - "src/api/grpc/proto/nv-rms-client/**"

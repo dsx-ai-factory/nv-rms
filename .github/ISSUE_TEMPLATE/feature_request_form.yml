@@ -1,0 +1,123 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+#
+# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
+# property and proprietary rights in and to this material, related
+# documentation and any modifications thereto. Any use, reproduction,
+# disclosure or distribution of this material and related documentation
+# without an express license agreement from NVIDIA CORPORATION or
+# its affiliates is strictly prohibited.
+
+name: Feature/Enhancement Request Form
+description: Request new or improved NVIDIA Rack Management Service functionality
+title: "feat: "
+labels: ["feature"]
+type: Enhancement
+
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to fill out this feature request.
+
+  - type: dropdown
+    id: new_or_improvement
+    attributes:
+      label: Is this a new feature, an enhancement, or a change to existing functionality?
+      options:
+        - New Feature
+        - Enhancement
+        - Change
+    validations:
+      required: true
+
+  - type: dropdown
+    id: criticality
+    attributes:
+      label: How would you describe the priority of this feature request?
+      options:
+        - Critical (currently preventing usage)
+        - High
+        - Medium
+        - Low (would be nice)
+      default: 2
+    validations:
+      required: true
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Affected component
+      options:
+        - RMS service
+        - gRPC API
+        - Helm chart
+        - Firmware update
+        - Redfish / BMC integration
+        - Switch / NVUE / NMX-C integration
+        - Persistence / database
+        - Documentation
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem statement
+      description: Describe the user or system problem this feature solves. Real usage examples are especially helpful.
+    validations:
+      required: true
+
+  - type: textarea
+    id: feature_description
+    attributes:
+      label: Feature description
+      description: Describe the requested capability. User story or EARS-style requirements are encouraged.
+      placeholder: |
+        As a <persona>, I want <capability>, so that <outcome>.
+
+        When <pre-condition>, RMS shall <process> <object> <condition>.
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: Ideal solution
+      description: Describe the behavior, interface, workflow, or API shape you would like.
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: List any other designs, tools, workarounds, or implementation approaches you have considered.
+
+  - type: textarea
+    id: test_plan
+    attributes:
+      label: Suggested validation or acceptance criteria
+      description: Describe how this should be verified, including expected automated tests, manual validation, or QA coverage.
+
+  - type: textarea
+    id: misc
+    attributes:
+      label: Additional context
+      description: Add links, related issues, modules affected, diagrams, or other context.
+
+  - type: checkboxes
+    id: code_of_conduct
+    attributes:
+      label: Code of Conduct
+      description: By submitting this issue, you agree to follow our [Code of Conduct](https://github.com/NVIDIA/nv-rms/blob/main/CODE_OF_CONDUCT.md).
+      options:
+        - label: I agree to follow NVIDIA Rack Management Service's Code of Conduct.
+          required: true
+
+  - type: checkboxes
+    id: terms
+    attributes:
+      label: Submission checklist
+      options:
+        - label: I have searched the open feature requests and found no duplicate for this request.
+          required: true

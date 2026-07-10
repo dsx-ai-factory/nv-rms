@@ -1,0 +1,29 @@
+# Local override for manual helm install (e.g. local k3s).
+# Layer on top of helm/values.yaml; do not commit unless your site standardizes on this name.
+#
+# Enables in-memory persistence, plaintext inbound gRPC (allowInsecure), and insecure outbound
+# switch connectivity (insecureSwitch). See helm/INSECURE_SWITCH_TESTING.md for transport
+# details and verification steps. For insecure switch only, see helm/examples/overrides/switch-insecure-values.yaml.
+#
+# Install:
+#   helm upgrade --install rack ./helm \
+#     -f helm/values.yaml \
+#     -f helm/examples/overrides/local-dev-values.yaml \
+#     --set global.image.tag=<APP_TAG> \
+#     -n rack-manager --create-namespace
+
+databaseMode: memory
+
+global:
+  imagePullSecrets:
+    - name: imagepullsecret
+
+apiServer:
+  environmentPath: local-dev
+  allowInsecure: true
+  insecureSwitch: true
+  clientTlsCertificates: []
+  switchCertCertificates: []
+  defaultSwitchDomain: ""
+  tls:
+    enabled: false

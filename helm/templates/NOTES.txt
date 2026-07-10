@@ -1,0 +1,19 @@
+Rack Manager has been installed.
+
+Namespace: {{ include "rack-manager.namespace" . }}
+
+Components:
+{{- if .Values.apiServer.enabled }}
+  - RMS API Server (rms-api-server): port {{ .Values.apiServer.port }}
+    Database migrations run automatically on API startup when DATABASE_URL is configured.
+{{- end }}
+{{- if .Values.postgres.enabled }}
+  - Postgres (standalone): service postgres:5432
+{{- end }}
+
+To get the API server URL:
+  export NAMESPACE={{ include "rack-manager.namespace" . }}
+  kubectl get svc rms-api-server -n $NAMESPACE
+
+To port-forward and access the API locally:
+  kubectl port-forward -n $NAMESPACE svc/rms-api-server {{ .Values.apiServer.port }}:{{ .Values.apiServer.port }}

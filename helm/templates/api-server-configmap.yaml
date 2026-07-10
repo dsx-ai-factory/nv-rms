@@ -1,0 +1,14 @@
+{{- if and .Values.apiServer.enabled (not (include "rack-manager.useMemoryPersistence" .)) }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rms-database-config
+  namespace: {{ include "rack-manager.namespace" . }}
+  labels:
+    {{- include "rack-manager.labels" . | nindent 4 }}
+    app: rms-api-server
+data:
+  DB_HOST: {{ .Values.database.host | quote }}
+  DB_PORT: {{ .Values.database.port | quote }}
+  DB_NAME: {{ .Values.database.name | quote }}
+{{- end }}
