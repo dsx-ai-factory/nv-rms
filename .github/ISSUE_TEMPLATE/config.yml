@@ -1,0 +1,21 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+#
+# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
+# property and proprietary rights in and to this material, related
+# documentation and any modifications thereto. Any use, reproduction,
+# disclosure or distribution of this material and related documentation
+# without an express license agreement from NVIDIA CORPORATION or
+# its affiliates is strictly prohibited.
+
+# GitHub info on config.yml
+# https://docs.github.com/en/communities/using-templates-to-encourage-useful-issues-and-pull-requests/configuring-issue-templates-for-your-repository#configuring-the-template-chooser
+# Set to 'false' if you only want the templates to be used.
+blank_issues_enabled: true
+
+# When using discussions instead of Question issue templates, link that below
+# to have it show up in the 'Submit Issue' page.
+contact_links:
+  - name: Ask a Question
+    url: https://github.com/NVIDIA/nv-rms/discussions
+    about: Please ask general questions here.

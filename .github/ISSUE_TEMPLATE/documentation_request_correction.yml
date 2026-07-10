@@ -1,0 +1,74 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+#
+# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
+# property and proprietary rights in and to this material, related
+# documentation and any modifications thereto. Any use, reproduction,
+# disclosure or distribution of this material and related documentation
+# without an express license agreement from NVIDIA CORPORATION or
+# its affiliates is strictly prohibited.
+
+name: Documentation - Correction/Update Request
+description: Request corrections or updates to existing NVIDIA Rack Management Service documentation
+title: "docs: "
+labels: ["doc"]
+type: Documentation
+
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to improve our documentation.
+
+  - type: dropdown
+    id: criticality
+    attributes:
+      label: How would you describe the priority of this documentation request?
+      options:
+        - Critical (currently preventing usage)
+        - High
+        - Medium
+        - Low (would be nice)
+      default: 2
+    validations:
+      required: true
+
+  - type: input
+    id: correction_location
+    attributes:
+      label: Documentation location
+      description: Provide a link or path to the relevant documentation.
+      placeholder: "example: README.md, helm/README.md"
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Describe the documentation problem
+      placeholder: The documentation says to use X, but RMS behaves like Y.
+    validations:
+      required: true
+
+  - type: textarea
+    id: correction
+    attributes:
+      label: Proposed correction
+      description: Optional. Suggest the wording, command, diagram, or example that should replace the current documentation.
+
+  - type: checkboxes
+    id: code_of_conduct
+    attributes:
+      label: Code of Conduct
+      description: By submitting this issue, you agree to follow our [Code of Conduct](https://github.com/NVIDIA/nv-rms/blob/main/CODE_OF_CONDUCT.md).
+      options:
+        - label: I agree to follow NVIDIA Rack Management Service's Code of Conduct.
+          required: true
+
+  - type: checkboxes
+    id: terms
+    attributes:
+      label: Submission checklist
+      options:
+        - label: I have searched the open documentation issues and found no duplicate for this request.
+          required: true

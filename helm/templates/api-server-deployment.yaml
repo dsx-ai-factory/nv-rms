@@ -1,0 +1,193 @@
+{{- if .Values.apiServer.enabled }}
+{{- include "rack-manager.validateSftpOptions" . -}}
+{{- $firmwarePersistentVolumeClaim := .Values.apiServer.firmwarePersistentVolumeClaim | default "" | trim }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rms-api-server
+  namespace: {{ include "rack-manager.namespace" . }}
+  labels:
+    {{- include "rack-manager.labels" . | nindent 4 }}
+    app: rms-api-server
+spec:
+  selector:
+    matchLabels:
+      app: rms-api-server
+  replicas: {{ .Values.apiServer.replicaCount }}
+  template:
+    metadata:
+      labels:
+        app: rms-api-server
+        {{- with .Values.commonLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with .Values.apiServer.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- $imagePullSecrets := .Values.global.imagePullSecrets | default .Values.apiServer.imagePullSecrets }}
+      {{- with $imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: rms-api-server
+          image: "{{ .Values.apiServer.image.repository }}:{{ include "rack-manager.apiServerImageTag" . }}"
+          imagePullPolicy: {{ include "rack-manager.apiServerImagePullPolicy" . }}
+          {{- if or .Values.apiServer.tls.enabled .Values.apiServer.allowInsecure .Values.apiServer.insecureSwitch .Values.apiServer.switchCertCertificates .Values.apiServer.clientTlsCertificates .Values.apiServer.defaultSwitchDomain .Values.apiServer.dnsDomain }}
+          args:
+            {{- if .Values.apiServer.allowInsecure }}
+            - --insecure
+            {{- end }}
+            {{- if .Values.apiServer.insecureSwitch }}
+            - --insecure-switch
+            {{- end }}
+            {{- if .Values.apiServer.tls.enabled }}
+            - --tls-cert
+            - {{ printf "%s/tls.crt" .Values.apiServer.tls.secretMountPath }}
+            - --tls-key
+            - {{ printf "%s/tls.key" .Values.apiServer.tls.secretMountPath }}
+            {{- if .Values.apiServer.tls.caEnabled }}
+            - --tls-ca
+            - {{ printf "%s/ca.crt" .Values.apiServer.tls.secretMountPath }}
+            {{- end }}
+            {{- end }}
+            {{- if .Values.apiServer.switchCertCertificates }}
+            - --switch-cert-root
+            - {{ required "apiServer.switchCertRoot must be set when switchCertCertificates is configured" .Values.apiServer.switchCertRoot | quote }}
+            {{- end }}
+            {{- if .Values.apiServer.clientTlsCertificates }}
+            - --client-tls-root
+            - {{ required "apiServer.clientTlsRoot must be set when clientTlsCertificates is configured" .Values.apiServer.clientTlsRoot | quote }}
+            {{- end }}
+            {{- if .Values.apiServer.defaultSwitchDomain }}
+            - --default-switch-domain
+            - {{ .Values.apiServer.defaultSwitchDomain | quote }}
+            {{- end }}
+            {{- if .Values.apiServer.dnsDomain }}
+            - --dns-domain
+            - {{ .Values.apiServer.dnsDomain | quote }}
+            {{- end }}
+          {{- end }}
+          ports:
+            - containerPort: {{ .Values.apiServer.port }}
+          volumeMounts:
+            - name: firmware-storage
+              mountPath: {{ .Values.apiServer.firmwareMountPath }}
+              readOnly: false
+            {{- if .Values.apiServer.tls.enabled }}
+            - name: api-server-tls
+              mountPath: {{ .Values.apiServer.tls.secretMountPath }}
+              readOnly: true
+            {{- end }}
+            {{- range $i, $cert := .Values.apiServer.switchCertCertificates }}
+            - name: switch-cert-{{ $i }}
+              mountPath: {{ printf "%s/%s" (required "apiServer.switchCertRoot must be set when switchCertCertificates is configured" $.Values.apiServer.switchCertRoot) $cert.domain }}
+              readOnly: true
+            {{- end }}
+            {{- range $i, $cert := .Values.apiServer.clientTlsCertificates }}
+            - name: client-tls-{{ $i }}
+              mountPath: {{ printf "%s/%s" (required "apiServer.clientTlsRoot must be set when clientTlsCertificates is configured" $.Values.apiServer.clientTlsRoot) $cert.domain }}
+              readOnly: true
+            {{- end }}
+          env:
+            {{- if not (include "rack-manager.useMemoryPersistence" .) }}
+            - name: DB_HOST
+              valueFrom:
+                configMapKeyRef:
+                  name: rms-database-config
+                  key: DB_HOST
+            - name: DB_PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: rms-database-config
+                  key: DB_PORT
+            - name: DB_NAME
+              valueFrom:
+                configMapKeyRef:
+                  name: rms-database-config
+                  key: DB_NAME
+            - name: DB_USER
+              valueFrom:
+                secretKeyRef:
+                  key: username
+                  name: {{ include "rack-manager.databaseCredentialsSecret" . }}
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  key: password
+                  name: {{ include "rack-manager.databaseCredentialsSecret" . }}
+            - name: DATABASE_URL
+              value: "postgres://$(DB_USER):$(DB_PASSWORD)@$(DB_HOST):$(DB_PORT)/$(DB_NAME)?sslmode={{ .Values.database.sslMode }}"
+            {{- end }}
+            {{- if .Values.apiServer.allowInsecure }}
+            - name: RMS_ALLOW_INSECURE
+              value: "1"
+            {{- end }}
+            - name: RMS_FIRMWARE_DIR
+              value: {{ .Values.apiServer.firmwareMountPath | quote }}
+            - name: ENVIRONMENT_PATH
+              value: {{ .Values.apiServer.environmentPath | quote }}
+            - name: RMS_SFTP_UPLOAD_TIMEOUT_SECONDS
+              value: {{ .Values.apiServer.sftpUploadTimeoutSeconds | quote }}
+            - name: RMS_SFTP_STEP_TIMEOUT_SECONDS
+              value: {{ .Values.apiServer.sftpStepTimeoutSeconds | quote }}
+      volumes:
+        - name: firmware-storage
+          {{- if $firmwarePersistentVolumeClaim }}
+          persistentVolumeClaim:
+            claimName: {{ $firmwarePersistentVolumeClaim | quote }}
+          {{- else }}
+          hostPath:
+            path: {{ .Values.apiServer.firmwareStoragePath }}
+            type: DirectoryOrCreate
+          {{- end }}
+        {{- if .Values.apiServer.tls.enabled }}
+        - name: api-server-tls
+          secret:
+            secretName: {{ default (printf "%s-api-server-tls" (include "rack-manager.fullname" .)) .Values.apiServer.tls.existingSecret }}
+        {{- end }}
+        {{- range $i, $cert := .Values.apiServer.switchCertCertificates }}
+        - name: switch-cert-{{ $i }}
+          secret:
+            secretName: {{ $cert.secret }}
+            items:
+              - key: ca.crt
+                path: ca.pem
+              - key: tls.crt
+                path: client.pem
+              - key: tls.key
+                path: client.key
+        {{- end }}
+        {{- range $i, $cert := .Values.apiServer.clientTlsCertificates }}
+        - name: client-tls-{{ $i }}
+          secret:
+            secretName: {{ $cert.secret }}
+            items:
+              - key: ca.crt
+                path: ca.pem
+              - key: tls.crt
+                path: client.pem
+              - key: tls.key
+                path: client.key
+        {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rms-api-server
+  namespace: {{ include "rack-manager.namespace" . }}
+  labels:
+    {{- include "rack-manager.labels" . | nindent 4 }}
+    app: rms-api-server
+spec:
+  type: ClusterIP
+  ports:
+    - port: {{ .Values.apiServer.port }}
+      targetPort: {{ .Values.apiServer.port }}
+      protocol: TCP
+      name: http
+  selector:
+    app: rms-api-server
+{{- end }}

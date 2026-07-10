@@ -1,0 +1,13 @@
+apiVersion: v2
+name: rack-manager
+description: Helm chart for Rack Management System (RMS) - API server and optional Postgres
+type: application
+# Chart semver — bump when helm/** changes. Use 0.x.y-rcN during RC; 0.x.y at GA (see helm/README.md).
+version: 0.9.0-rc2
+# Default RMS app image tag fallback; CI sets the packaged appVersion via --app-version.
+appVersion: "0.0.0"
+keywords:
+  - rack-manager
+  - rms
+  - dcim
+maintainers: []

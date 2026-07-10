@@ -1,0 +1,13 @@
+{{- $useRmsPostgres := eq (include "rack-manager.useRmsPostgres" .) "true" }}
+{{- $patchEnabled := index .Values.rmsPostgres.patchForgeCluster "enabled" | default false }}
+{{- if and .Values.createNamespace (not (and $useRmsPostgres $patchEnabled)) }}
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ include "rack-manager.namespace" . }}
+  labels:
+    name: {{ include "rack-manager.namespace" . }}
+    {{- with .Values.commonLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+{{- end }}

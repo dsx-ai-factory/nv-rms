@@ -1,0 +1,66 @@
+# Test case: insecureSwitch false (secure switch — production default)
+#
+# Secure switch meaning:
+#   - nvue_api: mTLS over HTTPS
+#   - scale_up_fabric_manager: gRPC over HTTPS
+#   - scale_up_fabric_telemetry_interface: gRPC over HTTPS (same transport rules as scale_up_fabric_manager)
+#
+# Objective
+#   Verify RMS outbound switch connectivity uses mTLS over HTTPS for nvue_api and
+#   gRPC over HTTPS for scale_up_fabric_manager and scale_up_fabric_telemetry_interface.
+#   The chart must NOT pass --insecure-switch; client and switch cert material must be mounted and
+#   forwarded to the binary.
+#
+# Prerequisites
+#   - Kubernetes secrets with switch and RMS client cert material (ca.crt, tls.crt, tls.key)
+#   - API server TLS secret (apiServer.tls.existingSecret or --set-file cert/key/ca)
+#   - PostgreSQL reachable (or layer databaseMode: memory for chart-only validation)
+#   - Switches configured for mTLS (nvue_api mTLS over HTTPS; gRPC services gRPC over HTTPS)
+#
+# Expected chart behavior
+#   - Deployment args omit --insecure-switch
+#   - Args include --client-tls-root, --switch-cert-root, --default-switch-domain
+#   - Volume mounts under clientTlsRoot and switchCertRoot per domain
+#   - Pod starts only when clientTlsCertificates and defaultSwitchDomain are set
+#
+# Expected RMS runtime behavior
+#   - Startup validates client-tls-root and default-switch-domain
+#   - nvue_api calls use mTLS over HTTPS (RMS client certificate and server CA verification)
+#   - scale_up_fabric_manager and scale_up_fabric_telemetry_interface calls use gRPC over HTTPS with client mTLS and server certificate verification
+#   - ConfigureSwitchCertificate installs switch-side cert material (not unset-mode)
+#   - Startup log does NOT warn about insecure-switch
+#
+# Verification steps
+#   1. helm template rack ./helm -f helm/values.yaml -f helm/examples/overrides/switch-mtls-values.yaml --set global.image.tag=test \
+#        | grep -E 'insecure-switch|client-tls-root|switch-cert-root|default-switch-domain'
+#   2. Confirm deployment args contain --client-tls-root and --default-switch-domain
+#   3. Deploy and confirm pod reaches Ready
+#   4. Invoke switch RPCs (e.g. ConfigureSwitchCertificate, ConfigureScaleUpFabricManager,
+#      SetScaleUpFabricTelemetryInterfaceState)
+#   5. Confirm switch-side mTLS is active and RMS presents client certificates
+#   6. Confirm ConfigureSwitchCertificate response mode is NOT "insecure-switch"
+#
+# Install example:
+#   helm upgrade --install rack ./helm \
+#     -f helm/values.yaml \
+#     -f helm/examples/overrides/switch-mtls-values.yaml \
+#     --set global.image.tag=<APP_TAG> \
+#     -n rack-manager --create-namespace
+#
+# Replace secret names below with your site PKI before deploying.
+
+apiServer:
+  insecureSwitch: false
+  defaultSwitchDomain: site-wide
+  switchCertRoot: /var/run/secrets/switch-cert
+  switchCertCertificates:
+    - domain: site-wide
+      secret: rms-switch-cert-material
+  clientTlsRoot: /var/run/secrets/client-tls
+  clientTlsCertificates:
+    - domain: site-wide
+      secret: rms-nmxc-client-certificate
+  tls:
+    enabled: true
+    caEnabled: true
+    existingSecret: rms-api-server-tls

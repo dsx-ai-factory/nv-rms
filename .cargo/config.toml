@@ -1,0 +1,9 @@
+# Use LLVM lld instead of the default GNU ld for faster linking. lld is installed
+# via apt on dev hosts; the Docker builder image uses the default linker instead
+# (see Dockerfile). -fuse-ld=lld keeps gcc as the driver and only swaps the
+# linker. Both arch targets are listed because CI fans out across amd64 and arm64.
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-fuse-ld=lld"]
+
+[target.aarch64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-fuse-ld=lld"]
