@@ -1,0 +1,13 @@
+# Site override for firmware download storage backed by an existing PVC.
+# Layer on top of helm/values.yaml and replace the claim name with the
+# PersistentVolumeClaim provisioned for your cluster.
+#
+# Install:
+#   helm upgrade --install rack ./helm \
+#     -f helm/values.yaml \
+#     -f helm/examples/overrides/firmware-pvc-values.yaml \
+#     --set global.image.tag=<APP_TAG> \
+#     -n rack-manager --create-namespace
+
+apiServer:
+  firmwarePersistentVolumeClaim: rms-firmware-downloads

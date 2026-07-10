@@ -1,0 +1,103 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+#
+# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
+# property and proprietary rights in and to this material, related
+# documentation and any modifications thereto. Any use, reproduction,
+# disclosure or distribution of this material and related documentation
+# without an express license agreement from NVIDIA CORPORATION or
+# its affiliates is strictly prohibited.
+
+name: Bug Report
+description: File a bug report for NVIDIA Rack Management Service
+title: "bug: "
+labels: ["bug"]
+type: Bug
+
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to fill out this bug report.
+
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: What version, branch, tag, or commit SHA of NVIDIA Rack Management Service are you running?
+      placeholder: "example: v0.9.0, main, 8f5b925"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Affected component
+      options:
+        - RMS service
+        - gRPC API
+        - Helm chart
+        - Firmware update
+        - Redfish / BMC integration
+        - Switch / NVUE / NMX-C integration
+        - Persistence / database
+        - Documentation
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Describe the bug
+      description: Include what happened and what you expected to happen.
+      placeholder: RMS did ABC; I expected XYZ.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Minimum reproducible example
+      description: Provide the smallest set of steps, commands, config, or requests that reproduces the issue.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log output
+      description: Paste relevant error and log output here. Redact credentials, tokens, hostnames, and site-specific data.
+      render: shell
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Include deployment mode, hardware/rack type, Kubernetes/Helm details, TLS mode, database mode, or other relevant context.
+
+  - type: textarea
+    id: misc
+    attributes:
+      label: Other context
+      description: Add any other helpful information here.
+
+  - type: checkboxes
+    id: code_of_conduct
+    attributes:
+      label: Code of Conduct
+      description: By submitting this issue, you agree to follow our [Code of Conduct](https://github.com/NVIDIA/nv-rms/blob/main/CODE_OF_CONDUCT.md).
+      options:
+        - label: I agree to follow NVIDIA Rack Management Service's Code of Conduct.
+          required: true
+
+  - type: checkboxes
+    id: terms
+    attributes:
+      label: Submission checklist
+      options:
+        - label: I have not included passwords, private keys, tokens, or sensitive site data.
+          required: true
+        - label: I have searched the open bug reports and found no duplicate for this issue.
+          required: true

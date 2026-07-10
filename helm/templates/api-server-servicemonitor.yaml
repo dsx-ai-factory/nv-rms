@@ -1,0 +1,53 @@
+{{- if and .Values.apiServer.enabled .Values.apiServer.serviceMonitor.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: rms-api-server
+  namespace: {{ include "rack-manager.namespace" . }}
+  labels:
+    {{- include "rack-manager.labels" . | nindent 4 }}
+    prometheus: {{ .Values.apiServer.serviceMonitor.prometheus }}
+spec:
+  selector:
+    matchLabels:
+      app: rms-api-server
+  namespaceSelector:
+    matchNames:
+      - {{ include "rack-manager.namespace" . }}
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 30s
+      scrapeTimeout: 25s
+      scheme: {{ if .Values.apiServer.tls.enabled }}https{{ else }}http{{ end }}
+      {{- if .Values.apiServer.tls.enabled }}
+      {{- $tlsCfg := .Values.apiServer.serviceMonitor.tlsConfig }}
+      {{- $sm := .Values.apiServer.serviceMonitor }}
+      {{- $clientSecret := $tlsCfg.clientCertSecret }}
+      {{- if and (not $clientSecret) $sm.clientCert.create }}
+      {{- $clientSecret = $sm.clientCert.secretName }}
+      {{- end }}
+      {{- if or $tlsCfg.insecureSkipVerify $tlsCfg.serverName $tlsCfg.caSecret $clientSecret }}
+      tlsConfig:
+        insecureSkipVerify: {{ $tlsCfg.insecureSkipVerify | default false }}
+        {{- if $tlsCfg.serverName }}
+        serverName: {{ $tlsCfg.serverName }}
+        {{- end }}
+        {{- if $tlsCfg.caSecret }}
+        ca:
+          secret:
+            name: {{ $tlsCfg.caSecret }}
+            key: {{ $tlsCfg.caSecretKey | default "ca.crt" }}
+        {{- end }}
+        {{- if $clientSecret }}
+        cert:
+          secret:
+            name: {{ $clientSecret }}
+            key: {{ $tlsCfg.clientCertKey | default "tls.crt" }}
+        keySecret:
+          name: {{ $clientSecret }}
+          key: {{ $tlsCfg.clientKeyKey | default "tls.key" }}
+        {{- end }}
+      {{- end }}
+      {{- end }}
+{{- end }}

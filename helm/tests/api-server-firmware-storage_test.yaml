@@ -1,0 +1,61 @@
+suite: API server firmware storage
+templates:
+  - templates/api-server-deployment.yaml
+tests:
+  - it: uses hostPath firmware storage by default
+    set:
+      global.image.tag: test
+      apiServer.tls.enabled: false
+    documentSelector:
+      path: kind
+      value: Deployment
+    asserts:
+      - isKind:
+          of: Deployment
+      - equal:
+          path: spec.template.spec.volumes[0].name
+          value: firmware-storage
+      - equal:
+          path: spec.template.spec.volumes[0].hostPath.path
+          value: /mnt/data
+      - equal:
+          path: spec.template.spec.volumes[0].hostPath.type
+          value: DirectoryOrCreate
+      - notExists:
+          path: spec.template.spec.volumes[0].persistentVolumeClaim
+      - equal:
+          path: spec.template.spec.containers[0].volumeMounts[0].mountPath
+          value: /mnt/firmware
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: RMS_FIRMWARE_DIR
+            value: /mnt/firmware
+
+  - it: uses PVC firmware storage when a claim is configured
+    set:
+      global.image.tag: test
+      apiServer.tls.enabled: false
+      apiServer.firmwarePersistentVolumeClaim: rms-firmware-downloads
+    documentSelector:
+      path: kind
+      value: Deployment
+    asserts:
+      - isKind:
+          of: Deployment
+      - equal:
+          path: spec.template.spec.volumes[0].name
+          value: firmware-storage
+      - equal:
+          path: spec.template.spec.volumes[0].persistentVolumeClaim.claimName
+          value: rms-firmware-downloads
+      - notExists:
+          path: spec.template.spec.volumes[0].hostPath
+      - equal:
+          path: spec.template.spec.containers[0].volumeMounts[0].mountPath
+          value: /mnt/firmware
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: RMS_FIRMWARE_DIR
+            value: /mnt/firmware

@@ -1,0 +1,284 @@
+#####################################################################################
+# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+#
+# NVIDIA CORPORATION and its licensors retain all intellectual property
+# and proprietary rights in and to this software, related documentation
+# and any modifications thereto. Any use, reproduction, disclosure or
+# distribution of this software and related documentation without an express
+# license agreement from NVIDIA CORPORATION is strictly prohibited.
+#####################################################################################
+
+GlobalOptions:
+  Groups:
+    - Target
+    - ConfigFile
+  Usage: "[-t BMC-TARGET] [-v] < command >"
+  Options:
+    - Target:
+        Description: Target comprising BMC/NVOS IP address and BMC/NVOS login credentials. NVOS IP used for GB200Switch/GB300Switch. servertype, port, verify_tls, and bmc_ca_cert are optional arguments. HTTPS certificate validation uses built-in public roots plus the host trust store by default; pass bmc_ca_cert to trust a per-command CA, or verify_tls=false only when cert validation must be disabled. Valid value for servertype is one of [DGX, DGXRUBIN, HGX, MGX, GH200, HGXB100, HGXB300, HGXRUBIN, GB200, GB300, VRNVL72, MGX-NVL, GB200Switch, GB300Switch, VRNVL72Switch, Powershelf]
+        Short: t
+        Long: target
+        Arg: ip=<BMC IP/NVOS IP> user=<login id> password=<password> port=<port num for port forwarding> servertype=<Type of server> verify_tls=<true|false> bmc_ca_cert=<CA PEM path>
+        Nargs: +
+        Action: store
+        Validator: validate_target
+    - OSTarget:
+        Description: OS target comprising OS IP address and OS login credentials. servertype and port are optional. Valid value for servertype is one of [DGX, DGXRUBIN, HGX, MGX, GH200, HGXB100, HGXB300, HGXRUBIN, GB200, GB300, VRNVL72, MGX-NVL, GB200Switch, GB300Switch, VRNVL72Switch, Powershelf]
+        Short: o
+        Long: os_target
+        Arg: ip=<OS IP> user=<OS login id> password=<OS password> port=<port num for port forwarding> servertype=<Type of server>
+        Nargs: +
+        Action: store
+        Validator: validate_target
+    - Config:
+        Description: Configure tool behavior
+        Short: c
+        Long: config
+        Action: store
+        Nargs: +
+        Required: false
+        Arg: "Path for config file (optional)."
+        Validator: ''
+    - Verbosity:
+        Description: Increase verbosity
+        Short: v
+        Long: verbose
+        Action: store
+        Nargs: '*'
+        Required: false
+        Arg: "Chosen path for logfile (optional). Default path is current working directory."
+        Validator: ''
+Commands:
+  - Name: help
+    Class: Help
+    RequireGlobalOption: false
+    Description: Show tool help.
+  - Name: version
+    Class: ToolVersion
+    Usage: "version"
+    RequireGlobalOption: false
+    Description: Show tool version.
+  - Name: show_version
+    Class: ShowVersion
+    RequireGlobalOption: true
+    Usage: "show_version -p/--package FWPKG [FWPKG ...] [-j] [-s] [-i]"
+    Options:
+     - Description: PLDM firmware package
+       Short: p
+       Long: package
+       Nargs: '+'
+       Action: store
+       Required: false
+       Validator: validate_recipe
+     - Description: show output in JSON
+       Short: j
+       Long: json
+       Action: store_true
+       Required: false
+       Validator: validate_recipe
+     - Description: Show staged firmware versions
+       Short: 's'
+       Long: 'staged'
+       Action: store_true
+     - Description: Show software inventory such as IST Vector Versions
+       Short: 'i'
+       Long: 'inventory'
+       Action: store_true
+  - Name: update_fw
+    Class: UpdateFirmware
+    RequireGlobalOption: true
+    Usage: "update_fw [-p FWPKG [FWPKG ...]] [-y] [-b] [-s] [-o] [-t] [-j] [-d]"
+    Options:
+      - Description: PLDM firmware package
+        Short: p
+        Long: package
+        Nargs: '+'
+        Action: store
+        Validator: validate_recipe
+      - Description: Bypass firmware update confirmation prompt
+        Short: 'y'
+        Long: 'yes'
+        Action: store_true
+      - Description: Exit without waiting for the update process to finish
+        Short: b
+        Long: background
+        Action: store_true
+      - Description: API request timeout value in seconds
+        Short: t
+        Long: timeout
+        Action: store
+      - Description: Special Update json file
+        Short: s
+        Long: special
+        Nargs: '+'
+        Action: store
+      - Description: Oem Parameters json file
+        Short: o
+        Long: oem_parameters
+        Nargs: '+'
+        Action: store
+      - Description: Show update progress in table format
+        Short: d
+        Long: details
+        Action: store_true
+      - Description: show output in JSON. Must be paired with the -b background option, and always bypasses update confirmation prompt.
+        Short: j
+        Long: json
+        Action: store_true
+        Required: false
+        Validator: validate_recipe
+      - Description: SPI Staged Update
+        Short: u
+        Long: staged_update
+        Action: store_true
+      - Description: SPI and Activate Staged Update
+        Short: a
+        Long: staged_activate_update
+        Action: store_true
+      - Description: Skip pre-flight checks before firmware update
+        Short: k
+        Long: skip_pre_flight_checks
+        Action: store_true
+  - Name: activate_fw
+    Class: ActivateFirmware
+    RequireGlobalOption: true
+    Usage: activate_fw [-y] [-c]
+    Options:
+        - Description: Activation command name
+          Short: 'c'
+          Long: 'cmd'
+          Action: store
+          Required: true
+  - Name: background_copy
+    Class: BackgroundCopy
+    RequireGlobalOption: true
+    Usage: "background_copy [-s] [-i] [-t] [-p]"
+    Options:
+        - Description: JSON File for selecting background copy target
+          Short: s
+          Long: special
+          Nargs: '+'
+          Action: store
+          Required: true
+        - Description: Interactive mode - poll until Active and Inactive firmware slots match
+          Short: i
+          Long: interactive
+          Action: store_true
+          Required: false
+        - Description: Maximum wait time in seconds for interactive mode polling (default 600)
+          Short: t
+          Long: timeout
+          Action: store
+          Required: false
+        - Description: Poll interval in seconds for interactive mode (default 20)
+          Short: p
+          Long: poll_interval
+          Action: store
+          Required: false
+  - Name: force_update
+    Class: ForceUpdate
+    RequireGlobalOption: true
+    Usage: "force_update [enable|disable|status] [-j]"
+    Options:
+        - Description: enable, disable or check current force update value on target
+          Long: force_upd_action
+          Nargs: 1
+          Action: store
+        - Description: show output in JSON
+          Short: j
+          Long: json
+          Action: store_true
+          Required: false
+  - Name: show_update_progress
+    Class: ShowUpdateProgress
+    RequireGlobalOption: true
+    Usage: show_update_progress [-j] -i/--id Task Ids [RECIPE ...]
+    Options:
+     - Description: List of Task IDs delimited by space
+       Short: i
+       Long: id
+       Nargs: '+'
+       Action: store
+       Required: true
+     - Description: show output in JSON
+       Short: j
+       Long: json
+       Action: store_true
+       Required: false
+       Validator: validate_recipe
+  - Name: perform_factory_reset
+    Class: PerformFactoryReset
+    RequireGlobalOption: true
+    Usage: perform_factory_reset
+  - Name: show_pkg_content
+    Class: ShowRecipe
+    RequireGlobalOption: false
+    Usage: show_pkg_content -p/--package [fwpkg]
+    Options:
+    - Description: PLDM firmware package
+      Short: p
+      Long: package
+      Nargs: '+'
+      Action: store
+      Required: true
+      Validator: validate_recipe
+  - Name: unpack
+    Class: UnpackPLDM
+    RequireGlobalOption: false
+    Usage: unpack -o/--outdir [dirpath to save unpacked files] -p/--package [fwpkg]
+    Options:
+    - Description: PLDM firmware package
+      Short: p
+      Long: package
+      Nargs: '+'
+      Action: store
+      Required: true
+      Validator: validate_recipe
+    - Description: Directory path to save unpacked firmware files (optional). Default path is current working directory of tool.
+      Short: o
+      Long: outdir
+      Action: store
+      Required: false
+      Validator: validate_recipe
+  - Name: make_upd_targets
+    Class: CreateUpdateTargets
+    RequireGlobalOption: true
+    Usage: make_upd_targets -o/--outdir <dirpath to save update target files>
+    Options:
+    - Description: Directory path to create update target files (optional). Default path is current working directory of tool.
+      Short: o
+      Long: outdir
+      Action: store
+      Required: false
+  - Name: flint_update
+    Class: FlintUpdate
+    RequireGlobalOption: true
+    Usage: "flint_update [-i IMAGE [FWPKG ...]] [-d DEVICE_TYPE] [-j] [-v] [-t TIMEOUT]"
+    Options:
+      - Description: Image file for firmware flashing and version comparison
+        Short: i
+        Long: image
+        Nargs: '+'
+        Action: store
+        Validator: validate_recipe
+      - Description: Device type for firmware flashing and version query (e.g., BlueField3, ConnectX)
+        Short: d
+        Long: device_type
+        Action: store
+        Required: false
+      - Description: show output in JSON.
+        Short: j
+        Long: json
+        Action: store_true
+        Required: false
+        Validator: validate_recipe
+      - Description: Query firmware version only
+        Short: v
+        Long: version
+        Action: store_true
+        Required: false
+      - Description: Query timeout in seconds for OS commands. Flash timeout is 20x the query timeout. (default 60 for queries, 1200 for flash operations)
+        Short: t
+        Long: timeout
+        Action: store
+        Required: false

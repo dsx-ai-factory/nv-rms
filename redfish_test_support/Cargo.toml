@@ -1,0 +1,19 @@
+[package]
+name = "redfish_test_support"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+axum = "0.8"
+flate2 = "1"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "server-auto"] }
+rcgen = "0.13"
+rustls = { version = "0.23", features = ["ring"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tar = "0.4"
+tokio = { workspace = true, features = ["full"] }
+tokio-rustls = "0.26"
+tower = "0.5"

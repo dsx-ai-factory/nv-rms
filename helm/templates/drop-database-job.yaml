@@ -1,0 +1,59 @@
+{{- if and .Values.dropDatabaseOnUninstall (not (include "rack-manager.useMemoryPersistence" .)) }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: drop-database
+  namespace: {{ include "rack-manager.namespace" . }}
+  labels:
+    {{- include "rack-manager.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: pre-delete
+    helm.sh/hook-weight: "5"
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  ttlSecondsAfterFinished: 300
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        {{- include "rack-manager.labels" . | nindent 8 }}
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: drop-db
+          image: postgres:15-alpine
+          env:
+            - name: PGHOST
+              value: {{ .Values.database.host | quote }}
+            - name: PGPORT
+              value: {{ .Values.database.port | quote }}
+            - name: PGUSER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "rack-manager.databaseCredentialsSecret" . }}
+                  key: username
+                  optional: true
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "rack-manager.databaseCredentialsSecret" . }}
+                  key: password
+                  optional: true
+            - name: DB_NAME
+              value: {{ .Values.database.name | quote }}
+            - name: PGSSLMODE
+              value: {{ .Values.database.sslMode | default "prefer" | quote }}
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              if [ -z "$PGUSER" ] || [ -z "$PGPASSWORD" ]; then
+                echo "WARNING: DB credentials unavailable; skipping database drop."
+                exit 0
+              fi
+              echo "Dropping database \"$DB_NAME\"..."
+              psql -d postgres -v ON_ERROR_STOP=1 -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '$DB_NAME' AND pid <> pg_backend_pid();" 2>/dev/null || true
+              psql -d postgres -v ON_ERROR_STOP=1 -c "DROP DATABASE IF EXISTS \"$DB_NAME\";"
+              echo "Database \"$DB_NAME\" dropped."
+{{- end }}

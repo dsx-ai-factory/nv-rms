@@ -1,0 +1,63 @@
+# Test case: insecureSwitch true (lab / bootstrap — switch mTLS disabled)
+#
+# Contrast with secure (insecureSwitch false):
+#   - nvue_api: mTLS over HTTPS  ->  HTTPS (TLS only, no client mTLS)
+#   - scale_up_fabric_manager: gRPC over HTTPS  ->  gRPC over HTTP
+#   - scale_up_fabric_telemetry_interface: gRPC over HTTPS  ->  gRPC over HTTP
+#
+# Objective
+#   Verify RMS can reach switches without provisioning RMS client mTLS material.
+#   The chart passes --insecure-switch; outbound nvue_api and gRPC services
+#   (scale_up_fabric_manager, scale_up_fabric_telemetry_interface) skip client certs.
+#
+# Prerequisites
+#   - Trusted management network or lab environment only — NOT for production
+#   - API server TLS secret unless combined with allowInsecure (see local-dev-values.yaml)
+#   - Switches reachable over management network (nvue_api HTTPS/TLS; gRPC services HTTP)
+#   - No clientTlsCertificates or switchCertCertificates secrets required
+#
+# Expected chart behavior
+#   - Deployment args include --insecure-switch
+#   - Args omit --client-tls-root and --switch-cert-root (when cert lists are empty)
+#   - No client-tls or switch-cert volume mounts
+#   - Pod starts without clientTlsCertificates or defaultSwitchDomain
+#
+# Expected RMS runtime behavior
+#   - Startup skips client-tls-root, switch-cert-root, default-switch-domain validation
+#   - Startup logs warn: "insecure-switch disables switch client mTLS"
+#   - nvue_api uses HTTPS (TLS) with server certificate verification disabled
+#   - scale_up_fabric_manager and scale_up_fabric_telemetry_interface use gRPC over HTTP
+#   - ConfigureSwitchCertificate runs in unset-mode (removes switch mTLS via SSH)
+#   - ConfigureSwitchCertificate response mode is "insecure-switch"
+#
+# Verification steps
+#   1. helm template rack ./helm \
+#       -f helm/values.yaml \
+#       -f helm/examples/overrides/switch-insecure-values.yaml \
+#       --set databaseMode=memory \
+#       --set global.image.tag=test \
+#       | grep -E 'insecure-switch|client-tls-root|switch-cert-root|default-switch-domain'
+#
+#   2. Confirm deployment args do NOT contain --client-tls-root or --switch-cert-root
+#   3. Deploy and confirm pod reaches Ready without client TLS secrets
+#   4. Invoke switch RPCs against lab switches without client cert provisioning
+#   5. Confirm nvue_api over HTTPS (TLS) and gRPC services over HTTP
+#   6. Invoke ConfigureSwitchCertificate and confirm mode "insecure-switch" in response
+#
+# Install example (memory DB for quick local validation):
+#   helm upgrade --install rack ./helm \
+#     -f helm/values.yaml \
+#     -f helm/examples/overrides/switch-insecure-values.yaml \
+#     --set databaseMode=memory \
+#     --set global.image.tag=<APP_TAG> \
+#     -n rack-manager --create-namespace
+#
+# For full local k3s dev (plaintext gRPC + insecure switch + imagePullSecrets), use
+# helm/examples/overrides/local-dev-values.yaml instead.
+
+apiServer:
+  insecureSwitch: true
+  tls:
+    enabled: true
+    caEnabled: true
+    existingSecret: rms-api-server-tls

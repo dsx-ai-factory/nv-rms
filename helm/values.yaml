@@ -1,0 +1,267 @@
+# Default values for the rack-manager Helm chart.
+#
+# Default layout: external PostgreSQL (databaseMode: external) with optional
+# rmsPostgres helpers (ESO credential sync, cluster patch). Does not deploy
+# in-cluster Postgres (postgres.enabled: false).
+#
+# Database modes (set databaseMode; override in a site-specific values file):
+#   external   — use an existing cluster (default here). Set database.host,
+#     database.name, database.credentialsSecret, and rmsPostgres.* to match your
+#     cluster name, namespace, and operator secret naming.
+#   standalone — chart-managed Postgres. Set databaseMode: standalone,
+#     postgres.enabled: true, and postgres.auth (or postgres.auth.existingSecret).
+#   memory     — no database; in-memory persistence only. No credentials secret,
+#     database ConfigMap, or drop-database hook are created. Data is lost on
+#     restart — for development and testing only.
+#
+# Overrides: keep this file as the base; layer environment-specific settings with
+# -f (later files win). Example:
+#   helm upgrade --install rack ./helm \
+#     -f helm/values.yaml \
+#     -f helm/my-site-values.yaml \
+#     --set global.image.tag=<APP_TAG> \
+#     -n rack-manager --create-namespace
+#
+# Example my-site-values.yaml (external DB on a non-default cluster):
+#   database:
+#     host: my-pg-cluster.postgres.svc.cluster.local
+#     name: my_rms_db
+#     credentialsSecret: rms-api-server.rack-manager.my-pg-cluster.credentials
+#   rmsPostgres:
+#     externalSecret:
+#       enabled: true
+#       sourceSecretKey: rms-api-server.rack-manager.my-pg-cluster.credentials.postgresql.acid.zalan.do
+#     patchForgeCluster:
+#       enabled: true
+#       postgresqlName: my-pg-cluster
+#       databaseName: my_rms_db
+#
+# Example values-local-dev.yaml (development only — plaintext gRPC, no mTLS):
+#   apiServer:
+#     environmentPath: local-dev
+#     allowInsecure: true
+#     tls:
+#       enabled: false
+#   See helm/README.md "Insecure Mode" for when and how to use this override.
+#
+# Chart version (Chart.yaml `version`) tracks packaging changes only.
+# Application images are selected independently via global.image.tag at install/upgrade.
+#
+# Prerequisites (external DB mode):
+#   - PostgreSQL cluster reachable at database.host
+#   - DB/user provisioned on the target cluster
+#   - DB credentials via ESO (rmsPostgres.externalSecret) or pre-created database.credentialsSecret
+
+nameOverride: ""
+fullnameOverride: ""
+
+namespace: rack-manager
+createNamespace: false
+
+# Shared defaults for the RMS API server image.
+global:
+  image:
+    # Required at install unless apiServer.image.tag is set,
+    # or the chart was packaged with a non-empty appVersion.
+    tag: ""
+    pullPolicy: Always
+  imagePullSecrets: []
+
+# Database backend selection. Prefer external when a shared cluster already
+# exists; use standalone only for dev or when the chart should run its own Postgres.
+databaseMode: external
+
+# Run a pre-delete hook to drop the release database when uninstalling (external/standalone).
+# Set to false to keep the database on helm uninstall.
+dropDatabaseOnUninstall: true
+
+apiServer:
+  enabled: true
+  image:
+    repository: nvcr.io/nvidian/dcim/rms-api
+    pullPolicy: ""
+  replicaCount: 1
+  port: 8801
+  # Existing PersistentVolumeClaim for firmware artifacts. Leave empty (or omit) to
+  # use firmwareStoragePath hostPath; set a valid PVC name in a site override
+  # passed with -f.
+  firmwarePersistentVolumeClaim: ""
+  # Host directory on the node (hostPath volume source).
+  firmwareStoragePath: /mnt/data
+  # In-container mount for firmware artifacts; RMS reads this via RMS_FIRMWARE_DIR.
+  firmwareMountPath: /mnt/firmware
+  environmentPath: local-dev
+  # When true, chart passes `--insecure` and sets RMS_ALLOW_INSECURE=1 in the pod.
+  # Dev/test only: plaintext gRPC with no client authentication.
+  # Production MUST keep this false and enable apiServer.tls with a client CA (mTLS).
+  allowInsecure: false
+  # When false (default), outbound switch connectivity uses mTLS over HTTPS for nvue_api
+  # and gRPC over HTTPS for scale_up_fabric_manager and scale_up_fabric_telemetry_interface.
+  # Requires clientTlsCertificates and defaultSwitchDomain.
+  # When true, chart passes `--insecure-switch`: outbound switch client mTLS is disabled.
+  # nvue_api stays on HTTPS (TLS) without client certs or server verification;
+  # scale_up_fabric_manager and scale_up_fabric_telemetry_interface use gRPC over HTTP.
+  insecureSwitch: false
+  # Overall wall-clock timeout (seconds) for switch NVOS SFTP image uploads.
+  sftpUploadTimeoutSeconds: 3600
+  # Stall timeout (seconds) for one SFTP setup/read/write/flush step during
+  # switch NVOS image uploads. Must be <= sftpUploadTimeoutSeconds.
+  sftpStepTimeoutSeconds: 30
+
+  # Switch-side cert material to install on switches. Each entry mounts a secret at
+  # {switchCertRoot}/{domain}/ (ca.pem, client.pem, client.key).
+  switchCertRoot: /var/run/secrets/switch-cert
+  switchCertCertificates: []
+  #  - domain: site-wide
+  #    secret: rms-switch-cert-material
+  # RMS client mTLS for outbound switch nvue_api, scale_up_fabric_manager, and
+  # scale_up_fabric_telemetry_interface connections. Required unless
+  # apiServer.insecureSwitch is true. Each entry mounts a cert-manager secret at
+  # {clientTlsRoot}/{domain}/ (ca.pem, client.pem, client.key).
+  clientTlsRoot: /var/run/secrets/client-tls
+  clientTlsCertificates: []
+  #  - domain: site-wide
+  #    secret: rms-nmxc-client-certificate
+  #  - domain: ipp6-gb200-36x1.forge
+  #    secret: rms-nmxc-client-certificate-ipp6
+  # Default domain when switch RPCs omit domain; passed as --default-switch-domain.
+  # Set in site-specific overrides when switchCertCertificates / clientTlsCertificates are configured.
+  defaultSwitchDomain: ""
+  # Optional DNS domain used for switch, scale_up_fabric_manager, and
+  # scale_up_fabric_telemetry_interface TLS server-name verification.
+  dnsDomain: ""
+
+  tls:
+    enabled: true
+    # Directory where the API server TLS secret is mounted (tls.crt, tls.key, ca.crt).
+    secretMountPath: /var/run/secrets/rms-api
+    # Use an existing secret name (containing tls.crt/tls.key and optional ca.crt)
+    existingSecret: ""
+    # Provide file contents via --set-file apiServer.tls.cert=... and apiServer.tls.key=...
+    cert: ""
+    key: ""
+    # Client CA for mTLS; required by the RMS binary whenever TLS is enabled.
+    caEnabled: true
+    ca: ""
+  # ServiceMonitor for the API server metrics endpoint
+  serviceMonitor:
+    enabled: true
+    # Prometheus instance name: Must match the serviceMonitorSelector label
+    # on your Prometheus CR, unless you use a nil selector (picks up all ServiceMonitors).
+    prometheus: ""
+    # TLS configuration used when apiServer.tls.enabled is true.
+    # prometheus-operator v0.50+ resolves secrets from the ServiceMonitor's own namespace.
+    tlsConfig:
+      # insecureSkipVerify: Skip all server cert verification (traffic still encrypted).
+      #   Use only in dev/test environments.
+      insecureSkipVerify: false
+      # serverName: Override the hostname used for TLS SNI and cert verification.
+      #   Required when Prometheus scrapes by pod IP (the default) and the cert has no IP SANs.
+      #   Set to any DNS SAN on the server cert, e.g. rms-api-server.rack-manager.svc.cluster.local.
+      serverName: ""
+      # caSecret / caSecretKey: Secret in the ServiceMonitor namespace holding the CA cert.
+      #   Used to verify the server certificate chain.
+      caSecret: ""
+      caSecretKey: ca.crt
+      # Client certificate for mTLS. Set clientCertSecret to the name of an existing
+      # secret, or leave empty and set clientCert.create: true to have the chart create one.
+      clientCertSecret: ""
+      clientCertKey: tls.crt
+      clientKeyKey: tls.key
+    # Create a cert-manager Certificate for Prometheus to present as a client cert when
+    # scraping the mTLS-secured /metrics endpoint. Requires apiServer.tls.caEnabled: true
+    # and cert-manager to be installed. When create: true, the chart creates a Certificate
+    # in the chart namespace signed by issuerName, and the ServiceMonitor tlsConfig is
+    # automatically populated — no need to set tlsConfig.clientCertSecret manually.
+    clientCert:
+      create: false
+      # issuerName: Name of the issuer to use for the certificate.
+      issuerName: rms-ca-issuer
+      # issuerKind: Kind of the issuer to use for the certificate.
+      issuerKind: Issuer
+      # issuerGroup: only needed for external issuers (e.g. StepClusterIssuer, AWSPCAIssuer).
+      # cert-manager v1 infers cert-manager.io when issuerKind is Issuer or ClusterIssuer.
+      issuerGroup: ""
+      # secretName: Name of the secret to store the client certificate in.
+      secretName: prometheus-rms-client-tls
+      # duration: Certificate duration.
+      duration: 8760h
+      # renewBefore: Renew the certificate this amount of time before it expires.
+      renewBefore: 720h
+
+# External PostgreSQL connection (used when databaseMode is external).
+# Placeholder defaults below — override database.host, database.name, and
+# database.credentialsSecret for your cluster before installing.
+database:
+  host: my-pg-cluster.postgres.svc.cluster.local
+  port: "5432"
+  name: my_rms_db
+  credentialsSecret: rms-api-server.rack-manager.my-pg-cluster.credentials
+  sslMode: require
+
+# In-cluster Postgres (used only when databaseMode: standalone and postgres.enabled: true).
+# Leave enabled: false when using database.host / rmsPostgres above.
+postgres:
+  enabled: false
+  image:
+    repository: postgres
+    tag: "16-alpine"
+    pullPolicy: IfNotPresent
+  auth:
+    username: rms
+    password: ""
+    existingSecret: ""
+
+# Optional helpers for external DB on a Zalando PostgreSQL cluster.
+# Disable externalSecret when database.credentialsSecret is pre-created manually.
+# Disable the cluster patch job when the DB/user already exist on the target cluster.
+rmsPostgres:
+  externalSecret:
+    enabled: false
+    refreshTime: 30s
+    refreshInterval: 30s
+    deletionPolicy: Retain
+    secretStoreRef:
+      name: postgres-ns-secretstore
+      kind: ClusterSecretStore
+    # Required when enabled; see example my-site-values.yaml above.
+    sourceSecretKey: ""
+    sourceSecretVersion: v1
+  # Patch the target PostgreSQL CR to add RMS DB/user (requires RBAC in postgres namespace)
+  patchForgeCluster:
+    enabled: false
+    postgresqlNamespace: postgres
+    postgresqlName: my-pg-cluster
+    databaseName: my_rms_db
+    userName: rms-api-server.rack-manager
+
+grafana:
+  dashboard:
+    # When true, deploys a ConfigMap containing the RMS Grafana dashboard JSON.
+    # The Grafana grafana-sc-dashboard sidecar (included with kube-prometheus-stack)
+    # watches for ConfigMaps with the label below and hot-loads them — no Grafana restart required.
+    # Requires: Grafana with grafana-sc-dashboard sidecar enabled.
+    enabled: true
+
+    # Namespace where Grafana's sidecar is watching for ConfigMaps.
+    # Must match the namespace Grafana is deployed in.
+    #   - site monitoring stack:     monitoring (or your Prometheus/Grafana namespace)
+    #   - kube-prometheus-stack:       monitoring (or whichever namespace you installed it in)
+    #   - Leave empty to deploy into the chart's own namespace (rack-manager).
+    namespace: ""
+
+    # Label key the grafana-sc-dashboard sidecar watches for.
+    # kube-prometheus-stack sets this to "grafana_dashboard" by default.
+    label: grafana_dashboard
+
+    # Label value the sidecar requires on the ConfigMap.
+    # kube-prometheus-stack expects "1" by default.
+    labelValue: "1"
+
+    # Grafana folder the dashboard is placed in.
+    # This value is used as a Kubernetes label value — spaces are not allowed.
+    # Use alphanumeric characters, hyphens, underscores, or dots only.
+    # Leave empty to place the dashboard in the Grafana root (General) folder.
+    folder: "RackManagement"
+
+commonLabels: {}

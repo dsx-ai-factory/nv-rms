@@ -1,0 +1,2 @@
+avoid-breaking-exported-api = true
+enum-variant-name-threshold = 2

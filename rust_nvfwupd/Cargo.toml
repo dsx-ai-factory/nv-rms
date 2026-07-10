@@ -1,0 +1,54 @@
+[package]
+name = "nvfwupd"
+version = "2.1.2"
+edition = "2021"
+description = "CLI tool for updating firmware components through BMC using Redfish protocol"
+
+[[bin]]
+name = "nvfwupd"
+path = "src/main.rs"
+
+[lib]
+name = "nvfwupd"
+path = "src/lib.rs"
+
+[dependencies]
+async-trait = { workspace = true }
+clap = { workspace = true }
+reqwest = { workspace = true, features = [
+    "json",
+    "multipart",
+    "rustls-tls-webpki-roots",
+    "rustls-tls-native-roots",
+    "stream",
+    "charset",
+    "http2",
+    "system-proxy",
+] }
+serde = { workspace = true }
+serde_json = { workspace = true, features = ["preserve_order"] }
+noyalib = { version = "0.0.8", features = ["compat-serde-yaml"] }
+nvue_client = { path = "../nvue_client" }
+regex = { workspace = true }
+chrono = { version = "0.4", features = ["serde"] }
+log = "0.4"
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+tokio-util = { workspace = true, features = ["io", "rt"] }
+tracing = { workspace = true }
+tracing-appender = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = "1"
+tar = "0.4"
+tempfile = "3"
+dns-lookup = "2"
+tabled = "0.16"
+russh = { workspace = true }
+russh-sftp = { workspace = true }
+once_cell = "1"
+sha2 = "0.10"
+indexmap = { version = "2", features = ["serde"] }
+
+[dev-dependencies]
+tracing-subscriber = { workspace = true, features = ["json"] }
+wiremock = { workspace = true }
