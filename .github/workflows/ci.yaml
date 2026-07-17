@@ -1,0 +1,51 @@
+name: RMS CI
+
+on:
+  push:
+    branches:
+      - main
+      - "release/**"
+      - "pull-request/[0-9]+"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  runner-smoke:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: amd64, runner: linux-amd64-cpu16 }
+          - { arch: arm64, runner: linux-arm64-cpu16 }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Runner diagnostics
+        run: |
+          echo "matrix.arch = ${{ matrix.arch }}"
+          echo "matrix.runner = ${{ matrix.runner }}"
+          echo "uname     : $(uname -a)"
+          echo "whoami    : $(whoami)"
+          echo "nproc     : $(nproc)"
+          echo "runner arch (dpkg): $(dpkg --print-architecture 2>/dev/null || echo n/a)"
+
+      - name: Docker available
+        run: |
+          docker version
+          docker info --format 'server={{.ServerVersion}} storage-driver={{.Driver}}'
+
+      - name: BuildKit cache config present
+        run: |
+          if [ -f /etc/buildkit/buildkitd.toml ]; then
+            echo "OK: /etc/buildkit/buildkitd.toml found (layer-cache mirror available)"
+          else
+            echo "WARN: /etc/buildkit/buildkitd.toml NOT found — cache mirror may be unavailable on this runner"
+          fi
