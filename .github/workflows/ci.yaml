@@ -6,6 +6,7 @@ on:
       - main
       - "release/**"
       - "pull-request/[0-9]+"
+      - "tc/build-CI" # TEMP: verify runner on this branch; remove before merge
   workflow_dispatch:
 
 permissions:
