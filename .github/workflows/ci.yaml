@@ -1,0 +1,135 @@
+name: RMS CI
+
+on:
+  push:
+    branches:
+      - main
+      - "pull-request/[0-9]+"
+    tags:
+      - "v[0-9]*.[0-9]*.[0-9]*"
+      - "v[0-9][0-9][0-9][0-9].[0-9][0-9].[0-9][0-9]*"
+      - "v[0-9].[0-9].[0-9]-rc[0-9]*"
+
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_HOME: ${{ github.workspace }}/cargo
+  FF_USE_FASTZIP: "true"
+  GIT_SUBMODULE_STRATEGY: recursive
+
+jobs:
+  prepare:
+    runs-on: linux-amd64-cpu4
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      helm_version: ${{ steps.version.outputs.helm_version }}
+      short_sha: ${{ steps.version.outputs.short_sha }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Calculate version
+        id: version
+        run: |
+          set -euo pipefail
+
+          SHORT_SHA=$(git rev-parse --short=7 HEAD)
+          echo "short_sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+
+          # On a tagged commit this collapses to the clean tag (e.g. v2.0.0-rc.1);
+          # otherwise the long dev form (v2.0.0-3-gabc1234). nv-rms has NO release
+          # tags yet, so fall back to a synthetic v0.0.0 dev version off HEAD.
+          if git describe --tags --abbrev=0 >/dev/null 2>&1; then
+            VERSION=$(git describe --tags --first-parent --always)
+          else
+            VERSION="v0.0.0-0-g${SHORT_SHA}"
+          fi
+
+          # Long (dev) tags end in '-g<sha>' and need the helm suffix rewrite;
+          # short/clean (pre)release tags are already valid SemVer.
+          if [[ "$VERSION" =~ -g[0-9a-f]+$ ]]; then IS_LONG_TAG="true"; else IS_LONG_TAG="false"; fi
+
+          HELM_VERSION="${VERSION#v}"
+          if [[ "$IS_LONG_TAG" == "true" ]]; then
+            HELM_VERSION=$(echo "$HELM_VERSION" | sed 's/\(.*\)-/\1./')
+          fi
+
+          # Strict SemVer validation (official regex, POSIX ERE).
+          SEMVER_STRICT='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(0|[1-9][0-9]*|[0-9]*[a-zA-Z-][0-9a-zA-Z-]*)(\.(0|[1-9][0-9]*|[0-9]*[a-zA-Z-][0-9a-zA-Z-]*))*)?(\+[0-9a-zA-Z-]+(\.[0-9a-zA-Z-]+)*)?$'
+          if [[ ! "$HELM_VERSION" =~ $SEMVER_STRICT ]]; then
+            echo "::error::HELM_VERSION '${HELM_VERSION}' (from VERSION '${VERSION}') failed strict SemVer validation"
+            exit 1
+          fi
+
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "helm_version=${HELM_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Calculated VERSION=${VERSION}  HELM_VERSION=${HELM_VERSION}  SHORT_SHA=${SHORT_SHA}"
+
+          {
+            echo "## 📦 Build Version"
+            echo "| Variable | Value |"
+            echo "|----------|-------|"
+            echo "| VERSION | \`${VERSION}\` |"
+            echo "| HELM_VERSION | \`${HELM_VERSION}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  build-container-x86_64:
+    needs: prepare
+    runs-on: linux-amd64-cpu16
+    timeout-minutes: 120
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Build builder image (amd64)
+        uses: NVIDIA/dsx-github-actions/.github/actions/docker-build@v1.17.0
+        with:
+          image: rms-build-container
+          tags: ${{ needs.prepare.outputs.version }}-amd64
+          target: builder
+          platforms: linux/amd64
+          push: "false"
+          cache-scope: build-container-amd64
+          build-args: |
+            VERGEN_GIT_SHA=${{ github.sha }}
+            VERGEN_GIT_DESCRIBE=${{ needs.prepare.outputs.version }}
+
+  build-container-aarch64:
+    needs: prepare
+    runs-on: linux-arm64-cpu16
+    timeout-minutes: 120
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Build builder image (arm64)
+        uses: NVIDIA/dsx-github-actions/.github/actions/docker-build@v1.17.0
+        with:
+          image: rms-build-container
+          tags: ${{ needs.prepare.outputs.version }}-arm64
+          target: builder
+          platforms: linux/arm64
+          push: "false"
+          cache-scope: build-container-arm64
+          build-args: |
+            VERGEN_GIT_SHA=${{ github.sha }}
+            VERGEN_GIT_DESCRIBE=${{ needs.prepare.outputs.version }}
+
+  core-ci-pass:
+    needs: [prepare, build-container-x86_64, build-container-aarch64]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify all required jobs passed
+        run: |
+          set -euo pipefail
+          echo '${{ toJSON(needs) }}' | jq .
+          echo '${{ toJSON(needs) }}' \
+            | jq -e 'to_entries | map(select(.value.result != "success" and .value.result != "skipped")) | length == 0' >/dev/null \
+            || { echo "::error::one or more required jobs did not succeed"; exit 1; }
+          echo "All required jobs passed."
