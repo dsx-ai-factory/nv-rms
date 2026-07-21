@@ -328,8 +328,31 @@ jobs:
           docker rm -f "$PG_NAME" >/dev/null 2>&1 || true
           docker network rm "$PG_NET" >/dev/null 2>&1 || true
 
+  security-secret-scan:
+    name: Secret Scan with TruffleHog
+    needs: prepare
+    runs-on: linux-amd64-cpu8
+    timeout-minutes: 30
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0  # Full history for secret scanning
+
+      - name: Run TruffleHog Scan
+        uses: NVIDIA/dsx-github-actions/.github/actions/trufflehog-scan@9a9ce3a7770a8b53d2726afa920be3276bc3ddd7
+        with:
+          extra-args: '--results=verified,unknown --only-verified'
+          post-pr-comment: 'false'
+          fail-on-findings: 'true'
+
   core-ci-pass:
-    needs: [prepare, build-container-x86_64, build-container-aarch64, lint-police, test, coverage]
+    needs: [prepare, build-container-x86_64, build-container-aarch64, lint-police, test, coverage, security-secret-scan]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     steps:
