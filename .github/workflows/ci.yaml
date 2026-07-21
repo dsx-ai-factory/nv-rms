@@ -88,7 +88,7 @@ jobs:
       - name: Build builder image (amd64)
         uses: NVIDIA/dsx-github-actions/.github/actions/docker-build@v1.17.0
         with:
-          image: rms-build-container
+          image: rms-builder
           tags: ${{ needs.prepare.outputs.version }}-amd64
           target: builder
           platforms: linux/amd64
@@ -110,7 +110,7 @@ jobs:
       - name: Build builder image (arm64)
         uses: NVIDIA/dsx-github-actions/.github/actions/docker-build@v1.17.0
         with:
-          image: rms-build-container
+          image: rms-builder
           tags: ${{ needs.prepare.outputs.version }}-arm64
           target: builder
           platforms: linux/arm64
