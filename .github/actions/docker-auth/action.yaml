@@ -4,7 +4,6 @@ description: Setup authentication for Docker registries such as NGC
 inputs:
   registry:
     description: 'Registry to authenticate (e.g., nvcr.io)'
-    required: true
     default: 'nvcr.io'
   username:
     description: 'Username for registry'
