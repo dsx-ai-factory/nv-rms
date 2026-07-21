@@ -328,6 +328,34 @@ jobs:
           docker rm -f "$PG_NAME" >/dev/null 2>&1 || true
           docker network rm "$PG_NET" >/dev/null 2>&1 || true
 
+  security-codeql-scan:
+    name: CodeQL Security Analysis
+    needs: prepare
+    runs-on: linux-amd64-cpu8
+    timeout-minutes: 360
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+      packages: read
+      pull-requests: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Run CodeQL Scan
+        uses: NVIDIA/dsx-github-actions/.github/actions/codeql-scan@20dc10dda4fa9f8f0380a47cd9a7800d3da3dcf3
+        with:
+          languages: 'rust'
+          build-mode: 'none'
+          category: '/language:rust'
+          upload-sarif: 'false'
+          post-pr-comment: 'false'
+          fail-on-findings: 'true'
+          fail-on-severity: 'error'
+
   security-secret-scan:
     name: Secret Scan with TruffleHog
     needs: prepare
@@ -352,7 +380,7 @@ jobs:
           fail-on-findings: 'true'
 
   core-ci-pass:
-    needs: [prepare, build-container-x86_64, build-container-aarch64, lint-police, test, coverage, security-secret-scan]
+    needs: [prepare, build-container-x86_64, build-container-aarch64, lint-police, test, coverage, security-codeql-scan, security-secret-scan]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     steps:
