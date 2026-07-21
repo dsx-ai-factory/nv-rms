@@ -139,6 +139,7 @@ jobs:
       # no runnable image; rebuild the builder target here with load:true (cache
       # hit on the compile layer) so the lints can run inside it via `docker run`.
       - name: Build builder image (amd64)
+        id: build-image
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -152,15 +153,12 @@ jobs:
             VERGEN_GIT_SHA=${{ github.sha }}
             VERGEN_GIT_DESCRIBE=${{ needs.prepare.outputs.version }}
 
-      # `!cancelled()` on each lint so one failure still lets the others run and
-      # report (the job fails if any did) — the per-check visibility of separate
-      # jobs without paying for a separate image build per lint.
       - name: Run clippy
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.build-image.outcome == 'success' }}
         run: docker run --rm "$BUILDER_IMAGE" cargo clippy --workspace -- -D warnings
 
       - name: Check Rust formatting
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.build-image.outcome == 'success' }}
         run: docker run --rm "$BUILDER_IMAGE" cargo fmt --all -- --check
 
   # Test + coverage: matrixed across both arches (behaviour can diverge by arch,
@@ -213,7 +211,6 @@ jobs:
             VERGEN_GIT_DESCRIBE=${{ needs.prepare.outputs.version }}
 
       - name: Start Postgres
-        if: ${{ !cancelled() }}
         run: |
           set -euo pipefail
           docker network create "$PG_NET"
@@ -232,7 +229,6 @@ jobs:
           echo "::error::Postgres did not become ready within 60s"; exit 1
 
       - name: cargo test
-        if: ${{ !cancelled() }}
         run: |
           docker run --rm --network "$PG_NET" \
             -e DATABASE_URL="$DATABASE_URL" \
