@@ -78,7 +78,7 @@ jobs:
 
   build-container-x86_64:
     needs: prepare
-    runs-on: linux-amd64-cpu16
+    runs-on: linux-amd64-cpu32
     timeout-minutes: 120
     steps:
       - name: Checkout code
@@ -100,7 +100,7 @@ jobs:
 
   build-container-aarch64:
     needs: prepare
-    runs-on: linux-arm64-cpu16
+    runs-on: linux-arm64-cpu32
     timeout-minutes: 120
     steps:
       - name: Checkout code
@@ -120,8 +120,132 @@ jobs:
             VERGEN_GIT_SHA=${{ github.sha }}
             VERGEN_GIT_DESCRIBE=${{ needs.prepare.outputs.version }}
 
-  core-ci-pass:
+  lint-police:
+    needs: [prepare, build-container-x86_64]
+    runs-on: linux-amd64-cpu16
+    timeout-minutes: 120
+    env:
+      BUILDER_IMAGE: rms-builder:${{ needs.prepare.outputs.short_sha }}-amd64
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # build-container warms the GHA layer cache (push:false, no load), leaving
+      # no runnable image; rebuild the builder target here with load:true (cache
+      # hit on the compile layer) so the lints can run inside it via `docker run`.
+      - name: Build builder image (amd64)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: builder
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: ${{ env.BUILDER_IMAGE }}
+          cache-from: type=gha,scope=build-container-amd64
+          build-args: |
+            VERGEN_GIT_SHA=${{ github.sha }}
+            VERGEN_GIT_DESCRIBE=${{ needs.prepare.outputs.version }}
+
+      # `!cancelled()` on each lint so one failure still lets the others run and
+      # report (the job fails if any did) — the per-check visibility of separate
+      # jobs without paying for a separate image build per lint.
+      - name: Run clippy
+        if: ${{ !cancelled() }}
+        run: docker run --rm "$BUILDER_IMAGE" cargo clippy --workspace -- -D warnings
+
+      - name: Check Rust formatting
+        if: ${{ !cancelled() }}
+        run: docker run --rm "$BUILDER_IMAGE" cargo fmt --all -- --check
+
+  # Test + coverage: matrixed across both arches (behaviour can diverge by arch,
+  # so unlike lint this must run on each). Lint lives in `lint-police` above.
+  test:
     needs: [prepare, build-container-x86_64, build-container-aarch64]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: amd64, runner: linux-amd64-cpu32 }
+          - { arch: arm64, runner: linux-arm64-cpu32 }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    env:
+      # Local builder image these checks run inside (see "Build builder image").
+      BUILDER_IMAGE: rms-builder:${{ needs.prepare.outputs.short_sha }}-${{ matrix.arch }}
+      # Per-run, per-arch names so parallel matrix legs on a shared self-hosted
+      # host never collide.
+      PG_NET: rms-pg-net-${{ github.run_id }}-${{ matrix.arch }}
+      PG_NAME: rms-pg-${{ github.run_id }}-${{ matrix.arch }}
+      # Tests reach Postgres by container name over the per-run docker network.
+      DATABASE_URL: postgres://postgres:postgres@rms-pg-${{ github.run_id }}-${{ matrix.arch }}:5432/rms_test
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # The build-container job (dsx docker-build action) builds this same
+      # target with push:false, which only warms the GHA layer cache — it leaves
+      # no runnable image on the runner. Rebuild the builder target here with
+      # load:true, reusing that warm cache (so the cargo compile layer is a cache
+      # hit), so the cargo checks below can run inside it via `docker run`.
+      - name: Build builder image (${{ matrix.arch }})
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: builder
+          platforms: linux/${{ matrix.arch }}
+          load: true
+          push: false
+          tags: ${{ env.BUILDER_IMAGE }}
+          cache-from: type=gha,scope=build-container-${{ matrix.arch }}
+          build-args: |
+            VERGEN_GIT_SHA=${{ github.sha }}
+            VERGEN_GIT_DESCRIBE=${{ needs.prepare.outputs.version }}
+
+      - name: Start Postgres
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          docker network create "$PG_NET"
+          docker run -d --name "$PG_NAME" --network "$PG_NET" \
+            -e POSTGRES_USER=postgres \
+            -e POSTGRES_PASSWORD=postgres \
+            -e POSTGRES_DB=rms_test \
+            postgres:16-alpine
+          echo "Waiting for Postgres to accept connections..."
+          for i in $(seq 1 30); do
+            if docker exec "$PG_NAME" pg_isready -U postgres -d rms_test >/dev/null 2>&1; then
+              echo "Postgres ready"; exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::Postgres did not become ready within 60s"; exit 1
+
+      - name: cargo test
+        if: ${{ !cancelled() }}
+        run: |
+          docker run --rm --network "$PG_NET" \
+            -e DATABASE_URL="$DATABASE_URL" \
+            "$BUILDER_IMAGE" cargo test --workspace --release
+
+      - name: Stop Postgres
+        if: ${{ always() }}
+        run: |
+          docker rm -f "$PG_NAME" >/dev/null 2>&1 || true
+          docker network rm "$PG_NET" >/dev/null 2>&1 || true
+
+  core-ci-pass:
+    needs: [prepare, build-container-x86_64, build-container-aarch64, lint-police, test]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     steps:
