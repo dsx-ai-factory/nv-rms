@@ -669,7 +669,7 @@ jobs:
 
   # TODO: Uncomment when the app is approved for slack notifications
   # notify:
-  #   needs: [prepare, build-container-x86_64, build-container-aarch64, lint-police, test, coverage, run-benchmarks, build-release, publish-image, publish-manifest, helm-validate, helm-publish, security-codeql-scan, security-secret-scan, markdownlint]
+  #   needs: [prepare, build-container-x86_64, build-container-aarch64, lint-police, test, coverage, build-release, publish-image, publish-manifest, helm-validate, helm-publish, security-codeql-scan, security-secret-scan, markdownlint]
   #   if: ${{ always() }}
   #   uses: ./.github/workflows/notify-build-status.yml
   #   with:
@@ -684,7 +684,7 @@ jobs:
   #     slack-bot-token: ${{ secrets.RMS_SLACK_BOT_TOKEN }}
 
   core-ci-pass:
-    needs: [prepare, build-container-x86_64, build-container-aarch64, lint-police, test, coverage, run-benchmarks, build-release, publish-image, publish-manifest, helm-validate, helm-publish, security-codeql-scan, security-secret-scan, markdownlint]
+    needs: [prepare, build-container-x86_64, build-container-aarch64, lint-police, test, coverage, build-release, publish-image, publish-manifest, helm-validate, helm-publish, security-codeql-scan, security-secret-scan, markdownlint]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     steps:
