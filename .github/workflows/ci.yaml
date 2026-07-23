@@ -506,6 +506,93 @@ jobs:
             "${IMAGE}:${VERSION}-arm64"
           docker buildx imagetools inspect "${IMAGE}:${VERSION}"
 
+  # Helm chart validation. Lints + template-renders the chart on every run via
+  # the shared dsx helm-validate action, and guards the chart version (ported
+  # from GitLab's build-helm-chart-to-ngc): on a tag the Chart.yaml version must
+  # match the tag, and if any chart package input changed the version must have
+  # been bumped.
+  helm-validate:
+    needs: prepare
+    runs-on: linux-amd64-cpu4
+    timeout-minutes: 30
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0  # bump check diffs against the previous commit
+
+      - name: Guard chart version (tag sync + bump)
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          chart_ver() { awk '/^version:/{print $2; exit}' helm/Chart.yaml; }
+          # Tag sync: on a vX.Y.Z tag, Chart.yaml version must match (minus 'v').
+          if [ "${REF_TYPE}" = "tag" ]; then
+            expected="${REF_NAME#v}"; actual="$(chart_ver)"
+            if [ "${expected}" != "${actual}" ]; then
+              echo "::error::git tag ${REF_NAME} but helm/Chart.yaml version is ${actual}. Run ./helm/scripts/bump-chart-version.sh sync-tag ${REF_NAME}"
+              exit 1
+            fi
+          fi
+          # Bump check: if chart package inputs changed vs the previous commit,
+          # helm/Chart.yaml 'version:' must have changed too.
+          BASE="${BEFORE_SHA:-}"
+          if [ -n "${BASE}" ] && [ "${BASE}" != "0000000000000000000000000000000000000000" ] && git cat-file -e "${BASE}" 2>/dev/null; then
+            PKG='^helm/(Chart\.yaml|values\.yaml|values\.schema\.json|\.helmignore|templates/|crds/|charts/)'
+            if git diff --name-only "${BASE}" HEAD | grep -qE "${PKG}"; then
+              if ! git diff "${BASE}" HEAD -- helm/Chart.yaml | grep -qE '^[-+]version:'; then
+                echo "::error::Helm chart inputs changed but helm/Chart.yaml version was not bumped. Run ./helm/scripts/bump-chart-version.sh dev {patch|minor|major}"
+                exit 1
+              fi
+            fi
+          else
+            echo "Chart bump check skipped (no usable base SHA)."
+          fi
+
+      - name: Validate Helm chart
+        uses: NVIDIA/dsx-github-actions/.github/actions/helm-validate@v1.17.0
+        with:
+          chart-path: helm
+          lint: 'true'
+          template: 'true'
+
+  # Package + push the Helm chart to NGC. Gated to tags and release/** branches —
+  # chart versions are deliberate, versioned artifacts (Chart.yaml-driven), not
+  # pushed on every main merge (mirrors GitLab's .helm-chart-push-rules). Unified
+  # registry: the NGC token is the shared registry secret; the org/team path is a
+  # repo VARIABLE. ngc-duplicate:fail so re-pushing an unbumped version fails.
+  helm-publish:
+    needs: [prepare, helm-validate]
+    if: ${{ startsWith(github.ref, 'refs/tags/') || startsWith(github.ref, 'refs/heads/release/') }}
+    runs-on: linux-amd64-cpu4
+    timeout-minutes: 30
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # Chart version is Chart.yaml's declared version (matches the bump guard);
+      # app-version is the git-describe VERSION.
+      - name: Read chart version
+        id: chart
+        run: echo "version=$(awk '/^version:/{print $2; exit}' helm/Chart.yaml)" >> "$GITHUB_OUTPUT"
+
+      - name: Package and push Helm chart to NGC
+        uses: NVIDIA/dsx-github-actions/.github/actions/helm-package-push@v1.17.0
+        with:
+          chart-path: helm
+          chart-version: ${{ steps.chart.outputs.version }}
+          app-version: ${{ needs.prepare.outputs.version }}
+          lint: 'false'
+          ngc-key: ${{ secrets.RMS_DEV_REGISTRY_PASSWORD }}
+          ngc-path: ${{ vars.RMS_DEV_NGC_PATH }}
+          ngc-duplicate: fail
+
   security-codeql-scan:
     name: CodeQL Security Analysis
     needs: prepare
@@ -582,7 +669,7 @@ jobs:
 
   # TODO: Uncomment when the app is approved for slack notifications
   # notify:
-  #   needs: [prepare, build-container-x86_64, build-container-aarch64, lint-police, test, coverage, run-benchmarks, build-release, publish-image, publish-manifest, security-codeql-scan, security-secret-scan, markdownlint]
+  #   needs: [prepare, build-container-x86_64, build-container-aarch64, lint-police, test, coverage, run-benchmarks, build-release, publish-image, publish-manifest, helm-validate, helm-publish, security-codeql-scan, security-secret-scan, markdownlint]
   #   if: ${{ always() }}
   #   uses: ./.github/workflows/notify-build-status.yml
   #   with:
@@ -597,7 +684,7 @@ jobs:
   #     slack-bot-token: ${{ secrets.RMS_SLACK_BOT_TOKEN }}
 
   core-ci-pass:
-    needs: [prepare, build-container-x86_64, build-container-aarch64, lint-police, test, coverage, run-benchmarks, build-release, publish-image, publish-manifest, security-codeql-scan, security-secret-scan, markdownlint]
+    needs: [prepare, build-container-x86_64, build-container-aarch64, lint-police, test, coverage, run-benchmarks, build-release, publish-image, publish-manifest, helm-validate, helm-publish, security-codeql-scan, security-secret-scan, markdownlint]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     steps:
