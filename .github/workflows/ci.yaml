@@ -507,10 +507,9 @@ jobs:
           docker buildx imagetools inspect "${IMAGE}:${VERSION}"
 
   # Helm chart validation. Lints + template-renders the chart on every run via
-  # the shared dsx helm-validate action, and guards the chart version (ported
-  # from GitLab's build-helm-chart-to-ngc): on a tag the Chart.yaml version must
-  # match the tag, and if any chart package input changed the version must have
-  # been bumped.
+  # the shared dsx helm-validate action, and guards the chart version: if any
+  # chart package input changed the version must have been bumped. The chart
+  # version is independent of the RMS release version.
   helm-validate:
     needs: prepare
     runs-on: linux-amd64-cpu4
@@ -522,22 +521,11 @@ jobs:
           persist-credentials: false
           fetch-depth: 0  # bump check diffs against the previous commit
 
-      - name: Guard chart version (tag sync + bump)
+      - name: Guard chart version (bump)
         env:
           BEFORE_SHA: ${{ github.event.before }}
-          REF_TYPE: ${{ github.ref_type }}
-          REF_NAME: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          chart_ver() { awk '/^version:/{print $2; exit}' helm/Chart.yaml; }
-          # Tag sync: on a vX.Y.Z tag, Chart.yaml version must match (minus 'v').
-          if [ "${REF_TYPE}" = "tag" ]; then
-            expected="${REF_NAME#v}"; actual="$(chart_ver)"
-            if [ "${expected}" != "${actual}" ]; then
-              echo "::error::git tag ${REF_NAME} but helm/Chart.yaml version is ${actual}. Run ./helm/scripts/bump-chart-version.sh sync-tag ${REF_NAME}"
-              exit 1
-            fi
-          fi
           # Bump check: if chart package inputs changed vs the previous commit,
           # helm/Chart.yaml 'version:' must have changed too.
           BASE="${BEFORE_SHA:-}"
