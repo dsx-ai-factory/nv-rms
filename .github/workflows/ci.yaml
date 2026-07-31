@@ -49,19 +49,14 @@ jobs:
             VERSION="v0.0.0-0-g${SHORT_SHA}"
           fi
 
-          # Long (dev) tags end in '-g<sha>' and need the helm suffix rewrite;
-          # short/clean (pre)release tags are already valid SemVer.
-          if [[ "$VERSION" =~ -g[0-9a-f]+$ ]]; then IS_LONG_TAG="true"; else IS_LONG_TAG="false"; fi
-
-          HELM_VERSION="${VERSION#v}"
-          if [[ "$IS_LONG_TAG" == "true" ]]; then
-            HELM_VERSION=$(echo "$HELM_VERSION" | sed 's/\(.*\)-/\1./')
-          fi
+          # The chart version is an independently managed artifact version that
+          # is declared in helm/Chart.yaml; it is not derived from VERSION.
+          HELM_VERSION=$(awk '/^version:/{print $2; exit}' helm/Chart.yaml)
 
           # Strict SemVer validation (official regex, POSIX ERE).
           SEMVER_STRICT='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(0|[1-9][0-9]*|[0-9]*[a-zA-Z-][0-9a-zA-Z-]*)(\.(0|[1-9][0-9]*|[0-9]*[a-zA-Z-][0-9a-zA-Z-]*))*)?(\+[0-9a-zA-Z-]+(\.[0-9a-zA-Z-]+)*)?$'
           if [[ ! "$HELM_VERSION" =~ $SEMVER_STRICT ]]; then
-            echo "::error::HELM_VERSION '${HELM_VERSION}' (from VERSION '${VERSION}') failed strict SemVer validation"
+            echo "::error::helm/Chart.yaml version '${HELM_VERSION}' failed strict SemVer validation"
             exit 1
           fi
 
@@ -567,15 +562,11 @@ jobs:
 
       # Chart version is Chart.yaml's declared version (matches the bump guard);
       # app-version is the git-describe VERSION.
-      - name: Read chart version
-        id: chart
-        run: echo "version=$(awk '/^version:/{print $2; exit}' helm/Chart.yaml)" >> "$GITHUB_OUTPUT"
-
       - name: Package and push Helm chart to NGC
         uses: NVIDIA/dsx-github-actions/.github/actions/helm-package-push@v1.17.0
         with:
           chart-path: helm
-          chart-version: ${{ steps.chart.outputs.version }}
+          chart-version: ${{ needs.prepare.outputs.helm_version }}
           app-version: ${{ needs.prepare.outputs.version }}
           lint: 'false'
           ngc-key: ${{ secrets.RMS_DEV_REGISTRY_PASSWORD }}
