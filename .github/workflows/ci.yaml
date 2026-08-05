@@ -375,11 +375,13 @@ jobs:
             VERGEN_GIT_SHA=${{ github.sha }}
             VERGEN_GIT_DESCRIBE=${{ needs.prepare.outputs.version }}
 
+      # Benchmarks require a file descriptor limit increase
       - name: Run cargo bench
         run: |
           set -euo pipefail
           mkdir -p "${{ github.workspace }}/benchmark-results-${{ matrix.arch }}"
           docker run --rm \
+            --ulimit "nofile=$(ulimit -Hn):$(ulimit -Hn)" \
             -v "${{ github.workspace }}/benchmark-results-${{ matrix.arch }}:/out" \
             "$BUILDER_IMAGE" \
             bash -c 'set -euo pipefail; cargo bench; cp -r target/criterion /out/ 2>/dev/null || true'
