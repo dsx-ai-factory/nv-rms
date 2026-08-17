@@ -101,7 +101,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Build builder image (amd64)
-        uses: NVIDIA/dsx-github-actions/.github/actions/docker-build@v1.17.0
+        uses: dsx-ai-factory/dsx-github-actions/.github/actions/docker-build@v1.17.0
         with:
           image: rms-builder
           tags: ${{ needs.prepare.outputs.version }}-amd64
@@ -123,7 +123,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Build builder image (arm64)
-        uses: NVIDIA/dsx-github-actions/.github/actions/docker-build@v1.17.0
+        uses: dsx-ai-factory/dsx-github-actions/.github/actions/docker-build@v1.17.0
         with:
           image: rms-builder
           tags: ${{ needs.prepare.outputs.version }}-arm64
@@ -545,7 +545,7 @@ jobs:
           fi
 
       - name: Validate Helm chart
-        uses: NVIDIA/dsx-github-actions/.github/actions/helm-validate@v1.17.0
+        uses: dsx-ai-factory/dsx-github-actions/.github/actions/helm-validate@v1.17.0
         with:
           chart-path: helm
           lint: 'true'
@@ -588,7 +588,7 @@ jobs:
 
       - name: Package and push Helm chart to NGC
         if: ${{ steps.chart.outputs.changed == 'true' }}
-        uses: NVIDIA/dsx-github-actions/.github/actions/helm-package-push@v1.17.0
+        uses: dsx-ai-factory/dsx-github-actions/.github/actions/helm-package-push@v1.17.0
         with:
           chart-path: helm
           chart-version: ${{ needs.prepare.outputs.helm_version }}-OSS
@@ -620,7 +620,7 @@ jobs:
           persist-credentials: false
 
       - name: Run CodeQL Scan
-        uses: NVIDIA/dsx-github-actions/.github/actions/codeql-scan@20dc10dda4fa9f8f0380a47cd9a7800d3da3dcf3
+        uses: dsx-ai-factory/dsx-github-actions/.github/actions/codeql-scan@20dc10dda4fa9f8f0380a47cd9a7800d3da3dcf3
         with:
           languages: 'rust'
           build-mode: 'none'
@@ -647,7 +647,7 @@ jobs:
           fetch-depth: 0  # Full history for secret scanning
 
       - name: Run TruffleHog Scan
-        uses: NVIDIA/dsx-github-actions/.github/actions/trufflehog-scan@9a9ce3a7770a8b53d2726afa920be3276bc3ddd7
+        uses: dsx-ai-factory/dsx-github-actions/.github/actions/trufflehog-scan@9a9ce3a7770a8b53d2726afa920be3276bc3ddd7
         with:
           extra-args: '--results=verified,unknown --only-verified'
           post-pr-comment: 'false'
