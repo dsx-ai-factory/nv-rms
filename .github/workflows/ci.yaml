@@ -15,6 +15,8 @@ env:
   CARGO_HOME: ${{ github.workspace }}/cargo
   FF_USE_FASTZIP: "true"
   GIT_SUBMODULE_STRATEGY: recursive
+  RMS_COVERAGE_MIN_LINES: "1"
+  NVFWUPD_COVERAGE_MIN_LINES: "1"
 
 jobs:
   prepare:
@@ -168,7 +170,7 @@ jobs:
 
       - name: Run clippy
         if: ${{ !cancelled() && steps.build-image.outcome == 'success' }}
-        run: docker run --rm "$BUILDER_IMAGE" cargo clippy --workspace -- -D warnings
+        run: docker run --rm "$BUILDER_IMAGE" cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Check Rust formatting
         if: ${{ !cancelled() && steps.build-image.outcome == 'success' }}
@@ -316,11 +318,15 @@ jobs:
           mkdir -p "${{ github.workspace }}/coverage"
           docker run --rm --network "$PG_NET" \
             -e DATABASE_URL="$DATABASE_URL" \
+            -e RMS_COVERAGE_MIN_LINES="$RMS_COVERAGE_MIN_LINES" \
+            -e NVFWUPD_COVERAGE_MIN_LINES="$NVFWUPD_COVERAGE_MIN_LINES" \
             -v "${{ github.workspace }}/coverage:/cov" \
             "$BUILDER_IMAGE" bash -c '
               set -euo pipefail
               cargo llvm-cov --workspace --release --cobertura --output-path /cov/cobertura.xml
               cargo llvm-cov report --release
+              cargo llvm-cov -p rackmanagementservice --release --ignore-filename-regex "rust_nvfwupd/" --summary-only --fail-under-lines "$RMS_COVERAGE_MIN_LINES"
+              cargo llvm-cov -p nvfwupd --release --summary-only --fail-under-lines "$NVFWUPD_COVERAGE_MIN_LINES"
             '
 
       - name: Upload coverage report
@@ -464,11 +470,11 @@ jobs:
           target: release
           platforms: linux/${{ matrix.arch }}
           push: true
-          tags: ${{ vars.RMS_DEV_IMAGE }}:${{ needs.prepare.outputs.version }}-${{ matrix.arch }}
+          tags: ${{ vars.RMS_DEV_IMAGE }}:${{ needs.prepare.outputs.version }}_OSS-${{ matrix.arch }}
           cache-from: type=gha,scope=build-container-${{ matrix.arch }}
           build-args: |
             VERGEN_GIT_SHA=${{ github.sha }}
-            VERGEN_GIT_DESCRIBE=${{ needs.prepare.outputs.version }}-${{ matrix.arch }}
+            VERGEN_GIT_DESCRIBE=${{ needs.prepare.outputs.version }}_OSS-${{ matrix.arch }}
 
   publish-manifest:
     needs: [prepare, publish-image]
@@ -494,7 +500,7 @@ jobs:
       - name: Create and inspect multi-arch manifest
         env:
           IMAGE: ${{ vars.RMS_DEV_IMAGE }}
-          VERSION: ${{ needs.prepare.outputs.version }}
+          VERSION: ${{ needs.prepare.outputs.version }}_OSS
         run: |
           set -euo pipefail
           docker buildx imagetools create \
@@ -546,14 +552,13 @@ jobs:
           template: 'true'
           valueOverrides: '["global.image.tag=validate", "apiServer.tls.enabled=false"]'
 
-  # Package + push the Helm chart to NGC. Gated to tags and release/** branches —
-  # chart versions are deliberate, versioned artifacts (Chart.yaml-driven), not
-  # pushed on every main merge (mirrors GitLab's .helm-chart-push-rules). Unified
-  # registry: the NGC token is the shared registry secret; the org/team path is a
-  # repo VARIABLE. ngc-duplicate:fail so re-pushing an unbumped version fails.
+  # Package + push the Helm chart to NGC
+  # publish only when Chart.yaml changes on main or release/** (tags never publish
+  # the chart). Published versions carry an -OSS suffix. 
+  # ngc-duplicate:fail so re-pushing an unbumped version fails.
   helm-publish:
     needs: [prepare, helm-validate]
-    if: ${{ startsWith(github.ref, 'refs/tags/') || startsWith(github.ref, 'refs/heads/release/') }}
+    if: ${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/') }}
     runs-on: linux-amd64-cpu4
     timeout-minutes: 30
     steps:
@@ -561,19 +566,41 @@ jobs:
         uses: actions/checkout@v4
         with:
           persist-credentials: false
+          fetch-depth: 0
 
-      # Chart version is Chart.yaml's declared version (matches the bump guard);
-      # app-version is the git-describe VERSION.
+      - name: Detect Chart.yaml change
+        id: chart
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          changed=false
+          BASE="${BEFORE_SHA:-}"
+          if [ -n "${BASE}" ] && [ "${BASE}" != "0000000000000000000000000000000000000000" ] && git cat-file -e "${BASE}" 2>/dev/null; then
+            if git diff --name-only "${BASE}" HEAD | grep -qx 'helm/Chart.yaml'; then
+              changed=true
+            fi
+          else
+            echo "Chart.yaml change check skipped (no usable base SHA); treating as unchanged."
+          fi
+          echo "changed=${changed}" >> "$GITHUB_OUTPUT"
+          echo "Chart.yaml changed: ${changed}"
+
       - name: Package and push Helm chart to NGC
+        if: ${{ steps.chart.outputs.changed == 'true' }}
         uses: NVIDIA/dsx-github-actions/.github/actions/helm-package-push@v1.17.0
         with:
           chart-path: helm
-          chart-version: ${{ needs.prepare.outputs.helm_version }}
-          app-version: ${{ needs.prepare.outputs.version }}
+          chart-version: ${{ needs.prepare.outputs.helm_version }}-OSS
+          app-version: ${{ needs.prepare.outputs.version }}_OSS
           lint: 'false'
           ngc-key: ${{ secrets.RMS_DEV_REGISTRY_PASSWORD }}
           ngc-path: ${{ vars.RMS_DEV_NGC_PATH }}
           ngc-duplicate: fail
+
+      - name: Skip publish (Chart.yaml unchanged)
+        if: ${{ steps.chart.outputs.changed != 'true' }}
+        run: echo "helm/Chart.yaml unchanged on this ref; nothing to publish."
 
   security-codeql-scan:
     name: CodeQL Security Analysis
