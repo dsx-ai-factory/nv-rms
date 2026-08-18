@@ -91,8 +91,8 @@ CI requires a `Chart.yaml` version change only when chart package inputs change:
 `helm/Chart.yaml`, `helm/values.yaml`, `helm/values.schema.json`, `helm/.helmignore`,
 `helm/templates/**`, `helm/crds/**`, or `helm/charts/**`. Documentation, example,
 test, and helper-script changes under `helm/` do not require a chart version bump
-by themselves. On tagged pipelines CI also verifies `Chart.yaml` matches the git tag
-before publishing to NGC. `-dev.N` charts are built and linted in MR pipelines but
+by themselves. The chart version is independent of the RMS application version, so CI
+does not require it to match the git tag. `-dev.N` charts are built and linted in MR pipelines but
 are **not** pushed to NGC (only `vX.Y.Z` and `vX.Y.Z-rcN` tags publish).
 
 ## Chart components
