@@ -31,3 +31,4 @@ config:
 
 ignores:
   - "src/api/grpc/proto/nv-rms-client/**"
+  - "SECURITY.md"
