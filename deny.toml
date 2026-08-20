@@ -79,19 +79,6 @@ ignore = [
 # See Git Authentication for more information about setting up git authentication.
 #git-fetch-with-cli = true
 
-# The confidence threshold for detecting a license from license text.
-# The higher the value, the more closely the license text must be to the
-# canonical license text of a valid SPDX license file.
-# [possible values: any between 0.0 and 1.0].
-confidence-threshold = 0.8
-# Allow 1 or more licenses on a per-crate basis, so that particular licenses
-# aren't accepted for every possible crate as with the normal allow list
-exceptions = [
-  # Each entry is the crate and version constraint, and its specific allow
-  # list
-  #{ allow = ["Zlib"], crate = "adler32" },
-]
-
 # This section is considered when running `cargo deny check bans`.
 # More documentation about the 'bans' section can be found here:
 # https://embarkstudios.github.io/cargo-deny/checks/bans/cfg.html
@@ -181,6 +168,7 @@ unknown-git = "deny"
 # if not specified. If it is specified but empty, no registries are allowed.
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 # List of URLs for allowed Git repositories
+allow-git = ["https://github.com/NVIDIA/nv-rms-client"]
 
 [sources.allow-org]
 # github.com organizations to allow git sources for

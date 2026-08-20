@@ -1,0 +1,62 @@
+# Chart-managed cert-manager Certificates for a site.
+#
+# Replaces the manual `kubectl apply -f rms-apiserver-certificate.yaml` /
+# `rms-switch-certificates.yaml` step: the chart issues the API server
+# certificate and one certificate per switch cert entry.
+#
+# Prerequisites
+#   - cert-manager installed (CRDs present) in the target cluster
+#   - The referenced issuer exists and can issue for the SANs below
+#   - An operational plan for redistributing renewed material: cert-manager
+#     rewrites the Secrets, but the API server only reads its certificate at
+#     startup and switches only receive theirs from ConfigureSwitchCertificate.
+#     See "Rotation and renewal" in helm/README.md.
+#
+# Site-specific fields to review before deploying:
+#   - certificates.issuerRef.name / .kind   — site cluster issuer (name required)
+#   - certificates.spiffe.trustDomain       — site SPIFFE trust domain; empty
+#     issues no URI SAN
+#   - apiServer.dnsDomain                   — switch TLS server-name domain, and
+#                                             the switch server certificate's SAN
+#
+# Install example:
+#   helm upgrade --install rack ./helm \
+#     -f helm/values.yaml \
+#     -f helm/examples/overrides/site-certificates-values.yaml \
+#     --set global.image.tag=<APP_TAG> \
+#     -n rack-manager --create-namespace
+
+certificates:
+  enabled: true
+  issuerRef:
+    name: site-ca-issuer
+    kind: ClusterIssuer
+  # A renewed certificate reaches the switch client path on its own; the API
+  # server needs a pod restart and the switches need ConfigureSwitchCertificate
+  # re-run. Raise these if the site cannot redistribute on a 30-day cadence.
+  duration: 720h0m0s
+  renewBefore: 360h0m0s
+  privateKey:
+    algorithm: ECDSA
+    size: 384
+    rotationPolicy: Always
+  spiffe:
+    trustDomain: example.local
+    path: rack-manager/sa/rms-api-server
+
+apiServer:
+  allowInsecure: false
+  insecureSwitch: false
+  defaultSwitchDomain: site-wide
+  dnsDomain: my-site.example.com
+  tls:
+    enabled: true
+    caEnabled: true
+  switchCertRoot: /var/run/secrets/switch-cert
+  switchCertCertificates:
+    - domain: site-wide
+      secret: rms-switch-server-certificate
+  clientTlsRoot: /var/run/secrets/client-tls
+  clientTlsCertificates:
+    - domain: site-wide
+      secret: rms-switch-client-certificate

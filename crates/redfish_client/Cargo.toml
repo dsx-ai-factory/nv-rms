@@ -1,0 +1,25 @@
+[package]
+name = "redfish_client"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+nv-redfish = { workspace = true, features = [
+    "bmc-http",
+    "computer-systems",
+    "managers",
+    "processors",
+    "update-service",
+] }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["fs", "sync"] }
+tokio-util = { workspace = true, features = ["compat"] }
+url = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt"] }
+wiremock = { workspace = true }

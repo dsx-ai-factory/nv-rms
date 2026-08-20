@@ -1,0 +1,18 @@
+{{- if .Values.apiServer.enabled }}
+{{- include "rack-manager.validateSftpOptions" . -}}
+# RMS runtime configuration, rendered from values and mounted read-only at
+# /etc/rms/config.toml. The database connection string is intentionally NOT
+# rendered here: it (with its password) is injected via the DATABASE_URL
+# environment variable sourced from a Secret, which overrides the empty db_url.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rms-api-config
+  namespace: {{ include "rack-manager.namespace" . }}
+  labels:
+    {{- include "rack-manager.labels" . | nindent 4 }}
+    app: rms-api-server
+data:
+  config.toml: |
+    {{- include "rack-manager.apiServerConfigToml" . | nindent 4 }}
+{{- end }}

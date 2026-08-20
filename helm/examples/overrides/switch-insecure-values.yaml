@@ -1,19 +1,19 @@
 # Test case: insecureSwitch true (lab / bootstrap — switch mTLS disabled)
 #
 # Contrast with secure (insecureSwitch false):
-#   - nvue_api: mTLS over HTTPS  ->  HTTPS (TLS only, no client mTLS)
+#   - nvue_api: mTLS over HTTPS  ->  HTTPS without client mTLS or server verification
 #   - scale_up_fabric_manager: gRPC over HTTPS  ->  gRPC over HTTP
-#   - scale_up_fabric_telemetry_interface: gRPC over HTTPS  ->  gRPC over HTTP
+#   - gNMI Capabilities: secure mTLS check  ->  no outbound check
 #
 # Objective
 #   Verify RMS can reach switches without provisioning RMS client mTLS material.
-#   The chart passes --insecure-switch; outbound nvue_api and gRPC services
-#   (scale_up_fabric_manager, scale_up_fabric_telemetry_interface) skip client certs.
+#   The chart passes --insecure-switch; nvue_api uses unverified HTTPS, NMX-C uses
+#   plaintext HTTP, and no direct gNMI Capabilities call is made.
 #
 # Prerequisites
 #   - Trusted management network or lab environment only — NOT for production
 #   - API server TLS secret unless combined with allowInsecure (see local-dev-values.yaml)
-#   - Switches reachable over management network (nvue_api HTTPS/TLS; gRPC services HTTP)
+#   - Switches reachable over management network (nvue_api over HTTPS, NMX-C over HTTP)
 #   - No clientTlsCertificates or switchCertCertificates secrets required
 #
 # Expected chart behavior
@@ -24,9 +24,11 @@
 #
 # Expected RMS runtime behavior
 #   - Startup skips client-tls-root, switch-cert-root, default-switch-domain validation
-#   - Startup logs warn: "insecure-switch disables switch client mTLS"
-#   - nvue_api uses HTTPS (TLS) with server certificate verification disabled
-#   - scale_up_fabric_manager and scale_up_fabric_telemetry_interface use gRPC over HTTP
+#   - Startup logs warn that NVUE uses unverified HTTPS and NMX-C uses plaintext HTTP
+#   - nvue_api uses HTTPS without an RMS client certificate or server verification
+#   - scale_up_fabric_manager uses gRPC over HTTP
+#   - SetScaleUpFabricTelemetryInterfaceState configures gNMI through NVUE HTTPS
+#   - ConfigureSwitchCertificate skips the direct gNMI Capabilities connectivity test
 #   - ConfigureSwitchCertificate runs in unset-mode (removes switch mTLS via SSH)
 #   - ConfigureSwitchCertificate response mode is "insecure-switch"
 #
@@ -41,7 +43,7 @@
 #   2. Confirm deployment args do NOT contain --client-tls-root or --switch-cert-root
 #   3. Deploy and confirm pod reaches Ready without client TLS secrets
 #   4. Invoke switch RPCs against lab switches without client cert provisioning
-#   5. Confirm nvue_api over HTTPS (TLS) and gRPC services over HTTP
+#   5. Confirm nvue_api uses unverified HTTPS and NMX-C uses plaintext HTTP
 #   6. Invoke ConfigureSwitchCertificate and confirm mode "insecure-switch" in response
 #
 # Install example (memory DB for quick local validation):

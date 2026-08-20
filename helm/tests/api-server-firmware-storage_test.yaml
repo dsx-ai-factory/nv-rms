@@ -12,25 +12,31 @@ tests:
     asserts:
       - isKind:
           of: Deployment
-      - equal:
-          path: spec.template.spec.volumes[0].name
-          value: firmware-storage
-      - equal:
-          path: spec.template.spec.volumes[0].hostPath.path
-          value: /mnt/data
-      - equal:
-          path: spec.template.spec.volumes[0].hostPath.type
-          value: DirectoryOrCreate
-      - notExists:
-          path: spec.template.spec.volumes[0].persistentVolumeClaim
-      - equal:
-          path: spec.template.spec.containers[0].volumeMounts[0].mountPath
-          value: /mnt/firmware
       - contains:
-          path: spec.template.spec.containers[0].env
+          path: spec.template.spec.volumes
           content:
-            name: RMS_FIRMWARE_DIR
-            value: /mnt/firmware
+            name: firmware-storage
+            hostPath:
+              path: /mnt/data
+              type: DirectoryOrCreate
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: rms-config
+            configMap:
+              name: rms-api-config
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: firmware-storage
+            mountPath: /mnt/firmware
+            readOnly: false
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: rms-config
+            mountPath: /etc/rms
+            readOnly: true
 
   - it: uses PVC firmware storage when a claim is configured
     set:
@@ -43,19 +49,15 @@ tests:
     asserts:
       - isKind:
           of: Deployment
-      - equal:
-          path: spec.template.spec.volumes[0].name
-          value: firmware-storage
-      - equal:
-          path: spec.template.spec.volumes[0].persistentVolumeClaim.claimName
-          value: rms-firmware-downloads
-      - notExists:
-          path: spec.template.spec.volumes[0].hostPath
-      - equal:
-          path: spec.template.spec.containers[0].volumeMounts[0].mountPath
-          value: /mnt/firmware
       - contains:
-          path: spec.template.spec.containers[0].env
+          path: spec.template.spec.volumes
           content:
-            name: RMS_FIRMWARE_DIR
-            value: /mnt/firmware
+            name: firmware-storage
+            persistentVolumeClaim:
+              claimName: rms-firmware-downloads
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: firmware-storage
+            mountPath: /mnt/firmware
+            readOnly: false

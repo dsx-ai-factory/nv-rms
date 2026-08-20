@@ -6,94 +6,78 @@ applies embedded sqlx database migrations automatically on startup.
 
 ## Versioning
 
-This chart uses **two independent version axes**:
+The chart version is a plain **`MAJOR.MINOR.PATCH`** semver that is **versioned
+independently of the RMS application**. It carries **no `-rc` or `-dev` suffix**:
+every chart change ships under a single, monotonically increasing semver, and the
+developer chooses the bump for each change.
 
-| Axis              | Source                        | Example               | Meaning                            |
-| ----------------- | ----------------------------- | --------------------- | ---------------------------------- |
-| **Chart version** | `Chart.yaml` `version`        | `0.8.0-rc1`           | Semver for template/values changes |
-| **App image tag** | `global.image.tag` at install | `v0.8.0-rc4`          | RMS container images to run        |
+Two version axes stay independent:
 
-- Chart version is bumped in `Chart.yaml` whenever `helm/**` changes (enforced in CI).
-- CI packages with `helm package --version <chart>` and `--app-version <git-describe>`; the
-  artifact is named `rack-manager-<chart-version>.tgz`, not after the app image tag.
-- Set `global.image.tag` (or per-component `apiServer.image.tag`)
-  at install/upgrade to pick the application build.
+| Axis              | Source                        | Example  | Meaning                                   |
+| ----------------- | ----------------------------- | -------- | ----------------------------------------- |
+| **Chart version** | `Chart.yaml` `version`        | `1.0.0`  | Semver for template/values/schema changes |
+| **App image tag** | `global.image.tag` at install | `v1.2.3` | RMS container images to run               |
 
-Chart version policy:
+- The chart version describes the **chart** only, not the RMS release. Pick the
+  RMS build to run with `global.image.tag` (or per-component
+  `apiServer.image.tag`) at install/upgrade; it is unrelated to the chart version.
+- CI packages with `helm package --version <chart-version> --app-version <git-describe>`.
+  The artifact is named `rack-manager-<chart-version>.tgz`.
 
-| Change                         | Bump                                              |
-| ------------------------------ | ------------------------------------------------- |
-| Breaking values rename/removal | major                                             |
-| New values, optional resources | minor                                             |
-| Template bugfix, default tweak | patch                                             |
-| Pre-release / RC packaging     | add or increment `-rcN` suffix (e.g. `0.8.0-rc1`) |
-| GA release                     | drop pre-release suffix (e.g. `0.8.0`)            |
+### When to bump
 
-NGC publish (CI): GA git tags (`v1.0.0`) and pre-release git tags (`v0.8.0-rc1`) each
-trigger a chart push; chart `version` in `Chart.yaml` should match the intended artifact
-(e.g. tag `v0.8.0-rc1` → chart version `0.8.0-rc1` → `rack-manager-0.8.0-rc1.tgz`).
-App pre-release builds remain selected via `global.image.tag`, not chart version.
+Bump `Chart.yaml` `version` on **any** change to chart package inputs:
+`helm/Chart.yaml`, `helm/values.yaml`, `helm/values.schema.json`,
+`helm/.helmignore`, `helm/templates/**`, `helm/crds/**`, or `helm/charts/**`.
+Documentation, examples, tests, and helper scripts under `helm/` do **not**
+require a bump by themselves.
 
-### Chart version automation
+| Change                                           | Bump  |
+| ------------------------------------------------ | ----- |
+| Breaking values rename/removal, removed template | major |
+| New values, optional resources, new template     | minor |
+| Template bugfix, default tweak, non-breaking     | patch |
 
-Develop-branch chart edits use a **`-dev.N` pre-release suffix** so packaged artifacts are
-clearly not RC/GA builds. RC and GA versions align with git tags (`vX.Y.Z-rcN`, `vX.Y.Z`).
+Set the version by hand, or use the helper:
 
-| Workflow stage                | Chart version example | How to set                                                          |
-| ----------------------------- | --------------------- | ------------------------------------------------------------------- |
-| Feature / develop MR          | `0.8.1-dev.1`         | `helm/scripts/bump-chart-version.sh dev patch`                      |
-| Another helm commit (same MR) | `0.8.1-dev.2`         | `helm/scripts/bump-chart-version.sh dev next`                       |
-| RC cut                        | `0.8.0-rc8`           | `helm/scripts/bump-chart-version.sh rc next` or `rc 8 --base 0.8.0` |
-| GA release                    | `0.8.0`               | `helm/scripts/bump-chart-version.sh release --base 0.8.0`           |
-| Tagged release (CI / local)   | matches tag           | `helm/scripts/bump-chart-version.sh sync-tag v0.8.0-rc8`            |
+```bash
+./helm/scripts/bump-chart-version.sh patch   # or minor / major
+./helm/scripts/bump-chart-version.sh set 2.0.0
+./helm/scripts/bump-chart-version.sh show
+git add helm/Chart.yaml
+```
 
-Semver bump kind for `dev` follows the [policy table](#versioning) above (`patch` for template
-tweaks, `minor` for new optional values, `major` for breaking changes).
+### Enforcement
 
-#### Zero-touch pre-commit hook (optional)
-
-Install once after clone:
+CI (`build-helm-chart-to-ngc`) fails a pipeline when chart package inputs change
+but `Chart.yaml` `version` is unchanged, and also rejects any version that is not
+a plain `MAJOR.MINOR.PATCH` (no `-rc`/`-dev`). The same check runs locally as a
+pre-commit guard once you install the hooks:
 
 ```bash
 ./scripts/install-githooks.sh
 ```
 
-On every commit that stages chart package inputs (except a version-only `Chart.yaml` chore),
-the hook:
+The guard blocks a commit that stages chart package inputs without a version
+bump and suggests the bump kind from the staged diff. Skip it once with
+`SKIP_HELM_CHART_BUMP=1 git commit ...`.
 
-1. **Infers** `patch`, `minor`, or `major` from the staged diff (new values/templates → minor;
-   removed values/templates/schema fields → major; otherwise patch).
-2. **Auto-increments** `-dev.N` when the chart is already on a develop line (`dev next`).
-3. **Stages** the updated `helm/Chart.yaml` into your commit.
+### Publishing (CI)
 
-Bump details are printed to the terminal only (not appended to the commit message), so
-GitLab commit templates and `Signed-off-by` trailers stay intact.
+A chart version is published exactly once, and only when the chart itself
+changes. `push-helm-chart-to-ngc` runs when `Chart.yaml` changes on the default
+branch or on a `release/*` branch, and it still checks NGC for that version
+first and skips when it is already there. Whatever plain semver is in
+`Chart.yaml` is published as `rack-manager-<chart-version>.tgz`.
 
-Major bumps require confirmation unless you opt in with `HELM_CHART_BUMP_AUTO_MAJOR=1`.
-Set `HELM_CHART_BUMP_INTERACTIVE=1` to always choose the bump at commit time.
-Skip once with `SKIP_HELM_CHART_BUMP=1 git commit ...`.
+RMS release tags do not publish the chart. The chart is versioned independently,
+so a tag normally carries no chart change, and GitLab cannot filter on that in
+tag pipelines because `rules:changes` always evaluates true there. Land the
+version bump on the default branch or a `release/*` branch to ship it.
 
-Examples:
-
-```bash
-# After changing helm/templates or values.yaml on a feature branch:
-./helm/scripts/bump-chart-version.sh dev patch
-
-# Preparing an RC that will be tagged v0.8.0-rc8:
-./helm/scripts/bump-chart-version.sh sync-tag v0.8.0-rc8
-git add helm/Chart.yaml && git commit -m "chore(helm): chart 0.8.0-rc8 for v0.8.0-rc8"
-
-# GA tag v0.8.0:
-./helm/scripts/bump-chart-version.sh sync-tag v0.8.0
-```
-
-CI requires a `Chart.yaml` version change only when chart package inputs change:
-`helm/Chart.yaml`, `helm/values.yaml`, `helm/values.schema.json`, `helm/.helmignore`,
-`helm/templates/**`, `helm/crds/**`, or `helm/charts/**`. Documentation, example,
-test, and helper-script changes under `helm/` do not require a chart version bump
-by themselves. The chart version is independent of the RMS application version, so CI
-does not require it to match the git tag. `-dev.N` charts are built and linted in MR pipelines but
-are **not** pushed to NGC (only `vX.Y.Z` and `vX.Y.Z-rcN` tags publish).
+Published versions are immutable: the push does not force-overwrite. To ship a
+chart change, bump `version` in `Chart.yaml` (CI already fails a chart change
+that leaves it untouched).
 
 ## Chart components
 
@@ -117,11 +101,11 @@ For the default **external database** mode:
 ## Install from NGC
 
 Replace `<NGC_TOKEN>` with your [NGC API key](https://ngc.nvidia.com/setup/api-key),
-`<CHART_VERSION>` with the chart semver (e.g. `0.8.0-rc1`), and `<APP_TAG>` with the RMS
+`<CHART_VERSION>` with the chart semver (e.g. `1.0.0`), and `<APP_TAG>` with the RMS
 image tag (e.g. `v0.8.0-rc4`):
 
 ```bash
-helm pull https://helm.ngc.nvidia.com/nvidian/dcim/charts/rack-manager-<CHART_VERSION>.tgz \
+helm pull https://helm.ngc.nvidia.com/0837451325059433/rms-dev/charts/rack-manager-<CHART_VERSION>.tgz \
   --username='$oauthtoken' \
   --password='<NGC_TOKEN>'
 ```
@@ -285,18 +269,6 @@ migrations on startup. If pods do not roll automatically:
 kubectl rollout restart deployment/rms-api-server -n rack-manager
 ```
 
-### Migrating from databaseMode: forge
-
-Older releases may have `databaseMode: forge` stored in Helm release values. The
-chart still accepts `forge` as a deprecated alias for `external`, so upgrades
-with `--reuse-values` continue to work. Normalize stored values to `external`
-once so future chart versions can drop the alias:
-
-```bash
-helm upgrade rack ./rack-manager-<CHART_VERSION>.tgz -n rack-manager \
-  --reuse-values --set databaseMode=external
-```
-
 This is a one-time step. Later upgrades can use `--reuse-values` as usual.
 
 ## Configuration
@@ -307,27 +279,51 @@ Key sections in `values.yaml`:
 | --------------------------- | ----------------------------------------------------------------------------- |
 | `global.image`              | Shared RMS API image tag and pull policy.                                     |
 | `apiServer`                 | Image, replicas, port (8801), TLS, firmware path.                             |
+| `certificates`              | Opt-in cert-manager `Certificate` resources for API server and switch mTLS.   |
 | `database`                  | Host, port, DB name, `credentialsSecret`, `sslMode` (external DB).            |
 | `databaseMode`              | `external` (default), `standalone`, or `memory` (in-memory, dev/test).        |
 | `postgres`                  | Standalone Postgres configuration (for `databaseMode: "standalone"`).         |
 | `rmsPostgres`               | ExternalSecret (ESO) and optional patch for external PostgreSQL.              |
 | `dropDatabaseOnUninstall`   | If `true`, a pre-delete hook drops the release DB on uninstall.               |
 
+All RMS runtime configuration is delivered through a TOML file. The chart renders
+it from `apiServer.*` values into a ConfigMap (`rms-api-config`) and mounts it
+read-only at `/etc/rms/config.toml`; the binary reads that path by default. The
+database connection string is the only runtime override: it is built from the
+Secret-backed credentials and injected as the `DATABASE_URL` environment variable,
+which supersedes the (empty) `[postgres] db_url` in the ConfigMap so the password
+never lands in a ConfigMap. Because RMS reads the file once at startup, the
+Deployment carries a `checksum/config` annotation so config changes trigger a
+rollout.
+
+Beyond the top-level `port`, the rendered `config.toml` groups keys into sections
+matching the Rust config structs: `[metrics]`, `[tls]`, `[switches]`, `[postgres]`,
+`[workflows]`, and `[logging]`.
+
 By default, `apiServer.allowInsecure` is `false` and `apiServer.tls.enabled` is `true`.
-The RMS binary requires mTLS (server cert/key plus client CA) unless `--insecure` is
-explicitly passed. A bare install therefore needs TLS material in your values or via
-`--set-file`; see the site and insecure-mode examples below.
+The RMS binary requires mTLS (server cert/key plus client CA) unless `insecure` is set
+(via `apiServer.allowInsecure: true`). A bare install therefore needs TLS material in
+your values or via `--set-file`; see the site and insecure-mode examples below.
 
 `apiServer` also supports:
 
-- `switchCertCertificates` / `switchCertRoot` — switch-side cert material
-- `clientTlsCertificates` / `clientTlsRoot` — required RMS client mTLS for switch `nvue_api` (mTLS over HTTPS), `scale_up_fabric_manager` (gRPC over HTTPS), and `scale_up_fabric_telemetry_interface` (gRPC over HTTPS, same rules as `scale_up_fabric_manager`) unless `insecureSwitch` is true
-- `defaultSwitchDomain` — default when switch RPCs omit domain
-- `dnsDomain` — optional DNS domain used for switch, `scale_up_fabric_manager`, and `scale_up_fabric_telemetry_interface` TLS server-name verification, not the NVLink domain
-- `insecureSwitch` — passes `--insecure-switch`; disables outbound switch client mTLS. `nvue_api` stays on HTTPS (TLS) without client certs or server verification; `scale_up_fabric_manager` and `scale_up_fabric_telemetry_interface` use gRPC over HTTP.
+- `switchCertCertificates` / `switchCertRoot` — switch-side cert material (config.toml `[switches] switch_cert_root`)
+- `clientTlsCertificates` / `clientTlsRoot` - required RMS client mTLS for switch `nvue_api`, `scale_up_fabric_manager`, and secure certificate-install connectivity checks unless `insecureSwitch` is true (config.toml `[switches] client_tls_root`)
+- `defaultSwitchDomain` - default when switch RPCs omit domain (config.toml `[switches] default_switch_domain`)
+- `dnsDomain` - optional DNS domain used as the NVUE TLS authority and for switch gRPC server-name verification, not the NVLink domain (config.toml `[switches] dns_domain`)
+- `insecureSwitch` - sets config.toml `[switches] insecure_switch = true`; `nvue_api` remains HTTPS without client mTLS or server certificate verification, `scale_up_fabric_manager` uses plaintext HTTP, and secure-only gNMI connectivity checks are skipped.
+- `nmxGatewayId` — `gateway_id` sent on NMX-C gRPC requests (config.toml `[switches] nmx_gateway_id`). Default: `rack-manager-grpc-client`.
+- `dbPoolMax` — maximum Postgres connection pool size (config.toml `[postgres] db_pool_max`). Must be greater than 0. Default: `20`.
+- `maxTrackedJobs` — maximum async job records retained (config.toml `[workflows] max_tracked_jobs`). Default: `10000`.
+- `terminalJobTtlSeconds` — retention period for completed and failed job records (config.toml `[workflows] terminal_job_ttl_seconds`). Default: `86400`.
+- `expectedInventoryProfiles` — opaque profile identifiers mapped to NVFWUPD AP
+  names (config.toml `[workflows.expected_inventory_profiles]`). Nodes select a
+  profile with `NodeDescriptor.attributes["inventory_profile"]`. Default: `{}`.
+- `logLevel` — optional log level / filter directive replacing `RUST_LOG` (config.toml `[logging] log_level`). Empty uses the default `info` level plus dependency caps.
+- `enableTimestamps` — assuming a logging collector is adding its own timestamps, so this is disabled by default to prevent duplicate timestamp fields. If no logging collector is being used, set true to output timestamps natively (config.toml `[logging] enable_timestamps`). Default: `false`.
 - `firmwarePersistentVolumeClaim` — existing PVC to mount at `firmwareMountPath` for firmware downloads. Leave empty to use the default `firmwareStoragePath` hostPath.
-- `sftpUploadTimeoutSeconds` — overall SFTP upload wall-clock timeout (seconds); passed as `RMS_SFTP_UPLOAD_TIMEOUT_SECONDS`. Default: `3600`.
-- `sftpStepTimeoutSeconds` — per-step SFTP stall timeout (seconds); passed as `RMS_SFTP_STEP_TIMEOUT_SECONDS`. Must be <= `sftpUploadTimeoutSeconds`. Default: `30`.
+- `sftpUploadTimeoutSeconds` — overall SFTP upload wall-clock timeout (seconds); config.toml `[workflows] sftp_upload_timeout_seconds`. Default: `3600`.
+- `sftpStepTimeoutSeconds` — per-step SFTP stall timeout (seconds); config.toml `[workflows] sftp_step_timeout_seconds`. Must be <= `sftpUploadTimeoutSeconds`. Default: `30`.
 
 See [INSECURE_SWITCH_TESTING.md](INSECURE_SWITCH_TESTING.md) for values overrides and manual test cases for `insecureSwitch: false` and `true`.
 
@@ -350,12 +346,12 @@ rmsPostgres:
   externalSecret:
     enabled: true
     sourceSecretKey: rms-api-server.rack-manager.my-pg-cluster.credentials.postgresql.acid.zalan.do
-  patchForgeCluster:
+  patchExternalCluster:
     enabled: true
     postgresqlName: my-pg-cluster
     databaseName: my_rms_db
 apiServer:
-  environmentPath: ipp6-gb200-36x1
+  environmentPath: myrack
   allowInsecure: false
   tls:
     enabled: true
@@ -372,6 +368,119 @@ helm upgrade --install rack ./helm \
   --set global.image.tag=<APP_TAG> \
   -n rack-manager --create-namespace
 ```
+
+### Certificate automation
+
+Set `certificates.enabled: true` and the chart issues the cert-manager
+`Certificate` resources itself instead of requiring them to be applied by hand
+before install. Requires cert-manager CRDs and a reachable issuer, so it is off
+by default.
+
+| Certificate | Group defaults | Consumed by |
+| --- | --- | --- |
+| API server | `certificates.apiServer` | mounted at `apiServer.tls.secretMountPath` |
+| One per `apiServer.switchCertCertificates` entry | `certificates.switchServer` | switch-side material under `switchCertRoot` |
+| One per `apiServer.clientTlsCertificates` entry | `certificates.switchClient` | client mTLS under `clientTlsRoot` |
+
+Each `Certificate` is named after, and writes to, the secret its entry already
+references. The API server secret resolves as `certificates.apiServer.secretName`
+→ `apiServer.tls.existingSecret` → `rms-api-server-certificate`; whichever wins
+is what the Deployment mounts, and the inline `apiServer.tls.cert` / `key` / `ca`
+Secret is not rendered.
+
+Fields resolve narrowest scope first — a `certificate:` map on an individual
+entry, then the group, then shared `certificates.*`: `issuerRef`, `duration`,
+`renewBefore`, `privateKey`, `commonName`, `subject`, `secretTemplate`,
+`dnsNames`, `ipAddresses`, `uris`, `usages`, `additionalOutputFormats`, and
+`enabled`. `issuerRef` and `privateKey` merge per key, so a narrower scope can
+change `issuerRef.name` alone and keep the inherited `kind`.
+
+`certificates.issuerRef.name` is required and ships empty; rendering fails until
+a site sets it. `certificates.spiffe.trustDomain` also ships empty, and while it
+is no URI SAN is issued.
+
+SAN defaults:
+
+- **API server** — the four in-cluster Service names (`rms-api-server`,
+  `rms-api-server.{namespace}`, `.svc`, `.svc.cluster.local`).
+- **Switch server** — `apiServer.dnsDomain`. RMS uses that value verbatim as the
+  TLS authority for outbound switch connections, so the certificate is only
+  usable if it carries that name.
+- **`spiffe://{trustDomain}/{path}`** — added to the certificates RMS itself
+  presents (API server and `switchClient`), not to `switchServer` certificates,
+  which are installed on the switches and carry the switch identity.
+
+Rendering fails if a certificate would have no `dnsNames`, `uris`, `ipAddresses`,
+or `commonName`, since cert-manager rejects an identity-less certificate.
+
+```yaml
+certificates:
+  enabled: true
+  issuerRef:
+    name: site-ca-issuer
+  spiffe:
+    trustDomain: example.local
+apiServer:
+  dnsDomain: my-site.example.com
+  switchCertCertificates:
+    - domain: site-wide
+      secret: rms-switch-server-certificate
+  clientTlsCertificates:
+    - domain: site-wide
+      secret: rms-switch-client-certificate
+```
+
+See [`examples/overrides/site-certificates-values.yaml`](./examples/overrides/site-certificates-values.yaml)
+for a ready-made file.
+
+Issuance is asynchronous: the API server pod stays in `ContainerCreating` until
+cert-manager writes the secrets. Allow for that in `--wait` / `--timeout`;
+`certificates.annotations` can carry an `argocd.argoproj.io/sync-wave` when the
+resources need to be ordered ahead of the Deployment.
+
+#### Rotation and renewal
+
+Enabling `certificates` automates **issuance and renewal only**. cert-manager
+rewrites each Secret at `renewBefore`, and the kubelet refreshes the mounted
+files, but only one of the three consumers picks the new material up on its own:
+
+| Material | On renewal | To take effect |
+| --- | --- | --- |
+| API server certificate | Files update; the process keeps using the certificate it read at startup | Restart the pod |
+| Switch client mTLS | Picked up automatically, no restart | Nothing |
+| Switch server material | Files update; the copy on each switch is untouched | Re-run `ConfigureSwitchCertificate` |
+
+Two consequences follow, and both are load-bearing when choosing `duration`:
+
+- **The API server does not reload its own certificate.** RMS reads the cert,
+  key, and client CA once at startup and holds the parsed material for the life
+  of the process. When the mounted certificate expires, the pod keeps serving
+  the expired one — the Deployment has no probe and no rotation-triggered
+  rollout — until something restarts it. Use `kubectl rollout restart
+  deployment/rms-api-server -n <namespace>`, a controller such as
+  [Reloader](https://github.com/stakater/Reloader), or a scheduled restart.
+- **Switches keep the certificate that was pushed to them.** Renewing the
+  Secret changes the material inside the RMS pod, not the copy in the switch's
+  NVOS store. Only `ConfigureSwitchCertificate` installs it, and each run mints
+  fresh timestamped NVOS IDs, so re-pushing never collides with the previously
+  installed certificate. Until it is re-run, the switch's copy ages toward the
+  expiry it was issued with, and RMS rejects an expired switch certificate on
+  its outbound connections.
+
+So `certificates.duration` sets a hard deadline for a redistribution step that
+nothing in this chart performs. The 30-day default (`720h0m0s`, renewing at
+`360h0m0s`) suits sites that restart the API server and re-push to switches at
+least monthly; sites that do not should raise it — `8760h0m0s` for a yearly
+cadence — rather than rely on renewal alone. Both are settable per group, so the
+API server and the switch-side certificates can run on different clocks.
+
+`certificates.privateKey.rotationPolicy` defaults to `Always`, so each renewal
+mints a new private key. The chart sets this explicitly because cert-manager
+changed its own default from `Never` to `Always` in v1.18; without it the same
+values would rotate keys on one cluster and reuse them on another. Note that key
+rotation reaches a consumer only where certificate rotation does — for the API
+server and the switches, a reused key and a rotated one are equally stale until
+the restart or re-push happens.
 
 ### Firmware PVC
 
@@ -416,15 +525,17 @@ Create `values-local-dev.yaml` in your environment repo (not shipped with this c
 
 ```yaml
 apiServer:
-  environmentPath: local-dev
   allowInsecure: true
   tls:
     enabled: false
 ```
 
-When `allowInsecure: true`, the chart sets `RMS_ALLOW_INSECURE=1` in the pod
-environment so the binary honors `--insecure`. Without that env var, the process
-exits at startup even if the flag is passed.
+When `allowInsecure: true`, the rendered `config.toml` sets `[tls] insecure = true` and the
+Deployment injects the `RMS_ALLOW_INSECURE=1` environment gate, so the binary serves
+plaintext gRPC with no client authentication. RMS requires both signals -- the config
+flag and the env gate, which the chart always renders together -- as a defense-in-depth
+measure so a stale ConfigMap cannot on its own downgrade the API. Dev/test only;
+production MUST leave this `false`.
 
 Install or upgrade with the override layered on the chart base:
 
@@ -486,8 +597,8 @@ apiServer:
   clientTlsCertificates:
     - domain: site-wide
       secret: rms-nmxc-client-certificate
-    - domain: ipp6-gb200-36x1.forge
-      secret: rms-nmxc-client-certificate-ipp6
+    - domain: myrack.example.com
+      secret: rms-nmxc-client-certificate-myrack
   defaultSwitchDomain: site-wide
 ```
 
@@ -518,6 +629,89 @@ helm uninstall rack -n rack-manager
 
 If `dropDatabaseOnUninstall: true`, a pre-delete hook runs a job to drop the release database. Set it to `false` in values if you want to keep the database.
 
+> **Note — standalone Postgres reinstall after `dropDatabaseOnUninstall`**
+>
+> When `databaseMode: standalone`, the Postgres StatefulSet uses a PersistentVolumeClaim (PVC)
+> that Helm does **not** delete on uninstall. If `dropDatabaseOnUninstall: true`, the
+> `drop-database` pre-delete hook drops the release database from the live pod, but the PVC (and
+> its already-initialised data directory) survives. On the next `helm install`, the Postgres
+> container finds the existing data directory, skips its first-run initialisation, and
+> **`POSTGRES_DB` is never consulted** — so the database is not recreated.
+>
+> The chart handles this automatically via the `wait-for-db` init container in the api-server
+> Deployment, which waits for Postgres and idempotently runs `CREATE DATABASE` before the
+> api-server starts. If you hit this state on a cluster running an older chart version, create
+> the database manually:
+>
+> ```bash
+> kubectl exec -n <namespace> <postgres-pod> -- psql -U <admin-user> -c "CREATE DATABASE <db_name>;"
+> ```
+
+## Configuration values reference
+
+`values.yaml` (and its `values.schema.json` schema) is the exhaustive source of
+truth for chart values. Key sections:
+
+| Section | Purpose |
+| --- | --- |
+| `global.image` | Shared RMS API image tag and pull policy. |
+| `apiServer` | Image, replicas, port (8801), TLS, switch cert material, firmware path. |
+| `certificates` | Opt-in cert-manager `Certificate` resources for API server and switch mTLS. |
+| `database` | Host, port, DB name, `credentialsSecret`, `sslMode` (external DB). |
+| `databaseMode` | `external` (default), `standalone`, or `memory` (in-memory, dev/test). |
+| `postgres` | Standalone Postgres configuration (for `databaseMode: "standalone"`). |
+| `rmsPostgres` | ExternalSecret (ESO) and optional patch for external PostgreSQL. |
+| `dropDatabaseOnUninstall` | If `true`, a pre-delete hook drops the release DB on uninstall. |
+
+All RMS runtime configuration is delivered through a TOML file that the chart
+renders from `apiServer.*` values into the `rms-api-config` ConfigMap, mounted
+read-only at `/etc/rms/config.toml`. The database connection string is the only
+runtime override: it is built from Secret-backed credentials and injected as
+`DATABASE_URL` so the password never lands in a ConfigMap. The Deployment carries
+a `checksum/config` annotation so config changes trigger a rollout. See
+[Configuration via Helm](../docs/configuration/via-helm.md) for the
+full value → `config.toml` key mapping.
+
+`apiServer` values that map to the `config.toml` `[switches]`, `[postgres]`,
+`[workflows]`, and `[logging]` sections:
+
+- `switchCertCertificates` / `switchCertRoot` — switch-side cert material
+  (`[switches] switch_cert_root`).
+- `clientTlsCertificates` / `clientTlsRoot` — RMS client mTLS for switch NVUE,
+  scale-up fabric manager, and secure certificate-install checks, unless
+  `insecureSwitch` is true (`[switches] client_tls_root`).
+- `defaultSwitchDomain` — default when switch RPCs omit domain
+  (`[switches] default_switch_domain`).
+- `dnsDomain` — optional DNS domain used as the NVUE TLS authority and switch
+  gRPC server-name (`[switches] dns_domain`).
+- `insecureSwitch` — sets `[switches] insecure_switch = true`; NVUE stays HTTPS
+  without client mTLS or server-cert verification, NMX-C uses plaintext HTTP,
+  secure-only gNMI checks are skipped.
+- `nmxGatewayId` — `gateway_id` on NMX-C gRPC requests
+  (`[switches] nmx_gateway_id`; default `rack-manager-grpc-client`).
+- `dbPoolMax` — Postgres pool size (`[postgres] db_pool_max`; default `20`, must
+  be > 0).
+- `maxTrackedJobs` — retained async job records
+  (`[workflows] max_tracked_jobs`; default `10000`).
+- `terminalJobTtlSeconds` — retention for completed/failed jobs
+  (`[workflows] terminal_job_ttl_seconds`; default `86400`).
+- `expectedInventoryProfiles` — opaque expected-inventory profile map
+  (`[workflows.expected_inventory_profiles]`; default `{}`).
+- `logLevel` — log level / filter directive (`[logging] log_level`; empty →
+  `info` plus caps).
+- `firmwarePersistentVolumeClaim` — existing PVC mounted at
+  `firmwareMountPath`; empty uses the `firmwareStoragePath` hostPath.
+- `sftpUploadTimeoutSeconds` — overall SFTP upload timeout
+  (`[workflows] sftp_upload_timeout_seconds`; default `3600`).
+- `sftpStepTimeoutSeconds` — per-step SFTP stall timeout
+  (`[workflows] sftp_step_timeout_seconds`; default `30`, must be ≤ upload
+  timeout).
+
+The chart defaults to **mTLS** (`apiServer.allowInsecure: false`,
+`apiServer.tls.enabled: true`). See
+[INSECURE_SWITCH_TESTING.md](INSECURE_SWITCH_TESTING.md) for `insecureSwitch` test
+cases and `helm/examples/overrides/` for ready-made override files.
+
 ## Chart layout
 
 ```text
@@ -535,6 +729,7 @@ If `dropDatabaseOnUninstall: true`, a pre-delete hook runs a job to drop the rel
     ├── api-server-deployment.yaml
     ├── api-server-configmap.yaml
     ├── api-server-tls-secret.yaml
+    ├── certificates.yaml
     ├── api-server-servicemonitor.yaml
     ├── grafana-dashboard.yaml
     ├── api-server-servicemonitor.yaml

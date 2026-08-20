@@ -84,13 +84,17 @@ git fetch upstream
 
 A local build requires:
 
-- Rust 1.95 or later, installed through
-  [rustup](https://rustup.rs/)
+- Rust, installed through [rustup](https://rustup.rs/) (the version is pinned
+  by `rust-toolchain.toml` and installed automatically on first build)
+- [`just`](https://github.com/casey/just) for the repository's task recipes
+- [`cargo-deny`](https://github.com/EmbarkStudios/cargo-deny)
+  (`cargo install cargo-deny@0.20.2 --locked`, matching the CI pin), used by
+  `just check`
 - `protoc` and the Protocol Buffers development libraries
 - A standard SSL/CA bundle
 
 Alternatively, Docker 24 or later can build and test inside the repository's
-builder image. See [README.md](README.md#getting-started) for platform-specific
+builder image. See [README.md](README.md#quick-start) for platform-specific
 setup details.
 
 ### 4. Create a focused branch
@@ -152,15 +156,14 @@ locally, identify the gap and the substitute validation in the pull request.
 
 ## Validation
 
-For Rust code changes, run the same formatting and Clippy checks used by CI,
-then build the release binary and run the unit tests:
+For Rust code changes, run the formatting, Clippy, and rustdoc checks, then
+build the release binary and run the unit tests:
 
 ```bash
-cargo fmt -p rackmanagementservice -- --check
-cargo fmt -p nvfwupd -- --check
-cargo clippy --workspace -- -D warnings
-cargo build --release
-cargo test --lib
+just check
+just docs-api
+just build
+just test
 ```
 
 Run the full release-mode workspace test suite when PostgreSQL is available:
@@ -168,7 +171,7 @@ Run the full release-mode workspace test suite when PostgreSQL is available:
 ```bash
 docker compose up -d postgres
 export DATABASE_URL=postgres://postgres:postgres@localhost:5432/rms_test
-cargo test --workspace --release
+just test-full
 docker compose down
 ```
 
@@ -187,8 +190,7 @@ You can run the build, formatting, and Clippy checks in the builder image:
 ```bash
 docker build --target builder -t rms-builder .
 docker run --rm rms-builder cargo clippy --workspace -- -D warnings
-docker run --rm rms-builder cargo fmt -p rackmanagementservice -- --check
-docker run --rm rms-builder cargo fmt -p nvfwupd -- --check
+docker run --rm rms-builder cargo fmt --all -- --check
 docker build --target release -t rms-release .
 ```
 
@@ -198,7 +200,7 @@ equivalent database-backed test coverage without requiring contributors to
 reproduce that CI network setup manually.
 
 Run narrower tests during development, but complete the applicable checks before
-requesting review. See [Testing and Benchmarks](README.md#testing-and-benchmarks)
+requesting review. See [Testing RMS](docs/getting-started/testing.md)
 for integration-test and benchmark details.
 
 ## Pull Request Guidelines

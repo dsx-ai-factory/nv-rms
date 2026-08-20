@@ -11,6 +11,18 @@ Components:
   - Postgres (standalone): service postgres:5432
 {{- end }}
 
+{{- if .Values.certificates.enabled }}
+
+Certificates: cert-manager issues and renews them, but redistribution is manual.
+  - The API server reads its certificate once at startup. After a renewal, run:
+      kubectl rollout restart deployment/rms-api-server -n {{ include "rack-manager.namespace" . }}
+    (or install a controller such as stakater/Reloader).
+  - Switches keep the certificate last pushed to them. After a renewal, re-run
+    ConfigureSwitchCertificate for each NVLink domain.
+  - Certificates expire {{ .Values.certificates.duration }} after issuance whether or not either step ran.
+  See "Rotation and renewal" in helm/README.md.
+{{- end }}
+
 To get the API server URL:
   export NAMESPACE={{ include "rack-manager.namespace" . }}
   kubectl get svc rms-api-server -n $NAMESPACE

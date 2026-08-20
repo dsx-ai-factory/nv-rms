@@ -1,0 +1,72 @@
+flowchart TD
+    start["START: Pre-flight Checks<br/>(show_version parallel, verify access, check running tasks)"]
+    fork{"FORK"}
+
+    compute["COMPUTE TRAY<br/>Flash HMC Bundle (Redfish)<br/>Flash BMC Bundle (Redfish)<br/>Monitor task status<br/>Compute push done"]
+    switch["NVLINK SWITCH<br/>Flash switch bundle<br/>(NVUE REST)<br/>Monitor task status<br/>Switch push done"]
+    powershelf["POWER SHELF<br/>Flash PMC/PSU firmware<br/>(Redfish)<br/>Monitor task status<br/>Power push done"]
+
+    join{"JOIN"}
+    compute_activation["Compute Activation<br/>PWR_OFF -> RF_AUX_PWR_CYCLE -> PWR_ON<br/>(IPMI/Redfish)"]
+    switch_activation["Switch Activation<br/>NVUE_PWR_CYCLE"]
+    powershelf_activation["PowerShelf Activation<br/>RF_PWRSHELF_RESET (if OnReset)"]
+    post_verify["Post-Update Verification<br/>show_version (parallel)"]
+    done["DONE: Rack Firmware Update<br/>Complete"]
+
+    host_nic["SEPARATE: Host NIC In-Band<br/>(SSH/FLINT)<br/>Not part of parallel YAML; uses -o os_target"]
+    host_ssh["SSH + mst start"]
+    host_flash["flint_update per device (sequential)"]
+    host_activate["Activate: RF_PWR_OFF/ON"]
+    host_verify["Verify: flint_update -v"]
+
+    subgraph legend["LEGEND"]
+        direction LR
+        legend_compute["Compute Tray"]
+        legend_switch["NVLink Switch"]
+        legend_power["Power Shelf"]
+        legend_host["Host NIC"]
+        legend_join{"Fork/Join"}
+        legend_dependency["strict dependency"]
+    end
+
+    start --> fork
+    fork --> compute
+    fork --> switch
+    fork --> powershelf
+    compute --> join
+    switch --> join
+    powershelf --> join
+    join --> compute_activation
+    compute_activation --> switch_activation
+    switch_activation --> powershelf_activation
+    powershelf_activation --> post_verify
+    post_verify --> done
+
+    host_nic --> host_ssh
+    host_ssh --> host_flash
+    host_flash --> host_activate
+    host_activate --> host_verify
+
+    classDef start fill:#d9efb8,stroke:#5b8f22,color:#111,stroke-width:2px;
+    classDef compute fill:#f8c9da,stroke:#c85c8e,color:#111,stroke-width:2px;
+    classDef switch fill:#bfe4fb,stroke:#2e80b8,color:#111,stroke-width:2px;
+    classDef powershelf fill:#ffd49b,stroke:#d48319,color:#111,stroke-width:2px;
+    classDef verify fill:#7fc51e,stroke:#4c8612,color:#111,stroke-width:2px;
+    classDef done fill:#b90000,stroke:#7c0000,color:#fff,stroke-width:2px;
+    classDef host fill:#e7f6d5,stroke:#67a839,color:#111,stroke-width:2px;
+    classDef diamond fill:#d9efb8,stroke:#5b8f22,color:#111,stroke-width:2px;
+
+    class start start;
+    class compute compute;
+    class switch switch;
+    class powershelf powershelf;
+    class post_verify verify;
+    class done done;
+    class host_nic,host_ssh,host_flash,host_activate,host_verify host;
+    class fork,join diamond;
+    class legend_compute compute;
+    class legend_switch switch;
+    class legend_power powershelf;
+    class legend_host host;
+    class legend_join diamond;
+    class legend_dependency start;

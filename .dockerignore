@@ -1,5 +1,5 @@
 target/
 .git/
 *.fwpkg
-rust_nvfwupd/nvfwupd_log.txt
-rust_nvfwupd/fwpkg_unpack_log.txt
+crates/rust_nvfwupd/nvfwupd_log.txt
+crates/rust_nvfwupd/fwpkg_unpack_log.txt

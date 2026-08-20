@@ -1,0 +1,182 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+ *
+ * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
+ * property and proprietary rights in and to this material, related
+ * documentation and any modifications thereto. Any use, reproduction,
+ * disclosure or distribution of this material and related documentation
+ * without an express license agreement from NVIDIA CORPORATION or
+ * its affiliates is strictly prohibited.
+ */
+
+syntax = "proto3";
+
+package switch_client;
+
+/*********************************
+* NMX CONTROL INTERNAL MESSAGES *
+*********************************/
+
+// Internal command/response messages for NMX configuration
+// These are used internally by ConfigureNmxc and should not be exposed to external clients
+
+message GetNmxStaticConfigCommand {
+  string switch_host = 1;
+  int32 port = 2;  // Default: 9370
+  string config_file_name = 3;  // Config file to fetch: "fm_config" or "sm_config"
+  string key = 4;  // Specific config key to fetch (e.g., "MNNVL_TOPOLOGY") - uses ConfigKeys approach
+  // Note: Currently hardcoded to request "MNNVL_TOPOLOGY" key from the specified config file
+}
+
+message SetNmxStaticConfigCommand {
+  string switch_host = 1;
+  string hardware_platform = 2;
+  int32 port = 3;  // Default: 9370
+}
+
+message GetNmxStaticConfigResponse {
+  bytes config_data = 1;       // Raw protobuf response from switch
+  string message = 2;          // Status message
+}
+
+message SetNmxStaticConfigResponse {
+  string message = 1;          // Status message
+  string topology_used = 2;    // The topology that was applied
+}
+
+/*********************************
+* NMX SWITCH PROTOBUF MESSAGES *
+* (For calling NMX Controller service) *
+*********************************/
+
+// Message definitions for calling the external NMX switch gRPC service
+// These match the nmx_c.NMX_Controller service message structure
+
+message NmxContext {
+  string context = 1;
+}
+
+// Request message for calling NMX_Controller/Hello (initialization)
+// Enum for major version (from NMX API)
+enum ProtoMsgMajorVersion {
+  PROTO_MSG_MAJOR_VERSION_UNDEFINED = 0;
+  PROTO_MSG_MAJOR_VERSION_OBSOLETE1 = 1;
+  PROTO_MSG_MAJOR_VERSION = 2;
+}
+
+// Enum for minor version (from NMX API)
+enum ProtoMsgMinorVersion {
+  PROTO_MSG_MINOR_VERSION_UNDEFINED = 0;
+  PROTO_MSG_MINOR_VERSION_OBSOLETE1 = 1;
+  PROTO_MSG_MINOR_VERSION_OBSOLETE2 = 2;
+  PROTO_MSG_MINOR_VERSION_OBSOLETE3 = 3;
+  PROTO_MSG_MINOR_VERSION_OBSOLETE4 = 4;
+  PROTO_MSG_MINOR_VERSION = 5;
+}
+
+message NmxHelloRequest {
+  string gatewayId = 1;
+  ProtoMsgMajorVersion major_version = 2;  // Should be enum value 2
+  ProtoMsgMinorVersion minor_version = 3;  // Should be enum value 5
+}
+
+// Response message for parsing NMX_Controller/Hello response
+message NmxHelloResponse {
+  NmxServerHeader serverHeader = 1;
+}
+
+message NmxReturnCode {
+  NmxServerHeader serverHeader = 1;
+}
+
+// Message for requesting specific config keys
+message NmxConfigKey {
+  string configFileName = 1;  // e.g., "fm_config"
+  string key = 2;             // e.g., "MNNVL_TOPOLOGY"
+}
+
+message NmxConfigKeys {
+  repeated NmxConfigKey configKey = 1;
+}
+
+// Message for requesting complete config files
+message NmxConfigFile {
+  string configFileName = 1;  // e.g., "fm_config"
+}
+
+message NmxConfigFiles {
+  repeated NmxConfigFile configFile = 1;
+}
+
+// Request message for calling NMX_Controller/GetStaticConfig
+message NmxGetStaticConfigRequest {
+  NmxContext context = 1;
+  NmxConfigKeys configKeys = 2;  // Request specific key-value pairs
+  NmxConfigFiles configFiles = 3;  // Request complete config files
+  string gatewayId = 4;
+}
+
+// Message definitions for calling NMX_Controller/SetStaticConfig
+message NmxConfigKeyVal {
+  string configFileName = 1;  // e.g., "fm_config"
+  string key = 2;             // e.g., "MNNVL_TOPOLOGY"
+  string value = 3;           // e.g., "gb200_nvl36r1_c2g4_topology" (changed from 'val' to match NMX API)
+}
+
+message NmxConfigKeyVals {
+  repeated NmxConfigKeyVal configKeyVal = 1;
+}
+
+message NmxConfigFileContent {
+  string configFileName = 1;
+  string configFileContent = 2;
+}
+
+message NmxConfigFileContents {
+  repeated NmxConfigFileContent configFileContent = 1;
+}
+
+// Request message for calling NMX_Controller/SetStaticConfig
+message NmxSetStaticConfigRequest {
+  string gatewayId = 1;
+  NmxStaticConfig staticConfig = 2;
+}
+
+// Response message structures for parsing NMX switch responses
+// NMX Controller return code enum
+enum ST_ReturnCode {
+  NMX_ST_UNDEFINED = 0;
+  NMX_ST_SUCCESS = 1;
+  NMX_ST_BADPARAM = 2;
+  NMX_ST_GENERIC_ERROR = 3;
+  NMX_ST_NOT_SUPPORTED = 4;
+  NMX_ST_UNINITIALIZED = 5;
+  NMX_ST_TIMEOUT = 6;
+  NMX_ST_INTERNAL_ERROR = 7;
+  NMX_ST_IN_USE = 8;
+  NMX_ST_NOT_CONFIGURED = 9;
+  NMX_ST_CONNECTION_NOT_VALID = 10;
+}
+
+message NmxServerHeader {
+  string domain_uuid = 1;
+  string app_uuid = 2;
+  string app_ver = 3;
+  ST_ReturnCode returnCode = 4;  // NMX Controller return code enum (NMX_ST_SUCCESS = 1)
+}
+
+// Static config returned as either key-value pairs or complete file contents
+message NmxStaticConfig {
+  NmxContext context = 1;
+  NmxConfigKeyVals configKeyVals = 2;
+  NmxConfigFileContents configFileContents = 3;
+}
+
+// Response message for parsing NMX_Controller/GetStaticConfig response
+// Note: NMX switch may return data in different formats, so we support multiple field structures
+message NmxGetStaticConfigResponse {
+  NmxServerHeader serverHeader = 1;
+  NmxStaticConfig staticConfig = 2;
+  NmxConfigKeyVals configKeyVals = 4;  // Compatibility with responses that return values directly
+}

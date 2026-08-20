@@ -1,11 +1,84 @@
 {
   "$schema": "https://json-schema.org/draft-07/schema#",
   "type": "object",
+  "definitions": {
+    "issuerRef": {
+      "type": "object",
+      "properties": {
+        "name": { "type": "string" },
+        "kind": {
+          "type": "string",
+          "enum": ["Issuer", "ClusterIssuer"]
+        },
+        "group": { "type": "string" }
+      }
+    },
+    "certDuration": {
+      "type": "string",
+      "pattern": "^$|^([0-9]+h)?([0-9]+m)?([0-9]+(\\.[0-9]+)?s)?$",
+      "description": "Go duration accepted by cert-manager, e.g. 720h0m0s."
+    },
+    "certPrivateKey": {
+      "type": "object",
+      "properties": {
+        "algorithm": {
+          "type": "string",
+          "enum": ["RSA", "ECDSA", "Ed25519"]
+        },
+        "size": { "type": "integer" },
+        "encoding": {
+          "type": "string",
+          "enum": ["PKCS1", "PKCS8"]
+        },
+        "rotationPolicy": {
+          "type": "string",
+          "enum": ["Never", "Always"]
+        }
+      }
+    },
+    "certificateGroup": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "secretName": { "type": "string" },
+        "issuerRef": { "$ref": "#/definitions/issuerRef" },
+        "duration": { "$ref": "#/definitions/certDuration" },
+        "renewBefore": { "$ref": "#/definitions/certDuration" },
+        "privateKey": { "$ref": "#/definitions/certPrivateKey" },
+        "commonName": { "type": "string" },
+        "subject": { "type": "object" },
+        "secretTemplate": { "type": "object" },
+        "dnsNames": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "ipAddresses": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "uris": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "usages": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "additionalOutputFormats": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": ["DER", "CombinedPEM"]
+          }
+        }
+      }
+    }
+  },
   "properties": {
     "databaseMode": {
       "type": "string",
-      "enum": ["external", "standalone", "memory", "forge"],
-      "description": "external: existing PostgreSQL cluster. standalone: chart-managed Postgres. memory: in-memory only (dev/testing, data lost on restart). forge is a deprecated alias for external."
+      "enum": ["external", "standalone", "memory"],
+      "description": "external: existing PostgreSQL cluster. standalone: chart-managed Postgres. memory: in-memory only (dev/testing, data lost on restart)."
     },
     "global": {
       "type": "object",
@@ -28,6 +101,46 @@
         }
       }
     },
+    "certificates": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Issue cert-manager Certificates for the API server and switch mTLS material. Requires cert-manager CRDs and a reachable issuer."
+        },
+        "issuerRef": { "$ref": "#/definitions/issuerRef" },
+        "duration": { "$ref": "#/definitions/certDuration" },
+        "renewBefore": { "$ref": "#/definitions/certDuration" },
+        "privateKey": { "$ref": "#/definitions/certPrivateKey" },
+        "spiffe": {
+          "type": "object",
+          "properties": {
+            "trustDomain": {
+              "type": "string",
+              "description": "SPIFFE trust domain; empty omits the URI SAN."
+            },
+            "path": { "type": "string" },
+            "uri": {
+              "type": "string",
+              "description": "Full SPIFFE URI SAN, overriding trustDomain and path."
+            }
+          }
+        },
+        "labels": {
+          "type": "object",
+          "additionalProperties": { "type": "string" },
+          "description": "Extra labels applied to every Certificate. Rendered into metadata.labels, so values must be strings."
+        },
+        "annotations": {
+          "type": "object",
+          "additionalProperties": { "type": "string" },
+          "description": "Extra annotations applied to every Certificate. Rendered into metadata.annotations, so values must be strings."
+        },
+        "apiServer": { "$ref": "#/definitions/certificateGroup" },
+        "switchServer": { "$ref": "#/definitions/certificateGroup" },
+        "switchClient": { "$ref": "#/definitions/certificateGroup" }
+      }
+    },
     "apiServer": {
       "type": "object",
       "properties": {
@@ -48,6 +161,52 @@
           "maxLength": 253,
           "pattern": "^$|^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)*$",
           "description": "Existing PVC claimName for the firmware download filesystem. Empty string uses apiServer.firmwareStoragePath hostPath. Non-empty values must be valid Kubernetes DNS subdomain names."
+        },
+        "nmxGatewayId": {
+          "type": "string",
+          "minLength": 1,
+          "description": "gateway_id sent on NMX-C gRPC requests from RMS (config.toml [switches] nmx_gateway_id)."
+        },
+        "dbPoolMax": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Maximum size of the Postgres connection pool (config.toml [postgres] db_pool_max). Must be greater than 0."
+        },
+        "maxTrackedJobs": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Maximum number of async job records the tracker retains (config.toml [workflows] max_tracked_jobs). Must be greater than 0."
+        },
+        "terminalJobTtlSeconds": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Retention period for completed and failed job records, in seconds (config.toml [workflows] terminal_job_ttl_seconds). Must be greater than 0."
+        },
+        "expectedInventoryProfiles": {
+          "type": "object",
+          "default": {},
+          "propertyNames": {
+            "minLength": 1,
+            "pattern": ".*\\S.*"
+          },
+          "additionalProperties": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "pattern": ".*\\S.*"
+            }
+          },
+          "description": "Opaque expected-inventory profile identifiers mapped to NVFWUPD AP names (config.toml [workflows.expected_inventory_profiles])."
+        },
+        "logLevel": {
+          "type": "string",
+          "description": "Optional log level / filter directive replacing RUST_LOG (config.toml [logging] log_level). Empty string uses the default info level plus dependency caps."
+        },
+        "enableTimestamps": {
+          "type": "boolean",
+          "description": "Assuming a logging collector is adding its own timestamps, so this is disabled by default to prevent duplicate timestamp fields. If no logging collector is being used, set true to output timestamps natively (config.toml [logging] enable_timestamps)."
         }
       }
     }

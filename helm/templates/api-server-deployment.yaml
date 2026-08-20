@@ -21,6 +21,10 @@ spec:
         {{- with .Values.commonLabels }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
+      annotations:
+        # Roll the Deployment when the rendered config.toml changes, since RMS
+        # reads the mounted file only once at startup.
+        checksum/config: {{ include "rack-manager.apiServerConfigToml" . | sha256sum }}
     spec:
       {{- with .Values.apiServer.affinity }}
       affinity:
@@ -31,48 +35,82 @@ spec:
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      {{- if eq (include "rack-manager.useStandalonePostgres" .) "true" }}
+      # Waits for Postgres to be ready and ensures the named database exists before the
+      # api-server container starts. Combining both steps here (rather than relying on a
+      # post-install/post-upgrade Helm hook) avoids a deadlock when helm is invoked with
+      # --wait or --atomic: hooks only run after all non-hook resources are Ready, but a
+      # separate hook-based approach would prevent the pod from ever becoming Ready first.
+      initContainers:
+        - name: wait-for-db
+          image: "{{ .Values.postgres.image.repository }}:{{ .Values.postgres.image.tag }}"
+          imagePullPolicy: {{ .Values.postgres.image.pullPolicy }}
+          env:
+            - name: PGHOST
+              valueFrom:
+                configMapKeyRef:
+                  name: rms-database-config
+                  key: DB_HOST
+            - name: PGPORT
+              valueFrom:
+                configMapKeyRef:
+                  name: rms-database-config
+                  key: DB_PORT
+            - name: PGUSER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "rack-manager.databaseCredentialsSecret" . }}
+                  key: username
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "rack-manager.databaseCredentialsSecret" . }}
+                  key: password
+            - name: DB_NAME
+              valueFrom:
+                configMapKeyRef:
+                  name: rms-database-config
+                  key: DB_NAME
+            - name: PGSSLMODE
+              value: {{ .Values.database.sslMode | default "prefer" | quote }}
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              attempts=0
+              until pg_isready -h "$PGHOST" -p "$PGPORT" -U "$PGUSER"; do
+                attempts=$((attempts + 1))
+                if [ "$attempts" -ge 150 ]; then
+                  echo "Timed out waiting for Postgres after $((150 * 2))s."
+                  exit 1
+                fi
+                echo "Waiting for Postgres to be ready... ($attempts/150)"
+                sleep 2
+              done
+              if psql -d postgres -v ON_ERROR_STOP=1 -c "CREATE DATABASE \"$DB_NAME\";"; then
+                echo "Database \"$DB_NAME\" created."
+              else
+                echo "CREATE DATABASE did not succeed; verifying database exists..."
+                echo "SELECT 1 FROM pg_database WHERE datname = :'dbname'" \
+                  | psql -d postgres -v ON_ERROR_STOP=1 -v dbname="$DB_NAME" -tA \
+                  | grep -q 1
+                echo "Database \"$DB_NAME\" already exists."
+              fi
+      {{- end }}
       containers:
         - name: rms-api-server
           image: "{{ .Values.apiServer.image.repository }}:{{ include "rack-manager.apiServerImageTag" . }}"
           imagePullPolicy: {{ include "rack-manager.apiServerImagePullPolicy" . }}
-          {{- if or .Values.apiServer.tls.enabled .Values.apiServer.allowInsecure .Values.apiServer.insecureSwitch .Values.apiServer.switchCertCertificates .Values.apiServer.clientTlsCertificates .Values.apiServer.defaultSwitchDomain .Values.apiServer.dnsDomain }}
-          args:
-            {{- if .Values.apiServer.allowInsecure }}
-            - --insecure
-            {{- end }}
-            {{- if .Values.apiServer.insecureSwitch }}
-            - --insecure-switch
-            {{- end }}
-            {{- if .Values.apiServer.tls.enabled }}
-            - --tls-cert
-            - {{ printf "%s/tls.crt" .Values.apiServer.tls.secretMountPath }}
-            - --tls-key
-            - {{ printf "%s/tls.key" .Values.apiServer.tls.secretMountPath }}
-            {{- if .Values.apiServer.tls.caEnabled }}
-            - --tls-ca
-            - {{ printf "%s/ca.crt" .Values.apiServer.tls.secretMountPath }}
-            {{- end }}
-            {{- end }}
-            {{- if .Values.apiServer.switchCertCertificates }}
-            - --switch-cert-root
-            - {{ required "apiServer.switchCertRoot must be set when switchCertCertificates is configured" .Values.apiServer.switchCertRoot | quote }}
-            {{- end }}
-            {{- if .Values.apiServer.clientTlsCertificates }}
-            - --client-tls-root
-            - {{ required "apiServer.clientTlsRoot must be set when clientTlsCertificates is configured" .Values.apiServer.clientTlsRoot | quote }}
-            {{- end }}
-            {{- if .Values.apiServer.defaultSwitchDomain }}
-            - --default-switch-domain
-            - {{ .Values.apiServer.defaultSwitchDomain | quote }}
-            {{- end }}
-            {{- if .Values.apiServer.dnsDomain }}
-            - --dns-domain
-            - {{ .Values.apiServer.dnsDomain | quote }}
-            {{- end }}
-          {{- end }}
           ports:
             - containerPort: {{ .Values.apiServer.port }}
+              name: http
+            - containerPort: {{ .Values.apiServer.metrics.port }}
+              name: metrics
           volumeMounts:
+            - name: rms-config
+              mountPath: /etc/rms
+              readOnly: true
             - name: firmware-storage
               mountPath: {{ .Values.apiServer.firmwareMountPath }}
               readOnly: false
@@ -91,8 +129,22 @@ spec:
               mountPath: {{ printf "%s/%s" (required "apiServer.clientTlsRoot must be set when clientTlsCertificates is configured" $.Values.apiServer.clientTlsRoot) $cert.domain }}
               readOnly: true
             {{- end }}
+          {{- $needsDbEnv := not (include "rack-manager.useMemoryPersistence" .) }}
+          {{- if or .Values.apiServer.allowInsecure $needsDbEnv }}
+          # All other configuration comes from the mounted config.toml. Only two
+          # runtime inputs are injected here, both sourced outside the ConfigMap:
+          #   * DATABASE_URL -- the connection string (with password) built from
+          #     Secret-backed credentials, superseding the (empty) db_url.
+          #   * RMS_ALLOW_INSECURE -- an independent production safeguard that must
+          #     accompany `insecure = true` before RMS will bind plaintext gRPC, so
+          #     a stale config alone cannot downgrade the API to unauthenticated
+          #     plaintext.
           env:
-            {{- if not (include "rack-manager.useMemoryPersistence" .) }}
+            {{- if .Values.apiServer.allowInsecure }}
+            - name: RMS_ALLOW_INSECURE
+              value: "1"
+            {{- end }}
+            {{- if $needsDbEnv }}
             - name: DB_HOST
               valueFrom:
                 configMapKeyRef:
@@ -121,19 +173,11 @@ spec:
             - name: DATABASE_URL
               value: "postgres://$(DB_USER):$(DB_PASSWORD)@$(DB_HOST):$(DB_PORT)/$(DB_NAME)?sslmode={{ .Values.database.sslMode }}"
             {{- end }}
-            {{- if .Values.apiServer.allowInsecure }}
-            - name: RMS_ALLOW_INSECURE
-              value: "1"
-            {{- end }}
-            - name: RMS_FIRMWARE_DIR
-              value: {{ .Values.apiServer.firmwareMountPath | quote }}
-            - name: ENVIRONMENT_PATH
-              value: {{ .Values.apiServer.environmentPath | quote }}
-            - name: RMS_SFTP_UPLOAD_TIMEOUT_SECONDS
-              value: {{ .Values.apiServer.sftpUploadTimeoutSeconds | quote }}
-            - name: RMS_SFTP_STEP_TIMEOUT_SECONDS
-              value: {{ .Values.apiServer.sftpStepTimeoutSeconds | quote }}
+          {{- end }}
       volumes:
+        - name: rms-config
+          configMap:
+            name: rms-api-config
         - name: firmware-storage
           {{- if $firmwarePersistentVolumeClaim }}
           persistentVolumeClaim:
@@ -146,7 +190,7 @@ spec:
         {{- if .Values.apiServer.tls.enabled }}
         - name: api-server-tls
           secret:
-            secretName: {{ default (printf "%s-api-server-tls" (include "rack-manager.fullname" .)) .Values.apiServer.tls.existingSecret }}
+            secretName: {{ include "rack-manager.apiServerTlsSecretName" . }}
         {{- end }}
         {{- range $i, $cert := .Values.apiServer.switchCertCertificates }}
         - name: switch-cert-{{ $i }}
@@ -188,6 +232,10 @@ spec:
       targetPort: {{ .Values.apiServer.port }}
       protocol: TCP
       name: http
+    - port: {{ .Values.apiServer.metrics.port }}
+      targetPort: {{ .Values.apiServer.metrics.port }}
+      protocol: TCP
+      name: metrics
   selector:
     app: rms-api-server
 {{- end }}

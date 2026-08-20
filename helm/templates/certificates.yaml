@@ -1,0 +1,50 @@
+{{- if and .Values.certificates.enabled .Values.apiServer.enabled }}
+{{- $root := . }}
+{{- $certificates := .Values.certificates }}
+{{- $issued := dict }}
+{{- /* The SPIFFE SAN names the RMS workload, so it belongs only on the
+certificates RMS itself presents: the API server certificate and the client
+certificates used for outbound switch connections. Switch server certificates
+are installed on the switches and must carry the switch identity, set per entry. */}}
+{{- $rmsUris := list }}
+{{- $spiffeUri := include "rack-manager.spiffeUri" . }}
+{{- if $spiffeUri }}
+{{- $rmsUris = list $spiffeUri }}
+{{- end }}
+{{- if eq (include "rack-manager.apiServerCertificateEnabled" .) "true" }}
+{{- $secretName := include "rack-manager.apiServerCertificateSecret" . }}
+{{- $_ := set $issued $secretName true }}
+{{- $ns := include "rack-manager.namespace" . }}
+{{- $defaultDnsNames := list "rms-api-server" (printf "rms-api-server.%s" $ns) (printf "rms-api-server.%s.svc" $ns) (printf "rms-api-server.%s.svc.cluster.local" $ns) }}
+---
+{{ include "rack-manager.certificate" (dict "root" $root "group" $certificates.apiServer "override" dict "secretName" $secretName "defaultDnsNames" $defaultDnsNames "defaultUris" $rmsUris) }}
+{{- end }}
+{{- $switchServerDnsNames := list }}
+{{- if .Values.apiServer.dnsDomain }}
+{{- $switchServerDnsNames = list .Values.apiServer.dnsDomain }}
+{{- end }}
+{{- range $entry := .Values.apiServer.switchCertCertificates }}
+{{- $override := $entry.certificate | default dict }}
+{{- $enabled := $certificates.switchServer.enabled }}
+{{- if hasKey $override "enabled" }}
+{{- $enabled = $override.enabled }}
+{{- end }}
+{{- if and $enabled $entry.secret (not (hasKey $issued $entry.secret)) }}
+{{- $_ := set $issued $entry.secret true }}
+---
+{{ include "rack-manager.certificate" (dict "root" $root "group" $certificates.switchServer "override" $override "secretName" $entry.secret "defaultDnsNames" $switchServerDnsNames) }}
+{{- end }}
+{{- end }}
+{{- range $entry := .Values.apiServer.clientTlsCertificates }}
+{{- $override := $entry.certificate | default dict }}
+{{- $enabled := $certificates.switchClient.enabled }}
+{{- if hasKey $override "enabled" }}
+{{- $enabled = $override.enabled }}
+{{- end }}
+{{- if and $enabled $entry.secret (not (hasKey $issued $entry.secret)) }}
+{{- $_ := set $issued $entry.secret true }}
+---
+{{ include "rack-manager.certificate" (dict "root" $root "group" $certificates.switchClient "override" $override "secretName" $entry.secret "defaultUris" $rmsUris) }}
+{{- end }}
+{{- end }}
+{{- end }}

@@ -1,0 +1,568 @@
+suite: cert-manager Certificates
+templates:
+  - templates/certificates.yaml
+tests:
+  - it: renders no Certificates by default
+    set:
+      global.image.tag: test
+      databaseMode: memory
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: issues api server, switch server, and switch client certificates for a site
+    set:
+      global.image.tag: test
+      databaseMode: memory
+      certificates.enabled: true
+      certificates.issuerRef.name: site-ca-issuer
+      certificates.spiffe.trustDomain: nico.local
+      apiServer.tls.existingSecret: rms-api-server-certificate
+      apiServer.defaultSwitchDomain: site-wide
+      apiServer.switchCertCertificates:
+        - domain: site-wide
+          secret: rms-switch-server-certificate
+          certificate:
+            dnsNames:
+              - my-site.example.com
+      apiServer.clientTlsCertificates:
+        - domain: site-wide
+          secret: rms-switch-client-certificate
+    asserts:
+      - hasDocuments:
+          count: 3
+      - isKind:
+          of: Certificate
+      - equal:
+          path: apiVersion
+          value: cert-manager.io/v1
+      - equal:
+          path: metadata.namespace
+          value: rack-manager
+      - documentIndex: 0
+        equal:
+          path: metadata.name
+          value: rms-api-server-certificate
+      - documentIndex: 0
+        equal:
+          path: spec.secretName
+          value: rms-api-server-certificate
+      - documentIndex: 0
+        equal:
+          path: spec.dnsNames
+          value:
+            - rms-api-server
+            - rms-api-server.rack-manager
+            - rms-api-server.rack-manager.svc
+            - rms-api-server.rack-manager.svc.cluster.local
+      - documentIndex: 0
+        equal:
+          path: spec.uris
+          value:
+            - spiffe://nico.local/rack-manager/sa/rms-api-server
+      - documentIndex: 0
+        equal:
+          path: spec.issuerRef
+          value:
+            name: site-ca-issuer
+            kind: ClusterIssuer
+            group: cert-manager.io
+      - documentIndex: 0
+        equal:
+          path: spec.duration
+          value: 720h0m0s
+      - documentIndex: 0
+        equal:
+          path: spec.renewBefore
+          value: 360h0m0s
+      - documentIndex: 0
+        equal:
+          path: spec.privateKey
+          value:
+            algorithm: ECDSA
+            size: 384
+            rotationPolicy: Always
+      - documentIndex: 1
+        equal:
+          path: metadata.name
+          value: rms-switch-server-certificate
+      - documentIndex: 1
+        equal:
+          path: spec.dnsNames
+          value:
+            - my-site.example.com
+      - documentIndex: 1
+        equal:
+          path: spec.additionalOutputFormats
+          value:
+            - type: CombinedPEM
+      - documentIndex: 1
+        isNull:
+          path: spec.uris
+      - documentIndex: 2
+        equal:
+          path: metadata.name
+          value: rms-switch-client-certificate
+      - documentIndex: 2
+        equal:
+          path: spec.uris
+          value:
+            - spiffe://nico.local/rack-manager/sa/rms-api-server
+      - documentIndex: 2
+        equal:
+          path: spec.usages
+          value:
+            - client auth
+            - digital signature
+      - documentIndex: 2
+        isNull:
+          path: spec.additionalOutputFormats
+
+  - it: applies site issuer, SPIFFE trust domain, and lifetime overrides
+    set:
+      global.image.tag: test
+      databaseMode: memory
+      certificates.enabled: true
+      certificates.issuerRef.name: site-ca-issuer
+      certificates.issuerRef.kind: Issuer
+      certificates.duration: 2160h0m0s
+      certificates.renewBefore: 720h0m0s
+      certificates.privateKey.algorithm: RSA
+      certificates.privateKey.size: 4096
+      certificates.spiffe.trustDomain: dsx.local
+      certificates.spiffe.path: rms/sa/rms-api-server
+      certificates.apiServer.dnsNames:
+        - rms-api-server.rack-manager.svc.cluster.local
+        - rms.myrack-dev1.dev.dsx.nvidia.com
+      apiServer.tls.existingSecret: rms-api-server-certificate
+    asserts:
+      - hasDocuments:
+          count: 1
+      - equal:
+          path: spec.issuerRef
+          value:
+            name: site-ca-issuer
+            kind: Issuer
+            group: cert-manager.io
+      - equal:
+          path: spec.duration
+          value: 2160h0m0s
+      - equal:
+          path: spec.renewBefore
+          value: 720h0m0s
+      - equal:
+          path: spec.privateKey
+          value:
+            algorithm: RSA
+            size: 4096
+            rotationPolicy: Always
+      - equal:
+          path: spec.uris
+          value:
+            - spiffe://dsx.local/rms/sa/rms-api-server
+      - equal:
+          path: spec.dnsNames
+          value:
+            - rms-api-server.rack-manager.svc.cluster.local
+            - rms.myrack-dev1.dev.dsx.nvidia.com
+
+  - it: lets an entry reset the inherited private key size to the algorithm default
+    set:
+      global.image.tag: test
+      databaseMode: memory
+      certificates.enabled: true
+      certificates.issuerRef.name: site-ca-issuer
+      certificates.spiffe.trustDomain: nico.local
+      certificates.apiServer.enabled: false
+      apiServer.tls.enabled: false
+      apiServer.allowInsecure: true
+      apiServer.clientTlsCertificates:
+        - domain: site-wide
+          secret: rms-switch-client-certificate
+        - domain: myrack
+          secret: rms-switch-client-certificate-myrack
+          certificate:
+            privateKey:
+              algorithm: Ed25519
+              size: 0
+    asserts:
+      - hasDocuments:
+          count: 2
+      - documentIndex: 0
+        equal:
+          path: spec.privateKey
+          value:
+            algorithm: ECDSA
+            size: 384
+            rotationPolicy: Always
+      - documentIndex: 1
+        equal:
+          path: spec.privateKey
+          value:
+            algorithm: Ed25519
+            size: 0
+            rotationPolicy: Always
+
+  - it: pins the key rotation policy rather than inheriting the cert-manager default
+    set:
+      global.image.tag: test
+      databaseMode: memory
+      certificates.enabled: true
+      certificates.issuerRef.name: site-ca-issuer
+      certificates.spiffe.trustDomain: nico.local
+      certificates.apiServer.enabled: false
+      apiServer.tls.enabled: false
+      apiServer.allowInsecure: true
+      apiServer.clientTlsCertificates:
+        - domain: site-wide
+          secret: rms-switch-client-certificate
+        - domain: myrack
+          secret: rms-switch-client-certificate-myrack
+          certificate:
+            privateKey:
+              rotationPolicy: Never
+    asserts:
+      - documentIndex: 0
+        equal:
+          path: spec.privateKey.rotationPolicy
+          value: Always
+      - documentIndex: 1
+        equal:
+          path: spec.privateKey.rotationPolicy
+          value: Never
+
+  - it: carries the switch identity when a switch server entry sets its own uris
+    set:
+      global.image.tag: test
+      databaseMode: memory
+      certificates.enabled: true
+      certificates.issuerRef.name: site-ca-issuer
+      certificates.apiServer.enabled: false
+      apiServer.tls.enabled: false
+      apiServer.allowInsecure: true
+      apiServer.switchCertCertificates:
+        - domain: site-wide
+          secret: rms-switch-server-certificate
+          certificate:
+            dnsNames:
+              - my-site.example.com
+            uris:
+              - spiffe://nico.local/switch/my-site
+    asserts:
+      - hasDocuments:
+          count: 1
+      - equal:
+          path: spec.uris
+          value:
+            - spiffe://nico.local/switch/my-site
+
+  - it: tracks the release namespace in the default api server dnsNames
+    set:
+      global.image.tag: test
+      databaseMode: memory
+      namespace: rms-site
+      certificates.enabled: true
+      certificates.issuerRef.name: site-ca-issuer
+      apiServer.tls.existingSecret: rms-api-server-certificate
+    asserts:
+      - hasDocuments:
+          count: 1
+      - equal:
+          path: spec.dnsNames
+          value:
+            - rms-api-server
+            - rms-api-server.rms-site
+            - rms-api-server.rms-site.svc
+            - rms-api-server.rms-site.svc.cluster.local
+
+  - it: applies shared certificates defaults to groups that set none
+    set:
+      global.image.tag: test
+      databaseMode: memory
+      certificates.enabled: true
+      certificates.issuerRef.name: site-ca-issuer
+      certificates.ipAddresses:
+        - 10.0.0.10
+      certificates.usages:
+        - server auth
+      certificates.additionalOutputFormats:
+        - DER
+      certificates.switchClient.usages: null
+      certificates.switchServer.additionalOutputFormats: null
+      apiServer.tls.existingSecret: rms-api-server-certificate
+      apiServer.switchCertCertificates:
+        - domain: site-wide
+          secret: rms-switch-server-certificate
+          certificate:
+            dnsNames:
+              - my-site.example.com
+      apiServer.clientTlsCertificates:
+        - domain: site-wide
+          secret: rms-switch-client-certificate
+    asserts:
+      - hasDocuments:
+          count: 3
+      - equal:
+          path: spec.ipAddresses
+          value:
+            - 10.0.0.10
+      - equal:
+          path: spec.usages
+          value:
+            - server auth
+      - equal:
+          path: spec.additionalOutputFormats
+          value:
+            - type: DER
+      - documentIndex: 0
+        equal:
+          path: spec.dnsNames
+          value:
+            - rms-api-server
+            - rms-api-server.rack-manager
+            - rms-api-server.rack-manager.svc
+            - rms-api-server.rack-manager.svc.cluster.local
+
+  - it: prefers group and entry values over shared certificates defaults
+    set:
+      global.image.tag: test
+      databaseMode: memory
+      certificates.enabled: true
+      certificates.issuerRef.name: site-ca-issuer
+      certificates.dnsNames:
+        - shared.nvidia.com
+      certificates.usages:
+        - server auth
+      apiServer.tls.existingSecret: rms-api-server-certificate
+      certificates.apiServer.dnsNames:
+        - rms.myrack-dev1.dev.dsx.nvidia.com
+      apiServer.clientTlsCertificates:
+        - domain: site-wide
+          secret: rms-switch-client-certificate
+          certificate:
+            dnsNames:
+              - entry.nvidia.com
+    asserts:
+      - hasDocuments:
+          count: 2
+      - documentIndex: 0
+        equal:
+          path: spec.dnsNames
+          value:
+            - rms.myrack-dev1.dev.dsx.nvidia.com
+      - documentIndex: 0
+        equal:
+          path: spec.usages
+          value:
+            - server auth
+      - documentIndex: 1
+        equal:
+          path: spec.dnsNames
+          value:
+            - entry.nvidia.com
+      - documentIndex: 1
+        equal:
+          path: spec.usages
+          value:
+            - client auth
+            - digital signature
+
+  - it: lets an individual entry override its group defaults
+    set:
+      global.image.tag: test
+      databaseMode: memory
+      certificates.enabled: true
+      certificates.issuerRef.name: site-ca-issuer
+      certificates.spiffe.trustDomain: nico.local
+      certificates.apiServer.enabled: false
+      apiServer.tls.enabled: false
+      apiServer.allowInsecure: true
+      apiServer.clientTlsCertificates:
+        - domain: site-wide
+          secret: rms-switch-client-certificate
+        - domain: myrack
+          secret: rms-switch-client-certificate-myrack
+          certificate:
+            issuerRef:
+              name: myrack-issuer
+            duration: 8760h0m0s
+            usages:
+              - client auth
+            uris:
+              - spiffe://nico.local/rack-manager/sa/myrack
+    asserts:
+      - hasDocuments:
+          count: 2
+      - documentIndex: 0
+        equal:
+          path: spec.issuerRef.name
+          value: site-ca-issuer
+      - documentIndex: 1
+        equal:
+          path: spec.issuerRef
+          value:
+            name: myrack-issuer
+            kind: ClusterIssuer
+            group: cert-manager.io
+      - documentIndex: 1
+        equal:
+          path: spec.duration
+          value: 8760h0m0s
+      - documentIndex: 1
+        equal:
+          path: spec.usages
+          value:
+            - client auth
+      - documentIndex: 1
+        equal:
+          path: spec.uris
+          value:
+            - spiffe://nico.local/rack-manager/sa/myrack
+
+  - it: skips entries whose secret is managed outside the chart
+    set:
+      global.image.tag: test
+      databaseMode: memory
+      certificates.enabled: true
+      certificates.issuerRef.name: site-ca-issuer
+      certificates.spiffe.trustDomain: nico.local
+      certificates.apiServer.enabled: false
+      apiServer.tls.enabled: false
+      apiServer.allowInsecure: true
+      apiServer.switchCertCertificates:
+        - domain: site-wide
+          secret: preexisting-switch-server-certificate
+          certificate:
+            enabled: false
+      apiServer.clientTlsCertificates:
+        - domain: site-wide
+          secret: rms-switch-client-certificate
+    asserts:
+      - hasDocuments:
+          count: 1
+      - equal:
+          path: metadata.name
+          value: rms-switch-client-certificate
+
+  - it: issues one Certificate when several domains share a secret
+    set:
+      global.image.tag: test
+      databaseMode: memory
+      certificates.enabled: true
+      certificates.issuerRef.name: site-ca-issuer
+      certificates.spiffe.trustDomain: nico.local
+      certificates.apiServer.enabled: false
+      apiServer.tls.enabled: false
+      apiServer.allowInsecure: true
+      apiServer.clientTlsCertificates:
+        - domain: site-wide
+          secret: rms-switch-client-certificate
+        - domain: myrack
+          secret: rms-switch-client-certificate
+    asserts:
+      - hasDocuments:
+          count: 1
+
+  - it: omits the SPIFFE URI SAN when no trust domain is configured
+    set:
+      global.image.tag: test
+      databaseMode: memory
+      certificates.enabled: true
+      certificates.issuerRef.name: site-ca-issuer
+      certificates.spiffe.trustDomain: ""
+      apiServer.tls.existingSecret: rms-api-server-certificate
+    asserts:
+      - hasDocuments:
+          count: 1
+      - isNull:
+          path: spec.uris
+
+  - it: fails when certificates are enabled before an issuer is configured
+    set:
+      global.image.tag: test
+      databaseMode: memory
+      certificates.enabled: true
+      apiServer.tls.existingSecret: rms-api-server-certificate
+    asserts:
+      - failedTemplate:
+          errorMessage: certificates.issuerRef.name must be set when certificates.enabled is true
+
+  - it: fails when a site clears the issuer name
+    set:
+      global.image.tag: test
+      databaseMode: memory
+      certificates.enabled: true
+      certificates.issuerRef.name: ""
+      apiServer.tls.existingSecret: rms-api-server-certificate
+    asserts:
+      - failedTemplate:
+          errorMessage: certificates.issuerRef.name must be set when certificates.enabled is true
+
+  - it: defaults the switch server SAN to apiServer.dnsDomain
+    set:
+      global.image.tag: test
+      databaseMode: memory
+      certificates.enabled: true
+      certificates.issuerRef.name: vault-nico-issuer
+      certificates.apiServer.enabled: false
+      apiServer.tls.enabled: false
+      apiServer.allowInsecure: true
+      apiServer.dnsDomain: myrack-dev1.dev.dsx.nvidia.com
+      apiServer.switchCertCertificates:
+        - domain: site-wide
+          secret: rms-switch-server-certificate
+    asserts:
+      - hasDocuments:
+          count: 1
+      - equal:
+          path: spec.dnsNames
+          value:
+            - myrack-dev1.dev.dsx.nvidia.com
+
+  - it: prefers group and entry dnsNames over the apiServer.dnsDomain default
+    set:
+      global.image.tag: test
+      databaseMode: memory
+      certificates.enabled: true
+      certificates.issuerRef.name: vault-nico-issuer
+      certificates.apiServer.enabled: false
+      certificates.switchServer.dnsNames:
+        - switch.example.com
+      apiServer.tls.enabled: false
+      apiServer.allowInsecure: true
+      apiServer.dnsDomain: myrack-dev1.dev.dsx.nvidia.com
+      apiServer.switchCertCertificates:
+        - domain: site-wide
+          secret: rms-switch-server-certificate
+        - domain: other
+          secret: rms-switch-server-certificate-other
+          certificate:
+            dnsNames:
+              - per-entry.example.com
+    asserts:
+      - documentIndex: 0
+        equal:
+          path: spec.dnsNames
+          value:
+            - switch.example.com
+      - documentIndex: 1
+        equal:
+          path: spec.dnsNames
+          value:
+            - per-entry.example.com
+
+  - it: fails rendering when a certificate would carry no subject identity
+    set:
+      global.image.tag: test
+      databaseMode: memory
+      certificates.enabled: true
+      certificates.issuerRef.name: vault-nico-issuer
+      certificates.apiServer.enabled: false
+      apiServer.tls.enabled: false
+      apiServer.allowInsecure: true
+      apiServer.switchCertCertificates:
+        - domain: site-wide
+          secret: rms-switch-server-certificate
+    asserts:
+      - failedTemplate:
+          errorMessage: certificate "rms-switch-server-certificate" would have no dnsNames, uris, ipAddresses, or commonName; set dnsNames for it (switch server certificates default to apiServer.dnsDomain)

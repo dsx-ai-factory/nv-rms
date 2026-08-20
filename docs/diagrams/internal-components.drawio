@@ -1,0 +1,36 @@
+<mxfile host="rms-docs">
+  <diagram id="internal-components" name="Internal-Components">
+    <mxGraphModel dx="860" dy="600" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="860" pageHeight="600" math="0" shadow="0">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+        <mxCell id="api" value="&lt;b&gt;api/grpc — gRPC gateway (tonic)&lt;/b&gt;&lt;br&gt;power · inventory · firmware · switch · switch-image · cert/security · fabric-manager   ·   conversions (proto ⇄ domain)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f7f7f7;strokeColor=#7a7a7a;fontColor=#1a1a1a;arcSize=8;verticalAlign=middle;" parent="1" vertex="1">
+          <mxGeometry x="60" y="30" width="740" height="66" as="geometry"/>
+        </mxCell>
+        <mxCell id="orch" value="&lt;b&gt;orchestrator — RackManager (rack map + dispatch)&lt;/b&gt;&lt;br&gt;JobTracker + job_lifecycle (registry · supervisor · cleanup)   ·   stage_timeline" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f7f7f7;strokeColor=#7a7a7a;fontColor=#1a1a1a;arcSize=8;verticalAlign=middle;" parent="1" vertex="1">
+          <mxGeometry x="60" y="140" width="740" height="66" as="geometry"/>
+        </mxCell>
+        <mxCell id="racks" value="&lt;b&gt;racks — trait Rack&lt;/b&gt;&lt;br&gt;NvlGb200Rack · NvlGb300Rack · NvlVrnvl72Rack" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f7f7f7;strokeColor=#7a7a7a;fontColor=#1a1a1a;arcSize=8;verticalAlign=middle;" parent="1" vertex="1">
+          <mxGeometry x="60" y="250" width="350" height="66" as="geometry"/>
+        </mxCell>
+        <mxCell id="persist" value="&lt;b&gt;persistence — Backends&lt;/b&gt;&lt;br&gt;FirmwareObjectStore:  memory  |  postgres (sqlx + migrations)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f7f7f7;strokeColor=#7a7a7a;fontColor=#1a1a1a;arcSize=8;verticalAlign=middle;" parent="1" vertex="1">
+          <mxGeometry x="450" y="250" width="350" height="66" as="geometry"/>
+        </mxCell>
+        <mxCell id="nodes" value="&lt;b&gt;nodes — trait Node&lt;/b&gt;&lt;br&gt;Compute (Redfish) · Powershelf (Redfish) · Switch (NVUE/SSH)   ·   nvfwupd_adapter" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f7f7f7;strokeColor=#7a7a7a;fontColor=#1a1a1a;arcSize=8;verticalAlign=middle;" parent="1" vertex="1">
+          <mxGeometry x="60" y="360" width="740" height="66" as="geometry"/>
+        </mxCell>
+        <mxCell id="transport" value="&lt;b&gt;transport &amp;amp; protocol crates&lt;/b&gt;&lt;br&gt;http_client (reqwest) · ssh_client (russh/SFTP) · redfish_client · nvue_client · nvfwupd · libnmxc · libgnmi" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f7fbef;strokeColor=#76B900;strokeWidth=1.6;fontColor=#1a1a1a;arcSize=8;verticalAlign=middle;" parent="1" vertex="1">
+          <mxGeometry x="60" y="470" width="740" height="66" as="geometry"/>
+        </mxCell>
+        <mxCell id="cross" value="cross-cutting:   config (TOML)   ·   logging (logfmt)   ·   metrics (Prometheus)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fafafa;strokeColor=#9a9a9a;dashed=1;fontColor=#3a3a3a;arcSize=8;" parent="1" vertex="1">
+          <mxGeometry x="60" y="556" width="740" height="34" as="geometry"/>
+        </mxCell>
+        <mxCell id="a1" style="endArrow=classic;html=1;strokeColor=#5a5a5a;" parent="1" source="api" target="orch" edge="1"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="a2" style="endArrow=classic;html=1;strokeColor=#5a5a5a;" parent="1" source="orch" target="racks" edge="1"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="a3" style="endArrow=classic;html=1;strokeColor=#5a5a5a;" parent="1" source="orch" target="persist" edge="1"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="a4" style="endArrow=classic;html=1;strokeColor=#5a5a5a;" parent="1" source="racks" target="nodes" edge="1"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="a5" style="endArrow=classic;html=1;strokeColor=#5a5a5a;" parent="1" source="nodes" target="transport" edge="1"><mxGeometry relative="1" as="geometry"/></mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

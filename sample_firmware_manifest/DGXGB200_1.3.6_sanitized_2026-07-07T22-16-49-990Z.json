@@ -1,0 +1,751 @@
+{
+  "ProductName": "DGXGB200",
+  "Milestones": [
+    {
+      "Name": "1.3.6",
+      "State": "Released",
+      "BoardSKUs": [
+        {
+          "Name": "Switch Name",
+          "Type": "Switch Tray",
+          "Components": {
+            "Software": [
+              {
+                "Component": "NVOS",
+                "Version": "25.02.2553",
+                "Type": "Prod",
+                "FileNames": [
+                  "nvos-amd64-25.02.2553.bin",
+                  "NMX-Controller%20%28NMX-C%29%20Documentation%20v1.3.2.pdf",
+                  "NMX%20Telemetry%20%28NMX-T%29%20Documentation%20v1.3.4.pdf",
+                  "1.3.2_2026-01-23_19-27_nmx-m-nmx-c.proto",
+                  "4.13.0-2500-2_yangs.zip",
+                  "openapi.json",
+                  "GB200-P4978_0005_260128.1.0_prod-signed.corim"
+                ],
+                "Locations": [
+                  {
+                    "Location": "https://urm.nvidia.com/artifactory/sw-nbu-sws-nvos-generic-local/release/25.02.2553/amd64/prod/nvos-amd64-25.02.2553.bin",
+                    "LocationType": "HTTPS",
+                    "PackageName": "",
+                    "Type": "",
+                    "FileName": "nvos-amd64-25.02.2553.bin"
+                  },
+                  {
+                    "Location": null,
+                    "LocationType": "",
+                    "PackageName": "",
+                    "Type": "",
+                    "FileName": "NMX-Controller%20%28NMX-C%29%20Documentation%20v1.3.2.pdf"
+                  },
+                  {
+                    "Location": null,
+                    "LocationType": "",
+                    "PackageName": "",
+                    "Type": "",
+                    "FileName": "NMX%20Telemetry%20%28NMX-T%29%20Documentation%20v1.3.4.pdf"
+                  },
+                  {
+                    "Location": null,
+                    "LocationType": "",
+                    "PackageName": "",
+                    "Type": "",
+                    "FileName": "1.3.2_2026-01-23_19-27_nmx-m-nmx-c.proto"
+                  },
+                  {
+                    "Location": null,
+                    "LocationType": "",
+                    "PackageName": "",
+                    "Type": "",
+                    "FileName": "4.13.0-2500-2_yangs.zip"
+                  },
+                  {
+                    "Location": null,
+                    "LocationType": "",
+                    "PackageName": "",
+                    "Type": "",
+                    "FileName": "openapi.json"
+                  },
+                  {
+                    "Location": null,
+                    "LocationType": "",
+                    "PackageName": "",
+                    "Type": "",
+                    "FileName": "GB200-P4978_0005_260128.1.0_prod-signed.corim"
+                  }
+                ],
+                "SubComponents": [
+                  {
+                    "Component": "SM",
+                    "Version": "2025.03.18",
+                    "Type": null
+                  },
+                  {
+                    "Component": "NMX-C",
+                    "Version": "1.3.2_2026-01-23_19-27",
+                    "Type": null
+                  },
+                  {
+                    "Component": "GFM",
+                    "Version": "570.195.07",
+                    "Type": null
+                  },
+                  {
+                    "Component": "NMX-T",
+                    "Version": "1.3.4_2026-01-10",
+                    "Type": null
+                  },
+                  {
+                    "Component": "QM3",
+                    "Version": "35_2014_1974",
+                    "Type": null
+                  },
+                  {
+                    "Component": "NETIR",
+                    "Version": "2014.1974",
+                    "Type": null
+                  }
+                ]
+              }
+            ],
+            "Firmware": [
+              {
+                "Component": "BMC+FPGA+EROT",
+                "Version": "GB200-P4978_0004_260127.1.3",
+                "Type": "Prod",
+                "FileNames": [
+                  "nvfw_GB200-P4978_0004_260127.1.3_prod-signed.fwpkg",
+                  "GB200-P4978_0004_260127.1.3_prod-signed.corim",
+                  "nvfw_GB200-P4978_0004_260127.1.3_recovery_prod-signed.fwpkg",
+                  "NVIDIA%20Switch%20BMC%20Release%20Notes%20v88.0002.1336.pdf",
+                  "NVIDIA%20Switch%20BMC%20User%20Manual%20v88.0002.1336.pdf"
+                ],
+                "Locations": [
+                  {
+                    "Location": "https://urm.nvidia.com/artifactory/sw-dgx-fw-package-generic-local/GB200-P4978/Package/production/GB200-P4978_0004_260127.1.3/BU-prod/nvfw_GB200-P4978_0004_260127.1.3_prod-signed.fwpkg",
+                    "LocationType": "HTTPS",
+                    "PackageName": "",
+                    "Type": "Firmware",
+                    "FileName": "nvfw_GB200-P4978_0004_260127.1.3_prod-signed.fwpkg"
+                  },
+                  {
+                    "Location": null,
+                    "LocationType": "",
+                    "PackageName": "",
+                    "Type": "Certificate",
+                    "FileName": "GB200-P4978_0004_260127.1.3_prod-signed.corim"
+                  },
+                  {
+                    "Location": null,
+                    "LocationType": "",
+                    "PackageName": "",
+                    "Type": "Firmware-Recovery",
+                    "FileName": "nvfw_GB200-P4978_0004_260127.1.3_recovery_prod-signed.fwpkg"
+                  },
+                  {
+                    "Location": null,
+                    "LocationType": "",
+                    "PackageName": "",
+                    "Type": "",
+                    "FileName": "NVIDIA%20Switch%20BMC%20Release%20Notes%20v88.0002.1336.pdf"
+                  },
+                  {
+                    "Location": null,
+                    "LocationType": "",
+                    "PackageName": "",
+                    "Type": "",
+                    "FileName": "NVIDIA%20Switch%20BMC%20User%20Manual%20v88.0002.1336.pdf"
+                  }
+                ],
+                "SubComponents": [
+                  {
+                    "Component": "EROT",
+                    "Version": "01.04.0026.0000_n04",
+                    "Type": null
+                  },
+                  {
+                    "Component": "BMC",
+                    "Version": "88.0002.1336",
+                    "Type": null
+                  },
+                  {
+                    "Component": "SMR",
+                    "Version": "0.1A",
+                    "Type": null
+                  }
+                ]
+              },
+              {
+                "Component": "SBIOS+EROT",
+                "Version": "GB200-P4978_0006_251130.1.0",
+                "Type": "Prod",
+                "FileNames": [
+                  "nvfw_GB200-P4978_0006_251130.1.0_prod-signed.fwpkg",
+                  "GB200-P4978_0006_251130.1.0_prod-signed.corim",
+                  "nvfw_GB200-P4978_0006_251130.1.0_recovery_prod-signed.fwpkg",
+                  "tpm_corim_signed-0ACTV_00.01.022.cbor"
+                ],
+                "Locations": [
+                  {
+                    "Location": "https://urm.nvidia.com/artifactory/sw-dgx-fw-package-generic-local/GB200-P4978/Package/production/GB200-P4978_0006_251130.1.0/BU-BIOS-prod/nvfw_GB200-P4978_0006_251130.1.0_prod-signed.fwpkg",
+                    "LocationType": "HTTPS",
+                    "PackageName": "",
+                    "Type": "Firmware",
+                    "FileName": "nvfw_GB200-P4978_0006_251130.1.0_prod-signed.fwpkg"
+                  },
+                  {
+                    "Location": null,
+                    "LocationType": "",
+                    "PackageName": "",
+                    "Type": "Certificate",
+                    "FileName": "GB200-P4978_0006_251130.1.0_prod-signed.corim"
+                  },
+                  {
+                    "Location": null,
+                    "LocationType": "",
+                    "PackageName": "",
+                    "Type": "Firmware-Recovery",
+                    "FileName": "nvfw_GB200-P4978_0006_251130.1.0_recovery_prod-signed.fwpkg"
+                  },
+                  {
+                    "Location": null,
+                    "LocationType": "",
+                    "PackageName": "",
+                    "Type": "Misc",
+                    "FileName": "tpm_corim_signed-0ACTV_00.01.022.cbor"
+                  }
+                ],
+                "SubComponents": [
+                  {
+                    "Component": "EROT",
+                    "Version": "01.04.0026.0000_n04",
+                    "Type": null
+                  },
+                  {
+                    "Component": "SBIOS",
+                    "Version": "0ACTV_00.01.022",
+                    "Type": null
+                  }
+                ]
+              },
+              {
+                "Component": "CPLD",
+                "Version": "GB200-P4978_0007_251130.1.2",
+                "Type": "Prod",
+                "FileNames": [
+                  "nvfw_GB200-P4978_0007_251130.1.2_prod-signed.fwpkg"
+                ],
+                "Locations": [
+                  {
+                    "Location": "https://urm.nvidia.com/artifactory/sw-dgx-fw-package-generic-local/GB200-P4978/Package/production/GB200-P4978_0007_251130.1.2/BU-CPLD-prod/nvfw_GB200-P4978_0007_251130.1.2_prod-signed.fwpkg",
+                    "LocationType": "HTTPS",
+                    "PackageName": "",
+                    "Type": "Firmware",
+                    "FileName": "nvfw_GB200-P4978_0007_251130.1.2_prod-signed.fwpkg"
+                  }
+                ],
+                "SubComponents": [
+                  {
+                    "Component": "CPLD1",
+                    "Version": "CPLD000370_REV0600",
+                    "Type": null
+                  },
+                  {
+                    "Component": "CPLD2",
+                    "Version": "CPLD000377_REV1700",
+                    "Type": null
+                  },
+                  {
+                    "Component": "CPLD3",
+                    "Version": "CPLD000373_REV1200",
+                    "Type": null
+                  },
+                  {
+                    "Component": "CPLD4",
+                    "Version": "CPLD000390_REV0400",
+                    "Type": null
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "Name": "Compute Name",
+          "Type": "Compute Node",
+          "Components": {
+            "Software": [
+              {
+                "Component": "DOCA_Host",
+                "Version": "3.2.1-044413",
+                "Type": "Prod",
+                "FileNames": ["doca-ofed_3.2.1-044413_arm64.deb"],
+                "Locations": [
+                  {
+                    "Location": null,
+                    "LocationType": "",
+                    "PackageName": "",
+                    "Type": "Binary",
+                    "FileName": "doca-ofed_3.2.1-044413_arm64.deb"
+                  }
+                ]
+              },
+              {
+                "Component": "RM Driver",
+                "Version": "580.126.20",
+                "Type": "Prod",
+                "FileNames": [
+                  "nvidia-driver-local-repo-ubuntu2404-580.126.20_1.0-1_arm64.deb",
+                  "nvidia-dkms-580-open_580.126.20-1ubuntu1_arm64.deb",
+                  "libnvidia-nscq_580.126.20-1_arm64.deb",
+                  "nvidia-driver-580-open_580.126.20-1ubuntu1_arm64.deb"
+                ],
+                "Locations": [
+                  {
+                    "Location": null,
+                    "LocationType": "",
+                    "PackageName": "",
+                    "Type": "Binary",
+                    "FileName": "nvidia-driver-local-repo-ubuntu2404-580.126.20_1.0-1_arm64.deb"
+                  },
+                  {
+                    "Location": null,
+                    "LocationType": "",
+                    "PackageName": "",
+                    "Type": "Binary",
+                    "FileName": "nvidia-dkms-580-open_580.126.20-1ubuntu1_arm64.deb"
+                  },
+                  {
+                    "Location": null,
+                    "LocationType": "",
+                    "PackageName": "",
+                    "Type": "Binary",
+                    "FileName": "libnvidia-nscq_580.126.20-1_arm64.deb"
+                  },
+                  {
+                    "Location": null,
+                    "LocationType": "",
+                    "PackageName": "",
+                    "Type": "Binary",
+                    "FileName": "nvidia-driver-580-open_580.126.20-1ubuntu1_arm64.deb"
+                  }
+                ]
+              },
+              {
+                "Component": "IMEX",
+                "Version": "580.126.20",
+                "Type": "Prod",
+                "FileNames": ["nvidia-imex_580.126.20-1_arm64.deb"],
+                "Locations": [
+                  {
+                    "Location": null,
+                    "LocationType": "",
+                    "PackageName": "",
+                    "Type": "Binary",
+                    "FileName": "nvidia-imex_580.126.20-1_arm64.deb"
+                  }
+                ]
+              },
+              {
+                "Component": "CUDA",
+                "Version": "13.0.2",
+                "Type": "Prod",
+                "FileNames": ["cuda_13.0.2-1_arm64.deb"],
+                "Locations": [
+                  {
+                    "Location": null,
+                    "LocationType": "",
+                    "PackageName": "",
+                    "Type": "Binary",
+                    "FileName": "cuda_13.0.2-1_arm64.deb"
+                  }
+                ]
+              },
+              {
+                "Component": "MFT Tools",
+                "Version": "4.34.1-12",
+                "Type": "Prod",
+                "FileNames": [
+                  "NVIDIA%20Firmware%20Tools%20(MFT)%20Documentation%20v4.34.1-12.pdf",
+                  "mft_4.34.1-12_arm64.deb"
+                ],
+                "Locations": [
+                  {
+                    "Location": null,
+                    "LocationType": "",
+                    "PackageName": "",
+                    "Type": "Misc",
+                    "FileName": "NVIDIA%20Firmware%20Tools%20(MFT)%20Documentation%20v4.34.1-12.pdf"
+                  },
+                  {
+                    "Location": null,
+                    "LocationType": "",
+                    "PackageName": "",
+                    "Type": "Binary",
+                    "FileName": "mft_4.34.1-12_arm64.deb"
+                  }
+                ]
+              }
+            ],
+            "Firmware": [
+              {
+                "Component": "CX7",
+                "Version": "28.47.2526",
+                "Type": "Prod",
+                "FileNames": [
+                  "fw-ConnectX7-rel-28_47_2526-P4768_QP_Ax-UEFI-14.40.10-FlexBoot-3.8.201.bin",
+                  "fw-ConnectX7-rel-28_47_2526-P4768_DK_Ax-UEFI-14.40.10-FlexBoot-3.8.201.bin",
+                  "fw-ConnectX7-rel-28_47_2526-900-24768-0002_Ax-UEFI-14.40.10-FlexBoot-3.8.201.signed.pldm",
+                  "fw-ConnectX7-rel-28_47_2526-900-24768-0002_Ax-UEFI-14.40.10-FlexBoot-3.8.201.signed.reduced.bin",
+                  "fw-ConnectX7-rel-28_47_2526-900-24768-0002_Ax-UEFI-14.40.10-FlexBoot-3.8.201.signed.cbor",
+                  "fw-ConnectX7-rel-28_47_2526-900-24768-0002_Ax-UEFI-14.40.10-FlexBoot-3.8.201.signed-comid.json",
+                  "NVIDIA%20ConnectX-7%20Adapter%20Cards%20Firmware%20Release%20Notes%20v28.47.2526.pdf"
+                ],
+                "Locations": [
+                  {
+                    "Location": null,
+                    "LocationType": "",
+                    "PackageName": "",
+                    "Type": "",
+                    "FileName": "fw-ConnectX7-rel-28_47_2526-P4768_QP_Ax-UEFI-14.40.10-FlexBoot-3.8.201.bin"
+                  },
+                  {
+                    "Location": null,
+                    "LocationType": "",
+                    "PackageName": "",
+                    "Type": "",
+                    "FileName": "fw-ConnectX7-rel-28_47_2526-P4768_DK_Ax-UEFI-14.40.10-FlexBoot-3.8.201.bin"
+                  },
+                  {
+                    "Location": null,
+                    "LocationType": "",
+                    "PackageName": "",
+                    "Type": "",
+                    "FileName": "fw-ConnectX7-rel-28_47_2526-900-24768-0002_Ax-UEFI-14.40.10-FlexBoot-3.8.201.signed.pldm"
+                  },
+                  {
+                    "Location": null,
+                    "LocationType": "",
+                    "PackageName": "",
+                    "Type": "",
+                    "FileName": "fw-ConnectX7-rel-28_47_2526-900-24768-0002_Ax-UEFI-14.40.10-FlexBoot-3.8.201.signed.reduced.bin"
+                  },
+                  {
+                    "Location": null,
+                    "LocationType": "",
+                    "PackageName": "",
+                    "Type": "",
+                    "FileName": "fw-ConnectX7-rel-28_47_2526-900-24768-0002_Ax-UEFI-14.40.10-FlexBoot-3.8.201.signed.cbor"
+                  },
+                  {
+                    "Location": null,
+                    "LocationType": "",
+                    "PackageName": "",
+                    "Type": "",
+                    "FileName": "fw-ConnectX7-rel-28_47_2526-900-24768-0002_Ax-UEFI-14.40.10-FlexBoot-3.8.201.signed-comid.json"
+                  },
+                  {
+                    "Location": null,
+                    "LocationType": "",
+                    "PackageName": "",
+                    "Type": "",
+                    "FileName": "NVIDIA%20ConnectX-7%20Adapter%20Cards%20Firmware%20Release%20Notes%20v28.47.2526.pdf"
+                  }
+                ]
+              },
+              {
+                "Component": "BF3_BFB",
+                "Version": "3.2.1-42_25.11",
+                "Type": "Prod",
+                "FileNames": [
+                  "bf-bundle-3.2.1-42_25.11_ubuntu-22.04_prod.bfb",
+                  "bf-fwbundle-3.2.1-42_25.11-prod.bfb",
+                  "doca-documentation-v3-2-1-lts.pdf"
+                ],
+                "Locations": [
+                  {
+                    "Location": null,
+                    "LocationType": "",
+                    "PackageName": "",
+                    "Type": "",
+                    "FileName": "bf-bundle-3.2.1-42_25.11_ubuntu-22.04_prod.bfb"
+                  },
+                  {
+                    "Location": null,
+                    "LocationType": "",
+                    "PackageName": "",
+                    "Type": "",
+                    "FileName": "bf-fwbundle-3.2.1-42_25.11-prod.bfb"
+                  },
+                  {
+                    "Location": null,
+                    "LocationType": "",
+                    "PackageName": "",
+                    "Type": "",
+                    "FileName": "doca-documentation-v3-2-1-lts.pdf"
+                  }
+                ]
+              },
+              {
+                "Component": "BF3_NIC",
+                "Version": "32.47.2526",
+                "Type": "Prod",
+                "FileNames": [
+                  "fw-BlueField-3-rel-32_47_2526-900-9D3B6-00CN-P_Ax-NVME-20.4.1-UEFI-21.4.13-UEFI-22.4.14-UEFI-14.40.10-FlexBoot-3.8.201.signed.cbor",
+                  "fw-BlueField-3-rel-32_47_2526-900-9D3B6-00CN-P_Ax-NVME-20.4.1-UEFI-21.4.13-UEFI-22.4.14-UEFI-14.40.10-FlexBoot-3.8.201.signed-comid.json",
+                  "fw-BlueField-3-rel-32_47_2526-900-9D3B6-00CV-A_Ax-NVME-20.4.1-UEFI-21.4.13-UEFI-22.4.14-UEFI-14.40.10-FlexBoot-3.8.201.signed.cbor",
+                  "fw-BlueField-3-rel-32_47_2526-900-9D3B6-00CV-A_Ax-NVME-20.4.1-UEFI-21.4.13-UEFI-22.4.14-UEFI-14.40.10-FlexBoot-3.8.201.signed-comid.json"
+                ],
+                "Locations": [
+                  {
+                    "Location": null,
+                    "LocationType": "",
+                    "PackageName": "",
+                    "Type": "",
+                    "FileName": "fw-BlueField-3-rel-32_47_2526-900-9D3B6-00CN-P_Ax-NVME-20.4.1-UEFI-21.4.13-UEFI-22.4.14-UEFI-14.40.10-FlexBoot-3.8.201.signed.cbor"
+                  },
+                  {
+                    "Location": null,
+                    "LocationType": "",
+                    "PackageName": "",
+                    "Type": "",
+                    "FileName": "fw-BlueField-3-rel-32_47_2526-900-9D3B6-00CN-P_Ax-NVME-20.4.1-UEFI-21.4.13-UEFI-22.4.14-UEFI-14.40.10-FlexBoot-3.8.201.signed-comid.json"
+                  },
+                  {
+                    "Location": null,
+                    "LocationType": "",
+                    "PackageName": "",
+                    "Type": "",
+                    "FileName": "fw-BlueField-3-rel-32_47_2526-900-9D3B6-00CV-A_Ax-NVME-20.4.1-UEFI-21.4.13-UEFI-22.4.14-UEFI-14.40.10-FlexBoot-3.8.201.signed.cbor"
+                  },
+                  {
+                    "Location": null,
+                    "LocationType": "",
+                    "PackageName": "",
+                    "Type": "",
+                    "FileName": "fw-BlueField-3-rel-32_47_2526-900-9D3B6-00CV-A_Ax-NVME-20.4.1-UEFI-21.4.13-UEFI-22.4.14-UEFI-14.40.10-FlexBoot-3.8.201.signed-comid.json"
+                  }
+                ]
+              },
+              {
+                "Component": "Powershelf FW",
+                "Version": "",
+                "Type": "Prod",
+                "SubComponents": [
+                  {
+                    "Component": "PR1 PSU",
+                    "Version": "0104",
+                    "FileNames": [
+                      "NVIDIA_5500W_APP_01040104_20241220_MULTIECD.hex.tar"
+                    ],
+                    "Locations": [
+                      {
+                        "Location": null,
+                        "LocationType": "",
+                        "PackageName": "",
+                        "Type": "",
+                        "FileName": "NVIDIA_5500W_APP_01040104_20241220_MULTIECD.hex.tar"
+                      }
+                    ],
+                    "Type": null
+                  },
+                  {
+                    "Component": "PR1 PMC",
+                    "Version": "3.2.4",
+                    "FileNames": [
+                      "common-pmc-3.2.4-RELEASE.FOR.UPDATE.mtd.tar"
+                    ],
+                    "Locations": [
+                      {
+                        "Location": null,
+                        "LocationType": "",
+                        "PackageName": "",
+                        "Type": "",
+                        "FileName": "common-pmc-3.2.4-RELEASE.FOR.UPDATE.mtd.tar"
+                      }
+                    ],
+                    "Type": null
+                  },
+                  {
+                    "Component": "PR3 PSU",
+                    "Version": "0104",
+                    "FileNames": [
+                      "NVIDIA_GB200_PR3_5500W_APP_v01040104_20250527.hex.tar"
+                    ],
+                    "Locations": [
+                      {
+                        "Location": null,
+                        "LocationType": "",
+                        "PackageName": "",
+                        "Type": "",
+                        "FileName": "NVIDIA_GB200_PR3_5500W_APP_v01040104_20250527.hex.tar"
+                      }
+                    ],
+                    "Type": null
+                  },
+                  {
+                    "Component": "PR3 PMC",
+                    "Version": "",
+                    "FileNames": [
+                      "nvidia-pmc-3.2.4-RELEASE.FOR.BACKUP.UPDATE.CEC-CFG.fwpkg",
+                      "nvidia-pmc-3.2.4-RELEASE.FOR.UPDATE.CEC-CFG.fwpkg"
+                    ],
+                    "Locations": [
+                      {
+                        "Location": null,
+                        "LocationType": "",
+                        "PackageName": "",
+                        "Type": "",
+                        "FileName": "nvidia-pmc-3.2.4-RELEASE.FOR.BACKUP.UPDATE.CEC-CFG.fwpkg"
+                      },
+                      {
+                        "Location": null,
+                        "LocationType": "",
+                        "PackageName": "",
+                        "Type": "",
+                        "FileName": "nvidia-pmc-3.2.4-RELEASE.FOR.UPDATE.CEC-CFG.fwpkg"
+                      }
+                    ],
+                    "Type": null
+                  }
+                ]
+              },
+              {
+                "Component": "HMC",
+                "Version": "",
+                "Type": "Prod",
+                "FileNames": [
+                  "nvfw_HGX-GBX00_0023_260302.1.1_custom_prod-signed.fwpkg",
+                  "nvfw_HGX-GBX00_0023_260302.1.1_custom_recovery_prod-signed.fwpkg",
+                  "HGX-GBX00_0023_260302.1.1_custom_prod-signed.corim",
+                  "nvfw_GB200-P4975_fwpkg_prod_cert.crt",
+                  "nvfw_GB200-P4975_fwpkg_prod_pub.pem"
+                ],
+                "Locations": [
+                  {
+                    "Location": "https://urm.nvidia.com/artifactory/sw-dgx-fw-package-generic-local/GB200-P4975/Package/production/HGX-GBX00_0023_260302.1.1_custom/GB100_SKU201_891/nvfw_HGX-GBX00_0023_260302.1.1_custom_prod-signed.fwpkg",
+                    "LocationType": "HTTPS",
+                    "PackageName": "",
+                    "Type": "Firmware",
+                    "FileName": "nvfw_HGX-GBX00_0023_260302.1.1_custom_prod-signed.fwpkg"
+                  },
+                  {
+                    "Location": null,
+                    "LocationType": "",
+                    "PackageName": "",
+                    "Type": "Firmware-Recovery",
+                    "FileName": "nvfw_HGX-GBX00_0023_260302.1.1_custom_recovery_prod-signed.fwpkg"
+                  },
+                  {
+                    "Location": null,
+                    "LocationType": "",
+                    "PackageName": "",
+                    "Type": "Certificate",
+                    "FileName": "HGX-GBX00_0023_260302.1.1_custom_prod-signed.corim"
+                  },
+                  {
+                    "Location": null,
+                    "LocationType": "",
+                    "PackageName": "",
+                    "Type": "Certificate",
+                    "FileName": "nvfw_GB200-P4975_fwpkg_prod_cert.crt"
+                  },
+                  {
+                    "Location": null,
+                    "LocationType": "",
+                    "PackageName": "",
+                    "Type": "Certificate",
+                    "FileName": "nvfw_GB200-P4975_fwpkg_prod_pub.pem"
+                  }
+                ],
+                "SubComponents": [
+                  {
+                    "Component": "CPLD",
+                    "Version": "0.22",
+                    "Type": null
+                  },
+                  {
+                    "Component": "GPU",
+                    "Version": "97.00.B9.00.99",
+                    "Type": null
+                  },
+                  {
+                    "Component": "GPU",
+                    "Version": "97.00.B9.00.98",
+                    "Type": null
+                  },
+                  {
+                    "Component": "EROT",
+                    "Version": "01.04.0031.0000_n04",
+                    "Type": null
+                  },
+                  {
+                    "Component": "HMC",
+                    "Version": "GB200Nvl-25.06-A",
+                    "Type": null
+                  },
+                  {
+                    "Component": "SBIOS",
+                    "Version": "02.04.14",
+                    "Type": null
+                  },
+                  {
+                    "Component": "SMR",
+                    "Version": "1.60",
+                    "Type": null
+                  }
+                ]
+              },
+              {
+                "Component": "BMC",
+                "Version": "",
+                "Type": "Prod",
+                "FileNames": [
+                  "nvfw_DGX-GBX00_0023_250901.1.0_custom_prod-signed.fwpkg",
+                  "nvfw_DGX-GBX00_0101_250901.1.0_custom_recovery_prod-signed.fwpkg",
+                  "DGX-GBX00_0023_250901.1.0_custom_prod-signed.corim"
+                ],
+                "Locations": [
+                  {
+                    "Location": "https://urm.nvidia.com/artifactory/sw-dgx-fw-package-generic-local/GB200-P4972/Package/production/DGX-GBX00_0023_250901.1.0_custom/SKU_191/nvfw_DGX-GBX00_0023_250901.1.0_custom_prod-signed.fwpkg",
+                    "LocationType": "HTTPS",
+                    "PackageName": "",
+                    "Type": "Firmware",
+                    "FileName": "nvfw_DGX-GBX00_0023_250901.1.0_custom_prod-signed.fwpkg"
+                  },
+                  {
+                    "Location": null,
+                    "LocationType": "",
+                    "PackageName": "",
+                    "Type": "Firmware-Recovery",
+                    "FileName": "nvfw_DGX-GBX00_0101_250901.1.0_custom_recovery_prod-signed.fwpkg"
+                  },
+                  {
+                    "Location": null,
+                    "LocationType": "",
+                    "PackageName": "",
+                    "Type": "Certificate",
+                    "FileName": "DGX-GBX00_0023_250901.1.0_custom_prod-signed.corim"
+                  }
+                ],
+                "SubComponents": [
+                  {
+                    "Component": "EROT",
+                    "Version": "01.04.0031.0000_n04",
+                    "Type": null
+                  },
+                  {
+                    "Component": "BMC",
+                    "Version": "GB200Nvl-25.06-A",
+                    "Type": null
+                  }
+                ]
+              }
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}
+
