@@ -43,7 +43,7 @@ WORKDIR /app
 # `cargo fmt` / `cargo clippy` in CI (including on aarch64 runners).
 COPY rust-toolchain.toml .
 RUN rustc --version \
-    && cargo install cargo-llvm-cov@0.6.21 --locked
+    && cargo install cargo-llvm-cov@0.6.21 cargo-deny@0.20.2 --locked
 
 COPY . .
 
@@ -57,9 +57,9 @@ RUN sed -i '/fuse-ld=lld/d' .cargo/config.toml
 ARG VERGEN_GIT_SHA
 ARG VERGEN_GIT_DESCRIBE
 
-RUN cargo build --release --workspace
+RUN cargo build --release --workspace --locked
 # Pre-compile test binaries so the CI run-tests job doesn't need to recompile
-RUN cargo test --workspace --release --no-run
+RUN cargo test --workspace --release --no-run --locked
 
 # ── Stage 2: Release ──
 # Minimal runtime image with the service binary, the NVFWUPD CLI for operator
@@ -77,4 +77,13 @@ COPY --from=builder /app/target/release/nvfwupd /usr/local/bin/
 
 EXPOSE 8801
 
+# RMS reads all runtime configuration from a TOML file (default
+# /etc/rms/config.toml). No configuration is baked into the image; supply it at
+# run time via a read-only bind mount (Docker) or a ConfigMap volume (Kubernetes):
+#
+#   docker run -v "$PWD/config.toml:/etc/rms/config.toml:ro" \
+#     -e DATABASE_URL="postgres://..." rms-api:latest
+#
+# See docker/config.example.toml for a documented template. Override the path
+# with `--config <path>` if needed.
 ENTRYPOINT ["rackmanagementservice"]

@@ -15,19 +15,14 @@ spec:
     matchNames:
       - {{ include "rack-manager.namespace" . }}
   endpoints:
-    - port: http
+    - port: metrics
       path: /metrics
       interval: 30s
       scrapeTimeout: 25s
-      scheme: {{ if .Values.apiServer.tls.enabled }}https{{ else }}http{{ end }}
-      {{- if .Values.apiServer.tls.enabled }}
+      scheme: {{ if and .Values.apiServer.metrics.tls.enabled .Values.apiServer.tls.enabled }}https{{ else }}http{{ end }}
+      {{- if and .Values.apiServer.metrics.tls.enabled .Values.apiServer.tls.enabled }}
       {{- $tlsCfg := .Values.apiServer.serviceMonitor.tlsConfig }}
-      {{- $sm := .Values.apiServer.serviceMonitor }}
-      {{- $clientSecret := $tlsCfg.clientCertSecret }}
-      {{- if and (not $clientSecret) $sm.clientCert.create }}
-      {{- $clientSecret = $sm.clientCert.secretName }}
-      {{- end }}
-      {{- if or $tlsCfg.insecureSkipVerify $tlsCfg.serverName $tlsCfg.caSecret $clientSecret }}
+      {{- if or $tlsCfg.insecureSkipVerify $tlsCfg.serverName $tlsCfg.caSecret }}
       tlsConfig:
         insecureSkipVerify: {{ $tlsCfg.insecureSkipVerify | default false }}
         {{- if $tlsCfg.serverName }}
@@ -38,15 +33,6 @@ spec:
           secret:
             name: {{ $tlsCfg.caSecret }}
             key: {{ $tlsCfg.caSecretKey | default "ca.crt" }}
-        {{- end }}
-        {{- if $clientSecret }}
-        cert:
-          secret:
-            name: {{ $clientSecret }}
-            key: {{ $tlsCfg.clientCertKey | default "tls.crt" }}
-        keySecret:
-          name: {{ $clientSecret }}
-          key: {{ $tlsCfg.clientKeyKey | default "tls.key" }}
         {{- end }}
       {{- end }}
       {{- end }}

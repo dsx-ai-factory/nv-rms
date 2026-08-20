@@ -1,0 +1,81 @@
+[package]
+name = "rackmanagementservice"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = []
+grpc-client = ["librms/client"]
+
+[dependencies]
+anyhow = { workspace = true }
+async-tempfile = { workspace = true }
+async-trait = { workspace = true }
+axum = { workspace = true }
+chrono = { workspace = true }
+clap = { workspace = true, features = ["env"] }
+eyre = { workspace = true }
+figment = { workspace = true }
+futures = { workspace = true }
+hex = { workspace = true }
+http = { workspace = true }
+hyper-util = { workspace = true }
+librms = { workspace = true, features = ["serde", "server"] }
+mimalloc = { workspace = true }
+nvfwupd = { workspace = true }
+nvue_client = { workspace = true }
+prometheus = { workspace = true }
+prost = { workspace = true }
+prost-types = { workspace = true }
+rand = { workspace = true }
+redfish_client = { workspace = true }
+regex = { workspace = true }
+reqwest = { workspace = true }
+russh = { workspace = true }
+russh-sftp = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+secrecy = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+sqlx = { workspace = true }
+tempfile = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+tokio-rustls = { workspace = true }
+tokio-util = { workspace = true, features = ["io", "rt"] }
+tonic = { workspace = true }
+tonic-prost = { workspace = true }
+tonic_prometheus_layer = { workspace = true }
+tower = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }
+uuid = { workspace = true }
+x509-parser = { workspace = true }
+
+[build-dependencies]
+tonic-prost-build = { workspace = true }
+vergen-gitcl = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+figment = { workspace = true, features = ["test"] }
+hyper = { workspace = true }
+hyper-util = { workspace = true, features = ["tokio", "server-auto"] }
+librms = { workspace = true, features = ["client", "serde"] }
+portpicker = { workspace = true }
+rcgen = { workspace = true }
+redfish_test_support = { workspace = true }
+tar = { workspace = true }
+tokio-rustls = { workspace = true }
+wiremock = { workspace = true }
+
+[[bin]]
+name = "rack_manager_client"
+path = "tests/client/src/main.rs"
+required-features = ["grpc-client"]
+
+[[bench]]
+name = "scale"
+harness = false

@@ -1,0 +1,48 @@
+[package]
+name = "nvfwupd"
+version = "2.1.2"
+edition = "2021"
+description = "CLI tool for updating firmware components through BMC using Redfish protocol"
+
+[[bin]]
+name = "nvfwupd"
+path = "src/main.rs"
+
+[lib]
+name = "nvfwupd"
+path = "src/lib.rs"
+
+[dependencies]
+async-trait = { workspace = true }
+reqwest = { workspace = true, features = [
+    "json",
+    "multipart",
+    "rustls-tls-webpki-roots",
+    "rustls-tls-native-roots",
+    "stream",
+    "charset",
+    "http2",
+    "system-proxy",
+] }
+serde = { workspace = true }
+serde_json = { workspace = true, features = ["preserve_order"] }
+noyalib = { workspace = true }
+nvue_client = { workspace = true }
+regex = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+tokio-util = { workspace = true, features = ["io", "rt"] }
+tracing = { workspace = true }
+tracing-appender = { workspace = true }
+tracing-subscriber = { workspace = true }
+tar = { workspace = true }
+tempfile = { workspace = true }
+russh = { workspace = true }
+russh-sftp = { workspace = true }
+sha2 = { workspace = true }
+indexmap = { workspace = true }
+
+[dev-dependencies]
+tracing-subscriber = { workspace = true, features = ["json"] }
+wiremock = { workspace = true }

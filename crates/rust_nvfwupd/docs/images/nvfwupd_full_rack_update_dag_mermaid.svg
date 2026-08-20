@@ -1,0 +1,149 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1376" height="960" viewBox="0 0 1376 960" role="img" aria-labelledby="title desc">
+  <title id="title">NVFWUPD - Full Rack Firmware Update DAG</title>
+  <desc id="desc">Dependency graph showing update ordering and parallelism for the NVFWUPD CLI.</desc>
+  <style>
+    text { font-family: Arial, Helvetica, sans-serif; fill: #111; }
+    .title { font-size: 36px; font-weight: 500; }
+    .subtitle { font-size: 24px; font-style: italic; fill: #666; }
+    .section { font-size: 18px; font-weight: 700; }
+    .node-title { font-size: 17px; font-weight: 700; }
+    .node-text { font-size: 14px; }
+    .node-text-tight { font-size: 13px; }
+    .small { font-size: 13px; }
+    .legend-text { font-size: 14px; }
+    .legend-title { font-size: 15px; font-weight: 700; }
+    .line { stroke: #222; stroke-width: 1.8; fill: none; }
+    .dash { stroke-dasharray: 7 5; }
+    .compute { fill: #f8c9da; stroke: #c85c8e; }
+    .switch { fill: #bfe4fb; stroke: #2e80b8; }
+    .powershelf { fill: #ffd49b; stroke: #d48319; }
+    .host { fill: #e7f6d5; stroke: #67a839; }
+    .start { fill: #d9efb8; stroke: #5b8f22; }
+    .verify { fill: #7fc51e; stroke: #4c8612; }
+    .done { fill: #b90000; stroke: #7c0000; }
+    .done-label { fill: #fff; }
+    .box { stroke-width: 1.8; rx: 8; }
+    .inner { stroke-width: 1.8; rx: 6; }
+    .diamond { fill: #d9efb8; stroke: #5b8f22; stroke-width: 1.8; }
+  </style>
+  <defs>
+    <marker id="arrow" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0,0 L0,6 L6,3 z" fill="#222"/>
+    </marker>
+  </defs>
+
+  <rect x="0" y="0" width="1376" height="960" fill="#fff"/>
+
+  <text x="688" y="50" text-anchor="middle" class="title">NVFWUPD - Full Rack Firmware Update DAG</text>
+  <text x="688" y="82" text-anchor="middle" class="subtitle">Dependency graph showing update ordering and parallelism | NVFWUPD CLI</text>
+
+  <rect x="498" y="106" width="380" height="50" class="start box"/>
+  <text x="688" y="128" text-anchor="middle" class="node-title">START: Pre-flight Checks</text>
+  <text x="688" y="145" text-anchor="middle" class="node-text">(show_version parallel, verify access, check running tasks)</text>
+
+  <polygon points="688,176 736,198 688,220 640,198" class="diamond"/>
+  <text x="688" y="204" text-anchor="middle" class="node-text">FORK</text>
+
+  <path d="M688 158 L688 168" class="line" marker-end="url(#arrow)"/>
+  <path d="M640 198 H420 V252" class="line" marker-end="url(#arrow)"/>
+  <path d="M688 220 V252" class="line" marker-end="url(#arrow)"/>
+  <path d="M736 198 H956 V252" class="line" marker-end="url(#arrow)"/>
+
+  <text x="80" y="230" text-anchor="start" class="section">PARALLEL:</text>
+  <text x="80" y="250" text-anchor="start" class="section">Firmware Push + Task Monitoring</text>
+
+  <rect x="290" y="260" width="260" height="235" fill="#fff5f8" stroke="#c85c8e" stroke-width="1.8" stroke-dasharray="7 5" rx="8"/>
+  <text x="420" y="282" text-anchor="middle" class="section">COMPUTE TRAY</text>
+  <path d="M420 326 V346" class="line" marker-end="url(#arrow)"/>
+  <path d="M420 382 V398" class="line" marker-end="url(#arrow)"/>
+  <path d="M420 434 V450" class="line" marker-end="url(#arrow)"/>
+  <rect x="314" y="296" width="212" height="28" class="compute inner"/>
+  <text x="420" y="315" text-anchor="middle" class="node-text">Flash HMC Bundle (Redfish)</text>
+  <rect x="314" y="352" width="212" height="28" class="compute inner"/>
+  <text x="420" y="371" text-anchor="middle" class="node-text">Flash BMC Bundle (Redfish)</text>
+  <rect x="350" y="404" width="140" height="28" class="compute inner"/>
+  <text x="420" y="423" text-anchor="middle" class="node-text">Monitor Task Status</text>
+  <rect x="340" y="456" width="160" height="28" class="compute inner"/>
+  <text x="420" y="475" text-anchor="middle" class="node-text">Compute Push Done</text>
+
+  <rect x="558" y="260" width="260" height="235" fill="#f2faff" stroke="#2e80b8" stroke-width="1.8" stroke-dasharray="7 5" rx="8"/>
+  <text x="688" y="282" text-anchor="middle" class="section">NVLINK SWITCH</text>
+  <path d="M688 344 V362" class="line" marker-end="url(#arrow)"/>
+  <path d="M688 398 V414" class="line" marker-end="url(#arrow)"/>
+  <rect x="584" y="296" width="208" height="42" class="switch inner"/>
+  <text x="688" y="314" text-anchor="middle" class="node-text">Flash Switch Bundle</text>
+  <text x="688" y="330" text-anchor="middle" class="node-text-tight">(NVUE REST)</text>
+  <rect x="618" y="368" width="140" height="28" class="switch inner"/>
+  <text x="688" y="387" text-anchor="middle" class="node-text">Monitor Task Status</text>
+  <rect x="610" y="420" width="156" height="28" class="switch inner"/>
+  <text x="688" y="439" text-anchor="middle" class="node-text">Switch Push Done</text>
+
+  <rect x="826" y="260" width="260" height="235" fill="#fff8ed" stroke="#d48319" stroke-width="1.8" stroke-dasharray="7 5" rx="8"/>
+  <text x="956" y="282" text-anchor="middle" class="section">POWER SHELF</text>
+  <path d="M956 344 V362" class="line" marker-end="url(#arrow)"/>
+  <path d="M956 398 V414" class="line" marker-end="url(#arrow)"/>
+  <rect x="852" y="296" width="208" height="42" class="powershelf inner"/>
+  <text x="956" y="314" text-anchor="middle" class="node-text">Flash PMC/PSU Firmware</text>
+  <text x="956" y="330" text-anchor="middle" class="node-text-tight">(Redfish)</text>
+  <rect x="886" y="368" width="140" height="28" class="powershelf inner"/>
+  <text x="956" y="387" text-anchor="middle" class="node-text">Monitor Task Status</text>
+  <rect x="884" y="420" width="144" height="28" class="powershelf inner"/>
+  <text x="956" y="439" text-anchor="middle" class="node-text">Power Push Done</text>
+
+  <path d="M420 486 V534 H632" class="line" marker-end="url(#arrow)"/>
+  <path d="M688 450 V504" class="line" marker-end="url(#arrow)"/>
+  <path d="M956 450 V534 H744" class="line" marker-end="url(#arrow)"/>
+  <polygon points="688,512 736,534 688,556 640,534" class="diamond"/>
+  <text x="688" y="540" text-anchor="middle" class="node-text">JOIN</text>
+
+  <text x="688" y="586" text-anchor="middle" class="section">SEQUENTIAL: Activation</text>
+  <path d="M688 558 V564 H332 V623 H362" class="line" marker-end="url(#arrow)"/>
+  <path d="M688 650 V666" class="line" marker-end="url(#arrow)"/>
+  <path d="M688 708 V724" class="line" marker-end="url(#arrow)"/>
+  <path d="M688 766 V780" class="line" marker-end="url(#arrow)"/>
+  <path d="M688 824 V834" class="line" marker-end="url(#arrow)"/>
+  <rect x="370" y="600" width="636" height="46" class="compute inner"/>
+  <text x="688" y="620" text-anchor="middle" class="node-title">Compute Activation</text>
+  <text x="688" y="637" text-anchor="middle" class="node-text-tight">PWR_OFF -> RF_AUX_PWR_CYCLE -> PWR_ON (IPMI/Redfish)</text>
+  <rect x="542" y="672" width="292" height="32" class="switch inner"/>
+  <text x="688" y="693" text-anchor="middle" class="node-text">Switch Activation: NVUE_PWR_CYCLE</text>
+  <rect x="468" y="730" width="440" height="32" class="powershelf inner"/>
+  <text x="688" y="751" text-anchor="middle" class="node-text">PowerShelf Activation: RF_PWRSHELF_RESET (if OnReset)</text>
+  <rect x="506" y="786" width="364" height="32" class="verify inner"/>
+  <text x="688" y="807" text-anchor="middle" class="node-text">Post-Update Verification: show_version (parallel)</text>
+  <rect x="488" y="840" width="400" height="44" class="done inner"/>
+  <text x="688" y="860" text-anchor="middle" class="node-title done-label">DONE: Rack Firmware Update</text>
+  <text x="688" y="877" text-anchor="middle" class="node-title done-label">Complete</text>
+
+  <rect x="1030" y="608" width="310" height="250" fill="#fbfff5" stroke="#67a839" stroke-width="1.8" stroke-dasharray="7 5" rx="8"/>
+  <text x="1185" y="630" text-anchor="middle" class="section">SEPARATE: Host NIC In-Band</text>
+  <text x="1185" y="648" text-anchor="middle" class="node-text">(SSH/FLINT)</text>
+  <text x="1185" y="666" text-anchor="middle" class="node-text-tight" font-style="italic">Not part of parallel YAML - uses -o os_target</text>
+  <path d="M1185 710 V716" class="line" marker-end="url(#arrow)"/>
+  <path d="M1185 762 V774" class="line" marker-end="url(#arrow)"/>
+  <path d="M1185 810 V814" class="line" marker-end="url(#arrow)"/>
+  <rect x="1116" y="680" width="138" height="26" class="host inner"/>
+  <text x="1185" y="697" text-anchor="middle" class="node-text-tight">SSH + mst start</text>
+  <rect x="1078" y="722" width="214" height="36" class="host inner"/>
+  <text x="1185" y="738" text-anchor="middle" class="node-text-tight">flint_update per device</text>
+  <text x="1185" y="752" text-anchor="middle" class="node-text-tight">(sequential)</text>
+  <rect x="1098" y="780" width="174" height="26" class="host inner"/>
+  <text x="1185" y="797" text-anchor="middle" class="node-text-tight">Activate: RF_PWR_OFF/ON</text>
+  <rect x="1104" y="820" width="162" height="26" class="host inner"/>
+  <text x="1185" y="837" text-anchor="middle" class="node-text-tight">Verify: flint_update -v</text>
+
+  <rect x="168" y="910" width="1040" height="34" fill="#fff" stroke="#aaa" stroke-width="1.4"/>
+  <text x="186" y="932" class="legend-title">LEGEND:</text>
+  <rect x="260" y="918" width="20" height="18" class="compute inner"/>
+  <text x="286" y="932" class="legend-text">= Compute Tray</text>
+  <rect x="410" y="918" width="20" height="18" class="switch inner"/>
+  <text x="436" y="932" class="legend-text">= NVLink Switch</text>
+  <rect x="574" y="918" width="20" height="18" class="powershelf inner"/>
+  <text x="600" y="932" class="legend-text">= Power Shelf</text>
+  <rect x="728" y="918" width="20" height="18" class="host inner"/>
+  <text x="754" y="932" class="legend-text">= Host NIC</text>
+  <polygon points="874,917 894,927 874,937 854,927" class="diamond"/>
+  <text x="902" y="932" class="legend-text">= Fork/Join</text>
+  <path d="M1016 927 H1062" class="line dash" marker-end="url(#arrow)"/>
+  <text x="1072" y="932" class="legend-text">= strict dependency</text>
+</svg>

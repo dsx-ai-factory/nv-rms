@@ -1,0 +1,37 @@
+suite: API server insecure env gate
+templates:
+  - templates/api-server-deployment.yaml
+tests:
+  - it: injects RMS_ALLOW_INSECURE gate when allowInsecure is true
+    set:
+      global.image.tag: test
+      databaseMode: memory
+      apiServer.allowInsecure: true
+      apiServer.tls.enabled: false
+    documentSelector:
+      path: kind
+      value: Deployment
+    asserts:
+      - isKind:
+          of: Deployment
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: RMS_ALLOW_INSECURE
+            value: "1"
+
+  - it: omits RMS_ALLOW_INSECURE gate when allowInsecure is false
+    set:
+      global.image.tag: test
+      databaseMode: memory
+      apiServer.allowInsecure: false
+      apiServer.tls.enabled: false
+    documentSelector:
+      path: kind
+      value: Deployment
+    asserts:
+      - isKind:
+          of: Deployment
+      # With memory persistence and secure defaults, no env block is rendered.
+      - isNull:
+          path: spec.template.spec.containers[0].env

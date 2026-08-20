@@ -25,9 +25,10 @@ contract will be. Landing both changes together means we can look at it all holi
 
 ## Lints and Warnings
 
-We enable all clippy lints by default, and treat all warnings as errors. If a warning or clippy lint is firing for
-your code, strongly consider fixing it. Avoid using `#[allow(...)]` unless you have a strong reason to do so. New
-code should generally not have to `#[allow]` any lints or warnings.
+CI runs clippy's default lint set across the whole workspace and treats all warnings as errors (`just check` runs
+the same checks locally). If a warning or clippy lint is firing for your code, strongly consider fixing it. Avoid
+using `#[allow(...)]` unless you have a strong reason to do so. New code should generally not have to `#[allow]`
+any lints or warnings.
 
 ### A note on dead code
 
@@ -195,9 +196,7 @@ code should typically be synchronous.
 
 Transactions should be used to group write operations together such that they can be rolled back on failure. But do
 not hold a transaction open while doing long-running work. Doing so can exhaust the connection pool if the thing
-you're awaiting is blocked or slow. We have a custom lint, `txn_held_across_await` which will catch cases where you're
-`await`ing a future while holding a transaction, which mitigates this. If it happens, your
-code needs to be fixed, do not `#[allow(txn_held_across_await)]`.
+you're awaiting is blocked or slow.
 
 ## Database wrappers
 
@@ -212,7 +211,7 @@ Avoid spawning background tasks without joining them. Any panics that happen in 
 the rest of the process unless you join them via `JoinHandle::join()` or add them to a `JoinSet` which is later awaited
 with `JoinSet::join_all()`.
 
-For carbide-api, we use a single `JoinSet` to spawn all background tasks, and call `join_all()` to block "forever" until
+Prefer a single `JoinSet` that spawns all background tasks, with `join_all()` blocking "forever" until
 the process is shut down. This makes it so any panics in the JoinSet will propagate to the main task, and crash the
 process (which is what we want.) If you want to spawn background work, prefer accepting a `&mut JoinSet` and spawn your
 background task into it.
@@ -258,7 +257,7 @@ pub struct Handle {
 
 For background tasks that have no clients, but instead run forever at some interval until the container is terminated,
 the RAII style is less useful, since there are no clients to keep track of. In this case, prefer accepting an explicit
-cancellation token from the toplevel `initialize_and_start_controllers` method, and stop your work when that token is
+cancellation token from the top-level startup path, and stop your work when that token is
 cancelled.
 
 Example:
@@ -280,7 +279,7 @@ impl ClientlessBackgroundJob {
 ```
 
 Avoid mixing the approaches and returning an RAII handle for "client-less" background tasks, if it only exists to stop
-the task when dropped. In carbide-api, there are many such client-less background jobs, and storing each of their
+the task when dropped. With many such client-less background jobs, storing each of their
 handles for the correct lifetime is awkward and error-prone. Propagating a single top-level CancellationToken to each of
 them is the preferred approach.
 

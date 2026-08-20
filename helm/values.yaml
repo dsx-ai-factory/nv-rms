@@ -31,7 +31,7 @@
 #     externalSecret:
 #       enabled: true
 #       sourceSecretKey: rms-api-server.rack-manager.my-pg-cluster.credentials.postgresql.acid.zalan.do
-#     patchForgeCluster:
+#     patchExternalCluster:
 #       enabled: true
 #       postgresqlName: my-pg-cluster
 #       databaseName: my_rms_db
@@ -78,29 +78,63 @@ dropDatabaseOnUninstall: true
 apiServer:
   enabled: true
   image:
-    repository: nvcr.io/nvidian/dcim/rms-api
+    repository: nvcr.io/0837451325059433/rms-dev/rms-api
     pullPolicy: ""
   replicaCount: 1
   port: 8801
+  metrics:
+    # Dedicated Prometheus /metrics listener port (independent of gRPC API port).
+    port: 8802
+    tls:
+      # When true, config.toml sets [metrics] tls = true and /metrics is served over
+      # standard TLS using the API server certificate (no client certificate required).
+      enabled: false
   # Existing PersistentVolumeClaim for firmware artifacts. Leave empty (or omit) to
   # use firmwareStoragePath hostPath; set a valid PVC name in a site override
   # passed with -f.
   firmwarePersistentVolumeClaim: ""
   # Host directory on the node (hostPath volume source).
   firmwareStoragePath: /mnt/data
-  # In-container mount for firmware artifacts; RMS reads this via RMS_FIRMWARE_DIR.
+  # In-container mount for firmware artifacts; rendered into config.toml as
+  # [workflows] firmware_dir.
   firmwareMountPath: /mnt/firmware
+  # Deprecated / no-op: RMS no longer consumes ENVIRONMENT_PATH. Retained only so
+  # existing overrides that still set it do not fail. Safe to omit.
   environmentPath: local-dev
-  # When true, chart passes `--insecure` and sets RMS_ALLOW_INSECURE=1 in the pod.
-  # Dev/test only: plaintext gRPC with no client authentication.
+  # When true, config.toml sets [tls] insecure = true and the Deployment injects the
+  # RMS_ALLOW_INSECURE=1 environment gate. RMS requires both before it will bind
+  # plaintext gRPC (defense-in-depth so a stale ConfigMap alone cannot downgrade
+  # the API). Dev/test only: plaintext gRPC with no client authentication.
   # Production MUST keep this false and enable apiServer.tls with a client CA (mTLS).
   allowInsecure: false
-  # When false (default), outbound switch connectivity uses mTLS over HTTPS for nvue_api
-  # and gRPC over HTTPS for scale_up_fabric_manager and scale_up_fabric_telemetry_interface.
+  # gateway_id sent on NMX-C gRPC requests from RMS (config.toml [switches] nmx_gateway_id).
+  nmxGatewayId: rack-manager-grpc-client
+  # Maximum size of the Postgres connection pool (config.toml [postgres] db_pool_max). Must be > 0.
+  dbPoolMax: 20
+  # Maximum number of async job records the tracker retains (config.toml [workflows] max_tracked_jobs).
+  maxTrackedJobs: 10000
+  # Retention period for completed and failed job records, in seconds
+  # (config.toml [workflows] terminal_job_ttl_seconds).
+  terminalJobTtlSeconds: 86400
+  # Opaque deployment-defined profile identifiers mapped to NVFWUPD AP names.
+  # Nodes select one with NodeDescriptor.attributes["inventory_profile"].
+  expectedInventoryProfiles: {}
+  #  gb200-compute-variant-a:
+  #    - FW_BMC_0
+  #    - HGX_FW_GPU_0
+  # Optional log level / filter directive, replacing RUST_LOG (config.toml [logging] log_level).
+  # Leave empty to use the default `info` level plus dependency caps.
+  logLevel: ""
+  # Assuming a logging collector is adding its own timestamps, so this is disabled by default to
+  # prevent duplicate timestamp fields. If no logging collector is being used, set true to output
+  # timestamps natively (config.toml [logging] enable_timestamps).
+  enableTimestamps: false
+  # When false (default), outbound switch connectivity uses mTLS over HTTPS for nvue_api,
+  # gRPC over HTTPS for scale_up_fabric_manager, and mTLS for secure-only gNMI checks.
   # Requires clientTlsCertificates and defaultSwitchDomain.
-  # When true, chart passes `--insecure-switch`: outbound switch client mTLS is disabled.
-  # nvue_api stays on HTTPS (TLS) without client certs or server verification;
-  # scale_up_fabric_manager and scale_up_fabric_telemetry_interface use gRPC over HTTP.
+  # When true, config.toml sets [switches] insecure_switch = true: nvue_api remains HTTPS
+  # without client mTLS or server verification, scale_up_fabric_manager uses plaintext
+  # HTTP, and direct gNMI connectivity checks are skipped.
   insecureSwitch: false
   # Overall wall-clock timeout (seconds) for switch NVOS SFTP image uploads.
   sftpUploadTimeoutSeconds: 3600
@@ -115,20 +149,21 @@ apiServer:
   #  - domain: site-wide
   #    secret: rms-switch-cert-material
   # RMS client mTLS for outbound switch nvue_api, scale_up_fabric_manager, and
-  # scale_up_fabric_telemetry_interface connections. Required unless
+  # secure certificate-install connectivity checks. Required unless
   # apiServer.insecureSwitch is true. Each entry mounts a cert-manager secret at
   # {clientTlsRoot}/{domain}/ (ca.pem, client.pem, client.key).
   clientTlsRoot: /var/run/secrets/client-tls
   clientTlsCertificates: []
   #  - domain: site-wide
   #    secret: rms-nmxc-client-certificate
-  #  - domain: ipp6-gb200-36x1.forge
-  #    secret: rms-nmxc-client-certificate-ipp6
-  # Default domain when switch RPCs omit domain; passed as --default-switch-domain.
-  # Set in site-specific overrides when switchCertCertificates / clientTlsCertificates are configured.
+  #  - domain: myrack.example.com
+  #    secret: rms-nmxc-client-certificate-myrack
+  # Default domain when switch RPCs omit domain; rendered as config.toml
+  # [switches] default_switch_domain. Set in site-specific overrides when
+  # switchCertCertificates / clientTlsCertificates are configured.
   defaultSwitchDomain: ""
-  # Optional DNS domain used for switch, scale_up_fabric_manager, and
-  # scale_up_fabric_telemetry_interface TLS server-name verification.
+  # Optional DNS domain used for switch NVUE, scale_up_fabric_manager, and secure-only
+  # gNMI TLS server-name verification (config.toml [switches] dns_domain).
   dnsDomain: ""
 
   tls:
@@ -143,13 +178,13 @@ apiServer:
     # Client CA for mTLS; required by the RMS binary whenever TLS is enabled.
     caEnabled: true
     ca: ""
-  # ServiceMonitor for the API server metrics endpoint
+  # ServiceMonitor for the metrics endpoint on the dedicated metrics port
   serviceMonitor:
     enabled: true
     # Prometheus instance name: Must match the serviceMonitorSelector label
     # on your Prometheus CR, unless you use a nil selector (picks up all ServiceMonitors).
     prometheus: ""
-    # TLS configuration used when apiServer.tls.enabled is true.
+    # TLS configuration used when apiServer.metrics.tls.enabled is true.
     # prometheus-operator v0.50+ resolves secrets from the ServiceMonitor's own namespace.
     tlsConfig:
       # insecureSkipVerify: Skip all server cert verification (traffic still encrypted).
@@ -163,31 +198,62 @@ apiServer:
       #   Used to verify the server certificate chain.
       caSecret: ""
       caSecretKey: ca.crt
-      # Client certificate for mTLS. Set clientCertSecret to the name of an existing
-      # secret, or leave empty and set clientCert.create: true to have the chart create one.
-      clientCertSecret: ""
-      clientCertKey: tls.crt
-      clientKeyKey: tls.key
-    # Create a cert-manager Certificate for Prometheus to present as a client cert when
-    # scraping the mTLS-secured /metrics endpoint. Requires apiServer.tls.caEnabled: true
-    # and cert-manager to be installed. When create: true, the chart creates a Certificate
-    # in the chart namespace signed by issuerName, and the ServiceMonitor tlsConfig is
-    # automatically populated — no need to set tlsConfig.clientCertSecret manually.
-    clientCert:
-      create: false
-      # issuerName: Name of the issuer to use for the certificate.
-      issuerName: rms-ca-issuer
-      # issuerKind: Kind of the issuer to use for the certificate.
-      issuerKind: Issuer
-      # issuerGroup: only needed for external issuers (e.g. StepClusterIssuer, AWSPCAIssuer).
-      # cert-manager v1 infers cert-manager.io when issuerKind is Issuer or ClusterIssuer.
-      issuerGroup: ""
-      # secretName: Name of the secret to store the client certificate in.
-      secretName: prometheus-rms-client-tls
-      # duration: Certificate duration.
-      duration: 8760h
-      # renewBefore: Renew the certificate this amount of time before it expires.
-      renewBefore: 720h
+
+# cert-manager Certificates for the API server and switch mTLS material.
+# Requires the cert-manager CRDs and a reachable issuer, so this is opt-in: set
+# certificates.enabled: true and certificates.issuerRef.name in a site override.
+#
+# When enabled, the chart issues:
+#   - the API server certificate, mounted in place of apiServer.tls.existingSecret
+#   - one certificate per apiServer.switchCertCertificates entry (switch-side server certs)
+#   - one certificate per apiServer.clientTlsCertificates entry (RMS-side switch client certs)
+# The Certificate is named after, and writes to, the secret each entry already
+# references, so no secret name is repeated.
+#
+# Renewal only rewrites the Secret. Nothing here restarts the API server or
+# re-pushes to switches, so only the switch client material is picked up
+# automatically; see "Rotation and renewal" in helm/README.md before shortening
+# the lifetimes below.
+certificates:
+  enabled: false
+  issuerRef:
+    name: ""
+    kind: ClusterIssuer
+    group: cert-manager.io
+  # Set these to match how often the site actually redistributes the material:
+  # a certificate expires on this schedule whether or not anyone re-pushed it.
+  duration: 720h0m0s
+  renewBefore: 360h0m0s
+  privateKey:
+    algorithm: ECDSA
+    size: 384
+    # Explicit because cert-manager changed this default from Never to Always in
+    # v1.18; unset, the site's cert-manager version decides whether a renewal
+    # mints a new key.
+    rotationPolicy: Always
+  spiffe:
+    trustDomain: ""
+    path: rack-manager/sa/rms-api-server
+  labels: {}
+  annotations: {}
+  apiServer:
+    enabled: true
+    # Defaults to apiServer.tls.existingSecret, then rms-api-server-certificate.
+    secretName: ""
+    dnsNames: []
+  switchServer:
+    enabled: true
+    # NVOS switches consume the combined key+cert PEM written by this format.
+    additionalOutputFormats:
+      - CombinedPEM
+    # Defaults to apiServer.dnsDomain, which RMS uses verbatim as the switch TLS
+    # authority. Set here (or per entry) only for a switch domain that differs.
+    dnsNames: []
+  switchClient:
+    enabled: true
+    usages:
+      - client auth
+      - digital signature
 
 # External PostgreSQL connection (used when databaseMode is external).
 # Placeholder defaults below — override database.host, database.name, and
@@ -228,7 +294,7 @@ rmsPostgres:
     sourceSecretKey: ""
     sourceSecretVersion: v1
   # Patch the target PostgreSQL CR to add RMS DB/user (requires RBAC in postgres namespace)
-  patchForgeCluster:
+  patchExternalCluster:
     enabled: false
     postgresqlNamespace: postgres
     postgresqlName: my-pg-cluster

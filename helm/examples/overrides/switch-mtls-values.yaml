@@ -3,11 +3,11 @@
 # Secure switch meaning:
 #   - nvue_api: mTLS over HTTPS
 #   - scale_up_fabric_manager: gRPC over HTTPS
-#   - scale_up_fabric_telemetry_interface: gRPC over HTTPS (same transport rules as scale_up_fabric_manager)
+#   - gNMI Capabilities: direct mTLS connectivity check during secure certificate install
 #
 # Objective
-#   Verify RMS outbound switch connectivity uses mTLS over HTTPS for nvue_api and
-#   gRPC over HTTPS for scale_up_fabric_manager and scale_up_fabric_telemetry_interface.
+#   Verify RMS outbound switch connectivity uses mTLS over HTTPS for nvue_api,
+#   gRPC over HTTPS for scale_up_fabric_manager, and mTLS for direct gNMI checks.
 #   The chart must NOT pass --insecure-switch; client and switch cert material must be mounted and
 #   forwarded to the binary.
 #
@@ -15,7 +15,7 @@
 #   - Kubernetes secrets with switch and RMS client cert material (ca.crt, tls.crt, tls.key)
 #   - API server TLS secret (apiServer.tls.existingSecret or --set-file cert/key/ca)
 #   - PostgreSQL reachable (or layer databaseMode: memory for chart-only validation)
-#   - Switches configured for mTLS (nvue_api mTLS over HTTPS; gRPC services gRPC over HTTPS)
+#   - Switches configured for mTLS (NVUE and NMX-C HTTPS; gNMI secure check enabled)
 #
 # Expected chart behavior
 #   - Deployment args omit --insecure-switch
@@ -25,8 +25,10 @@
 #
 # Expected RMS runtime behavior
 #   - Startup validates client-tls-root and default-switch-domain
-#   - nvue_api calls use mTLS over HTTPS (RMS client certificate and server CA verification)
-#   - scale_up_fabric_manager and scale_up_fabric_telemetry_interface calls use gRPC over HTTPS with client mTLS and server certificate verification
+#   - nvue_api calls use mTLS over HTTPS with server certificate verification
+#   - scale_up_fabric_manager uses gRPC over HTTPS with client mTLS and server verification
+#   - SetScaleUpFabricTelemetryInterfaceState configures gNMI through NVUE HTTPS
+#   - ConfigureSwitchCertificate can run a direct gNMI Capabilities mTLS check
 #   - ConfigureSwitchCertificate installs switch-side cert material (not unset-mode)
 #   - Startup log does NOT warn about insecure-switch
 #

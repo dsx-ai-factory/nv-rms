@@ -1,0 +1,18 @@
+[package]
+name = "redfish_test_support"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+axum = { workspace = true }
+flate2 = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true, features = ["tokio", "server-auto"] }
+rcgen = { workspace = true }
+rustls = { workspace = true, features = ["ring"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tar = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+tokio-rustls = { workspace = true }

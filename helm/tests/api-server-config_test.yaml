@@ -1,0 +1,134 @@
+suite: API server config ConfigMap
+templates:
+  - templates/api-server-config.yaml
+tests:
+  - it: renders historical defaults into config.toml
+    set:
+      global.image.tag: test
+    asserts:
+      - isKind:
+          of: ConfigMap
+      - equal:
+          path: metadata.name
+          value: rms-api-config
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: "port = 8801"
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: "\\[metrics\\]\\nport = 8802"
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'nmx_gateway_id = "rack-manager-grpc-client"'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'firmware_dir = "/mnt/firmware"'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: "db_pool_max = 20"
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: "max_tracked_jobs = 10000"
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: "terminal_job_ttl_seconds = 86400"
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: "sftp_upload_timeout_seconds = 3600"
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: "sftp_step_timeout_seconds = 30"
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: "enable_timestamps = false"
+      - notMatchRegex:
+          path: data["config.toml"]
+          pattern: "\\[workflows.expected_inventory_profiles\\]"
+
+  - it: renders expected inventory profiles into config.toml
+    set:
+      global.image.tag: test
+      apiServer.expectedInventoryProfiles:
+        gb200-compute-variant-b:
+          - FW_BMC_0
+          - HGX_FW_GPU_0
+          - HGX_FW_GPU_1
+        gb200-compute-variant-a:
+          - FW_BMC_0
+          - HGX_FW_GPU_0
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: "\\[workflows.expected_inventory_profiles\\]"
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: '"gb200-compute-variant-a" = \\["FW_BMC_0","HGX_FW_GPU_0"\\]'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: '"gb200-compute-variant-b" = \\["FW_BMC_0","HGX_FW_GPU_0","HGX_FW_GPU_1"\\]'
+
+  - it: sets insecure = true when allowInsecure is true
+    set:
+      global.image.tag: test
+      apiServer.allowInsecure: true
+      apiServer.tls.enabled: false
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: "insecure = true"
+      - notMatchRegex:
+          path: data["config.toml"]
+          pattern: "allow_insecure"
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: "\\[metrics\\]\\nport = 8802\\ntls = false"
+
+  - it: renders tls paths and metrics tls when TLS is enabled
+    set:
+      global.image.tag: test
+      apiServer.tls.enabled: true
+      apiServer.metrics.tls.enabled: true
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: "\\[metrics\\]\\nport = 8802\\ntls = true"
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'cert = "/var/run/secrets/rms-api/tls.crt"'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'key = "/var/run/secrets/rms-api/tls.key"'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'ca = "/var/run/secrets/rms-api/ca.crt"'
+
+  - it: renders overridable scalars from values
+    set:
+      global.image.tag: test
+      apiServer.allowInsecure: true
+      apiServer.tls.enabled: false
+      apiServer.nmxGatewayId: custom-gateway
+      apiServer.dbPoolMax: 42
+      apiServer.maxTrackedJobs: 500
+      apiServer.terminalJobTtlSeconds: 600
+      apiServer.logLevel: "info,carbide=debug"
+      apiServer.enableTimestamps: true
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'nmx_gateway_id = "custom-gateway"'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: "db_pool_max = 42"
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: "max_tracked_jobs = 500"
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: "terminal_job_ttl_seconds = 600"
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'log_level = "info,carbide=debug"'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: "enable_timestamps = true"

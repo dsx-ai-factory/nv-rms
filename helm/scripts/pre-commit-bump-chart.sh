@@ -1,152 +1,65 @@
 #!/usr/bin/env bash
-# Pre-commit helper: bump helm/Chart.yaml when chart package inputs are staged.
+# Pre-commit guard: require a helm/Chart.yaml version bump whenever chart package
+# inputs are staged.
 #
-# Zero-touch by default:
-#   - infers patch|minor|major from the staged diff
-#   - on an existing -dev.N version, runs "dev next" instead of re-bumping semver
-#   - stages the updated Chart.yaml for the commit
+# The chart version is a plain MAJOR.MINOR.PATCH semver, versioned independently
+# of RMS; the developer chooses the bump for each change. This guard mirrors the
+# CI check (see .gitlab-ci.yml build-helm-chart-to-ngc) so the mistake is caught
+# locally, before pushing, rather than after a failed pipeline.
 #
-# Opt-in / override env vars:
-#   SKIP_HELM_CHART_BUMP=1           skip entirely (like SKIP=...)
-#   HELM_CHART_BUMP_INTERACTIVE=1    always prompt before bumping
-#   HELM_CHART_BUMP_KIND=patch|minor|major|next  force bump kind
-#   HELM_CHART_BUMP_AUTO_MAJOR=1     allow major without confirmation
+#   SKIP_HELM_CHART_BUMP=1   skip this check for one commit
 set -euo pipefail
 
 ROOT="$(git rev-parse --show-toplevel)"
 cd "$ROOT"
 
-BUMP_SCRIPT="${ROOT}/helm/scripts/bump-chart-version.sh"
 SUGGEST_SCRIPT="${ROOT}/helm/scripts/suggest-chart-bump.sh"
-CHART_YAML="${ROOT}/helm/Chart.yaml"
+CHART_YAML="helm/Chart.yaml"
 
 info() { echo "helm chart version: $*" >&2; }
-warn() { echo "helm chart version: warning: $*" >&2; }
 fail() { echo "helm chart version: error: $*" >&2; exit 1; }
+
+if [[ "${SKIP_HELM_CHART_BUMP:-}" == "1" ]]; then
+  info "check skipped (SKIP_HELM_CHART_BUMP=1)"
+  exit 0
+fi
 
 staged_chart_package_files() {
   git diff --cached --name-only -- helm/ | grep -E \
-    '^(helm/Chart\.yaml|helm/values\.yaml|helm/values\.schema\.json|helm/\.helmignore|helm/templates/|helm/crds/|helm/charts/)'
+    '^(helm/Chart\.yaml|helm/values\.yaml|helm/values\.schema\.json|helm/\.helmignore|helm/templates/|helm/crds/|helm/charts/)' || true
 }
 
-if [[ "${SKIP_HELM_CHART_BUMP:-}" == "1" ]]; then
-  info "skipped (SKIP_HELM_CHART_BUMP=1)"
+changed_files="$(staged_chart_package_files)"
+if [[ -z "$changed_files" ]]; then
   exit 0
 fi
 
-if [[ ! -x "$BUMP_SCRIPT" ]]; then
-  fail "missing executable ${BUMP_SCRIPT}"
-fi
-
-# Version-only Chart.yaml edits (release chore) - nothing to do.
-if git diff --cached --name-only -- helm/ | grep -qx 'helm/Chart.yaml'; then
-  if git diff --cached -- helm/Chart.yaml | grep -qE '^[-+]version:'; then
-    other_helm="$(git diff --cached --name-only -- helm/ | grep -v '^helm/Chart.yaml$' || true)"
-    if [[ -z "$other_helm" ]]; then
-      info "Chart.yaml version already set for this commit"
-      exit 0
-    fi
+# A staged change to the version line satisfies the requirement; validate that
+# the new value stays a plain X.Y.Z semver so CI does not reject it later.
+if git diff --cached -- "$CHART_YAML" | grep -qE '^[-+]version:'; then
+  new_version="$(git diff --cached -- "$CHART_YAML" | awk '/^\+version:/{print $2; exit}')"
+  if [[ -n "$new_version" && ! "$new_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    fail "chart version '${new_version}' is not a plain X.Y.Z semver (no -rc/-dev suffixes)."
   fi
-fi
-
-helm_content_changes="$(staged_chart_package_files || true)"
-if [[ -z "$helm_content_changes" ]]; then
   exit 0
 fi
 
-if git diff --cached -- helm/Chart.yaml | grep -qE '^[-+]version:'; then
-  info "Chart.yaml version already updated with helm changes"
-  exit 0
+suggestion="patch"
+reason="template/default tweak"
+if [[ -x "$SUGGEST_SCRIPT" ]]; then
+  IFS=$'\t' read -r suggestion reason < <("$SUGGEST_SCRIPT" || printf 'patch\tunknown')
 fi
-
-branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
-if [[ "$branch" == release/* ]]; then
-  fail "on ${branch}: do not auto-bump. Set Chart.yaml with:
-  ./helm/scripts/bump-chart-version.sh sync-tag vX.Y.Z-rcN
-  or commit with SKIP_HELM_CHART_BUMP=1"
-fi
-
-current="$("$BUMP_SCRIPT" show)"
-kind=""
-reason=""
-
-if [[ -n "${HELM_CHART_BUMP_KIND:-}" ]]; then
-  kind="${HELM_CHART_BUMP_KIND}"
-  reason="HELM_CHART_BUMP_KIND=${kind}"
-elif [[ "$current" =~ -dev\.[0-9]+$ ]]; then
-  kind="next"
-  reason="continuing develop chart line (${current})"
+if [[ "$suggestion" =~ ^(major|minor|patch)$ ]]; then
+  cmd_arg="$suggestion"
 else
-  IFS=$'\t' read -r kind reason < <("$SUGGEST_SCRIPT")
+  cmd_arg="{patch|minor|major}"
 fi
 
-choose_kind_interactive() {
-  local why="$2"
-  local suggested choice
-  case "$1" in
-    patch | minor | major | next | skip) suggested="$1" ;;
-    *) suggested="patch" ;;
-  esac
-  echo >&2
-  echo "Staged Helm chart package changes:" >&2
-  git diff --cached --stat -- helm/Chart.yaml helm/values.yaml helm/values.schema.json helm/.helmignore helm/templates/ helm/crds/ helm/charts/ | sed 's/^/  /' >&2
-  echo >&2
-  echo "Suggested chart bump: ${suggested} (${why})" >&2
-  echo "  [P]atch  [m]inor  [M]ajor  [n]ext-dev  [s]kip  [q]uit" >&2
-  read -r -p "Chart semver bump [${suggested}]: " choice </dev/tty || choice=""
-  choice="${choice:-$suggested}"
-  case "$choice" in
-    p | P) echo "patch" ;;
-    m) echo "minor" ;;
-    M) echo "major" ;;
-    n | N) echo "next" ;;
-    s | S) echo "skip" ;;
-    q | Q) fail "commit aborted at chart version prompt" ;;
-    *)
-      case "${choice,,}" in
-        patch) echo "patch" ;;
-        minor) echo "minor" ;;
-        major) echo "major" ;;
-        next) echo "next" ;;
-        skip) echo "skip" ;;
-        quit) fail "commit aborted at chart version prompt" ;;
-        *) echo "$suggested" ;;
-      esac
-      ;;
-  esac
-}
-
-if [[ "${HELM_CHART_BUMP_INTERACTIVE:-}" == "1" ]] && [[ -t 0 ]]; then
-  kind="$(choose_kind_interactive "$kind" "$reason")"
-  if [[ "$kind" == "skip" ]]; then
-    warn "skipped — CI will fail unless you bump helm/Chart.yaml manually"
-    exit 0
-  fi
-elif [[ "$kind" == "major" && "${HELM_CHART_BUMP_AUTO_MAJOR:-}" != "1" ]]; then
-  if [[ -t 0 ]]; then
-    kind="$(choose_kind_interactive "$kind" "$reason")"
-    [[ "$kind" != "skip" ]] || { warn "skipped"; exit 0; }
-  else
-    fail "inferred major bump (${reason}). Re-run with HELM_CHART_BUMP_AUTO_MAJOR=1, HELM_CHART_BUMP_KIND=..., or HELM_CHART_BUMP_INTERACTIVE=1"
-  fi
-elif [[ "$kind" == "ambiguous" ]]; then
-  if [[ -t 0 ]]; then
-    warn "${reason}"
-    kind="$(choose_kind_interactive "patch" "ambiguous diff")"
-    [[ "$kind" != "skip" ]] || { warn "skipped"; exit 0; }
-  else
-    warn "${reason}; defaulting to patch (set HELM_CHART_BUMP_INTERACTIVE=1 to choose)"
-    kind="patch"
-  fi
-fi
-
-info "bumping (${reason})"
-if [[ "$kind" == "next" ]]; then
-  "$BUMP_SCRIPT" dev next
-else
-  "$BUMP_SCRIPT" dev "$kind"
-fi
-
-git add "$CHART_YAML"
-new="$("$BUMP_SCRIPT" show)"
-info "staged helm/Chart.yaml: ${current} -> ${new} (${kind}: ${reason})"
+fail "chart package inputs are staged but helm/Chart.yaml 'version:' was not bumped.
+  Staged chart files:
+$(printf '%s\n' "$changed_files" | sed 's/^/    /')
+  Suggested bump: ${suggestion} (${reason})
+  Run:  ./helm/scripts/bump-chart-version.sh ${cmd_arg}
+        git add helm/Chart.yaml
+  Or set an explicit version with 'bump-chart-version.sh set X.Y.Z',
+  or skip this check once with SKIP_HELM_CHART_BUMP=1."

@@ -10,12 +10,18 @@ Do not use `CRLF` line endings for any file. Only use normalized `LF` endings.
 
 ### Markdown
 
-When generating Markdown (documentation or plans), always follow the [markdownlint-cli2 rules](./.markdownlint-cli2.yaml)
-and run `markdownlint-cli2 <markdownfile>`, fixing any errors displayed.
+When generating Markdown (documentation or plans), always follow the [rumdl rules](./.rumdl.toml)
+and run `rumdl check <markdownfile>`, fixing any errors displayed.
 
 ## Testing
 
 Code should not be added without accompanying unit tests, unless they prove impractical or impossible to write.
+
+## Documentation
+
+For any code or configuration changes in the repo, ensure the [docs](./docs/) reflect and do not contradict
+the new changes. If available, use the `nvidia-tech-docs` skills library to audit the changes to ensure docs
+conform to NVIDIA public-facing documentation requirements.
 
 ## Pre-flight Checks
 
@@ -25,21 +31,22 @@ errors or failing tests before presenting the changes to the user for review.
 ### Build
 
 ```bash
-cargo build
-cargo build --release
+just build
 ```
 
 ### Formatting/Linting
 
 ```bash
-cargo fmt -- --check
-cargo clippy -- -D warnings
+just check
+just docs-api
 ```
 
 ### Cargo Tests
 
 ```bash
-cargo test --lib
+just test
 cargo test --test grpc_e2e
-cargo test --release
+just test-full
 ```
+
+NOTE: Some e2e tests require non-loopback IP addresses to pass. Run the e2e tests outside the sandbox environment.

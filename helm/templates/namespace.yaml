@@ -1,5 +1,6 @@
+{{- include "rack-manager.validateRmsPostgresKeys" . -}}
 {{- $useRmsPostgres := eq (include "rack-manager.useRmsPostgres" .) "true" }}
-{{- $patchEnabled := index .Values.rmsPostgres.patchForgeCluster "enabled" | default false }}
+{{- $patchEnabled := dig "patchExternalCluster" "enabled" false (.Values.rmsPostgres | default dict) }}
 {{- if and .Values.createNamespace (not (and $useRmsPostgres $patchEnabled)) }}
 apiVersion: v1
 kind: Namespace

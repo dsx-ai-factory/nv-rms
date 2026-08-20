@@ -1,0 +1,46 @@
+<mxfile host="rms-docs">
+  <diagram id="northbound-southbound" name="Northbound-Southbound">
+    <mxGraphModel dx="860" dy="470" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="860" pageHeight="470" math="0" shadow="0">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+        <mxCell id="nb" value="NORTHBOUND — INCOMING" style="text;html=1;align=center;fontColor=#76B900;fontStyle=1;fontSize=12;letterSpacing=1;" parent="1" vertex="1">
+          <mxGeometry x="280" y="14" width="300" height="20" as="geometry"/>
+        </mxCell>
+        <mxCell id="clients" value="gRPC clients — operators, control planes" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#eef2f7;strokeColor=#5b6b7f;fontColor=#1a1a1a;arcSize=12;" parent="1" vertex="1">
+          <mxGeometry x="280" y="44" width="300" height="46" as="geometry"/>
+        </mxCell>
+        <mxCell id="rms" value="&lt;b&gt;Rack Management Service&lt;/b&gt;&lt;br&gt;RackManager gRPC service   ·   Prometheus /metrics :8802" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#eaf7d6;strokeColor=#76B900;strokeWidth=2;fontColor=#1a1a1a;arcSize=8;" parent="1" vertex="1">
+          <mxGeometry x="215" y="150" width="430" height="72" as="geometry"/>
+        </mxCell>
+        <mxCell id="e1" style="endArrow=classic;html=1;strokeColor=#5a5a5a;" parent="1" source="clients" target="rms" edge="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e1l" value="gRPC over mTLS · TLS 1.3 · :8801" style="text;html=1;align=left;fontSize=11;fontColor=#444444;" parent="1" vertex="1">
+          <mxGeometry x="442" y="112" width="220" height="20" as="geometry"/>
+        </mxCell>
+        <mxCell id="compute" value="&lt;b&gt;Compute tray BMC&lt;/b&gt;&lt;br&gt;power · device info · firmware" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f7f7f7;strokeColor=#7a7a7a;fontColor=#1a1a1a;arcSize=8;" parent="1" vertex="1">
+          <mxGeometry x="50" y="300" width="220" height="80" as="geometry"/>
+        </mxCell>
+        <mxCell id="switch" value="&lt;b&gt;NVSwitch tray&lt;/b&gt;&lt;br&gt;firmware · images · certs · fabric mgr" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f7f7f7;strokeColor=#7a7a7a;fontColor=#1a1a1a;arcSize=8;" parent="1" vertex="1">
+          <mxGeometry x="320" y="300" width="220" height="80" as="geometry"/>
+        </mxCell>
+        <mxCell id="pshelf" value="&lt;b&gt;Power shelf controller&lt;/b&gt;&lt;br&gt;power · device info · firmware" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f7f7f7;strokeColor=#7a7a7a;fontColor=#1a1a1a;arcSize=8;" parent="1" vertex="1">
+          <mxGeometry x="590" y="300" width="220" height="80" as="geometry"/>
+        </mxCell>
+        <mxCell id="e2" value="Redfish / HTTPS" style="endArrow=classic;html=1;strokeColor=#5a5a5a;fontSize=11;fontColor=#444444;" parent="1" source="rms" target="compute" edge="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e3" value="NVUE · SSH · SFTP / NMX-C · gNMI" style="endArrow=classic;html=1;strokeColor=#5a5a5a;fontSize=11;fontColor=#444444;" parent="1" source="rms" target="switch" edge="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e4" value="Redfish / HTTPS" style="endArrow=classic;html=1;strokeColor=#5a5a5a;fontSize=11;fontColor=#444444;" parent="1" source="rms" target="pshelf" edge="1">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="sb" value="SOUTHBOUND — OUTGOING" style="text;html=1;align=center;fontColor=#76B900;fontStyle=1;fontSize=12;letterSpacing=1;" parent="1" vertex="1">
+          <mxGeometry x="280" y="404" width="300" height="20" as="geometry"/>
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

@@ -1,5 +1,6 @@
+{{- include "rack-manager.validateRmsPostgresKeys" . -}}
 {{- $useRmsPostgres := eq (include "rack-manager.useRmsPostgres" .) "true" }}
-{{- $patchEnabled := index .Values.rmsPostgres.patchForgeCluster "enabled" | default false }}
+{{- $patchEnabled := dig "patchExternalCluster" "enabled" false (.Values.rmsPostgres | default dict) }}
 {{- if and $useRmsPostgres $patchEnabled }}
 {{- if .Values.createNamespace }}
 ---
@@ -35,7 +36,7 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
   name: rms-postgres-patch
-  namespace: {{ .Values.rmsPostgres.patchForgeCluster.postgresqlNamespace }}
+  namespace: {{ .Values.rmsPostgres.patchExternalCluster.postgresqlNamespace }}
   labels:
     {{- include "rack-manager.labels" . | nindent 4 }}
   annotations:
@@ -54,7 +55,7 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
   name: rms-postgres-patch
-  namespace: {{ .Values.rmsPostgres.patchForgeCluster.postgresqlNamespace }}
+  namespace: {{ .Values.rmsPostgres.patchExternalCluster.postgresqlNamespace }}
   labels:
     {{- include "rack-manager.labels" . | nindent 4 }}
   annotations:
@@ -99,9 +100,9 @@ spec:
             - -c
             - |
               set -e
-              PATCH='{"spec":{"databases":{"{{ .Values.rmsPostgres.patchForgeCluster.databaseName }}":"{{ .Values.rmsPostgres.patchForgeCluster.userName }}"},"users":{"{{ .Values.rmsPostgres.patchForgeCluster.userName }}":["superuser","createdb"]}}}'
-              kubectl patch postgresql {{ .Values.rmsPostgres.patchForgeCluster.postgresqlName }} \
-                -n {{ .Values.rmsPostgres.patchForgeCluster.postgresqlNamespace }} \
+              PATCH='{"spec":{"databases":{"{{ .Values.rmsPostgres.patchExternalCluster.databaseName }}":"{{ .Values.rmsPostgres.patchExternalCluster.userName }}"},"users":{"{{ .Values.rmsPostgres.patchExternalCluster.userName }}":["superuser","createdb"]}}}'
+              kubectl patch postgresql {{ .Values.rmsPostgres.patchExternalCluster.postgresqlName }} \
+                -n {{ .Values.rmsPostgres.patchExternalCluster.postgresqlNamespace }} \
                 --type=merge -p "$PATCH"
               echo "Patch applied successfully"
 {{- end }}

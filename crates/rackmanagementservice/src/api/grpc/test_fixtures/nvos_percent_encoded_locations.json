@@ -1,0 +1,51 @@
+{
+  "ProductName": "GB200NVL_72x1",
+  "Milestones": [
+    {
+      "Name": "1.3.5-GA",
+      "State": "Released",
+      "BoardSKUs": [
+        {
+          "SKUID": "Sample SKUID",
+          "Name": "Sample Switch",
+          "Type": "Switch Tray",
+          "Components": {
+            "Software": [
+              {
+                "Component": "NVOS",
+                "Type": "Prod",
+                "Version": "25.02.2553",
+                "Locations": [
+                  {
+                    "Name": "NVOS_Prod_AMD64",
+                    "Location": "https://urm.example.com/release/25.02.2553/amd64/prod/nvos-amd64-25.02.2553.bin",
+                    "LocationType": "HTTPS",
+                    "PackageName": "GB200NVL72_NVOS",
+                    "PackageSubdirectory": "NVOS",
+                    "Required": true
+                  },
+                  {
+                    "Name": "NMX-C Documentation",
+                    "Location": "https://artifactory.example.com/docs/NMX-Controller%20%28NMX-C%29%20Documentation%20v1.3.2.pdf",
+                    "LocationType": "HTTPS",
+                    "PackageName": "GB200NVL72_NVOS",
+                    "PackageSubdirectory": "NVOS",
+                    "Required": true
+                  },
+                  {
+                    "Name": "NMX-T Documentation",
+                    "Location": "https://artifactory.example.com/docs/NMX%20Telemetry%20%28NMX-T%29%20Documentation%20v1.3.4.pdf",
+                    "LocationType": "HTTPS",
+                    "PackageName": "GB200NVL72_NVOS",
+                    "PackageSubdirectory": "NVOS",
+                    "Required": true
+                  }
+                ]
+              }
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}

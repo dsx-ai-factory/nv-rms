@@ -1,0 +1,119 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+#
+# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
+# property and proprietary rights in and to this material, related
+# documentation and any modifications thereto. Any use, reproduction,
+# disclosure or distribution of this material and related documentation
+# without an express license agreement from NVIDIA CORPORATION or
+# its affiliates is strictly prohibited.
+
+# yaml-language-server: $schema=https://schema.buildwithfern.dev/docs-yml.json
+
+global-theme: nvidia
+
+instances:
+  - url: nvidia-rms.docs.buildwithfern.com/rms
+    # custom-domain: docs.nvidia.com/rms
+    multi-source: true
+
+title: NVIDIA Rack Management Service
+
+metadata:
+  canonical-host: "docs.nvidia.com"
+
+ai-search:
+  location:
+    - docs
+
+navbar-links:
+  - type: filled
+    text: GitHub
+    href: https://github.com/NVIDIA/nv-rms
+
+tabs:
+  documentation:
+    display-name: Documentation
+
+#==============================================================================
+# Content navigation from here down
+#==============================================================================
+
+navigation:
+  - tab: documentation
+
+    layout:
+
+    - page: Home
+      path: ../docs/index.md
+      icon: home
+
+    - page: Overview
+      path: ../docs/overview.md
+      icon: circle-info
+
+    - section: Getting Started
+      icon: rocket
+      contents:
+        - page: Prerequisites
+          path: ../docs/getting-started/prerequisites.md
+        - page: Building RMS
+          path: ../docs/getting-started/build.md
+        - page: Testing RMS
+          path: ../docs/getting-started/testing.md
+        - page: Running RMS
+          path: ../docs/getting-started/running.md
+
+    - section: Architecture
+      icon: sitemap
+      contents:
+        - page: External View
+          path: ../docs/architecture/external_view.md
+        - page: Internal View
+          path: ../docs/architecture/internal_view.md
+
+    - section: Configuration
+      icon: gear
+      contents:
+        - page: Configuring RMS
+          path: ../docs/configuration/configuring-rms.md
+        - page: Configuration via Helm
+          path: ../docs/configuration/via-helm.md
+
+    - section: Deployment
+      icon: server
+      contents:
+        - page: Deployment Prerequisites
+          path: ../docs/deployment/prerequisites.md
+        - page: Kubernetes Deployment with Helm
+          path: ../docs/deployment/kubernetes.md
+
+    - section: Operations
+      icon: bolt
+      contents:
+        - page: Overview
+          path: ../docs/operations/overview.md
+        - page: Power Control
+          path: ../docs/operations/power-control.md
+        - page: Inventory
+          path: ../docs/operations/inventory.md
+        - page: Firmware
+          path: ../docs/operations/firmware.md
+        - page: Switch Management
+          path: ../docs/operations/switch-management.md
+        - page: Utility
+          path: ../docs/operations/utility.md
+
+    - section: Reference
+      icon: book
+      contents:
+        - page: Hardware Compatibility List
+          path: ../docs/reference/hcl.md
+        - page: Workspace Crates
+          path: ../docs/reference/crates.md
+        - page: Development
+          path: ../docs/reference/development.md
+        - page: Adding Support for New Hardware
+          path: ../docs/reference/new-hardware-support.md
+        - page: Glossary
+          path: ../docs/reference/glossary.md
