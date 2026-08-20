@@ -149,6 +149,8 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
+        with:
+          buildkitd-config: /etc/buildkit/buildkitd.toml
 
       # build-container warms the GHA layer cache (push:false, no load), leaving
       # no runnable image; rebuild the builder target here with load:true (cache
@@ -205,6 +207,8 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
+        with:
+          buildkitd-config: /etc/buildkit/buildkitd.toml
 
       # The build-container job (dsx docker-build action) builds this same
       # target with push:false, which only warms the GHA layer cache — it leaves
@@ -277,6 +281,8 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
+        with:
+          buildkitd-config: /etc/buildkit/buildkitd.toml
 
       # Same local-build-then-run pattern as lint-police / test: build-container
       # only warms the cache, so rebuild the builder target with load:true.
@@ -364,6 +370,8 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
+        with:
+          buildkitd-config: /etc/buildkit/buildkitd.toml
 
       # Rebuild the builder target locally (cache hit) so `cargo bench` can run
       # inside it — same local-build-then-run pattern as lint-police / test.
@@ -423,6 +431,8 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
+        with:
+          buildkitd-config: /etc/buildkit/buildkitd.toml
 
       - name: Build release image (${{ matrix.arch }})
         uses: docker/build-push-action@v6
@@ -455,6 +465,8 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
+        with:
+          buildkitd-config: /etc/buildkit/buildkitd.toml
 
       - name: Log in to registry
         uses: ./.github/actions/docker-auth
@@ -489,6 +501,8 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
+        with:
+          buildkitd-config: /etc/buildkit/buildkitd.toml
 
       - name: Log in to registry
         uses: ./.github/actions/docker-auth
