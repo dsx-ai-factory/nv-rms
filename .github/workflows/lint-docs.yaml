@@ -1,0 +1,44 @@
+name: Lint Docs
+
+# Trigger mirrors ci.yaml: `pull-request/<number>` are the branches the
+# copy-pr-bot app mirrors PRs onto, which is how PRs from forks get linted.
+#
+# Deliberately has no `paths` filter, unlike preview-docs.yaml: a skipped
+# path-filtered workflow reports no status at all, which would deadlock any PR
+# that made this a required check without touching docs.
+on:
+  push:
+    branches:
+      - main
+      - "pull-request/[0-9]+"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lint-docs-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint Docs
+    runs-on: linux-amd64-cpu4
+    timeout-minutes: 15
+    env:
+      FERN_NO_VERSION_REDIRECTION: "true"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # No setup-fern-cli here: docs-lint.sh pins its own fern and rumdl
+      # versions through npx, so this only needs Node on the PATH. That keeps
+      # the script the single source of truth for CI and `just docs-lint`.
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Lint docs site
+        run: ./scripts/docs-lint.sh
