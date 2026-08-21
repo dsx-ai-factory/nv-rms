@@ -4,16 +4,16 @@
 # Rules are evaluated from top to bottom, with later rules taking precedence.
 
 # Default owners for everything in the repo
-* @NVIDIA/rms-sw-contributors
+* @dsx-ai-factory/rms-sw-contributors
 
 # GitHub process and automation files
-/.github/ @NVIDIA/dsx-sw-cicd @NVIDIA/rms-sw-admins
+/.github/ @dsx-ai-factory/dsx-sw-cicd @dsx-ai-factory/rms-sw-admins
 
 # CODEOWNERS file itself - requires admin approval
-/.github/CODEOWNERS @NVIDIA/rms-sw-admins
+/.github/CODEOWNERS @dsx-ai-factory/rms-sw-admins
 
 # Helm charts
-/helm/ @NVIDIA/dsx-sw-helm
+/helm/ @dsx-ai-factory/dsx-sw-helm
 
 # Security policy
-/SECURITY.md @NVIDIA/rms-sw-admins
+/SECURITY.md @dsx-ai-factory/rms-sw-admins
