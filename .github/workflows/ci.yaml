@@ -667,21 +667,6 @@ jobs:
           post-pr-comment: 'false'
           fail-on-findings: 'true'
 
-  markdownlint:
-    name: Markdown Lint
-    needs: prepare
-    runs-on: linux-amd64-cpu4
-    timeout-minutes: 15
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-      - name: Run markdownlint-cli2
-        run: |
-          docker run --rm -v "${{ github.workspace }}:/workdir" \
-            davidanson/markdownlint-cli2:v0.17.2 "**/*.md"
-
   # Slack notification via nico's ported reusable workflow. Runs after every job
   # (always()), so it fires on all three triggers this workflow allows: PR
   # (pull-request/*), main, and tags. Overall status is computed from the needs
@@ -692,7 +677,7 @@ jobs:
 
   # TODO: Uncomment when the app is approved for slack notifications
   # notify:
-  #   needs: [prepare, build-container-x86_64, build-container-aarch64, lint-police, test, coverage, build-release, publish-image, publish-manifest, helm-validate, helm-publish, security-codeql-scan, security-secret-scan, markdownlint]
+  #   needs: [prepare, build-container-x86_64, build-container-aarch64, lint-police, test, coverage, build-release, publish-image, publish-manifest, helm-validate, helm-publish, security-codeql-scan, security-secret-scan]
   #   if: ${{ always() }}
   #   uses: ./.github/workflows/notify-build-status.yml
   #   with:
@@ -707,7 +692,7 @@ jobs:
   #     slack-bot-token: ${{ secrets.RMS_SLACK_BOT_TOKEN }}
 
   core-ci-pass:
-    needs: [prepare, build-container-x86_64, build-container-aarch64, lint-police, test, coverage, build-release, publish-image, publish-manifest, helm-validate, helm-publish, security-codeql-scan, security-secret-scan, markdownlint]
+    needs: [prepare, build-container-x86_64, build-container-aarch64, lint-police, test, coverage, build-release, publish-image, publish-manifest, helm-validate, helm-publish, security-codeql-scan, security-secret-scan]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     steps:

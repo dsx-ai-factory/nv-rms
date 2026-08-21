@@ -1,0 +1,48 @@
+name: Publish Docs
+
+# Follows the reference workflow Fern publishes at
+# https://buildwithfern.com/learn/docs/preview-publish/publishing-your-docs
+#
+# fern/docs.yml declares a single instance, so this is the "publish to
+# production" shape: no `--instance` flag and no staging site.
+on:
+  push:
+    branches:
+      - main
+  # Lets a failed or superseded publish be re-run from the Actions tab without
+  # an empty commit, as in Fern's staging/production examples.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-docs
+  cancel-in-progress: false  # never cancel a publish mid-flight
+
+jobs:
+  publish:
+    name: Publish Docs
+    runs-on: linux-amd64-cpu4
+    timeout-minutes: 30
+    env:
+      FERN_NO_VERSION_REDIRECTION: "true"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Setup Fern CLI
+        uses: fern-api/setup-fern-cli@v1
+
+      # Fern's staging and production examples both validate before publishing.
+      # This is the stricter form the lint workflow runs, as a last gate before
+      # the site goes live.
+      - name: Validate configuration
+        run: fern check --broken-links --local --warnings
+
+      - name: Publish Docs
+        env:
+          FERN_TOKEN: ${{ secrets.FERN_TOKEN }}
+        run: fern generate --docs

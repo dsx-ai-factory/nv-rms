@@ -59,7 +59,7 @@ docker-build-builder image="rms-builder" context=".":
 docs-api:
     RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 
-# Docs-site checks; same script CI's lint_docs job runs.
+# Docs-site checks; same script CI's Lint Docs workflow runs.
 docs-lint:
     ./scripts/docs-lint.sh
 

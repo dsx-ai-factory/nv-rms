@@ -29,7 +29,7 @@ ai-search:
 navbar-links:
   - type: filled
     text: GitHub
-    href: https://github.com/NVIDIA/nv-rms
+    href: https://github.com/dsx-ai-factory/nv-rms
 
 tabs:
   documentation:
