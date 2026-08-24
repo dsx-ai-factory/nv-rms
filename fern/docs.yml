@@ -1,12 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# SPDX-License-Identifier: Apache-2.0
 
 # yaml-language-server: $schema=https://schema.buildwithfern.dev/docs-yml.json
 
@@ -19,17 +12,16 @@ instances:
 
 title: NVIDIA Rack Management Service
 
-metadata:
-  canonical-host: "docs.nvidia.com"
+# metadata:
+#   canonical-host: "docs.nvidia.com/rms"
 
-ai-search:
-  location:
-    - docs
+check:
+  rules:
+    broken-links: error
 
 navbar-links:
-  - type: filled
-    text: GitHub
-    href: https://github.com/dsx-ai-factory/nv-rms
+  - type: github
+    value: https://github.com/dsx-ai-factory/nv-rms
 
 tabs:
   documentation:
