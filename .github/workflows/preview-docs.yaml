@@ -42,6 +42,11 @@ jobs:
           persist-credentials: false
           fetch-depth: 0  # origin/main...HEAD diff for the changed-page links
 
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
       - name: Setup Fern CLI
         uses: fern-api/setup-fern-cli@v1
 
