@@ -19686,7 +19686,7 @@ DEALINGS IN THE SOFTWARE.
 
 [[third_party_libraries]]
 package_name = "russh"
-package_version = "0.62.6"
+package_version = "0.63.1"
 repository = "https://github.com/warp-tech/russh"
 license = "Apache-2.0"
 

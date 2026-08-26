@@ -1,13 +1,18 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+ * SPDX-License-Identifier: Apache-2.0
  *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 //! Password-based SSH/SFTP transport helpers.
@@ -21,7 +26,7 @@ use std::sync::LazyLock;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use russh::keys::{known_hosts, PublicKey};
+use russh::keys::{known_hosts, PublicKey, PublicKeyOrCertificate};
 use russh::{client, ChannelMsg, Disconnect};
 use russh_sftp::client::SftpSession;
 use russh_sftp::protocol::{FileAttributes, OpenFlags};
@@ -296,9 +301,10 @@ impl client::Handler for VerifyServerKey {
 
     async fn check_server_key(
         &mut self,
-        server_public_key: &russh::keys::PublicKey,
+        server_public_key: &PublicKeyOrCertificate,
     ) -> Result<bool, Self::Error> {
-        match self.policy.verify(&self.host, self.port, server_public_key) {
+        let public_key = server_public_key.public_key();
+        match self.policy.verify(&self.host, self.port, &public_key) {
             Ok(()) => Ok(true),
             Err(message) => {
                 if let Ok(mut failure) = self.failure.lock() {

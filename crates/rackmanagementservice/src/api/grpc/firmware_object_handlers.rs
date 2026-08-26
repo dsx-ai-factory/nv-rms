@@ -1,13 +1,18 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+ * SPDX-License-Identifier: Apache-2.0
  *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -2730,8 +2735,8 @@ fn parse_firmware_component(
                         .filter(|value| !value.trim().is_empty())
                         .or_else(|| {
                             let filename = json_string(location, "FileName");
-                            // P4110 has one update package plus a non-payload
-                            // CoRIM; only infer the .fwpkg as firmware.
+                            // This manifest shape has one update package plus a
+                            // non-payload CoRIM; only infer the .fwpkg as firmware.
                             (infer_vrnvl72_defaults
                                 && component.eq_ignore_ascii_case("BMC")
                                 && filename.to_ascii_lowercase().ends_with(".fwpkg"))
@@ -4310,7 +4315,7 @@ mod tests {
     fn hmc_lookup_table_from_firmware_manifest() -> FirmwareLookupTable {
         build_firmware_lookup_table(&ParsedFirmwareComponents {
             board_skus: vec![BoardSkuFirmware {
-                sku_id: "699-24764-0001-TS3".to_owned(),
+                sku_id: "test-compute-sku".to_owned(),
                 name: "compute".to_owned(),
                 sku_type: "Compute Node".to_owned(),
                 firmware_components: vec![FirmwareComponent {
@@ -4336,8 +4341,8 @@ mod tests {
     fn supermicro_gb300_lookup_table_from_firmware_manifest() -> FirmwareLookupTable {
         build_firmware_lookup_table(&ParsedFirmwareComponents {
             board_skus: vec![BoardSkuFirmware {
-                sku_id: "supermicro-gb300".to_owned(),
-                name: "Supermicro GB300 compute".to_owned(),
+                sku_id: "test-supermicro-compute-sku".to_owned(),
+                name: "Test Supermicro compute".to_owned(),
                 sku_type: "Compute Node".to_owned(),
                 firmware_components: vec![
                     FirmwareComponent {
@@ -4348,16 +4353,14 @@ mod tests {
                         context: String::new(),
                         locations: vec![
                             FirmwareLocation {
-                                location: "https://example.test/BIOS_GPU-NVGB300_2.3b.bin"
-                                    .to_owned(),
+                                location: "https://example.test/test-bios-image.bin".to_owned(),
                                 location_type: "HTTPS".to_owned(),
                                 firmware_type: Some("Firmware".to_owned()),
                                 sha256: None,
                                 context: String::new(),
                             },
                             FirmwareLocation {
-                                location: "https://example.test/nvfw_GB300_custom_nosbios_prod-signed.fwpkg"
-                                    .to_owned(),
+                                location: "https://example.test/compute-nosbios.fwpkg".to_owned(),
                                 location_type: "HTTPS".to_owned(),
                                 firmware_type: Some("Firmware".to_owned()),
                                 sha256: None,
@@ -4373,8 +4376,7 @@ mod tests {
                         component_type: Some("prod".to_owned()),
                         context: String::new(),
                         locations: vec![FirmwareLocation {
-                            location: "https://example.test/NvOBMC_GBNVL72_70.02.01.05.bin"
-                                .to_owned(),
+                            location: "https://example.test/NvOBMC_test-image.bin".to_owned(),
                             location_type: "HTTPS".to_owned(),
                             firmware_type: Some("Firmware".to_owned()),
                             sha256: None,
@@ -4391,7 +4393,7 @@ mod tests {
     fn duplicate_bmc_lookup_table_from_firmware_manifest() -> FirmwareLookupTable {
         build_firmware_lookup_table(&ParsedFirmwareComponents {
             board_skus: vec![BoardSkuFirmware {
-                sku_id: "699-24764-0001-TS3".to_owned(),
+                sku_id: "test-compute-sku".to_owned(),
                 name: "compute".to_owned(),
                 sku_type: "Compute Node".to_owned(),
                 firmware_components: vec![FirmwareComponent {
@@ -4828,7 +4830,7 @@ mod tests {
                             "Firmware": [{
                                 "Component": "BMC+FPGA+EROT",
                                 "Type": "Prod",
-                                "Version": "GB200-P4978_0004_260127.1.3",
+                                "Version": "test-switch-firmware-version",
                                 "Locations": [{
                                     "Location": "https://example.test/switch-bmc.fwpkg",
                                     "LocationType": "HTTPS",
@@ -4847,18 +4849,18 @@ mod tests {
                                 "Version": "",
                                 "Locations": [
                                     {
-                                        "Location": "https://example.test/GB200-P4975_SBIOS_020414_TPM.zip",
+                                        "Location": "https://example.test/compute-sbios.zip",
                                         "LocationType": "HTTPS",
                                         "PackageName": "",
                                         "Type": "Firmware",
-                                        "FileName": "GB200-P4975_SBIOS_020414_TPM.zip"
+                                        "FileName": "compute-sbios.zip"
                                     },
                                     {
-                                        "Location": "https://example.test/GB200-P4975_0011_260205.1.2_custom_prod-signed.corim",
+                                        "Location": "https://example.test/compute-sbios.corim",
                                         "LocationType": "HTTPS",
                                         "PackageName": "",
                                         "Type": "Certificate",
-                                        "FileName": "GB200-P4975_0011_260205.1.2_custom_prod-signed.corim"
+                                        "FileName": "compute-sbios.corim"
                                     }
                                 ],
                                 "SubComponents": [{
@@ -4897,10 +4899,7 @@ mod tests {
             .devices
             .get("Compute Node")
             .expect("compute lookup should exist");
-        assert_eq!(
-            compute["HMC_prod_0001"].filename,
-            "prod/GB200-P4975_SBIOS_020414_TPM.zip"
-        );
+        assert_eq!(compute["HMC_prod_0001"].filename, "prod/compute-sbios.zip");
         assert_eq!(parsed.switch_system_images[0].package_name, "GB200NVL_72x1");
         assert_eq!(parsed.switch_system_images[0].firmware_type, "prod");
         assert_eq!(
@@ -4927,7 +4926,7 @@ mod tests {
                                 "Location": "",
                                 "LocationType": "",
                                 "Type": "Firmware",
-                                "FileName": "GB200-P4975_SBIOS_020414_TPM.zip"
+                                "FileName": "compute-sbios.zip"
                             }]
                         }]
                     }
@@ -4957,10 +4956,10 @@ mod tests {
                         "Firmware": [{
                             "Component": "HMC",
                             "Locations": [{
-                                "Location": "https://example.test/GB200-P4975_SBIOS_020414_TPM.zip",
+                                "Location": "https://example.test/compute-sbios.zip",
                                 "LocationType": "HTTPS",
                                 "Type": "Firmware",
-                                "FileName": "GB200-P4975_SBIOS_020414_TPM.zip"
+                                "FileName": "compute-sbios.zip"
                             }]
                         }]
                     }
@@ -5003,7 +5002,7 @@ mod tests {
                                     "Location": "",
                                     "LocationType": "",
                                     "Type": "Firmware",
-                                    "FileName": "GB200-P4975_SBIOS_020414_TPM.zip"
+                                    "FileName": "compute-sbios.zip"
                                 }]
                             }
                         ]
@@ -5535,7 +5534,7 @@ mod tests {
     fn download_artifacts_uses_firmware_type_cache_dirs() {
         let parsed = ParsedFirmwareComponents {
             board_skus: vec![BoardSkuFirmware {
-                sku_id: "699-24764-0001-TS3".to_owned(),
+                sku_id: "test-compute-sku".to_owned(),
                 name: "compute".to_owned(),
                 sku_type: "Compute Node".to_owned(),
                 firmware_components: vec![FirmwareComponent {
@@ -5863,7 +5862,7 @@ mod tests {
     fn lookup_table_maps_compute_bmc_to_empty_target() {
         let parsed = ParsedFirmwareComponents {
             board_skus: vec![BoardSkuFirmware {
-                sku_id: "699-24764-0001-TS3".to_owned(),
+                sku_id: "test-compute-sku".to_owned(),
                 name: "compute".to_owned(),
                 sku_type: "Compute Node".to_owned(),
                 firmware_components: vec![FirmwareComponent {
@@ -5898,8 +5897,8 @@ mod tests {
     fn lookup_table_preserves_multiple_firmware_payloads_per_target_key() {
         let parsed = ParsedFirmwareComponents {
             board_skus: vec![BoardSkuFirmware {
-                sku_id: "692-24764-0001-000".to_owned(),
-                name: "P4059".to_owned(),
+                sku_id: "test-compute-sku".to_owned(),
+                name: "test-compute-board".to_owned(),
                 sku_type: "Compute Node".to_owned(),
                 firmware_components: vec![FirmwareComponent {
                     component: "HMC".to_owned(),
@@ -5988,8 +5987,8 @@ mod tests {
     fn apply_filter_prunes_ephemeral_downloads_to_requested_component() {
         let config = release_catalog(serde_json::json!([
             {
-                "SKUID": "692-24764-0001-000",
-                "Name": "P4059",
+                "SKUID": "test-compute-sku",
+                "Name": "test-compute-board",
                 "Type": "Compute Tray",
                 "Components": {
                     "Firmware": [
@@ -5999,13 +5998,13 @@ mod tests {
                             "Locations": [
                                 {
                                     "Name": "Production_Package",
-                                    "Location": "https://example.test/nvfw_DGX-GBX00_prod-signed.fwpkg",
+                                    "Location": "https://example.test/compute-bmc.fwpkg",
                                     "LocationType": "HTTPS",
                                     "Type": "Firmware"
                                 },
                                 {
                                     "Name": "Recovery_Package",
-                                    "Location": "https://example.test/nvfw_DGX-GBX00_recovery_prod-signed.fwpkg",
+                                    "Location": "https://example.test/compute-bmc-recovery.fwpkg",
                                     "LocationType": "HTTPS",
                                     "Type": "Firmware"
                                 }
@@ -6015,7 +6014,7 @@ mod tests {
                             "Component": "HMC",
                             "Type": "Prod",
                             "Locations": [{
-                                "Location": "https://example.test/nvfw_HGX-GBX00_prod-signed.fwpkg",
+                                "Location": "https://example.test/compute-hmc.fwpkg",
                                 "LocationType": "HTTPS",
                                 "Type": "Firmware"
                             }]
@@ -6033,7 +6032,7 @@ mod tests {
                 }
             },
             {
-                "SKUID": "Sample SKUID",
+                "SKUID": "test-switch-sku",
                 "Name": "Sample Switch",
                 "Type": "Switch Tray",
                 "Components": {
@@ -6041,7 +6040,7 @@ mod tests {
                         "Component": "BMC+FPGA+EROT",
                         "Type": "Prod",
                         "Locations": [{
-                            "Location": "https://example.test/nvfw_GB300-P4093_prod-signed.fwpkg",
+                            "Location": "https://example.test/switch-firmware.fwpkg",
                             "LocationType": "HTTPS",
                             "Type": "Firmware"
                         }]
@@ -6084,10 +6083,7 @@ mod tests {
 
         let artifacts = build_download_artifacts(&parsed);
         assert_eq!(artifacts.len(), 1);
-        assert_eq!(
-            artifacts[0].url,
-            "https://example.test/nvfw_DGX-GBX00_prod-signed.fwpkg"
-        );
+        assert_eq!(artifacts[0].url, "https://example.test/compute-bmc.fwpkg");
 
         let lookup = build_firmware_lookup_table(&parsed);
         let compute = lookup
@@ -6096,17 +6092,14 @@ mod tests {
             .expect("compute lookup should exist");
         assert_eq!(compute.len(), 1);
         assert_eq!(compute["BMC_prod_0001"].target, "");
-        assert_eq!(
-            compute["BMC_prod_0001"].filename,
-            "prod/nvfw_DGX-GBX00_prod-signed.fwpkg"
-        );
+        assert_eq!(compute["BMC_prod_0001"].filename, "prod/compute-bmc.fwpkg");
     }
 
     #[test]
     fn apply_filter_keeps_all_lenovo_hmc_payloads_without_component_filter() {
         let config = release_catalog(serde_json::json!([{
-            "SKUID": "692-24764-0001-000",
-            "Name": "P4059",
+            "SKUID": "test-compute-sku",
+            "Name": "test-compute-board",
             "Type": "Compute Tray",
             "Components": {
                 "Firmware": [{
@@ -6175,8 +6168,8 @@ mod tests {
     #[test]
     fn apply_filter_keeps_supermicro_nosbios_bios_and_bmc_payloads() {
         let config = release_catalog(serde_json::json!([{
-            "SKUID": "supermicro-gb300",
-            "Name": "Supermicro GB300 compute",
+            "SKUID": "test-supermicro-compute-sku",
+            "Name": "Test Supermicro compute",
             "Type": "Compute Tray",
             "Components": {
                 "Firmware": [
@@ -6185,12 +6178,12 @@ mod tests {
                         "Type": "Prod",
                         "Locations": [
                             {
-                                "Location": "https://example.test/BIOS_GPU-NVGB300_2.3b.bin",
+                                "Location": "https://example.test/test-bios-image.bin",
                                 "LocationType": "HTTPS",
                                 "Type": "Firmware"
                             },
                             {
-                                "Location": "https://example.test/nvfw_GB300_custom_nosbios_prod-signed.fwpkg",
+                                "Location": "https://example.test/compute-nosbios.fwpkg",
                                 "LocationType": "HTTPS",
                                 "Type": "Firmware"
                             }
@@ -6200,7 +6193,7 @@ mod tests {
                         "Component": "BMC",
                         "Type": "Prod",
                         "Locations": [{
-                            "Location": "https://example.test/NvOBMC_GBNVL72_70.02.01.05.bin",
+                            "Location": "https://example.test/NvOBMC_test-image.bin",
                             "LocationType": "HTTPS",
                             "Type": "Firmware"
                         }]
@@ -6238,7 +6231,7 @@ mod tests {
         assert!(
             artifacts
                 .iter()
-                .any(|artifact| artifact.url.contains("BIOS_GPU"))
+                .any(|artifact| artifact.url.contains("bios-image"))
         );
         assert!(
             artifacts
@@ -6250,7 +6243,7 @@ mod tests {
     #[test]
     fn apply_filter_keeps_both_wiwynn_bmc_payloads_from_firmware_manifest() {
         let config = release_catalog(serde_json::json!([{
-            "SKUID": "699-24764-0001-TS3",
+            "SKUID": "test-compute-sku",
             "Name": "compute",
             "Type": "Compute Tray",
             "Components": {
@@ -6349,7 +6342,7 @@ mod tests {
     #[test]
     fn apply_filter_keeps_only_liteon_downloads_for_liteon_powershelf() {
         let config = release_catalog(serde_json::json!([{
-            "SKUID": "PowerShelf,SKUXXXXX,XXX",
+            "SKUID": "test-powershelf-sku",
             "Name": "PowerShelf",
             "Type": "PowerShelf",
             "Components": {
@@ -6442,8 +6435,8 @@ mod tests {
     fn lookup_table_maps_gb300_firmware_manifest_device_shapes() {
         let config = release_catalog(serde_json::json!([
             {
-                "SKUID": "699-24764-0001-TS3,699-24764-0001-TS1,692-24764-0001-000",
-                "Name": "P4059",
+                "SKUID": "test-compute-sku-a,test-compute-sku-b,test-compute-sku-c",
+                "Name": "test-compute-board",
                 "Type": "Compute Tray",
                 "Components": {
                     "Firmware": [
@@ -6451,7 +6444,7 @@ mod tests {
                             "Component": "BMC",
                             "Type": "Prod",
                             "Locations": [{
-                                "Location": "https://example.test/nvfw_GB300-P4059_prod-signed.fwpkg",
+                                "Location": "https://example.test/compute-bmc.fwpkg",
                                 "LocationType": "HTTPS",
                                 "Type": "Firmware"
                             }]
@@ -6460,7 +6453,7 @@ mod tests {
                             "Component": "HMC",
                             "Type": "Prod",
                             "Locations": [{
-                                "Location": "https://example.test/nvfw_HGX-GBX00_prod-signed.fwpkg",
+                                "Location": "https://example.test/compute-hmc.fwpkg",
                                 "LocationType": "HTTPS",
                                 "Type": "Firmware"
                             }]
@@ -6469,7 +6462,7 @@ mod tests {
                 }
             },
             {
-                "SKUID": "Sample SKUID",
+                "SKUID": "test-switch-sku",
                 "Name": "Sample Switch",
                 "Type": "Switch Tray",
                 "Components": {
@@ -6478,7 +6471,7 @@ mod tests {
                             "Component": "BMC+FPGA+EROT",
                             "Type": "Prod",
                             "Locations": [{
-                                "Location": "https://example.test/nvfw_GB300-P4093_prod-signed.fwpkg",
+                                "Location": "https://example.test/switch-firmware.fwpkg",
                                 "LocationType": "HTTPS",
                                 "Type": "Firmware"
                             }]
@@ -6487,7 +6480,7 @@ mod tests {
                             "Component": "CPLD",
                             "Type": "Prod",
                             "Locations": [{
-                                "Location": "https://example.test/nvfw_GB300-P4093_cpld.fwpkg",
+                                "Location": "https://example.test/switch-cpld.fwpkg",
                                 "LocationType": "HTTPS",
                                 "Type": "Firmware"
                             }]
@@ -6496,7 +6489,7 @@ mod tests {
                 }
             },
             {
-                "SKUID": "PowerShelf,SKUXXXXX,XXX",
+                "SKUID": "test-powershelf-sku",
                 "Name": "PowerShelf",
                 "Type": "PowerShelf",
                 "Components": {
@@ -6505,7 +6498,7 @@ mod tests {
                             "Component": "Delta-PMC",
                             "Type": "Prod",
                             "Locations": [{
-                                "Location": "https://example.test/nvidia-pmc-3.2.4.fwpkg",
+                                "Location": "https://example.test/delta-pmc-firmware.fwpkg",
                                 "LocationType": "HTTPS",
                                 "Type": "Binary"
                             }]
@@ -6514,7 +6507,7 @@ mod tests {
                             "Component": "Delta-PSU",
                             "Type": "Prod",
                             "Locations": [{
-                                "Location": "https://example.test/Nvidia_GB300_5500W_APP_01040104.hex.tar",
+                                "Location": "https://example.test/delta-psu-firmware.tar",
                                 "LocationType": "HTTPS",
                                 "Type": "Binary"
                             }]
@@ -6523,7 +6516,7 @@ mod tests {
                             "Component": "LiteOn PSU",
                             "Type": "Prod",
                             "Locations": [{
-                                "Location": "https://example.test/SP-2552-7RD_0101_Bootloader.tar",
+                                "Location": "https://example.test/liteon-psu-firmware.tar",
                                 "LocationType": "HTTPS",
                                 "Type": "Binary"
                             }]
@@ -6532,7 +6525,7 @@ mod tests {
                             "Component": "LiteOn PMC",
                             "Type": "Prod",
                             "Locations": [{
-                                "Location": "https://example.test/cm14mp2rd_r1.3.10.tar",
+                                "Location": "https://example.test/liteon-pmc-firmware.tar",
                                 "LocationType": "HTTPS",
                                 "Type": "Binary"
                             }]
@@ -6561,10 +6554,7 @@ mod tests {
             .devices
             .get("Compute Node")
             .expect("GB300 compute entries should be present");
-        assert_eq!(
-            compute["BMC_prod_0001"].filename,
-            "prod/nvfw_GB300-P4059_prod-signed.fwpkg"
-        );
+        assert_eq!(compute["BMC_prod_0001"].filename, "prod/compute-bmc.fwpkg");
         assert_eq!(compute["BMC_prod_0001"].target, "");
         assert_eq!(
             compute["HMC_prod_0001"].target,
@@ -6591,12 +6581,12 @@ mod tests {
         assert_eq!(powershelf["DeltaPMC_prod_0001"].target, "");
         assert_eq!(
             powershelf["DeltaPMC_prod_0001"].filename,
-            "prod/nvidia-pmc-3.2.4.fwpkg"
+            "prod/delta-pmc-firmware.fwpkg"
         );
         assert_eq!(powershelf["DeltaPSU_prod_0001"].target, "");
         assert_eq!(
             powershelf["DeltaPSU_prod_0001"].filename,
-            "prod/Nvidia_GB300_5500W_APP_01040104.hex.tar"
+            "prod/delta-psu-firmware.tar"
         );
         assert_eq!(powershelf["LiteOnPSU_prod_0001"].target, "");
         assert_eq!(powershelf["LiteOnPMC_prod_0001"].target, "");
@@ -6620,36 +6610,36 @@ mod tests {
     }
 
     #[test]
-    fn p4109_without_component_type_or_skuid_uses_compute_tray_role() {
+    fn vrnvl72_manifest_without_component_type_or_skuid_uses_compute_tray_role() {
         let config = serde_json::json!({
             "ProductName": "VR-NVL72",
             "Milestones": [{
                 "Name": "test-release",
                 "BoardSKUs": [{
-                    "Name": "P4109",
+                    "Name": "test-compute-board",
                     "Type": "Compute Tray",
                     "Components": {
                         "Firmware": [{
                             "Component": "HMC",
                             "Locations": [{
-                                "Location": "https://example.test/nvfw_VR-NVL72-P4109-HMC_prod-signed.fwpkg",
+                                "Location": "https://example.test/compute-hmc.fwpkg",
                                 "LocationType": "HTTPS",
                                 "Type": "Firmware",
-                                "FileName": "nvfw_VR-NVL72-P4109-HMC_prod-signed.fwpkg"
+                                "FileName": "compute-hmc.fwpkg"
                             }]
                         }, {
                             "Component": "BMC",
                             "Type": "",
                             "Locations": [{
-                                "Location": "https://example.test/nvfw_VR-NVL72-P4110-BMC_prod-signed.fwpkg",
+                                "Location": "https://example.test/compute-bmc.fwpkg",
                                 "LocationType": "HTTPS",
                                 "Type": "",
-                                "FileName": "nvfw_VR-NVL72-P4110-BMC_prod-signed.fwpkg"
+                                "FileName": "compute-bmc.fwpkg"
                             }, {
                                 "Location": "",
                                 "LocationType": "",
                                 "Type": "",
-                                "FileName": "VR-NVL72-P4110-BMC_prod-signed.corim"
+                                "FileName": "compute-bmc.corim"
                             }]
                         }]
                     }
@@ -6726,10 +6716,10 @@ mod tests {
                         "Firmware": [{
                             "Component": "BMC+CPLD+SMA+ERoT+SBIOS",
                             "Locations": [{
-                                "Location": "/home/anunna/nvfw_VR-NVL72-N6100-LD_prod-signed.fwpkg",
+                                "Location": "/firmware/test-switch-bundle.fwpkg",
                                 "LocationType": "FILE",
                                 "Type": "Firmware",
-                                "FileName": "nvfw_VR-NVL72-N6100-LD_prod-signed.fwpkg"
+                                "FileName": "test-switch-bundle.fwpkg"
                             }]
                         }]
                     }
@@ -6804,7 +6794,7 @@ mod tests {
         assert!(
             package_targets[0]
                 .filename
-                .ends_with("/prod/nvfw_VR-NVL72-N6100-LD_prod-signed.fwpkg")
+                .ends_with("/prod/test-switch-bundle.fwpkg")
         );
 
         let bmc_targets = build_firmware_targets(
@@ -6840,7 +6830,7 @@ mod tests {
         power_shelf_entries.insert(
             "DeltaPMC_prod".to_owned(),
             FirmwareLookupEntry {
-                filename: "prod/nvidia-pmc-3.2.4.fwpkg".to_owned(),
+                filename: "prod/delta-pmc-firmware.fwpkg".to_owned(),
                 target: String::new(),
                 component: "Delta-PMC".to_owned(),
                 bundle: String::new(),
@@ -6852,7 +6842,7 @@ mod tests {
         power_shelf_entries.insert(
             "DeltaPSU_prod".to_owned(),
             FirmwareLookupEntry {
-                filename: "prod/Nvidia_GB300_5500W_APP_01040104.hex.tar".to_owned(),
+                filename: "prod/delta-psu-firmware.tar".to_owned(),
                 target: String::new(),
                 component: "Delta-PSU".to_owned(),
                 bundle: String::new(),
@@ -6897,12 +6887,12 @@ mod tests {
         assert_eq!(targets.targets[0].target, "");
         assert_eq!(
             targets.targets[0].filename,
-            "firmware_objects/fw-1/prod/nvidia-pmc-3.2.4.fwpkg"
+            "firmware_objects/fw-1/prod/delta-pmc-firmware.fwpkg"
         );
         assert_eq!(targets.targets[1].target, "");
         assert_eq!(
             targets.targets[1].filename,
-            "firmware_objects/fw-1/prod/Nvidia_GB300_5500W_APP_01040104.hex.tar"
+            "firmware_objects/fw-1/prod/delta-psu-firmware.tar"
         );
     }
 
@@ -7259,7 +7249,7 @@ mod tests {
         assert_eq!(targets[0].target, SUPERMICRO_HGX_TARGET);
         assert!(targets[0].filename.contains("nosbios"));
         assert_eq!(targets[1].target, SUPERMICRO_BIOS_TARGET);
-        assert!(targets[1].filename.contains("BIOS_GPU"));
+        assert!(targets[1].filename.contains("bios-image"));
         assert_eq!(targets[2].target, "");
         assert!(targets[2].filename.contains("NvOBMC"));
     }
@@ -7497,8 +7487,8 @@ mod tests {
         location_type: &str,
     ) -> BoardSkuFirmware {
         BoardSkuFirmware {
-            sku_id: "699-24764-0001-TS3".to_owned(),
-            name: "GB200-Compute".to_owned(),
+            sku_id: "test-compute-sku".to_owned(),
+            name: "test-compute-board".to_owned(),
             sku_type: "Compute Node".to_owned(),
             firmware_components: vec![FirmwareComponent {
                 component: component.to_owned(),

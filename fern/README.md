@@ -39,6 +39,36 @@ var before running `fern docs dev`:
 export NODE_OPTIONS="--experimental-sqlite"
 ```
 
+## Continuous Integration
+
+Four workflows cover the docs site, each following the reference workflow Fern
+publishes under
+[Preview changes](https://buildwithfern.com/learn/docs/preview-publish/preview-changes#preview-links)
+or
+[Publishing your docs](https://buildwithfern.com/learn/docs/preview-publish/publishing-your-docs).
+
+| Workflow | Trigger | Purpose |
+| --- | --- | --- |
+| [`lint-docs.yaml`](../.github/workflows/lint-docs.yaml) | Push to `main` or `pull-request/<number>` | Runs [`scripts/docs-lint.sh`](../scripts/docs-lint.sh), the same checks as `just docs-lint` |
+| [`preview-docs.yaml`](../.github/workflows/preview-docs.yaml) | `pull_request` against `main`, touching `docs/` or `fern/` | Publishes a preview and upserts a pull request comment with the URL plus deep links to every changed page |
+| [`cleanup-preview.yaml`](../.github/workflows/cleanup-preview.yaml) | `pull_request` closed, touching `docs/` or `fern/` | Deletes the preview when the pull request closes |
+| [`publish-docs.yaml`](../.github/workflows/publish-docs.yaml) | Push to `main`, or manual dispatch | Validates the site, then publishes it live |
+
+Previews are keyed on the head branch name, so every push to a pull request
+updates the same URL and `cleanup-preview.yaml` deletes it under that same id when
+the pull request closes. Fern previews never expire on their own, which is why the cleanup
+workflow exists.
+
+`fern/docs.yml` declares a single instance, so `publish-docs.yaml` publishes
+straight to production with no `--instance` flag and no staging site. It can be
+re-run by hand from the Actions tab.
+
+Every workflow except `lint-docs.yaml` authenticates to Fern with the
+`FERN_TOKEN` repository secret. Because `pull_request` does not expose secrets
+to forks, the preview and cleanup workflows skip pull requests opened from a
+fork; linting still runs on those through the mirrored
+`pull-request/<number>` branch.
+
 ## Layout
 
 | Path | Purpose |
