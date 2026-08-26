@@ -19,13 +19,13 @@ global-theme: nvidia
 
 instances:
   - url: nvidia-rms.docs.buildwithfern.com/rms
-    # custom-domain: docs.nvidia.com/rms
+    custom-domain: docs.nvidia.com/rms
     multi-source: true
 
 title: NVIDIA Rack Management Service
 
-# metadata:
-#   canonical-host: "docs.nvidia.com/rms"
+metadata:
+  canonical-host: "docs.nvidia.com/rms"
 
 check:
   rules:
