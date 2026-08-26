@@ -7,7 +7,7 @@ type: application
 # to chart package inputs (templates, values.yaml, values.schema.json,
 # .helmignore, crds/, charts/); CI fails a chart change that leaves it untouched.
 # See helm/README.md "Versioning".
-version: 1.0.0
+version: 1.0.1
 # The RMS app image to run is chosen at install via global.image.tag and is
 # decoupled from the chart version. This is only a fallback; CI stamps the
 # packaged appVersion via `helm package --app-version`.

@@ -94,5 +94,5 @@ information.
 
 ## License
 
-Licensed under the NVIDIA Software and Model Evaluation License. See
+Licensed under the Apache License, Version 2.0. See
 [`LICENSE`](LICENSE) for the full text.

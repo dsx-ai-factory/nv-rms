@@ -9,6 +9,9 @@ members = [
 default-members = ["crates/rackmanagementservice"]
 resolver = "3"
 
+[workspace.package]
+license = "Apache-2.0"
+
 [workspace.dependencies]
 anyhow = "1"
 async-tempfile = { version = "0.8.0", features = ["uuid"] }
@@ -43,7 +46,7 @@ redfish_client = { path = "crates/redfish_client" }
 redfish_test_support = { path = "crates/redfish_test_support" }
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots", "rustls-tls-native-roots", "multipart", "stream"] }
-russh = "0.62.6"
+russh = "0.63.1"
 russh-sftp = "2"
 rustls = "0.23"
 rustls-pemfile = "2"
