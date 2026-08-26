@@ -3,7 +3,7 @@
 ## Reporting a Vulnerability
 
 If you discover a potential security vulnerability in Rack Management Service (RMS),
-please **do not open a public issue, merge request, or discussion**.
+please **do not open a public issue, pull request, or discussion**.
 
 Report security issues privately through one of the NVIDIA channels below:
 
@@ -45,7 +45,9 @@ path to BMC, Redfish, NVUE, SSH/SFTP, NMX-C, PostgreSQL, and firmware-artifact
 surfaces.
 
 The audited production scope includes the `rackmanagementservice` service crate
-under `crates/rackmanagementservice` and the `rust_nvfwupd` workspace member.
+under `crates/rackmanagementservice` and the `rust_nvfwupd`, `redfish_client`,
+and `nvue_client` workspace members, all of which are compiled into deployed
+RMS binaries.
 The `redfish_test_support` workspace member is a test-only Redfish simulator used
 by integration tests and benchmarks; it is out of scope for deployed RMS binaries
 except where simulator behavior could affect production test confidence.
@@ -55,13 +57,13 @@ Key components and boundaries:
 | Boundary | Interface | Primary code | Security posture |
 | --- | --- | --- | --- |
 | Client to RMS gRPC | `RackManager` service on `0.0.0.0:<port>` | `crates/rackmanagementservice/src/api/grpc/server.rs`, `crates/rackmanagementservice/src/api/grpc/*_handlers.rs` | Production deployments are expected to use mTLS with the `[tls] cert`, `key`, and `ca` config keys. RMS does not implement application-level users, roles, per-RPC authorization, or in-process rate limiting; an mTLS-authenticated caller is treated as trusted for all RPCs. `[tls] insecure = true` is plaintext and unauthenticated, and is documented for development/testing only; RMS additionally requires the `RMS_ALLOW_INSECURE=1` environment gate (sourced outside the config file) before it will bind plaintext, so a stale config cannot by itself downgrade the API. |
-| RMS to BMC / Redfish / NVUE | HTTP(S) through `reqwest` and `rustls` | `crates/rackmanagementservice/src/transport/http_client.rs`, compute and powershelf node implementations, `crates/rackmanagementservice/src/nodes/switch_gb200_nvidia.rs`, `crates/nvue_client/` | Client-supplied endpoint configuration cannot change TLS certificate validation. BMC/Redfish uses HTTPS with Basic auth, but RMS disables BMC server certificate verification because current deployments do not provide BMC certificates that RMS can validate. Switch NVUE uses HTTPS with an RMS client certificate and validates the switch server certificate by default. With `[switches] insecure_switch = true`, NVUE remains HTTPS but uses no client certificate and does not verify the server certificate. These modes depend on trusted management-network controls. |
-| RMS to switch OS | SSH/SFTP for command execution and file transfer | `crates/rackmanagementservice/src/transport/ssh_client.rs`, `crates/rust_nvfwupd/src/ssh_transport.rs`, `crates/rackmanagementservice/src/nodes/switch_gb200_nvidia.rs` | SSH host-key verification is disabled on both RMS and `rust_nvfwupd` SSH paths; host identity is delegated to trusted management-network segmentation. |
+| RMS to BMC / Redfish / NVUE | HTTP(S) through `reqwest` and `rustls` | `crates/rackmanagementservice/src/transport/http_client.rs`, `crates/redfish_client/`, compute and powershelf node implementations, `crates/rackmanagementservice/src/nodes/switch_gb200_nvidia/`, `crates/nvue_client/` | Client-supplied endpoint configuration cannot change TLS certificate validation. BMC/Redfish uses HTTPS with Basic auth, but RMS disables BMC server certificate verification because current deployments do not provide BMC certificates that RMS can validate. Switch NVUE uses HTTPS with an RMS client certificate and validates the switch server certificate by default. With `[switches] insecure_switch = true`, NVUE remains HTTPS but uses no client certificate and does not verify the server certificate. These modes depend on trusted management-network controls. |
+| RMS to switch OS | SSH/SFTP for command execution and file transfer | `crates/rackmanagementservice/src/transport/ssh_client.rs`, `crates/rust_nvfwupd/src/ssh_transport.rs`, `crates/rackmanagementservice/src/nodes/switch_gb200_nvidia/` | SSH host-key verification is disabled on both RMS and `rust_nvfwupd` SSH paths; host identity is delegated to trusted management-network segmentation. |
 | RMS to NMX-C | gRPC over HTTPS/mTLS by default, or plaintext HTTP when explicitly opted out | `crates/rackmanagementservice/src/libnmxc/`, `crates/rackmanagementservice/src/api/grpc/scaleupfabricmanager_handlers.rs` | The client requires HTTPS and client certificates by default. `[switches] insecure_switch = true` uses plaintext HTTP without client TLS. |
 | Firmware artifacts | Local paths, `file:` URLs, and HTTP(S) URLs from firmware-object JSON | `crates/rackmanagementservice/src/api/grpc/firmware_object_handlers.rs`, `crates/rackmanagementservice/src/api/grpc/firmware_artifact_paths.rs` | RMS validates object IDs, artifact basenames, cache subdirectories, and local firmware paths under the `[workflows] firmware_dir` config key. HTTP(S) artifact downloads can use a caller-supplied JFrog token via `X-JFrog-Art-Api`, but RMS does not enforce an artifact host allow-list or independent signature/hash verification at cache time. |
 | Persistence | PostgreSQL or in-memory backend | `crates/rackmanagementservice/src/persistence/` | When `[postgres] db_url` (or the `DATABASE_URL` env override) is set, RMS connects to PostgreSQL with `sqlx` and runs embedded migrations; otherwise it logs a warning and uses in-memory storage. |
 | Kubernetes deployment | Helm-managed API server, secrets, and hostPath firmware cache | `helm/templates/api-server-deployment.yaml`, `helm/values.yaml` | The Helm chart defaults to `apiServer.allowInsecure: false` and `apiServer.tls.enabled: true`, mounts API server TLS material and optional switch/NMX-C client certificates from Kubernetes Secrets, and constructs `DATABASE_URL` from database credentials in a Secret or External Secrets Operator workflow. |
-| Metrics | Prometheus endpoint on the same service port | `crates/rackmanagementservice/src/api/grpc/server.rs`, `crates/rackmanagementservice/src/metrics/` | `/metrics` is served from the same tonic/axum server and exposes Prometheus metrics plus build metadata such as version and Git SHA. |
+| Metrics | Prometheus endpoint on a dedicated HTTP listener (default port 8802) | `crates/rackmanagementservice/src/metrics/server.rs`, `crates/rackmanagementservice/src/metrics/` | `/metrics` is served from an independent HTTP listener configured by the `[metrics]` section (`port`, default 8802). It is plaintext by default; with `[metrics] tls = true` it serves standard TLS using the API server certificate but requires no client certificate, so it sits outside the gRPC mTLS boundary in either mode. It exposes Prometheus metrics plus build metadata such as version and Git SHA. |
 
 RMS intentionally includes several local controls: response-size limits for
 Redfish/NVUE JSON responses, canonical firmware path resolution under the
@@ -144,10 +146,13 @@ storage for endpoint credentials held in memory.
 
 7. **Metrics and build metadata exposure**:
    `/metrics` exposes service metrics and build labels, including Git SHA and
-   version information. In an mTLS-protected deployment this is usually an
-   operator observability interface. In an insecure or overly broad network
-   exposure it can help attackers fingerprint the service and enumerate active
-   RPC methods or status patterns.
+   version information, on a dedicated HTTP listener (`[metrics] port`, default
+   8802) that is separate from the mTLS-protected gRPC port. The listener is
+   plaintext by default, and enabling `[metrics] tls = true` provides
+   server-only TLS with no client authentication, so network reachability is
+   the effective access control. Overly broad exposure can help attackers
+   fingerprint the service and enumerate active RPC methods or status
+   patterns.
 
 8. **Resource exhaustion through firmware downloads and job workflows**:
    Firmware-object download tasks write artifacts under the `[workflows] firmware_dir`
@@ -156,11 +161,13 @@ storage for endpoint credentials held in memory.
    when `Content-Length` is present, but a server that omits `Content-Length`
    can still stream a large response until the request timeout, available
    memory, or backing filesystem stops it. Firmware jobs are serialized per
-   rack/node in `crates/rackmanagementservice/src/orchestrator/job_tracker.rs`, and terminal jobs are
-   retained for one hour with lazy cleanup. High-volume or long-running
-   firmware activity can therefore consume disk, memory, network, and worker
-   capacity unless the deployment supplies storage quotas, monitoring, and
-   operational concurrency limits.
+   rack/node in `crates/rackmanagementservice/src/orchestrator/job_tracker.rs`. Terminal jobs are
+   retained for a configurable TTL (`[workflows] terminal_job_ttl_seconds`,
+   default 24 hours) and evicted by a periodic reaper, and the tracker caps
+   retained job records via `[workflows] max_tracked_jobs`. High-volume or
+   long-running firmware activity can still consume disk, memory, network, and
+   worker capacity unless the deployment supplies storage quotas, monitoring,
+   and operational concurrency limits.
 
 ### Critical Security Assumptions
 
@@ -203,8 +210,9 @@ storage for endpoint credentials held in memory.
   backup/restore policy. The in-memory backend is not a durable production
   persistence mode.
 - **Container and image supply chain are controlled**: the runtime image,
-  bundled `nvfwupd` binary, `ipmitool`, Helm chart, and NGC/GitLab CI artifacts
-  are assumed to come from trusted build and promotion pipelines.
+  bundled `nvfwupd` binary, `ipmitool`, Helm chart, and released build
+  artifacts are assumed to come from trusted NVIDIA build and promotion
+  pipelines.
 - **Downstream devices enforce operation safety**: RMS orchestrates device
   actions, but BMCs, switches, NVUE, NMX-C, Redfish services, and device
   firmware are assumed to enforce their own command semantics, package checks,
@@ -222,8 +230,10 @@ storage for endpoint credentials held in memory.
   mode, `ConfigureSwitchCertificate` unsets switch service mTLS mode over SSH
   instead of installing certificate material. Do not commit site-specific secret
   values in Helm overrides.
-- Restrict network reachability to port 8801 and `/metrics` to trusted clients
-  and monitoring systems.
+- Restrict network reachability to the gRPC port (default 8801) and the
+  dedicated `/metrics` port (default 8802) to trusted clients and monitoring
+  systems. The metrics listener does not require client authentication even
+  when `[metrics] tls` is enabled.
 - Restrict the `[workflows] firmware_dir` directory and any hostPath backing it to authorized
   operators and the RMS workload. Treat write access to that directory as a
   firmware-update privilege.

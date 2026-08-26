@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 # Run Helm chart unit tests, using a local helm-unittest plugin when present
 # and falling back to the official Docker image otherwise.
 set -euo pipefail

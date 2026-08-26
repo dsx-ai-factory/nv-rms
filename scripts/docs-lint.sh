@@ -1,4 +1,7 @@
 #!/bin/sh
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 # Docs-site checks: MDX <img> hygiene, Fern validation, markdown lint.
 # Shared by `just docs-lint` and CI's lint_docs job; POSIX sh because the CI
 # image (node:alpine) has no bash.

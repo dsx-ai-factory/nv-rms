@@ -14,9 +14,9 @@ For a local (non-Docker) build:
   > NOTE: On Ubuntu, do **not** use `apt install rustc` -
   the packaged compiler is too old.
 - **Protocol buffer compiler** (`protoc`) - required by `tonic-build` to compile
-  the `.proto` service definitions at build time.
-  - Debian/Ubuntu: `sudo apt-get install -y protobuf-compiler libprotobuf-dev`
-  - macOS: `brew install protobuf`
+  the `.proto` service definitions at build time. On Debian/Ubuntu, run
+  `sudo apt-get install -y protobuf-compiler libprotobuf-dev`. On macOS, run
+  `brew install protobuf`.
 - **`lld`** (Linux) - the default linker preference in `.cargo/config.toml`.
   Install with `sudo apt-get install -y lld` (or remove the `fuse-ld=lld` line
   for another linker).
