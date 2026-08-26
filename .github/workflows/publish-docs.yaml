@@ -33,6 +33,11 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
       - name: Setup Fern CLI
         uses: fern-api/setup-fern-cli@d07601425e9c9ede8745d71ca75c4c462d98755d
 
