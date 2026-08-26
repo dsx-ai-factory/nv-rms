@@ -1,0 +1,46 @@
+name: Clean Up Preview Links
+
+# Companion to preview-docs.yaml, following Fern's reference workflow at
+# https://buildwithfern.com/learn/docs/preview-publish/preview-changes#preview-links
+# Deletes the preview under the same `--id` (the head branch name) that
+# preview-docs.yaml generated it with. Fern previews never expire on their own.
+on:
+  pull_request:
+    types: [closed]
+    branches:
+      - main
+    # Mirror preview-docs.yaml: only PRs that touched docs/ or fern/ ever got a
+    # preview to delete. Safe to filter here; nothing gates on this workflow.
+    paths:
+      - "docs/**"
+      - "fern/**"
+
+permissions:
+  contents: read
+
+jobs:
+  cleanup:
+    name: Delete Preview
+    # Only same-repo PRs ever produced a preview to clean up (fork PRs are skipped
+    # in preview-docs.yaml). Run on any close, not just merge: previews persist
+    # until explicitly deleted.
+    if: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: linux-amd64-cpu4
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Setup Fern CLI
+        uses: fern-api/setup-fern-cli@v1
+
+      - name: Delete preview deployment
+        env:
+          FERN_TOKEN: ${{ secrets.FERN_TOKEN }}
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          echo "Deleting preview for branch: $HEAD_REF"
+          fern docs preview delete --id "$HEAD_REF" \
+            || echo "Preview deletion returned non-zero - it may already be gone"
