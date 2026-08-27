@@ -1,0 +1,85 @@
+<mxfile host="Electron">
+  <diagram id="kubernetes-deployment" name="Kubernetes-Deployment">
+    <mxGraphModel dx="1222" dy="791" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="980" pageHeight="640" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="cluster" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fbfbfb;strokeColor=#7a7a7a;fontColor=#1a1a1a;arcSize=3;verticalAlign=top;align=left;spacingLeft=12;spacingTop=6;fontSize=13;" value="&lt;b&gt;Kubernetes cluster — namespace: rack-manager&lt;/b&gt;" vertex="1">
+          <mxGeometry height="690" width="940" x="20" y="20" as="geometry" />
+        </mxCell>
+        <mxCell id="svc" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f7f7f7;strokeColor=#7a7a7a;fontColor=#1a1a1a;arcSize=14;fontSize=11;" value="&lt;b&gt;Service&lt;/b&gt; rms-api-server (ClusterIP)&amp;nbsp; ·&amp;nbsp; :8801 gRPC/HTTP&amp;nbsp; ·&amp;nbsp; :8802 metrics (ServiceMonitor → Prometheus)&amp;nbsp; ·&amp;nbsp; selector app=rms-api-server" vertex="1">
+          <mxGeometry height="32" width="880" x="40" y="58" as="geometry" />
+        </mxCell>
+        <mxCell id="nodeA" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f0f0f0;strokeColor=#8a8a8a;fontColor=#3a3a3a;arcSize=6;verticalAlign=top;align=left;spacingLeft=10;spacingTop=4;fontSize=11;" value="&lt;b&gt;Physical node 1&lt;/b&gt;&lt;br&gt;kubelet" vertex="1">
+          <mxGeometry height="250" width="270" x="45" y="170" as="geometry" />
+        </mxCell>
+        <mxCell id="nodeB" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f0f0f0;strokeColor=#8a8a8a;fontColor=#3a3a3a;arcSize=6;verticalAlign=top;align=left;spacingLeft=10;spacingTop=4;fontSize=11;" value="&lt;b&gt;Physical node 2&lt;/b&gt;&lt;br&gt;kubelet" vertex="1">
+          <mxGeometry height="250" width="270" x="331" y="170" as="geometry" />
+        </mxCell>
+        <mxCell id="nodeC" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f0f0f0;strokeColor=#8a8a8a;fontColor=#3a3a3a;arcSize=6;verticalAlign=top;align=left;spacingLeft=10;spacingTop=4;fontSize=11;" value="&lt;b&gt;Physical node 3&lt;/b&gt;&lt;br&gt;kubelet" vertex="1">
+          <mxGeometry height="250" width="270" x="617" y="170" as="geometry" />
+        </mxCell>
+        <mxCell id="more" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#a5a5a5;dashed=1;fontColor=#7a7a7a;arcSize=8;fontSize=11;verticalAlign=middle;" value="&lt;b&gt;⋯&lt;/b&gt;&lt;br&gt;&lt;br&gt;more&lt;br&gt;nodes" vertex="1">
+          <mxGeometry height="250" width="42" x="903" y="170" as="geometry" />
+        </mxCell>
+        <mxCell id="band" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#76B900;strokeWidth=1.6;dashed=1;dashPattern=8 4;fontColor=#4a7a10;arcSize=6;verticalAlign=top;align=left;spacingLeft=10;spacingTop=3;fontSize=11;" value="&lt;b&gt;&amp;nbsp;Deployment&lt;/b&gt; rms-api-server: replicas: 1" vertex="1">
+          <mxGeometry height="196" width="915" x="35" y="208" as="geometry" />
+        </mxCell>
+        <mxCell id="pod" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f7fbef;strokeColor=#76B900;fontColor=#1a1a1a;arcSize=8;verticalAlign=top;align=left;spacingLeft=10;spacingTop=3;fontSize=11;" value="&lt;b&gt;Pod&lt;/b&gt; rms-api-server" vertex="1">
+          <mxGeometry height="152" width="246" x="57" y="240" as="geometry" />
+        </mxCell>
+        <mxCell id="R8spnIszm6Pn2ATZ52PS-8" edge="1" parent="1" source="ctr" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;exitPerimeter=0;entryX=0.25;entryY=0;entryDx=0;entryDy=0;curved=0;strokeColor=#5A5A5A;" target="pg">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="180" y="550" />
+              <mxPoint x="270" y="550" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="ctr" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#76B900;strokeWidth=1.6;fontColor=#1a1a1a;arcSize=10;fontSize=11;points=[[0,0,0,0,0],[0,0.25,0,0,0],[0,0.5,0,0,0],[0,0.75,0,0,0],[0,1,0,0,0],[0.25,0,0,0,0],[0.25,1,0,0,0],[0.5,0,0,0,0],[0.5,1,0,0,0],[0.75,1,0,0,0],[0.83,0,0,0,0],[1,0,0,0,0],[1,0.25,0,0,0],[1,0.5,0,0,0],[1,0.75,0,0,0],[1,1,0,0,0]];" value="&lt;b&gt;container&lt;/b&gt;&lt;br&gt;rms-api-server&lt;br&gt;&lt;br&gt;gRPC/HTTP :8801&lt;br&gt;metrics :8802" vertex="1">
+          <mxGeometry height="110" width="222" x="69" y="270" as="geometry" />
+        </mxCell>
+        <mxCell id="noteB" parent="1" style="text;html=1;align=center;verticalAlign=middle;fontColor=#9a9a9a;fontSize=11;" value="&lt;div&gt;&lt;i&gt;Other site controller services&lt;/i&gt;&lt;/div&gt;" vertex="1">
+          <mxGeometry height="24" width="250" x="341" y="308" as="geometry" />
+        </mxCell>
+        <mxCell id="noteC" parent="1" style="text;html=1;align=center;verticalAlign=middle;fontColor=#9a9a9a;fontSize=11;" value="&lt;i&gt;Other site controller services&lt;/i&gt;" vertex="1">
+          <mxGeometry height="24" width="250" x="627" y="308" as="geometry" />
+        </mxCell>
+        <mxCell id="R8spnIszm6Pn2ATZ52PS-2" edge="1" parent="1" source="mounts" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0;exitY=0.5;exitDx=0;exitDy=0;entryX=0.75;entryY=1;entryDx=0;entryDy=0;strokeColor=#5A5A5A;curved=0;" target="pod">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="mounts" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#a5a5a5;dashed=1;fontColor=#6a6a6a;arcSize=6;verticalAlign=top;align=left;spacingLeft=10;spacingTop=3;fontSize=11;" value="&lt;b&gt;Volumes mounted into the Pod&lt;/b&gt;" vertex="1">
+          <mxGeometry height="180" width="556" x="331" y="440" as="geometry" />
+        </mxCell>
+        <mxCell id="cm" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fdf6e3;strokeColor=#b8912f;fontColor=#1a1a1a;arcSize=10;fontSize=11;" value="&lt;div&gt;&lt;i style=&quot;&quot;&gt;RMS Runtime Config&lt;/i&gt;&lt;/div&gt;&lt;b&gt;ConfigMap&lt;/b&gt; rms-api-config&lt;br&gt;ro → /etc/rms/config.toml" vertex="1">
+          <mxGeometry height="64" width="255" x="345" y="466" as="geometry" />
+        </mxCell>
+        <mxCell id="tls" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fbeeee;strokeColor=#b05b5b;fontColor=#1a1a1a;arcSize=10;fontSize=11;" value="&lt;div&gt;&lt;i&gt;RMS Server TLS&lt;/i&gt;&lt;/div&gt;&lt;b&gt;Secret&lt;/b&gt; rms-api-server-certificate&lt;div&gt;&lt;br/&gt;&lt;/div&gt;" vertex="1">
+          <mxGeometry height="64" width="257" x="616" y="466" as="geometry" />
+        </mxCell>
+        <mxCell id="fw" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#eef4fb;strokeColor=#5b83b0;fontColor=#1a1a1a;arcSize=10;fontSize=11;" value="&lt;div&gt;&lt;i&gt;RMS Firmware Object Cache&lt;/i&gt;&lt;/div&gt;&lt;div style=&quot;font-weight: bold;&quot;&gt;&lt;b&gt;HostPath&amp;nbsp;&lt;/b&gt;&lt;b style=&quot;background-color: transparent; color: light-dark(rgb(26, 26, 26), rgb(215, 215, 215));&quot;&gt;→ DirectoryOrCreate&lt;/b&gt;&lt;/div&gt;&lt;div style=&quot;&quot;&gt;&lt;span style=&quot;background-color: transparent; color: light-dark(rgb(26, 26, 26), rgb(215, 215, 215));&quot;&gt;OR&lt;/span&gt;&lt;/div&gt;&lt;b&gt;PVC → PersistentVolume&lt;/b&gt;" vertex="1">
+          <mxGeometry height="70" width="255" x="345" y="540" as="geometry" />
+        </mxCell>
+        <mxCell id="mtls" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fbeeee;strokeColor=#b05b5b;fontColor=#1a1a1a;arcSize=10;fontSize=11;" value="&lt;div&gt;&lt;i&gt;RMS Switch TLS&lt;/i&gt;&lt;/div&gt;&lt;b&gt;Secrets&lt;/b&gt; switch / client mTLS certs&lt;br&gt;ro → &lt;i&gt;certRoot&lt;/i&gt;/&amp;lt;domain&amp;gt;/" vertex="1">
+          <mxGeometry height="70" width="257" x="616" y="540" as="geometry" />
+        </mxCell>
+        <mxCell id="pg" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#eef4fb;strokeColor=#5b83b0;strokeWidth=1.6;fontColor=#1a1a1a;arcSize=8;fontSize=13;" value="&lt;b&gt;Postgres&lt;/b&gt;&amp;nbsp; ·&amp;nbsp; Service :5432&lt;br&gt;&lt;font style=&quot;font-size: 11px;&quot;&gt;RMS persistence: firmware apply history, firmware objects&lt;/font&gt;" vertex="1">
+          <mxGeometry height="56" width="880" x="50" y="640" as="geometry" />
+        </mxCell>
+        <mxCell id="R8spnIszm6Pn2ATZ52PS-6" edge="1" parent="1" source="svc" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.83;entryY=0;entryDx=0;entryDy=0;entryPerimeter=0;curved=0;strokeColor=#5A5A5A;" target="ctr">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="480" y="130" />
+              <mxPoint x="253" y="130" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="R8spnIszm6Pn2ATZ52PS-7" connectable="0" parent="R8spnIszm6Pn2ATZ52PS-6" style="edgeLabel;html=1;align=center;verticalAlign=middle;resizable=0;points=[];" value="gRPC / HTTP" vertex="1">
+          <mxGeometry relative="1" x="-0.2574" y="1" as="geometry">
+            <mxPoint as="offset" />
+          </mxGeometry>
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
