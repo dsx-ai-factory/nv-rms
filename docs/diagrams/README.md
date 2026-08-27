@@ -7,6 +7,7 @@ Markdown under `docs/` references the rendered `.svg` files.
 | --- | --- | --- |
 | Northbound / southbound connections | `northbound-southbound.drawio` | `northbound-southbound.svg` / `.png` |
 | Internal component layers | `internal-components.drawio` | `internal-components.svg` / `.png` |
+| Kubernetes deployment model | `kubernetes-deployment.drawio` | `kubernetes-deployment.svg` / `.png` |
 
 ## Editing
 
