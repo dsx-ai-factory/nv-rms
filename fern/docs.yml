@@ -113,6 +113,8 @@ navigation:
       contents:
         - page: Hardware Compatibility List
           path: ../docs/reference/hcl.md
+        - page: Firmware Sources
+          path: ../docs/reference/firmware-sources.md
         - page: Workspace Crates
           path: ../docs/reference/crates.md
         - page: Development
