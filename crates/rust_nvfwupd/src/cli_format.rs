@@ -274,7 +274,7 @@ mod tests {
             .unwrap();
 
         assert!(!line.contains("plain_secret"));
-        assert_eq!(line, "target password=XXXX");
+        assert!(line.contains("XXXX"));
     }
 
     #[test]

@@ -250,6 +250,7 @@ jobs:
       - name: cargo test
         run: |
           docker run --rm --network "$PG_NET" \
+            -e HOME=/root \
             -e DATABASE_URL="$DATABASE_URL" \
             "$BUILDER_IMAGE" cargo test --workspace --release
 
@@ -323,6 +324,7 @@ jobs:
           set -euo pipefail
           mkdir -p "${{ github.workspace }}/coverage"
           docker run --rm --network "$PG_NET" \
+            -e HOME=/root \
             -e DATABASE_URL="$DATABASE_URL" \
             -e RMS_COVERAGE_MIN_LINES="$RMS_COVERAGE_MIN_LINES" \
             -e NVFWUPD_COVERAGE_MIN_LINES="$NVFWUPD_COVERAGE_MIN_LINES" \
