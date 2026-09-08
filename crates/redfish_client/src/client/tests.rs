@@ -33,14 +33,17 @@ const MANAGER_RESET_TARGET: &str = "/custom/Managers/BMC_0/Reset";
 fn client_for(server: &MockServer) -> RedfishClient {
     let url = Url::parse(&server.uri()).unwrap();
 
-    RedfishClient::new(
-        url.host_str().unwrap(),
-        url.port().unwrap(),
+    let bmc = HttpBmc::new(
+        Client::with_params(client_params(true)).unwrap(),
+        url,
         credentials("secret"),
-        true,
-        false,
-    )
-    .unwrap()
+        CacheSettings::with_capacity(0),
+    );
+
+    RedfishClient {
+        bmc: Arc::new(bmc),
+        root: Arc::new(AsyncMutex::new(None)),
+    }
 }
 
 fn test_client(

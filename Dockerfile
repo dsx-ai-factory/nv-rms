@@ -42,6 +42,10 @@ RUN set -eux; \
 
 WORKDIR /app
 
+# Tests and SSH host-key defaults require a stable home directory. Do not rely
+# on the floating Rust base image to define HOME.
+ENV HOME=/root
+
 # Install the pinned toolchain and its components (see rust-toolchain.toml).
 # The base image default is 1.96.1; rust-toolchain.toml pins 1.96.0. Installing
 # components before this file is present targets the wrong toolchain and breaks
