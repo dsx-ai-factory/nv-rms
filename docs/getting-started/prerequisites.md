@@ -55,6 +55,9 @@ When running RMS against real hardware:
 - A writable firmware artifact directory for downloaded and staged firmware files.
 - Operator-supplied credentials for BMC, power-shelf, and switch endpoints,
   passed in gRPC requests at node-creation time. Do not commit credential files.
+- A reachable, supported endpoint for downloading firmware artifacts.
+  See [Firmware Sources](../reference/firmware-sources.md#firmware-sources) for the supported
+  protocols and endpoint types, including HTTP/HTTPS file servers, Artifactory, and local paths.
 
 ## The librms proto definitions
 
