@@ -62,10 +62,10 @@ tests:
           pattern: "\\[workflows.expected_inventory_profiles\\]"
       - matchRegex:
           path: data["config.toml"]
-          pattern: '"gb200-compute-variant-a" = \\["FW_BMC_0","HGX_FW_GPU_0"\\]'
+          pattern: "\"gb200-compute-variant-a\" = \\[\"FW_BMC_0\",\"HGX_FW_GPU_0\"\\]"
       - matchRegex:
           path: data["config.toml"]
-          pattern: '"gb200-compute-variant-b" = \\["FW_BMC_0","HGX_FW_GPU_0","HGX_FW_GPU_1"\\]'
+          pattern: "\"gb200-compute-variant-b\" = \\[\"FW_BMC_0\",\"HGX_FW_GPU_0\",\"HGX_FW_GPU_1\"\\]"
 
   - it: sets insecure = true when allowInsecure is true
     set:
