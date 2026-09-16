@@ -304,7 +304,7 @@ Key sections in `values.yaml`:
 | `global.image`              | Shared RMS API image tag and pull policy.                                     |
 | `apiServer`                 | Image, replicas, port (8801), TLS, firmware path.                             |
 | `certificates`              | Opt-in cert-manager `Certificate` resources for API server and switch mTLS.   |
-| `database`                  | Host, port, DB name, `credentialsSecret`, `sslMode` (external DB).            |
+| `database`                  | Host, port, DB name, `credentialsSecret`, `credentialsSecretKeys`, `sslMode`. |
 | `databaseMode`              | `external` (default), `standalone`, or `memory` (in-memory, dev/test).        |
 | `postgres`                  | Standalone Postgres configuration (for `databaseMode: "standalone"`).         |
 | `rmsPostgres`               | ExternalSecret (ESO) and optional patch for external PostgreSQL.              |
@@ -435,6 +435,39 @@ The role flag list is empty, so the user is not `SUPERUSER` and does not have
 `CREATEDB`. Migrations only create tables in the database the operator already
 created. The hook does not run again on upgrade, so a cluster already patched
 with `superuser` keeps that role until its PostgreSQL user flags are cleared.
+
+When the chart reads the username and password from a credentials secret it
+does not write itself — `database.credentialsSecret` (`external` mode, or
+`standalone` mode with `postgres.enabled: false`), or
+`postgres.auth.existingSecret` (standalone chart-managed Postgres) — it uses
+the keys `username` and `password` by default (the common Zalando naming). Some
+operators publish those under different keys — for example
+[CrunchyData/postgres-operator](https://github.com/CrunchyData/postgres-operator)
+writes the role name under `user` — so `database.credentialsSecretKeys` lets the
+chart consume an operator-managed secret directly, with no re-mapping step:
+
+```yaml
+database:
+  credentialsSecret: my-cluster-pguser-rms
+  credentialsSecretKeys:
+    username: user      # Crunchy publishes the role name under "user"
+    password: password
+```
+
+`credentialsSecretKeys` is consulted whenever the chart consumes a credentials
+secret it does not write itself: `external` mode, `standalone` mode with
+`postgres.enabled: false`, and standalone chart-managed Postgres pointed at
+`postgres.auth.existingSecret`. Only the chart-generated secret
+(`standalone` mode with `postgres.enabled: true` and no `existingSecret`)
+always uses the fixed `username`/`password` keys. The standalone Postgres
+StatefulSet keeps the fixed `POSTGRES_PASSWORD` bootstrap key for both the
+chart-generated secret and an `existingSecret`, following
+`database.credentialsSecretKeys.password` only when it is set to a non-default
+name — so existing installs render exactly as before and remapping stays
+opt-in. Key names
+must satisfy the Kubernetes Secret key syntax — non-empty, at most 253
+characters, matching `[-._a-zA-Z0-9]+`, and not `.`/`..`/`..`-prefixed;
+anything else fails at render time with an error naming the offending value.
 
 Install or upgrade:
 
@@ -759,7 +792,7 @@ truth for chart values. Key sections:
 | `global.image` | Shared RMS API image tag and pull policy. |
 | `apiServer` | Image, replicas, port (8801), TLS, switch cert material, firmware path. |
 | `certificates` | Opt-in cert-manager `Certificate` resources for API server and switch mTLS. |
-| `database` | Host, port, DB name, `credentialsSecret`, `sslMode` (external DB). |
+| `database` | Host, port, DB name, `credentialsSecret`, `credentialsSecretKeys`, `sslMode`. |
 | `databaseMode` | `external` (default), `standalone`, or `memory` (in-memory, dev/test). |
 | `postgres` | Standalone Postgres configuration (for `databaseMode: "standalone"`). |
 | `rmsPostgres` | ExternalSecret (ESO) and optional patch for external PostgreSQL. |

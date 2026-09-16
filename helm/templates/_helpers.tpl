@@ -64,6 +64,20 @@ true
 {{- end -}}
 
 {{/*
+True when the chart writes the DB credentials secret itself: standalone mode
+with chart-managed Postgres and no postgres.auth.existingSecret. Only then are
+the DB secret keys fixed to username/password; every other configuration
+consumes an operator-managed secret whose key names are configurable via
+database.credentialsSecretKeys.
+*/}}
+{{- define "rack-manager.chartWritesDbCredentials" -}}
+{{- $auth := .Values.postgres.auth | default dict -}}
+{{- if and (include "rack-manager.useStandalonePostgres" .) (not $auth.existingSecret) -}}
+true
+{{- end -}}
+{{- end -}}
+
+{{/*
 Credentials secret name for DB: standalone postgres secret, or external database.credentialsSecret.
 */}}
 {{- define "rack-manager.databaseCredentialsSecret" -}}
@@ -82,6 +96,61 @@ Credentials secret name for DB: standalone postgres secret, or external database
 {{- fail "database.credentialsSecret must be set when not using standalone in-cluster Postgres" }}
 {{- end }}
 {{- end }}
+
+{{/*
+Secret keys for the DB username/password. Whenever the chart consumes a
+credentials secret it does not write itself — database.credentialsSecret
+(external mode, or standalone mode with postgres.enabled: false), or
+postgres.auth.existingSecret (standalone chart-managed Postgres) — these are
+configurable (database.credentialsSecretKeys) so non-default key names
+(e.g. Crunchy's "user") can be read directly. Only the chart-generated
+standalone secret always uses username/password; see
+rack-manager.chartWritesDbCredentials.
+*/}}
+{{- define "rack-manager.dbUsernameKey" -}}
+{{- if eq (include "rack-manager.chartWritesDbCredentials" .) "true" -}}
+username
+{{- else -}}
+{{- dig "credentialsSecretKeys" "username" "username" (.Values.database | default dict) -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "rack-manager.dbPasswordKey" -}}
+{{- if eq (include "rack-manager.chartWritesDbCredentials" .) "true" -}}
+password
+{{- else -}}
+{{- dig "credentialsSecretKeys" "password" "password" (.Values.database | default dict) -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Validate the effective DB credential secret key names against the full
+Kubernetes Secret key constraint (apimachinery IsConfigMapKey): non-empty,
+at most 253 characters, matching [-._a-zA-Z0-9]+, and not "." / ".." /
+".."-prefixed. Anything else would render fine and only fail at apply time,
+with an error that never names the Helm value behind it; note dig returns
+the present-but-empty value rather than the default, so the empty case must
+be caught here. The primary home is the api-server Deployment; the
+drop-database job includes it when the Deployment does not render
+(apiServer.enabled: false), and postgres.yaml when it consumes a configured
+key and neither of the others renders — so exactly one template can raise
+the fail per configuration and helm-unittest failedTemplate assertions stay
+stable. Skipped in memory mode, where no credentials are consumed.
+*/}}
+{{- define "rack-manager.validateDbSecretKeys" -}}
+{{- if not (include "rack-manager.useMemoryPersistence" .) -}}
+{{- range $key := list
+      (dict "valueName" "database.credentialsSecretKeys.username" "value" (include "rack-manager.dbUsernameKey" $))
+      (dict "valueName" "database.credentialsSecretKeys.password" "value" (include "rack-manager.dbPasswordKey" $)) -}}
+{{- if gt (len $key.value) 253 -}}
+{{- fail (printf "%s must be no more than 253 characters (got %d)" $key.valueName (len $key.value)) -}}
+{{- end -}}
+{{- if or (not (regexMatch "^[-._a-zA-Z0-9]+$" $key.value)) (eq $key.value ".") (eq $key.value "..") (hasPrefix ".." $key.value) -}}
+{{- fail (printf "%s must be a non-empty Secret key name matching [-._a-zA-Z0-9]+, and not \".\", \"..\", or \"..\"-prefixed (got %q)" $key.valueName $key.value) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
 
 {{/*
 Image pull secrets: global.imagePullSecrets (legacy apiServer.imagePullSecrets accepted).
