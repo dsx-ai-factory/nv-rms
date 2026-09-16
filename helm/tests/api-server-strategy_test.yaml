@@ -1,0 +1,104 @@
+suite: API server deployment strategy
+release:
+  name: rms
+  namespace: rack-manager
+templates:
+  - templates/api-server-deployment.yaml
+  - templates/api-server-firmware-pvc.yaml
+tests:
+  - it: renders no strategy by default
+    set:
+      global.image.tag: test
+      apiServer.tls.enabled: false
+    asserts:
+      - template: templates/api-server-deployment.yaml
+        documentSelector:
+          path: kind
+          value: Deployment
+        notExists:
+          path: spec.strategy
+
+  - it: pairs ReadWriteOncePod with a Recreate strategy
+    set:
+      global.image.tag: test
+      apiServer.tls.enabled: false
+      apiServer.firmwarePvc.create: true
+      apiServer.firmwarePvc.accessModes:
+        - ReadWriteOncePod
+      apiServer.strategy.type: Recreate
+    asserts:
+      - template: templates/api-server-deployment.yaml
+        documentSelector:
+          path: kind
+          value: Deployment
+        equal:
+          path: spec.strategy.type
+          value: Recreate
+      - template: templates/api-server-firmware-pvc.yaml
+        equal:
+          path: spec.accessModes
+          value:
+            - ReadWriteOncePod
+
+  - it: renders rollingUpdate tuning
+    set:
+      global.image.tag: test
+      apiServer.tls.enabled: false
+      apiServer.strategy.rollingUpdate.maxSurge: 0
+    asserts:
+      - template: templates/api-server-deployment.yaml
+        documentSelector:
+          path: kind
+          value: Deployment
+        equal:
+          path: spec.strategy.rollingUpdate.maxSurge
+          value: 0
+
+  - it: renders maxUnavailable tuning
+    set:
+      global.image.tag: test
+      apiServer.tls.enabled: false
+      apiServer.strategy.rollingUpdate.maxUnavailable: 1
+    asserts:
+      - template: templates/api-server-deployment.yaml
+        documentSelector:
+          path: kind
+          value: Deployment
+        equal:
+          path: spec.strategy.rollingUpdate.maxUnavailable
+          value: 1
+
+  - it: treats a null strategy as unset
+    set:
+      global.image.tag: test
+      apiServer.tls.enabled: false
+      apiServer.strategy: null
+    asserts:
+      - template: templates/api-server-deployment.yaml
+        documentSelector:
+          path: kind
+          value: Deployment
+        notExists:
+          path: spec.strategy
+
+  - it: fails when rollingUpdate is combined with a Recreate strategy
+    set:
+      global.image.tag: test
+      apiServer.tls.enabled: false
+      apiServer.strategy.type: Recreate
+      apiServer.strategy.rollingUpdate.maxSurge: 0
+    asserts:
+      - template: templates/api-server-deployment.yaml
+        failedTemplate:
+          errorMessage: "apiServer.strategy.rollingUpdate is not allowed when apiServer.strategy.type is Recreate; Kubernetes rejects that Deployment strategy combination"
+
+  - it: fails when both rolling-update limits are zero
+    set:
+      global.image.tag: test
+      apiServer.tls.enabled: false
+      apiServer.strategy.rollingUpdate.maxSurge: 0
+      apiServer.strategy.rollingUpdate.maxUnavailable: 0
+    asserts:
+      - template: templates/api-server-deployment.yaml
+        failedTemplate:
+          errorMessage: "apiServer.strategy.rollingUpdate cannot set both maxSurge and maxUnavailable to 0; Kubernetes rejects that Deployment strategy combination"
