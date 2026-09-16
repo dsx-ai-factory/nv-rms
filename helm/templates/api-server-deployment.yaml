@@ -1,6 +1,7 @@
 {{- if .Values.apiServer.enabled }}
 {{- include "rack-manager.validateSftpOptions" . -}}
-{{- $firmwarePersistentVolumeClaim := .Values.apiServer.firmwarePersistentVolumeClaim | default "" | trim }}
+{{- $firmwareUsePvc := eq (include "rack-manager.firmwareUsePvc" .) "true" }}
+{{- $firmwarePvcName := include "rack-manager.firmwarePvcName" . }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -179,9 +180,9 @@ spec:
           configMap:
             name: rms-api-config
         - name: firmware-storage
-          {{- if $firmwarePersistentVolumeClaim }}
+          {{- if $firmwareUsePvc }}
           persistentVolumeClaim:
-            claimName: {{ $firmwarePersistentVolumeClaim | quote }}
+            claimName: {{ $firmwarePvcName | quote }}
           {{- else }}
           hostPath:
             path: {{ .Values.apiServer.firmwareStoragePath }}

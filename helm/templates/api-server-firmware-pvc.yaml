@@ -1,0 +1,18 @@
+{{- if and .Values.apiServer.enabled .Values.apiServer.firmwarePvc.create }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "rack-manager.firmwarePvcName" . }}
+  namespace: {{ include "rack-manager.namespace" . }}
+  labels:
+    {{- include "rack-manager.labels" . | nindent 4 }}
+spec:
+  accessModes:
+    {{- toYaml .Values.apiServer.firmwarePvc.accessModes | nindent 4 }}
+  resources:
+    requests:
+      storage: {{ .Values.apiServer.firmwarePvc.size | quote }}
+  {{- with .Values.apiServer.firmwarePvc.storageClass }}
+  storageClassName: {{ . | quote }}
+  {{- end }}
+{{- end }}
