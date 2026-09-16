@@ -84,6 +84,30 @@ Credentials secret name for DB: standalone postgres secret, or external database
 {{- end }}
 
 {{/*
+Secret keys for the DB username/password. Whenever the chart consumes an
+operator-managed database.credentialsSecret (external mode, or standalone
+mode with postgres.enabled: false) these are configurable
+(database.credentialsSecretKeys) so non-default key names (e.g. Crunchy's
+"user") can be read directly. Chart-managed Postgres (standalone mode with
+postgres.enabled) always uses username/password.
+*/}}
+{{- define "rack-manager.dbUsernameKey" -}}
+{{- if eq (include "rack-manager.useStandalonePostgres" .) "true" -}}
+username
+{{- else -}}
+{{- dig "credentialsSecretKeys" "username" "username" (.Values.database | default dict) -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "rack-manager.dbPasswordKey" -}}
+{{- if eq (include "rack-manager.useStandalonePostgres" .) "true" -}}
+password
+{{- else -}}
+{{- dig "credentialsSecretKeys" "password" "password" (.Values.database | default dict) -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
 Image pull secrets: global.imagePullSecrets (legacy apiServer.imagePullSecrets accepted).
 Use inline: {{ $s := .Values.global.imagePullSecrets | default .Values.apiServer.imagePullSecrets }}
 */}}
