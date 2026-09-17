@@ -44,7 +44,7 @@ fn json_pretty_4space(value: &Value) -> String {
     String::from_utf8(ser.into_inner()).unwrap_or_default()
 }
 
-use crate::bmc_access::BmcAccess;
+use crate::bmc_access::{AccessType, BmcAccess};
 use crate::check_exit_requested;
 use crate::cli_schema::{CLISchema, CommandSchema};
 use crate::config_parser::ConfigParser;
@@ -58,6 +58,7 @@ use crate::gh_rftarget::GHRFTarget;
 use crate::hgxb100_rftarget::{HGXB100RFTarget, HGXRUBINRFTarget};
 use crate::input_params::{InputParams, TaskId, WorkerResult};
 use crate::ipmitool_api::{IpmiCommandError, IpmiToolActivation, IPMI_CMD_DICT};
+use crate::nvos_image;
 use crate::os_access::{self, OsAccess};
 use crate::pldm::{self, FirmwarePkg, PLDM};
 use crate::powershelf_rftarget::PowerShelfRFTarget;
@@ -72,6 +73,10 @@ use crate::ssh_options::{
 use crate::util::{BailAction, TraceFlags, Util};
 use crate::utils::Util as NvUtils;
 use crate::version;
+use crate::workflow::{
+    FirmwareUpdateOutcome as WorkflowFirmwareUpdateOutcome, FlintDeviceFamily, FlintFirmwareTarget,
+    FlintFirmwareUpdateRequest, HostTargetConfig, SshHostKeyMode,
+};
 
 fn redfish_fallback_for_ipmi_command(command: &str) -> &str {
     match command {
@@ -91,6 +96,7 @@ fn target_input_option_supported(key: &str) -> bool {
             | "password"
             | "servertype"
             | "verify_tls"
+            | "allow_http"
             | "bmc_ca_cert"
             | SSH_KNOWN_HOSTS_ARG
             | SSH_HOST_KEY_MODE_ARG
@@ -728,15 +734,7 @@ impl<'a> FwUpdCmdBase<'a> {
                         if let Some(targets) = config.get("Targets").and_then(|v| v.as_array()) {
                             for target in targets {
                                 if let Some(pkg) = target.get("PACKAGE") {
-                                    if let Some(arr) = pkg.as_array() {
-                                        for p in arr {
-                                            if let Some(s) = p.as_str() {
-                                                pkgs.push(s.to_string());
-                                            }
-                                        }
-                                    } else if let Some(s) = pkg.as_str() {
-                                        pkgs.push(s.to_string());
-                                    }
+                                    pkgs.extend(Self::config_package_paths(pkg));
                                 }
                             }
                         }
@@ -982,6 +980,29 @@ impl<'a> FwUpdCmdBase<'a> {
         }
     }
 
+    /// Extract valid package paths from a config `PACKAGE` value.
+    ///
+    /// Config accepts either one string or an array of strings. Blank strings
+    /// and non-string array entries are ignored; callers reject the target when
+    /// no valid path remains.
+    fn config_package_paths(pkg: &Value) -> Vec<String> {
+        if let Some(arr) = pkg.as_array() {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty())
+                .map(str::to_string)
+                .collect()
+        } else if let Some(s) = pkg.as_str() {
+            if s.trim().is_empty() {
+                Vec::new()
+            } else {
+                vec![s.to_string()]
+            }
+        } else {
+            Vec::new()
+        }
+    }
+
     /// Build target list from config parser targets.
     async fn make_target_list(
         &self,
@@ -1097,12 +1118,21 @@ impl<'a> FwUpdCmdBase<'a> {
 
             // Handle package
             if let Some(pkg) = obj.get("PACKAGE") {
-                if let Some(arr) = pkg.as_array() {
-                    let pkg_str: Vec<&str> = arr.iter().filter_map(|v| v.as_str()).collect();
-                    ns.push(format!("package={}", pkg_str.join(" ")));
-                } else if let Some(s) = pkg.as_str() {
-                    ns.push(format!("package={}", s));
+                let packages = Self::config_package_paths(pkg);
+                if packages.is_empty() {
+                    Util::bail_nvfwupd(
+                        1,
+                        &format!(
+                            "Error: {} object has missing/invalid PACKAGE  ",
+                            NvUtils::sanitize_log(&Self::format_value_python_repr(target))
+                        ),
+                        BailAction::DoNothing,
+                        json_dict,
+                    );
+                    continue;
                 }
+                let encoded = serde_json::to_string(&packages).unwrap_or_else(|_| "[]".into());
+                ns.push(format!("package={encoded}"));
             }
 
             // Handle optional parameters
@@ -1124,6 +1154,28 @@ impl<'a> FwUpdCmdBase<'a> {
                             &format!(
                                 "Error: {} object has invalid VERIFY_TLS value. \
                                       VERIFY_TLS must be a boolean or one of \
+                                      1/0, true/false, yes/no, or on/off",
+                                NvUtils::sanitize_log(&Self::format_value_python_repr(target))
+                            ),
+                            BailAction::DoNothing,
+                            json_dict,
+                        );
+                        continue;
+                    }
+                }
+            }
+            if let Some(allow_http) = obj.get("ALLOW_HTTP") {
+                match allow_http {
+                    Value::Bool(value) => ns.push(format!("allow_http={}", value)),
+                    Value::String(value) if bool_string_value_supported(value) => {
+                        ns.push(format!("allow_http={}", value))
+                    }
+                    _ => {
+                        Util::bail_nvfwupd(
+                            1,
+                            &format!(
+                                "Error: {} object has invalid ALLOW_HTTP value. \
+                                      ALLOW_HTTP must be a boolean or one of \
                                       1/0, true/false, yes/no, or on/off",
                                 NvUtils::sanitize_log(&Self::format_value_python_repr(target))
                             ),
@@ -1631,6 +1683,28 @@ impl<'a> FwUpdCmdBase<'a> {
         }
     }
 
+    /// Parse the internal package argument used by config-driven workers.
+    ///
+    /// Config `PACKAGE` values are serialized as a JSON string array to preserve
+    /// path boundaries, including paths that contain whitespace. The legacy
+    /// whitespace split is retained only for older in-memory `package=` values.
+    fn parse_worker_package_list(package_arg: &str) -> Vec<String> {
+        let packages = if let Ok(packages) = serde_json::from_str::<Vec<String>>(package_arg) {
+            packages
+        } else if package_arg.chars().any(char::is_whitespace) {
+            package_arg.split_whitespace().map(str::to_string).collect()
+        } else if package_arg.trim().is_empty() {
+            Vec::new()
+        } else {
+            vec![package_arg.to_string()]
+        };
+
+        packages
+            .into_iter()
+            .filter(|package| !package.trim().is_empty())
+            .collect()
+    }
+
     /// Build per-target `InputParams` from the config target key=value lists.
     ///
     /// Each target's `Vec<String>` has entries like `ip=X`, `package=Y`, etc.
@@ -1647,11 +1721,12 @@ impl<'a> FwUpdCmdBase<'a> {
             let ip = arg_dict.get("ip").cloned().unwrap_or_default();
 
             let package_str = arg_dict.get("package").cloned();
-            let package_list: Vec<String> = if let Some(ref pkg) = package_str {
-                if pkg.contains(' ') {
-                    pkg.split_whitespace().map(|s| s.to_string()).collect()
+            let package_list: Vec<String> = if let Some(pkg) = package_str.as_deref() {
+                let parsed = Self::parse_worker_package_list(pkg);
+                if parsed.is_empty() && !default_recipe.is_empty() {
+                    default_recipe.to_vec()
                 } else {
-                    vec![pkg.clone()]
+                    parsed
                 }
             } else {
                 default_recipe.to_vec()
@@ -1880,6 +1955,16 @@ async fn path_is_file(path: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn recipe_supported_for_target(access_type: AccessType, recipe: &str) -> bool {
+    recipe.ends_with("fwpkg")
+        || recipe.ends_with("tar")
+        || (access_type == AccessType::NVSwitch && nvos_image::is_nvos_image_path(recipe))
+}
+
+fn recipe_should_parse_as_package(recipe: &str) -> bool {
+    !nvos_image::is_nvos_image_path(recipe)
+}
+
 /// Parse target arg list into a HashMap of key=value pairs.
 fn parse_target_args(target_args: &[String]) -> HashMap<String, String> {
     let mut arg_dict = HashMap::new();
@@ -1972,6 +2057,22 @@ async fn update_fw_worker(
     };
     let mut err_status: i32 = 0;
 
+    if params.package_list.is_empty() {
+        let message = "Error: No valid packages input for fw_update";
+        Util::bail_nvfwupd_threadsafe(1, message, BailAction::DoNothing, json_dict.as_ref(), true);
+        if let Some(ref mut jd) = json_dict {
+            append_json_error_lines(jd, message);
+        }
+        return WorkerResult {
+            input: params.clone(),
+            task_id_list: Vec::new(),
+            rf_target: None,
+            json_dict,
+            err_status: 1,
+            is_powershelf: false,
+        };
+    }
+
     if !json_mode {
         println!("Updating ip address: {}", ip_display);
     }
@@ -2006,7 +2107,7 @@ async fn update_fw_worker(
 
     // Validate recipe file types
     for recipe in &params.package_list {
-        if !recipe.ends_with("fwpkg") && !recipe.ends_with("tar") {
+        if !recipe_supported_for_target(bmc_access.access_type, recipe) {
             Util::bail_nvfwupd_threadsafe(
                 1,
                 "Invalid Firmware Package selected.",
@@ -2106,6 +2207,9 @@ async fn update_fw_worker(
 
     // Parse packages
     for recipe in &params.package_list {
+        if !recipe_should_parse_as_package(recipe) {
+            continue;
+        }
         let (ok, msg) = pkg_parser.parse_pkg(recipe, None).await;
         if !ok {
             Util::bail_nvfwupd_threadsafe(
@@ -2249,8 +2353,9 @@ impl<'a> FwUpdCmdHelp<'a> {
     fn print_target_option_notes() {
         const SERVER_TYPES: &str = "DGX, DGXRUBIN, HGX, MGX, GH200, HGXB100, HGXB300, HGXRUBIN, GB200, GB300, VRNVL72, GB200Switch, GB300Switch, VRNVL72Switch, Powershelf";
         const NOTES: &[&str] = &[
-            "Target options: port=<port num for port forwarding>, servertype=<Type of server>.",
+            "Target options: port=<port num for port forwarding>, servertype=<Type of server>, allow_http=<true|false>.",
             "OS target options: port=<SSH port>, servertype=<Type of server>.",
+            "Cleartext HTTP fallback is disabled by default. Use allow_http=true only for trusted HTTP-only Redfish targets or port-forwarding cases.",
         ];
 
         println!("Target option notes:");
@@ -2284,9 +2389,19 @@ impl<'a> FwUpdCmdHelp<'a> {
         Self::print_target_option_notes();
     }
 
+    fn sanitized_usage_args(args: &[String]) -> String {
+        NvUtils::sanitize_log(
+            &args
+                .iter()
+                .map(|arg| NvUtils::redact_secret_key_value_arg(arg))
+                .collect::<Vec<_>>()
+                .join(" "),
+        )
+    }
+
     pub fn print_usage(exec_name: &str, text: &str, schema: &CLISchema) {
         let args: Vec<String> = std::env::args().skip(1).collect();
-        let args_str = args.join(" ");
+        let args_str = Self::sanitized_usage_args(&args);
         if !args_str.is_empty() {
             println!("{}: {}", text, args_str);
         } else {
@@ -2496,17 +2611,29 @@ impl<'a> FwUpdCmdShowRecipe<'a> {
                 println!("Error: incorrect package format.");
                 println!("Given input file {} is not a valid PLDM fwpkg", pkg_file);
                 Util::bail_nvfwupd(1, "", BailAction::Exit, None);
-                continue;
+                return;
             }
 
             let (status, msg) = pkg_parser.parse_pkg(pkg_file, None).await;
             if !status {
-                println!("WARN: {} is not a valid PLDM package. Ignoring", pkg_file);
-                println!("{}", msg);
-                Util::bail_nvfwupd(1, "", BailAction::PrintDivider, None);
-                continue;
+                let message = if msg.is_empty() {
+                    format!("WARN: {} is not a valid PLDM package.", pkg_file)
+                } else {
+                    format!("WARN: {} is not a valid PLDM package.\n{}", pkg_file, msg)
+                };
+                Util::bail_nvfwupd(1, &message, BailAction::Exit, None);
+                return;
             }
 
+            if !pkg_parser.has_printable_package_content(pkg_file) {
+                Util::bail_nvfwupd(
+                    1,
+                    &format!("No package content was available to print for {}", pkg_file),
+                    BailAction::Exit,
+                    None,
+                );
+                return;
+            }
             pkg_parser.print_package_content(pkg_file);
 
             if recipe_list.len() == 1 {
@@ -2658,30 +2785,38 @@ impl<'a> FwUpdCmdShowVersion<'a> {
         // For non-parallel, create a single parser from the first package
         if let Some(ref rl) = recipe_list {
             if !rl.is_empty() && !parallel_update {
-                let mut parser = pldm::get_pkg_parser(
-                    &rl[0],
-                    self.base.g_verbose,
-                    false,
-                    json_error_return.as_ref(),
-                )
-                .await;
-                for pkg_file in rl {
-                    let (status, msg) = parser.parse_pkg(pkg_file, None).await;
-                    if !status {
-                        Util::bail_nvfwupd(
-                            1,
-                            &format!(
-                                "WARN: {} is not a valid package. Ignoring, {}",
-                                pkg_file, msg
-                            ),
-                            BailAction::PrintDivider,
-                            json_error_return.as_ref(),
-                        );
-                        continue;
+                if let Some(first_parseable) = rl
+                    .iter()
+                    .find(|pkg_file| recipe_should_parse_as_package(pkg_file))
+                {
+                    let mut parser = pldm::get_pkg_parser(
+                        first_parseable,
+                        self.base.g_verbose,
+                        false,
+                        json_error_return.as_ref(),
+                    )
+                    .await;
+                    for pkg_file in rl {
+                        if !recipe_should_parse_as_package(pkg_file) {
+                            continue;
+                        }
+                        let (status, msg) = parser.parse_pkg(pkg_file, None).await;
+                        if !status {
+                            Util::bail_nvfwupd(
+                                1,
+                                &format!(
+                                    "WARN: {} is not a valid package. Ignoring, {}",
+                                    pkg_file, msg
+                                ),
+                                BailAction::PrintDivider,
+                                json_error_return.as_ref(),
+                            );
+                            continue;
+                        }
                     }
+                    parser.remove_files().await;
+                    pkg_parser = Some(parser);
                 }
-                parser.remove_files().await;
-                pkg_parser = Some(parser);
             }
         }
 
@@ -2744,15 +2879,22 @@ impl<'a> FwUpdCmdShowVersion<'a> {
                         };
 
                         let mut target_pkg_parser: Option<Box<dyn FirmwarePkg>> = None;
-                        if !params.package_list.is_empty() {
+                        if let Some(first_parseable) = params
+                            .package_list
+                            .iter()
+                            .find(|pkg_file| recipe_should_parse_as_package(pkg_file))
+                        {
                             let mut parser = pldm::get_pkg_parser(
-                                &params.package_list[0],
+                                first_parseable,
                                 g_verbose,
                                 false,
                                 worker_json_dict.as_ref(),
                             )
                             .await;
                             for pkg_file in &params.package_list {
+                                if !recipe_should_parse_as_package(pkg_file) {
+                                    continue;
+                                }
                                 let (status, msg) = parser.parse_pkg(pkg_file, None).await;
                                 if !status {
                                     Util::bail_nvfwupd_threadsafe(
@@ -2977,7 +3119,7 @@ impl<'a> FwUpdCmdShowVersion<'a> {
 
         if let Some(ref rl) = recipe_list {
             for recipe in rl.iter() {
-                if !recipe.ends_with("fwpkg") && !recipe.ends_with("tar") {
+                if !recipe_supported_for_target(bmc_access.access_type, recipe) {
                     Util::bail_nvfwupd_threadsafe(
                         1,
                         "Invalid Firmware Package selected.",
@@ -3009,11 +3151,17 @@ impl<'a> FwUpdCmdShowVersion<'a> {
             inv_dict.extend(sw_inv);
         }
 
-        let pkg_names: Value = if let Some(ref parser) = pkg_parser {
-            let keys: Vec<String> = parser.apname_version_dict().keys().cloned().collect();
-            json!(keys)
-        } else {
+        let mut package_names = Vec::new();
+        if let Some(ref parser) = pkg_parser {
+            package_names.extend(parser.apname_version_dict().keys().cloned());
+        }
+        package_names.extend(nvos_image::package_versions_from_recipes(recipe_list));
+        package_names.sort();
+        package_names.dedup();
+        let pkg_names: Value = if package_names.is_empty() {
             json!("N/A")
+        } else {
+            json!(package_names)
         };
 
         json_output["System Model"] = json!(bmc_access.model);
@@ -3076,7 +3224,10 @@ impl<'a> FwUpdCmdShowVersion<'a> {
                     let mut up_to_date = "Yes".to_string();
                     let mut compare_pkg_version = true;
 
-                    if let Some(ref parser) = pkg_parser {
+                    if nvos_image::is_nvos_ap_name(&ap_inv_name) {
+                        pkg_version = nvos_image::package_version_from_recipes(recipe_list)
+                            .unwrap_or_else(|| "N/A".to_string());
+                    } else if let Some(ref parser) = pkg_parser {
                         if Self::skip_hgx_matching_for_dgx_only_package(
                             rf_target.as_ref(),
                             &ap_name,
@@ -4100,7 +4251,7 @@ impl<'a> FwUpdCmdUpdateFirmware<'a> {
 
                 // Validate recipe file types
                 for recipe in &recipe_list {
-                    if !recipe.ends_with("fwpkg") && !recipe.ends_with("tar") {
+                    if !recipe_supported_for_target(bmc_access.access_type, recipe) {
                         Util::bail_nvfwupd(
                             1,
                             "Invalid Firmware Package selected.",
@@ -4175,6 +4326,9 @@ impl<'a> FwUpdCmdUpdateFirmware<'a> {
 
                 // Parse packages for this target
                 for recipe in &recipe_list {
+                    if !recipe_should_parse_as_package(recipe) {
+                        continue;
+                    }
                     let (ok, msg) = pkg_parser.parse_pkg(recipe, None).await;
                     if !ok {
                         Util::bail_nvfwupd(
@@ -5007,6 +5161,51 @@ impl<'a> FwUpdCmdBackgroundCopy<'a> {
 // FwUpdCmdFlintUpdate
 // ===========================================================================
 
+fn flint_host_config_from_cli_args(
+    args: &HashMap<String, String>,
+) -> std::result::Result<HostTargetConfig, String> {
+    let required = |key: &str| {
+        args.get(key)
+            .filter(|value| !value.trim().is_empty())
+            .cloned()
+            .ok_or_else(|| format!("missing OS target {key}"))
+    };
+    let port = args
+        .get("port")
+        .map(|port| {
+            port.parse::<u16>()
+                .map_err(|_| format!("invalid OS target port {port}"))
+        })
+        .transpose()?;
+    let ssh_host_key_mode = match args
+        .get(SSH_HOST_KEY_MODE_ARG)
+        .map(String::as_str)
+        .unwrap_or(SSH_HOST_KEY_MODE_DISABLED)
+    {
+        SSH_HOST_KEY_MODE_DISABLED => SshHostKeyMode::Disabled,
+        SSH_HOST_KEY_MODE_TOFU => SshHostKeyMode::TrustOnFirstUse,
+        SSH_HOST_KEY_MODE_STRICT => SshHostKeyMode::Strict,
+        mode => return Err(format!("invalid SSH host-key mode {mode}")),
+    };
+
+    Ok(HostTargetConfig {
+        ip: required("ip")?,
+        username: required("user")?,
+        password: required("password")?,
+        port,
+        ssh_known_hosts: args.get(SSH_KNOWN_HOSTS_ARG).cloned(),
+        ssh_host_key_mode,
+    })
+}
+
+fn missing_image_files(image_files: &[String]) -> Vec<&str> {
+    image_files
+        .iter()
+        .filter(|image| std::fs::metadata(image).is_err())
+        .map(String::as_str)
+        .collect()
+}
+
 pub struct FwUpdCmdFlintUpdate<'a> {
     base: FwUpdCmdBase<'a>,
 }
@@ -5056,7 +5255,7 @@ impl<'a> FwUpdCmdFlintUpdate<'a> {
 
         // Create OS access
         let os_access_result = os_access::get_os_access(&os_target_args, json_output.as_ref());
-        let (os_access, _arg_dict) = match os_access_result {
+        let (os_access, arg_dict) = match os_access_result {
             Ok(v) => v,
             Err(msg) => {
                 Util::bail_nvfwupd(
@@ -5329,6 +5528,91 @@ impl<'a> FwUpdCmdFlintUpdate<'a> {
                 BailAction::DoNothing,
                 json_output.as_ref(),
             );
+            return;
+        }
+
+        let configured_device_type = device_type.clone().or_else(|| {
+            self.base
+                .config_parser
+                .as_ref()
+                .and_then(|cp| cp.config_dict.as_ref())
+                .and_then(|config| config.get("FlintDeviceType"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        });
+        let configured_family = configured_device_type
+            .as_deref()
+            .and_then(FlintDeviceFamily::from_component);
+        if let Some(family) = configured_family {
+            let missing_images = missing_image_files(&image_files);
+            if !missing_images.is_empty() {
+                Util::bail_nvfwupd(
+                    1,
+                    &format!("Image file not found: {}", missing_images.join(", ")),
+                    BailAction::Exit,
+                    json_output.as_ref(),
+                );
+                return;
+            }
+            let host = match flint_host_config_from_cli_args(&arg_dict) {
+                Ok(host) => host,
+                Err(error) => {
+                    Util::bail_nvfwupd(1, &error, BailAction::Exit, json_output.as_ref());
+                    return;
+                }
+            };
+            let request = FlintFirmwareUpdateRequest {
+                targets: vec![FlintFirmwareTarget {
+                    family,
+                    firmware_files: image_files.clone(),
+                }],
+                force_update: false,
+                timeout_secs: Some(query_timeout),
+                cancellation: None,
+                expected_device_counts: Default::default(),
+            };
+            match crate::workflow_api::update_flint_firmware(host, request).await {
+                Ok(outcome) => {
+                    let output = match outcome {
+                        WorkflowFirmwareUpdateOutcome::Completed(summary) => summary.message,
+                        WorkflowFirmwareUpdateOutcome::Skipped { reason } => reason,
+                        WorkflowFirmwareUpdateOutcome::Started(handle) => format!(
+                            "Flint workflow unexpectedly returned task {}",
+                            handle.task_id
+                        ),
+                    };
+                    let result = json!({
+                        "command": format!(
+                            "flint_flash {} {}",
+                            configured_device_type.as_deref().unwrap_or_default(),
+                            image_files.join(" ")
+                        ),
+                        "success": true,
+                        "output": output,
+                    });
+                    if let Some(ref mut json) = json_output {
+                        json["Output"] = json!([result]);
+                        println!("{}", json_pretty_4space(json));
+                    } else {
+                        println!("Command execution completed:");
+                        println!(
+                            "Command: {}",
+                            result.get("command").and_then(Value::as_str).unwrap_or("")
+                        );
+                        println!("Status: Success");
+                        println!("Output: {output}");
+                        println!("{}", "-".repeat(50));
+                    }
+                }
+                Err(error) => {
+                    Util::bail_nvfwupd(
+                        1,
+                        &format!("Firmware flashing failed: {error}"),
+                        BailAction::Exit,
+                        json_output.as_ref(),
+                    );
+                }
+            }
             return;
         }
 
@@ -5971,6 +6255,20 @@ mod tests {
     }
 
     #[test]
+    fn resolved_flint_workflow_rejects_any_missing_image() {
+        let existing = tempfile::NamedTempFile::new().expect("temporary image should be created");
+        let image_files = vec![
+            existing.path().to_string_lossy().into_owned(),
+            "/definitely/missing/flint-image.bin".to_owned(),
+        ];
+
+        assert_eq!(
+            missing_image_files(&image_files),
+            vec!["/definitely/missing/flint-image.bin"]
+        );
+    }
+
+    #[test]
     fn test_shell_quote() {
         assert_eq!(shell_quote("hello"), "'hello'");
         assert_eq!(shell_quote("it's"), "'it'\\''s'");
@@ -6003,6 +6301,7 @@ mod tests {
             "password",
             "servertype",
             "verify_tls",
+            "allow_http",
             "bmc_ca_cert",
             "ssh_known_hosts",
             "ssh_host_key_mode",
@@ -6157,6 +6456,127 @@ mod tests {
 
         let ips: Vec<&str> = ordered.iter().map(|wr| wr.input.ip.as_str()).collect();
         assert_eq!(ips, vec!["192.0.2.1", "192.0.2.2", "192.0.2.3"]);
+    }
+
+    #[test]
+    fn usage_args_are_redacted_before_printing() {
+        let _guard = crate::utils::SanitizeTestGuard::new();
+        let args = vec![
+            "-t".to_string(),
+            "ip=192.0.2.1".to_string(),
+            "user=admin".to_string(),
+            "password=plain secret".to_string(),
+            "show_version".to_string(),
+        ];
+
+        let rendered = FwUpdCmdHelp::sanitized_usage_args(&args);
+
+        assert!(!rendered.contains("plain secret"));
+        assert!(rendered.contains("password=XXXX"));
+    }
+
+    #[tokio::test]
+    async fn config_package_paths_with_spaces_survive_worker_materialization() {
+        let mut schema = CLISchema::new();
+        schema
+            .load_embedded_schema()
+            .expect("embedded CLI schema should parse");
+        let command = schema
+            .get_command_schema("update_fw")
+            .expect("update_fw schema should exist")
+            .clone();
+        let mut base = FwUpdCmdBase::new(
+            &schema,
+            "nvfwupd".to_string(),
+            "update_fw".to_string(),
+            command,
+            Vec::new(),
+            Vec::new(),
+        )
+        .await;
+
+        let targets = vec![json!({
+            "BMC_IP": "192.0.2.10",
+            "RF_USERNAME": "admin",
+            "RF_PASSWORD": "secret",
+            "ALLOW_HTTP": true,
+            "PACKAGE": [
+                "/tmp/fw bundle/update one.fwpkg",
+                "/tmp/second package.fwpkg"
+            ]
+        })];
+        base.config_parser = Some(ConfigParser {
+            config_dict: Some(json!({"ParallelUpdate": true, "Targets": targets.clone()})),
+            targets: targets.clone(),
+            config_file_path: "in-memory.yaml".to_string(),
+        });
+
+        let target_args = base.make_target_list(&targets, None).await;
+        let params = FwUpdCmdBase::create_input_params_list(&target_args, &[]);
+
+        assert_eq!(params.len(), 1);
+        assert!(
+            target_args[0].contains(&"allow_http=true".to_string()),
+            "ALLOW_HTTP should materialize as allow_http=true"
+        );
+        assert_eq!(
+            params[0].package_list,
+            vec![
+                "/tmp/fw bundle/update one.fwpkg".to_string(),
+                "/tmp/second package.fwpkg".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn config_invalid_package_values_do_not_materialize_package_paths() {
+        for package in [json!([]), json!([1, false, "  "]), json!("  ")] {
+            assert!(
+                FwUpdCmdBase::config_package_paths(&package).is_empty(),
+                "invalid PACKAGE should not create package paths"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_worker_package_string_still_splits_on_whitespace() {
+        let target_args = vec![vec![
+            "ip=192.0.2.10".to_string(),
+            "package=/tmp/pkg1.fwpkg\t/tmp/pkg2.fwpkg\n/tmp/pkg3.fwpkg".to_string(),
+        ]];
+
+        let params = FwUpdCmdBase::create_input_params_list(&target_args, &[]);
+
+        assert_eq!(
+            params[0].package_list,
+            vec![
+                "/tmp/pkg1.fwpkg".to_string(),
+                "/tmp/pkg2.fwpkg".to_string(),
+                "/tmp/pkg3.fwpkg".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn empty_json_worker_package_payload_uses_default_recipe() {
+        let target_args = vec![vec!["ip=192.0.2.10".to_string(), "package=[]".to_string()]];
+        let default_recipe = vec!["/tmp/default.fwpkg".to_string()];
+
+        let params = FwUpdCmdBase::create_input_params_list(&target_args, &default_recipe);
+
+        assert_eq!(params[0].package_list, default_recipe);
+    }
+
+    #[test]
+    fn blank_worker_package_payload_does_not_create_package_entries() {
+        let target_args = vec![vec![
+            "ip=192.0.2.10".to_string(),
+            "package=[\"\", \"  \"]".to_string(),
+        ]];
+
+        let params = FwUpdCmdBase::create_input_params_list(&target_args, &[]);
+
+        assert!(params[0].package_list.is_empty());
     }
 
     #[test]

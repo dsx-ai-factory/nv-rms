@@ -88,6 +88,7 @@ fn powershelf_target_args(server: &MockServer) -> Vec<String> {
         "password=test".to_string(),
         format!("port={port}"),
         "servertype=powershelf".to_string(),
+        "allow_http=true".to_string(),
     ]
 }
 
@@ -194,6 +195,33 @@ fn golden_stdout_for_package_only_command_paths() {
         String::from_utf8_lossy(&unpack.stdout).replace(&package_arg, "<PACKAGE>");
     assert_eq!(unpack.status.code(), Some(0));
     assert_eq!(normalized_unpack, expected_unpack);
+}
+
+#[test]
+fn show_pkg_content_invalid_fwpkg_exits_nonzero() {
+    let tmp = tempfile::tempdir().unwrap();
+    let package = tmp.path().join("invalid.fwpkg");
+    std::fs::write(&package, b"not a valid PLDM package").unwrap();
+    let package_arg = package.to_string_lossy().to_string();
+
+    let output = run_nvfwupd(
+        &[
+            "show_pkg_content".to_string(),
+            "-p".to_string(),
+            package_arg.clone(),
+        ],
+        tmp.path(),
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "unexpected exit status: stdout={stdout}, stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(stdout.contains("is not a valid PLDM package"), "{stdout}");
+    assert!(stdout.contains("Error Code: 1"), "{stdout}");
 }
 
 #[test]

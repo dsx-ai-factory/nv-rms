@@ -27,6 +27,7 @@ use std::collections::HashSet;
 
 use librms::protos::rack_manager as rm;
 
+use crate::api::grpc::conversions::failed_node_results;
 use crate::api::grpc::server::RackManagerServiceImpl;
 use crate::nodes::SwitchScaleUpManagement;
 use crate::orchestrator::job_lifecycle::{JobError, JobFailure};
@@ -97,18 +98,8 @@ async fn run_switch_sdn_factory_default_reset_job(
         nvue_client,
         request_domain,
         tls_server_name,
-        rack_id,
-        node_id,
+        ..
     } = target;
-
-    let job_id = job.id().to_string();
-
-    tracing::info!(
-        job_id = %job_id,
-        node = %node_id,
-        rack = %rack_id,
-        "switch SDN factory-default reset job starting"
-    );
 
     job.progress("Initializing switch NVUE client for SDN factory-default reset");
 
@@ -124,17 +115,7 @@ async fn run_switch_sdn_factory_default_reset_job(
         .await
     {
         let message = format!("failed to initialize switch NVUE client: {}", error.message);
-
-        tracing::warn!(
-            job_id = %job_id,
-            node = %node_id,
-            rack = %rack_id,
-            error = %error.message,
-            "switch SDN factory-default reset job failed before reset"
-        );
-
         job.fail(JobFailure::new(JobError::Other, message));
-
         return;
     }
 
@@ -144,29 +125,17 @@ async fn run_switch_sdn_factory_default_reset_job(
     // state exits factory-reset-in-progress, not merely after action submit.
     match switch.reset_sdn_factory_default().await {
         Ok(action_id) => {
-            tracing::info!(
-                job_id = %job_id,
-                node = %node_id,
-                rack = %rack_id,
-                action_id = %action_id,
-                "switch SDN factory-default reset job completed"
-            );
-
             // RMS stores only in-memory job state for this idempotent reset.
-            // The action ID is logged for switch-side audit/correlation.
-            job.complete("SDN factory-default reset completed", "");
+            // The action ID is folded into the completion description (rather
+            // than a separate log) so it survives in the guaranteed `job
+            // completed` chokepoint log for switch-side audit/correlation.
+            job.complete(
+                format!("SDN factory-default reset completed (action_id={action_id})"),
+                "",
+            );
         }
         Err(error) => {
             let message = format!("failed to reset SDN factory-default: {}", error.message);
-
-            tracing::warn!(
-                job_id = %job_id,
-                node = %node_id,
-                rack = %rack_id,
-                error = %error.message,
-                "switch SDN factory-default reset job failed"
-            );
-
             job.fail(JobFailure::new(JobError::Other, message));
         }
     }
@@ -295,50 +264,35 @@ fn prepare_sdn_reset_targets(
 
 /// Reserve one child job per valid target.
 ///
-/// `create_pending_job_if_node_idle` provides the per-node exclusion policy:
-/// a destructive reset is rejected while another tracked operation owns the
-/// same rack/node.
+/// `create_batch_jobs` provides the per-node exclusion policy: a destructive
+/// reset is rejected while another tracked operation owns the same rack/node.
+/// Targets are already validated and deduplicated by
+/// [`collect_sdn_reset_targets`], so admission depends only on that policy.
 fn create_sdn_reset_jobs(
     job_tracker: &JobTracker,
     parent_job_id: &str,
     targets: Vec<SdnResetTarget>,
     batch: &mut rm::NodeBatchResponse,
-    mut skipped: u32,
+    skipped: u32,
 ) -> CreatedSdnResetJobs {
-    let mut pending_resets = Vec::new();
+    let (admitted, rejected) = job_tracker.create_batch_jobs(
+        parent_job_id,
+        JobType::SwitchSdnFactoryDefaultReset,
+        targets
+            .into_iter()
+            .map(|target| (target.rack_id.clone(), target.node_id.clone(), target))
+            .collect(),
+        |_| Ok(()),
+    );
 
-    for target in targets {
-        let pending = match job_tracker.create_child_job_if_node_idle(
-            parent_job_id,
-            &target.rack_id,
-            &target.node_id,
-            JobType::SwitchSdnFactoryDefaultReset,
-        ) {
-            Ok(pending) => pending,
-            Err(failure) => {
-                tracing::warn!(
-                    node = %target.node_id,
-                    rack = %target.rack_id,
-                    error = %failure.message,
-                    "SDN factory-default reset job rejected"
-                );
-
-                batch.node_results.push(rm::NodeOperationResult {
-                    node_id: target.node_id,
-                    status: rm::ReturnCode::Failure.into(),
-                    error_message: failure.message,
-                });
-
-                skipped += 1;
-                continue;
-            }
-        };
-
-        pending_resets.push(PendingSdnReset { pending, target });
-    }
+    let skipped = skipped + rejected.len() as u32;
+    batch.node_results.extend(failed_node_results(rejected));
 
     CreatedSdnResetJobs {
-        pending_resets,
+        pending_resets: admitted
+            .into_iter()
+            .map(|(target, pending, ())| PendingSdnReset { pending, target })
+            .collect(),
         skipped,
     }
 }

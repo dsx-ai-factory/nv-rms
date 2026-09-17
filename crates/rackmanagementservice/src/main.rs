@@ -409,8 +409,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Parse configuration before logging is initialized so a bad config surfaces
     // immediately; report the failure to stderr since the tracing subscriber is
     // not yet installed.
-    let config = match RmsConfig::load(&cli.config) {
-        Ok(config) => config,
+    let (config, unknown_config_keys) = match RmsConfig::load(&cli.config) {
+        Ok(loaded) => loaded,
         Err(msg) => {
             eprintln!("configuration error: {msg}");
             std::process::exit(1);
@@ -424,6 +424,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.logging.log_level.as_deref(),
         config.logging.enable_timestamps,
     )?;
+
+    for key in &unknown_config_keys {
+        tracing::warn!(key, "unknown configuration key ignored; possible typo");
+    }
 
     // Plaintext gRPC requires `tls.insecure = true` in the config *and* the
     // RMS_ALLOW_INSECURE=1 env gate (sourced from a different channel than the

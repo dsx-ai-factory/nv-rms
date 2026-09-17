@@ -2,10 +2,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-set -euo pipefail
-
 # NOTE: This helper is retained for lab TLS validation and is intended for use
 # once customer discussions for NVFWUPD TLS enablement have completed.
+
+set -euo pipefail
 
 usage() {
     cat <<'USAGE'

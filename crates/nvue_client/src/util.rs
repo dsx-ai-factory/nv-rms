@@ -15,6 +15,8 @@
  * limitations under the License.
  */
 
+use serde::Deserialize;
+
 pub(crate) fn non_empty_trimmed(value: &str) -> Option<String> {
     let value = value.trim();
 
@@ -23,4 +25,23 @@ pub(crate) fn non_empty_trimmed(value: &str) -> Option<String> {
     } else {
         Some(value.to_owned())
     }
+}
+
+/// Deserializes an optional field that NVUE sometimes sends as a JSON string and
+/// sometimes as a JSON number. Any other JSON type (bool, array, object, explicit
+/// null) decodes to `None` rather than erroring, matching the permissive behavior
+/// of a plain `Value::as_str` lookup.
+pub(crate) fn deserialize_optional_lenient_string<'de, D>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+
+    Ok(value.and_then(|value| match value {
+        serde_json::Value::String(text) => Some(text),
+        serde_json::Value::Number(number) => Some(number.to_string()),
+        _ => None,
+    }))
 }

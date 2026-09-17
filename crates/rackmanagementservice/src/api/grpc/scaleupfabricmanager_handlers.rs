@@ -99,7 +99,7 @@ fn nmx_config_response_message(
 }
 
 /// Request-scoped switch and its validated connection identity.
-struct EphemeralSwitch {
+pub(crate) struct EphemeralSwitch {
     /// Switch client built from the caller-supplied `NodeInfo`.
     switch: Box<dyn SwitchScaleUpManagement>,
 
@@ -108,6 +108,14 @@ struct EphemeralSwitch {
 
     /// TLS server name from `host_endpoint`, falling back to `target_ip`.
     tls_server_name: String,
+}
+
+impl EphemeralSwitch {
+    /// Borrows the underlying switch client (e.g. for a cold-reboot NVOS
+    /// readiness probe).
+    pub(crate) fn switch(&self) -> &dyn SwitchScaleUpManagement {
+        self.switch.as_ref()
+    }
 }
 
 fn grpc_port_for_app(app_name: &str) -> i32 {
@@ -179,6 +187,51 @@ pub(super) async fn disable_insecure_nmx_controller_mtls(
         .unset_mtls_services(&[SwitchMtlsService::ScaleUpFabricManager])
         .await
         .map(|_| ())
+}
+
+/// Best-effort compensating teardown after a failed
+/// `ConfigureScaleUpFabricManager`.
+///
+/// Once Step 2 has run, the switch's `nmx-controller` management gRPC is open
+/// to external clients. If a later step fails and the handler returns
+/// `Failure`, leaving that open would put the switch in a *more exposed* state
+/// than the caller — who is told the configure failed — expects. Disabling
+/// external gRPC again makes a failed configure fail closed.
+///
+/// Scope and caveats:
+/// - Only the Step 2 exposure is undone. The Step 1 cluster-enabled state is
+///   intentionally left in place: it is the less sensitive, frequently desired
+///   durable state, and tearing down the whole cluster on a late-stage failure
+///   is more disruptive than the residual it would remove.
+/// - This is best-effort. The failure that triggers rollback is often the
+///   switch being unreachable, in which case this teardown fails too; the error
+///   is logged (not propagated) so the caller still sees the original failure.
+/// - `resp.grpc_enabled` is set to `false` only when the disable actually
+///   succeeds. A failed teardown leaves the flag unchanged so the response
+///   never reports the port as closed when it may still be open.
+async fn rollback_external_grpc(
+    switch: &dyn SwitchScaleUpManagement,
+    node_id: &str,
+    resp: &mut rm::ConfigureScaleUpFabricManagerResponse,
+) {
+    match switch
+        .enable_grpc_for_external_clients("nmx-controller", false)
+        .await
+    {
+        Ok(_) => {
+            resp.grpc_enabled = false;
+            tracing::info!(
+                node = %node_id,
+                "rolled back external-client gRPC after failed ScaleUpFabric configure"
+            )
+        }
+        Err(e) => tracing::warn!(
+            node = %node_id,
+            error = %e.message,
+            "failed to roll back external-client gRPC after failed ScaleUpFabric configure; \
+             switch may remain exposed until reconfigured or explicitly disabled"
+        ),
+    }
 }
 
 fn validate_switch_target_host(host: &str) -> Result<IpAddr> {
@@ -594,7 +647,7 @@ fn build_ephemeral_switch(device: &rm::NodeInfo) -> Result<EphemeralSwitch> {
 }
 
 impl RackManagerServiceImpl {
-    async fn build_ephemeral_switch(
+    pub(crate) async fn build_ephemeral_switch(
         &self,
         device: &rm::NodeInfo,
         request_domain: Option<&str>,
@@ -750,6 +803,14 @@ impl RackManagerServiceImpl {
             return Ok(tonic::Response::new(resp));
         }
 
+        // The external-client gRPC port is open from here on. Record the
+        // exposure immediately so every downstream failure path reports it
+        // accurately: rollback clears this flag only on a successful teardown,
+        // so if rollback fails (e.g. an unreachable switch) grpc_enabled stays
+        // true instead of the initial false that would misreport the port as
+        // closed while it is actually still open.
+        resp.grpc_enabled = true;
+
         if self.switch_tls_roots.insecure_switch {
             // A prior insecure certificate cleanup can no-op while the cluster
             // is disabled. Once the cluster is enabled, restore the NMX-C
@@ -757,6 +818,7 @@ impl RackManagerServiceImpl {
             if let Err(e) = disable_insecure_nmx_controller_mtls(sw.as_ref()).await {
                 tracing::warn!(node = %device.node_id, error = %e.message, "failed to disable NMX-C mTLS");
                 resp.message = format!("failed to disable NMX-C mTLS: {}", e.message);
+                rollback_external_grpc(sw.as_ref(), &device.node_id, &mut resp).await;
                 return Ok(tonic::Response::new(resp));
             }
         }
@@ -777,10 +839,9 @@ impl RackManagerServiceImpl {
         if !ready {
             tracing::warn!(node = %device.node_id, switch_target = %switch_target, "gRPC not ready for external clients");
             resp.message = "gRPC not ready for external clients".into();
+            rollback_external_grpc(sw.as_ref(), &device.node_id, &mut resp).await;
             return Ok(tonic::Response::new(resp));
         }
-
-        resp.grpc_enabled = true;
 
         // Step 4: NMX gRPC (Hello + SetStaticConfig with topology_type from request)
         let nmx_port = grpc_port_for_app("nmx-controller");
@@ -798,6 +859,7 @@ impl RackManagerServiceImpl {
                 Ok(server_name) => server_name,
                 Err(message) => {
                     resp.message = message;
+                    rollback_external_grpc(sw.as_ref(), &device.node_id, &mut resp).await;
                     return Ok(tonic::Response::new(resp));
                 }
             };
@@ -809,6 +871,7 @@ impl RackManagerServiceImpl {
                 )),
                 Err(message) => {
                     resp.message = message;
+                    rollback_external_grpc(sw.as_ref(), &device.node_id, &mut resp).await;
                     return Ok(tonic::Response::new(resp));
                 }
             }
@@ -825,6 +888,7 @@ impl RackManagerServiceImpl {
             Err(e) => {
                 tracing::warn!(node = %device.node_id, error = %e, "invalid NMX Controller target address");
                 resp.message = format!("invalid NMX Controller target address: {e}");
+                rollback_external_grpc(sw.as_ref(), &device.node_id, &mut resp).await;
                 return Ok(tonic::Response::new(resp));
             }
         };
@@ -834,6 +898,7 @@ impl RackManagerServiceImpl {
             Err(e) => {
                 tracing::error!(node = %device.node_id, error = %e, "failed to create NMX Controller client pool");
                 resp.message = format!("failed to create NMX Controller client pool: {e}");
+                rollback_external_grpc(sw.as_ref(), &device.node_id, &mut resp).await;
                 return Ok(tonic::Response::new(resp));
             }
         };
@@ -843,6 +908,7 @@ impl RackManagerServiceImpl {
             Err(e) => {
                 tracing::error!(node = %device.node_id, error = %e, "failed to connect to NMX Controller");
                 resp.message = format!("failed to connect to NMX Controller: {e}");
+                rollback_external_grpc(sw.as_ref(), &device.node_id, &mut resp).await;
                 return Ok(tonic::Response::new(resp));
             }
         };
@@ -851,6 +917,7 @@ impl RackManagerServiceImpl {
         if let Err(e) = client.hello(&self.nmx_gateway_id).await {
             tracing::error!(error = %e, node = %device.node_id, switch_target = %switch_target, nmx_port, "NMX Hello: RPC failed");
             resp.message = "NMX Controller Hello failed".into();
+            rollback_external_grpc(sw.as_ref(), &device.node_id, &mut resp).await;
             return Ok(tonic::Response::new(resp));
         }
 
@@ -881,6 +948,7 @@ impl RackManagerServiceImpl {
         } else {
             tracing::error!(node = %device.node_id, topology = %r.topology_type, result = ?config_result, "failed to set NMX topology");
             resp.status = rm::ReturnCode::Failure.into();
+            rollback_external_grpc(sw.as_ref(), &device.node_id, &mut resp).await;
         }
 
         resp.message = nmx_config_response_message(config_result, soft_reset_attempted).into();
@@ -1189,6 +1257,10 @@ mod tests {
             Err(RmsError::internal("unexpected get_cluster_state call"))
         }
 
+        async fn nvue_hello(&self) -> Result<()> {
+            Err(RmsError::internal("unexpected nvue_hello call"))
+        }
+
         async fn get_cluster_apps_status(&self, _app_name: &str) -> Result<Value> {
             self.app_status_calls.fetch_add(1, Ordering::SeqCst);
 
@@ -1270,6 +1342,162 @@ mod tests {
                 "ready_for_external_clients": false,
             },
         })
+    }
+
+    /// Records `enable_grpc_for_external_clients` calls so the compensating
+    /// teardown can be asserted, with a configurable result so the best-effort
+    /// error-swallow path is exercised too. All other trait methods are
+    /// unexpected: rollback must touch external gRPC only.
+    struct RollbackRecordingSwitch {
+        grpc_calls: Mutex<Vec<(String, bool)>>,
+        fail_disable: bool,
+    }
+
+    impl RollbackRecordingSwitch {
+        fn new(fail_disable: bool) -> Self {
+            Self {
+                grpc_calls: Mutex::new(Vec::new()),
+                fail_disable,
+            }
+        }
+    }
+
+    impl Node for RollbackRecordingSwitch {
+        fn id(&self) -> &str {
+            "sw-01"
+        }
+
+        fn rack_id(&self) -> &str {
+            "rack-01"
+        }
+
+        fn node_type(&self) -> NodeType {
+            NodeType::SwitchGb200Nvidia
+        }
+
+        fn get_info(&self) -> HashMap<String, String> {
+            HashMap::new()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SwitchScaleUpManagement for RollbackRecordingSwitch {
+        fn nvue_client(&self) -> Option<&nvue_client::SharedClient> {
+            None
+        }
+
+        async fn set_cluster_state(&self, _enabled: bool) -> Result<()> {
+            Err(RmsError::internal(
+                "rollback must not touch cluster state (set_cluster_state)",
+            ))
+        }
+
+        async fn get_cluster_state(&self) -> Result<Value> {
+            Err(RmsError::internal("unexpected get_cluster_state call"))
+        }
+
+        async fn nvue_hello(&self) -> Result<()> {
+            Err(RmsError::internal("unexpected nvue_hello call"))
+        }
+
+        async fn get_cluster_apps_status(&self, _app_name: &str) -> Result<Value> {
+            Err(RmsError::internal(
+                "unexpected get_cluster_apps_status call",
+            ))
+        }
+
+        async fn enable_grpc_for_external_clients(
+            &self,
+            app_name: &str,
+            enabled: bool,
+        ) -> Result<Value> {
+            self.grpc_calls
+                .lock()
+                .unwrap()
+                .push((app_name.to_owned(), enabled));
+
+            if self.fail_disable {
+                Err(RmsError::internal("switch unreachable"))
+            } else {
+                Ok(serde_json::json!({}))
+            }
+        }
+
+        async fn gnmi_service(&self, _enabled: bool) -> Result<Value> {
+            Err(RmsError::internal("unexpected gnmi_service call"))
+        }
+
+        async fn check_grpc_status(&self, _app_name: &str, _target_switch: &str) -> Result<Value> {
+            Err(RmsError::internal("unexpected check_grpc_status call"))
+        }
+
+        async fn restart_cluster_app(&self, _app_name: &str) -> Result<()> {
+            Err(RmsError::internal("unexpected restart_cluster_app call"))
+        }
+
+        async fn reset_sdn_factory_default(&self) -> Result<String> {
+            Err(RmsError::internal(
+                "unexpected reset_sdn_factory_default call",
+            ))
+        }
+    }
+
+    fn failed_configure_response() -> rm::ConfigureScaleUpFabricManagerResponse {
+        rm::ConfigureScaleUpFabricManagerResponse {
+            status: rm::ReturnCode::Failure.into(),
+            message: "gRPC not ready for external clients".into(),
+            topology_used: String::new(),
+            scale_up_fabric_state_enabled: true,
+            grpc_enabled: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn rollback_external_grpc_disables_external_clients_and_clears_flag() {
+        let switch = RollbackRecordingSwitch::new(false);
+        let mut resp = failed_configure_response();
+
+        rollback_external_grpc(&switch, "sw-01", &mut resp).await;
+
+        assert!(
+            !resp.grpc_enabled,
+            "rollback must clear grpc_enabled so the response reflects the disabled state"
+        );
+        assert_eq!(
+            *switch.grpc_calls.lock().unwrap(),
+            vec![("nmx-controller".to_owned(), false)],
+            "rollback must disable external-client gRPC for nmx-controller exactly once"
+        );
+        // Scoped teardown: cluster state is intentionally left enabled. The
+        // fake's set_cluster_state errors if called, so reaching this assert
+        // proves rollback never attempted a cluster teardown.
+        assert!(resp.scale_up_fabric_state_enabled);
+    }
+
+    #[tokio::test]
+    async fn rollback_external_grpc_swallows_switch_errors() {
+        let switch = RollbackRecordingSwitch::new(true);
+        let mut resp = failed_configure_response();
+
+        // Best-effort: an unreachable switch (the common trigger for rollback)
+        // must not panic or propagate, so the caller still surfaces the original
+        // failure.
+        rollback_external_grpc(&switch, "sw-01", &mut resp).await;
+
+        // Fail closed *and* report honestly: because the disable failed, the
+        // switch may still be exposed, so grpc_enabled must NOT be cleared. Only
+        // a successful teardown flips it to false; otherwise the response would
+        // claim the port is closed when it may still be open.
+        assert!(
+            resp.grpc_enabled,
+            "a failed rollback must leave grpc_enabled=true so the caller is not \
+             told the port is closed when it may still be open"
+        );
+        assert_eq!(
+            *switch.grpc_calls.lock().unwrap(),
+            vec![("nmx-controller".to_owned(), false)],
+            "rollback must still attempt the disable even when it will fail"
+        );
     }
 
     #[test]

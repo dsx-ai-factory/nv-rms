@@ -150,7 +150,35 @@ pub trait FirmwareObjectStore: Send + Sync {
 
     /// Mark `id` as the default bundle for its `rack_hardware_type`. Clears
     /// any previously-default bundle of the same hardware type. Atomic.
+    ///
+    /// Returns the resulting row for `id` (`is_default = true`, `updated`
+    /// bumped). Callers should use this returned row rather than one read
+    /// before the call: it is the only view that reflects the post-update
+    /// state.
     async fn set_default(&self, id: &str) -> Result<FirmwareObject>;
+
+    /// Make `id` the default for its hardware type *only if that hardware type
+    /// has no default yet*; if one already exists it is left untouched.
+    ///
+    /// This is the atomic form of "check [`has_default`], then [`set_default`]"
+    /// used when adding firmware. It serializes with other default changes for
+    /// the same hardware type (Postgres: a transaction-scoped advisory lock;
+    /// memory: the catalog write lock), so two concurrent first-time adds
+    /// cannot both observe an empty slot and both claim the default — and
+    /// therefore cannot collide on the partial unique index.
+    ///
+    /// Returns the authoritative post-call row for `id` whether or not it
+    /// became the default: its `is_default` is `true` when this bundle now
+    /// holds (or already held) the slot, and `false` when another bundle owns
+    /// it. Callers must use this returned row rather than a value captured
+    /// before the call (e.g. the row from [`create`]) — that earlier row
+    /// predates the default-selection update and would misreport `is_default`
+    /// and `updated`.
+    ///
+    /// [`create`]: FirmwareObjectStore::create
+    /// [`has_default`]: FirmwareObjectStore::has_default
+    /// [`set_default`]: FirmwareObjectStore::set_default
+    async fn set_default_if_none(&self, id: &str) -> Result<FirmwareObject>;
 
     /// Whether any bundle is currently default for `hw`.
     async fn has_default(&self, hw: &RackHardwareType) -> Result<bool>;

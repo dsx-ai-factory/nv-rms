@@ -18,4 +18,5 @@
 pub mod job_lifecycle;
 pub mod job_tracker;
 pub mod rack_manager;
+pub mod reboot_config;
 pub mod stage_timeline;

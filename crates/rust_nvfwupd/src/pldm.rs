@@ -66,6 +66,14 @@ pub trait FirmwarePkg: Send + Sync {
     /// Print the parsed package contents (formatted JSON for PLDM, summary for Tar).
     fn print_package_content(&self, package_name: &str);
 
+    /// Return whether parsed package content is available to print.
+    ///
+    /// Defaults to `true` for compatibility with custom implementations that
+    /// only implement printing.
+    fn has_printable_package_content(&self, _package_name: &str) -> bool {
+        true
+    }
+
     /// Unpack the package and populate the internal file-to-AP mapping.
     async fn prepare_unpack_file_dict(&mut self, _pkg_name: &str) {}
 
@@ -152,6 +160,9 @@ pub async fn is_tar_file(path: &str) -> bool {
 // ---------------------------------------------------------------------------
 // TarPkg
 // ---------------------------------------------------------------------------
+
+const MAX_TAR_ENTRIES: usize = 1024;
+const MAX_TAR_UNPACKED_BYTES: u64 = 1024 * 1024 * 1024;
 
 fn powershelf_component_type_from_purpose(purpose: &str) -> &'static str {
     let tokens: Vec<&str> = purpose
@@ -299,10 +310,13 @@ impl TarPkg {
             tempfile::tempdir().map_err(|e| format!("Failed to create temp dir: {}", e))?;
         let dir_str = dir_path.path().to_string_lossy().to_string();
 
-        validate_tar_entries(&package_name)?;
-
-        let tar_file =
+        let mut tar_file =
             File::open(&package_name).map_err(|e| format!("Error extracting tar file: {}", e))?;
+        validate_tar_entries_from_reader(&mut tar_file)?;
+        tar_file
+            .seek(SeekFrom::Start(0))
+            .map_err(|e| format!("Error extracting tar file: {}", e))?;
+
         let mut archive = tar::Archive::new(tar_file);
         archive
             .unpack(dir_path.path())
@@ -365,18 +379,47 @@ impl FirmwarePkg for TarPkg {
             }
         }
     }
+
+    fn has_printable_package_content(&self, package_name: &str) -> bool {
+        self.apname_version_dict.contains_key(package_name)
+    }
 }
 
+#[cfg(test)]
 fn validate_tar_entries(package_name: &str) -> Result<(), String> {
     let tar_file =
         File::open(package_name).map_err(|e| format!("Error reading tar file: {}", e))?;
-    let mut archive = tar::Archive::new(tar_file);
+    validate_tar_entries_from_reader(tar_file)
+}
+
+fn validate_tar_entries_from_reader<R: Read>(reader: R) -> Result<(), String> {
+    let mut archive = tar::Archive::new(reader);
     let entries = archive
         .entries()
         .map_err(|e| format!("Error reading tar file: {}", e))?;
 
-    for entry in entries {
+    let mut total_unpacked_bytes = 0u64;
+    for (index, entry) in entries.enumerate() {
+        if index >= MAX_TAR_ENTRIES {
+            return Err(format!(
+                "Security error: tar contains too many entries; maximum is {MAX_TAR_ENTRIES}"
+            ));
+        }
+
         let entry = entry.map_err(|e| format!("Error reading tar file: {}", e))?;
+        let size = entry
+            .header()
+            .size()
+            .map_err(|e| format!("Error reading tar file: {}", e))?;
+        total_unpacked_bytes = total_unpacked_bytes
+            .checked_add(size)
+            .ok_or_else(|| "Security error: tar unpacked size overflow".to_string())?;
+        if total_unpacked_bytes > MAX_TAR_UNPACKED_BYTES {
+            return Err(format!(
+                "Security error: tar unpacked size exceeds limit of {MAX_TAR_UNPACKED_BYTES} bytes"
+            ));
+        }
+
         let entry_type = entry.header().entry_type();
         if entry_type.is_symlink() || entry_type.is_hard_link() {
             return Err(format!(
@@ -922,19 +965,14 @@ impl PldmParsedData {
         out_dir: &str,
     ) -> Result<(), String> {
         let pkg_size = fs::metadata(package_path).map(|m| m.len()).unwrap_or(0);
+        Self::validate_component_image_ranges(images, pkg_size)?;
+
         let out_path = Path::new(out_dir);
         if !out_path.exists() {
             fs::create_dir_all(out_path).map_err(|e| format!("Cannot create dir: {}", e))?;
         }
 
         for (index, img) in images.iter_mut().enumerate() {
-            if (img.location_offset as u64) + (img.size as u64) > pkg_size {
-                return Err(format!(
-                    "Component offset {} + size {} exceeds package size {}",
-                    img.location_offset, img.size, pkg_size
-                ));
-            }
-
             let base_name = Self::get_image_file_name(records, index, &img.version_string);
             if base_name.is_empty() {
                 continue;
@@ -995,6 +1033,58 @@ impl PldmParsedData {
             img.sha256 = Some(sha_hex);
             img.image_size = Some(img.size as u64);
         }
+        Ok(())
+    }
+
+    fn validate_component_image_ranges(
+        images: &[ComponentImageInfo],
+        pkg_size: u64,
+    ) -> Result<(), String> {
+        let mut total_extracted_bytes = 0u64;
+        let mut ranges = Vec::with_capacity(images.len());
+
+        for img in images {
+            let start = u64::from(img.location_offset);
+            let size = u64::from(img.size);
+            let end = start.checked_add(size).ok_or_else(|| {
+                format!(
+                    "Component offset {} + size {} overflows",
+                    img.location_offset, img.size
+                )
+            })?;
+            if end > pkg_size {
+                return Err(format!(
+                    "Component offset {} + size {} exceeds package size {}",
+                    img.location_offset, img.size, pkg_size
+                ));
+            }
+
+            total_extracted_bytes = total_extracted_bytes
+                .checked_add(size)
+                .ok_or_else(|| "Total PLDM extracted component size overflow".to_string())?;
+            if total_extracted_bytes > pkg_size {
+                return Err(format!(
+                    "Total PLDM extracted component size {} exceeds package size {}",
+                    total_extracted_bytes, pkg_size
+                ));
+            }
+
+            if size > 0 {
+                ranges.push((start, end));
+            }
+        }
+
+        ranges.sort_unstable_by_key(|(start, _)| *start);
+        for window in ranges.windows(2) {
+            let (prev_start, prev_end) = window[0];
+            let (next_start, next_end) = window[1];
+            if prev_end > next_start {
+                return Err(format!(
+                    "PLDM component image ranges overlap: {prev_start}..{prev_end} overlaps {next_start}..{next_end}"
+                ));
+            }
+        }
+
         Ok(())
     }
 
@@ -1458,8 +1548,21 @@ impl PLDM {
         self.unpack_file_ap_dict = file_dict;
     }
 
+    fn display_package_content(&self, package_name: &str) -> Option<&Value> {
+        self.m_pldm_dict.get(package_name).or_else(|| {
+            // Combined DGX-HGX packages are parsed through the nested HGX
+            // package, so the printable key can differ from the user-provided
+            // wrapper package path.
+            if self.m_pldm_dict.len() == 1 {
+                self.m_pldm_dict.values().next()
+            } else {
+                None
+            }
+        })
+    }
+
     pub fn print_package(&self, package_name: &str) {
-        if let Some(pkg_data) = self.m_pldm_dict.get(package_name) {
+        if let Some(pkg_data) = self.display_package_content(package_name) {
             let buf = Vec::new();
             let formatter = serde_json::ser::PrettyFormatter::with_indent(b"    ");
             let mut ser = serde_json::Serializer::with_formatter(buf, formatter);
@@ -1593,6 +1696,10 @@ impl FirmwarePkg for PLDM {
         self.print_package(package_name);
     }
 
+    fn has_printable_package_content(&self, package_name: &str) -> bool {
+        self.display_package_content(package_name).is_some()
+    }
+
     async fn prepare_unpack_file_dict(&mut self, pkg_name: &str) {
         self.get_unpack_file_dict(pkg_name).await;
     }
@@ -1643,6 +1750,40 @@ mod tests {
         builder.finish().expect("finish test tar");
     }
 
+    fn write_test_tar_many_entries(tar_path: &Path, count: usize) {
+        let tar_file = File::create(tar_path).expect("create test tar");
+        let mut builder = tar::Builder::new(tar_file);
+        for index in 0..count {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(0);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(
+                    &mut header,
+                    format!("entry-{index}"),
+                    Cursor::new(Vec::<u8>::new()),
+                )
+                .expect("append tar entry");
+        }
+        builder.finish().expect("finish test tar");
+    }
+
+    fn write_test_tar_declared_size(tar_path: &Path, size: u64) {
+        let mut tar_file = File::create(tar_path).expect("create test tar");
+        let mut header = tar::Header::new_gnu();
+        header.set_path("large.bin").expect("set tar path");
+        header.set_size(size);
+        header.set_mode(0o644);
+        header.set_cksum();
+        tar_file
+            .write_all(header.as_bytes())
+            .expect("write tar header");
+        tar_file
+            .write_all(&[0u8; 1024])
+            .expect("write tar terminator");
+    }
+
     fn rewrite_first_tar_entry_name(tar_path: &Path, entry_path: &[u8]) {
         let mut tar_file = fs::OpenOptions::new()
             .read(true)
@@ -1677,6 +1818,34 @@ mod tests {
         let pldm = PLDM::new();
         assert!(pldm.m_pldm_dict.is_empty());
         assert!(pldm.apname_version_dict.is_empty());
+    }
+
+    #[test]
+    fn test_pldm_display_content_falls_back_to_single_parsed_package() {
+        let mut pldm = PLDM::new();
+        let nested_content = json!({
+            "PackageHeaderInformation": {
+                "PackageVersionString": "HGX-B300x8"
+            }
+        });
+        pldm.m_pldm_dict
+            .insert("nested-hgx.fwpkg".to_string(), nested_content.clone());
+
+        assert_eq!(
+            pldm.display_package_content("wrapper-dgx-hgx.fwpkg"),
+            Some(&nested_content)
+        );
+    }
+
+    #[test]
+    fn test_pldm_display_content_does_not_guess_when_multiple_packages_exist() {
+        let mut pldm = PLDM::new();
+        pldm.m_pldm_dict
+            .insert("first.fwpkg".to_string(), json!({"Package": "first"}));
+        pldm.m_pldm_dict
+            .insert("second.fwpkg".to_string(), json!({"Package": "second"}));
+
+        assert!(pldm.display_package_content("missing.fwpkg").is_none());
     }
 
     #[tokio::test]
@@ -1719,6 +1888,31 @@ mod tests {
         assert!(Path::new(&unpacked_path).exists());
         tar.remove_files().await;
         assert!(!Path::new(&unpacked_path).exists());
+    }
+
+    #[test]
+    fn test_tarpkg_validates_and_extracts_same_file_handle() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let tar_path = temp.path().join("firmware.tar");
+        let manifest = b"purpose=PSU\nversion=1.2.3\nmodel=LiteOn\n";
+        write_test_tar(&tar_path, "MANIFEST", manifest);
+
+        let mut tar_file = File::open(&tar_path).expect("open test tar");
+        validate_tar_entries_from_reader(&mut tar_file).expect("validate tar entries");
+        tar_file
+            .seek(SeekFrom::Start(0))
+            .expect("rewind validated tar");
+
+        let out_dir = temp.path().join("out");
+        fs::create_dir(&out_dir).expect("create output dir");
+        tar::Archive::new(tar_file)
+            .unpack(&out_dir)
+            .expect("extract validated tar");
+
+        assert_eq!(
+            fs::read(out_dir.join("MANIFEST")).expect("read extracted manifest"),
+            manifest
+        );
     }
 
     #[test]
@@ -1819,6 +2013,28 @@ mod tests {
         assert!(!ok);
         assert!(err.contains("link entry"), "{err}");
         assert!(tar.untar_file_path.is_empty());
+    }
+
+    #[test]
+    fn test_tarpkg_rejects_too_many_entries() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let tar_path = temp.path().join("too-many.tar");
+        write_test_tar_many_entries(&tar_path, MAX_TAR_ENTRIES + 1);
+
+        let err = validate_tar_entries(&tar_path.to_string_lossy()).unwrap_err();
+
+        assert!(err.contains("too many entries"), "{err}");
+    }
+
+    #[test]
+    fn test_tarpkg_rejects_excessive_unpacked_size() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let tar_path = temp.path().join("too-large.tar");
+        write_test_tar_declared_size(&tar_path, MAX_TAR_UNPACKED_BYTES + 1);
+
+        let err = validate_tar_entries(&tar_path.to_string_lossy()).unwrap_err();
+
+        assert!(err.contains("unpacked size exceeds"), "{err}");
     }
 
     #[test]
@@ -1966,6 +2182,18 @@ mod tests {
         count.to_le_bytes().to_vec()
     }
 
+    fn component_image_info(location_offset: u32, size: u32) -> ComponentImageInfo {
+        ComponentImageInfo {
+            identifier: 0,
+            location_offset,
+            size,
+            version_string: "1.0".to_string(),
+            fw_image_name: None,
+            sha256: None,
+            image_size: None,
+        }
+    }
+
     #[test]
     fn vendor_descriptor_rejects_length_shorter_than_title_metadata() {
         let bytes = device_record_with_vendor_descriptor(0, &[]);
@@ -2062,6 +2290,54 @@ mod tests {
         assert_eq!(images.len(), 1);
         assert_eq!(images[0].identifier, 0x1234);
         assert_eq!(images[0].version_string, "1.0");
+    }
+
+    #[test]
+    fn component_image_ranges_reject_overlapping_regions() {
+        let images = vec![component_image_info(0, 40), component_image_info(20, 30)];
+
+        let err = PldmParsedData::validate_component_image_ranges(&images, 100).unwrap_err();
+
+        assert!(err.contains("overlap"), "{err}");
+    }
+
+    #[test]
+    fn component_image_ranges_reject_extraction_amplification() {
+        let images = vec![component_image_info(0, 80), component_image_info(20, 80)];
+
+        let err = PldmParsedData::validate_component_image_ranges(&images, 100).unwrap_err();
+
+        assert!(err.contains("Total PLDM extracted component size"), "{err}");
+    }
+
+    #[test]
+    fn component_image_ranges_allow_adjacent_regions() {
+        let images = vec![component_image_info(0, 40), component_image_info(40, 30)];
+
+        PldmParsedData::validate_component_image_ranges(&images, 100)
+            .expect("adjacent ranges should be valid");
+    }
+
+    #[test]
+    fn extract_files_rejects_bad_ranges_before_creating_output_dir() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let package_path = temp.path().join("package.fwpkg");
+        fs::write(&package_path, vec![0u8; 100]).expect("write package");
+        let out_dir = temp.path().join("out");
+        let mut package_file = File::open(&package_path).expect("open package");
+        let mut images = vec![component_image_info(0, 40), component_image_info(20, 30)];
+
+        let err = PldmParsedData::extract_files(
+            &mut package_file,
+            &mut images,
+            &[],
+            &package_path.to_string_lossy(),
+            &out_dir.to_string_lossy(),
+        )
+        .unwrap_err();
+
+        assert!(err.contains("overlap"), "{err}");
+        assert!(!out_dir.exists());
     }
 
     fn device_record_for_image_name(name: &str) -> DeviceIdRecord {

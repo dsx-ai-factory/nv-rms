@@ -174,8 +174,9 @@ impl SshClient {
     /// # Errors
     ///
     /// Returns `Timeout` if connection or authentication exceeds `timeout`,
-    /// `ConnectionRefused` if the SSH connection cannot be opened, or
-    /// `InvalidArgument` if authentication fails.
+    /// `ConnectionRefused` if the SSH connection cannot be opened,
+    /// `Unauthenticated` if credentials are rejected, or `InvalidArgument` if
+    /// the authentication exchange fails.
     pub async fn connect(endpoint: SshEndpoint, timeout: Duration) -> Result<Self> {
         let SshEndpoint {
             host,
@@ -278,11 +279,7 @@ impl SshClient {
                     "SSH auth rejected credentials"
                 );
 
-                Err(SshError::AuthFailed {
-                    host,
-                    details: "authentication failed".to_owned(),
-                }
-                .into())
+                Err(SshError::AuthRejected { host }.into())
             }
         }
     }

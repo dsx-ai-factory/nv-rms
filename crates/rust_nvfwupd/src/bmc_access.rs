@@ -36,12 +36,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
-use reqwest::Client;
+use reqwest::{Client, Url};
 use serde::Serialize;
 use serde_json::{json, Value};
 use tokio_util::io::ReaderStream;
 
 use crate::expected_inventory;
+use crate::nvos_image;
 use crate::ssh_options::{
     self, SSH_HOST_KEY_MODE_ARG, SSH_HOST_KEY_MODE_DISABLED, SSH_HOST_KEY_MODE_STRICT,
     SSH_HOST_KEY_MODE_TOFU, SSH_KNOWN_HOSTS_ARG,
@@ -58,6 +59,7 @@ use crate::utils::Util as NvUtils;
 const DEFAULT_TIMEOUT_SECS: u64 = 900;
 const VERIFY_TLS_ARG: &str = "verify_tls";
 const BMC_CA_CERT_ARG: &str = "bmc_ca_cert";
+const ALLOW_HTTP_ARG: &str = "allow_http";
 
 /// Timeout for reachability probes (seconds).
 const REACHABILITY_TIMEOUT_SECS: u64 = 120;
@@ -178,9 +180,8 @@ fn tls_certificate_verification_message_for_detail(url: &str, detail: &str) -> O
 
     Some(format!(
         "Connection Error: TLS certificate verification failed while connecting to {}. \
-         Certificate validation is disabled by default; pass verify_tls=true to use built-in \
-         public roots plus the host trust store, or pass bmc_ca_cert=/path/to/ca.pem to trust a \
-         per-command CA. \
+         Certificate validation is enabled for this connection; check target certificate trust \
+         configuration. \
          Details: {}",
         NvUtils::sanitize_log(url),
         NvUtils::sanitize_log(detail)
@@ -249,6 +250,8 @@ pub struct BmcAccess {
     pub base_url: String,
     /// Transport scheme, either "https" or "http".
     pub transport_type: String,
+    /// Whether cleartext HTTP fallback is allowed after HTTPS reachability fails.
+    pub allow_http: bool,
     /// Which access strategy is in use.
     pub access_type: AccessType,
     /// Optional known_hosts file for SSH/SFTP host-key verification.
@@ -272,6 +275,7 @@ impl fmt::Debug for BmcAccess {
             .field("servertype", &self.servertype)
             .field("base_url", &self.base_url)
             .field("transport_type", &self.transport_type)
+            .field("allow_http", &self.allow_http)
             .field("access_type", &self.access_type)
             .field("ssh_known_hosts", &self.ssh_known_hosts)
             .field("ssh_host_key_mode", &self.ssh_host_key_mode)
@@ -315,9 +319,9 @@ fn switch_ssh_upload_has_retry_budget(
     elapsed: Duration,
     retry_interval: Duration,
     retry_window: Duration,
+    attempt_timeout_secs: u64,
 ) -> bool {
-    let next_attempt_budget =
-        retry_interval + Duration::from_secs(SWITCH_SSH_UPLOAD_ATTEMPT_TIMEOUT_SECS);
+    let next_attempt_budget = retry_interval + Duration::from_secs(attempt_timeout_secs);
     elapsed + next_attempt_budget <= retry_window
 }
 
@@ -359,7 +363,103 @@ fn switch_remote_upload_path(remote_dir: &str, remote_filename: &str) -> Result<
     Ok(format!("{normalized_remote_dir}/{remote_filename}"))
 }
 
+fn switch_remote_cleanup_path(remote_path: &str) -> Result<&str, String> {
+    let remote_path = remote_path.trim();
+    if remote_path.is_empty()
+        || remote_path == "/"
+        || !remote_path.starts_with('/')
+        || remote_path.ends_with('/')
+        || remote_path.contains("//")
+        || remote_path.chars().any(char::is_control)
+    {
+        return Err("refusing to remove an unsafe remote path".to_string());
+    }
+
+    if remote_path
+        .split('/')
+        .any(|segment| segment == "." || segment == ".." || segment.contains('\\'))
+    {
+        return Err("refusing to remove an unsafe remote path".to_string());
+    }
+
+    Ok(remote_path)
+}
+
 impl BmcAccess {
+    fn same_url_origin(left: &Url, right: &Url) -> bool {
+        left.scheme() == right.scheme()
+            && left.host_str() == right.host_str()
+            && left.port_or_known_default() == right.port_or_known_default()
+    }
+
+    /// Resolve a Redfish/NVUE request URI against the selected target origin.
+    ///
+    /// Wrapper request methods attach BMC credentials after URL construction, so
+    /// device/config supplied links must remain on the same scheme, host, and
+    /// port as `base_url`. Relative Redfish paths and same-origin absolute URLs
+    /// are accepted; authority-like, off-origin, userinfo-bearing, and
+    /// control-character-containing values are rejected.
+    fn same_origin_request_url(&self, uri: &str, label: &str) -> Result<String, String> {
+        let uri = uri.trim();
+        if uri.is_empty() || uri.starts_with("//") || uri.chars().any(char::is_control) {
+            return Err(format!(
+                "{label} is not a safe same-origin URI: {}",
+                NvUtils::sanitize_log(uri)
+            ));
+        }
+
+        let base = Url::parse(&self.base_url).map_err(|e| {
+            format!(
+                "Invalid BMC base URL {}: {e}",
+                NvUtils::sanitize_log(&self.base_url)
+            )
+        })?;
+        let resolved = if uri.starts_with("http://") || uri.starts_with("https://") {
+            Url::parse(uri)
+                .map_err(|e| format!("Invalid {label} {}: {e}", NvUtils::sanitize_log(uri)))?
+        } else if uri.starts_with('/') {
+            base.join(uri)
+                .map_err(|e| format!("Invalid {label} {}: {e}", NvUtils::sanitize_log(uri)))?
+        } else {
+            return Err(format!(
+                "{label} must be a Redfish/NVUE path or same-origin absolute URL: {}",
+                NvUtils::sanitize_log(uri)
+            ));
+        };
+
+        if !Self::same_url_origin(&base, &resolved) {
+            return Err(format!(
+                "{label} must stay on the selected target origin: {}",
+                NvUtils::sanitize_log(uri)
+            ));
+        }
+        if !resolved.username().is_empty() || resolved.password().is_some() {
+            return Err(format!(
+                "{label} must not contain user info: {}",
+                NvUtils::sanitize_log(uri)
+            ));
+        }
+
+        Ok(resolved.to_string())
+    }
+
+    /// Resolve a device/config URI to the path/query form expected by callers
+    /// that still append the result to `base_url` themselves.
+    fn same_origin_request_path(&self, uri: &str, label: &str) -> Result<String, String> {
+        let resolved = Url::parse(&self.same_origin_request_url(uri, label)?).map_err(|e| {
+            format!(
+                "Invalid resolved {label} {}: {e}",
+                NvUtils::sanitize_log(uri.trim())
+            )
+        })?;
+        let mut path = resolved.path().to_string();
+        if let Some(query) = resolved.query() {
+            path.push('?');
+            path.push_str(query);
+        }
+        Ok(path)
+    }
+
     fn clean_redfish_str(value: Option<&str>) -> Option<String> {
         let value = value?.trim();
         if value.is_empty() {
@@ -499,11 +599,16 @@ impl BmcAccess {
     ) -> Result<bool, String> {
         match verify_arg {
             Some(value) => Self::parse_bool_arg(VERIFY_TLS_ARG, value),
-            // TLS verification is wired and ready in NVFWUPD; default enablement
-            // is pending final customer discussions.
             None => Ok(ca_cert_path
                 .map(str::trim)
                 .is_some_and(|path| !path.is_empty())),
+        }
+    }
+
+    fn should_allow_http_fallback(allow_arg: Option<&str>) -> Result<bool, String> {
+        match allow_arg {
+            Some(value) => Self::parse_bool_arg(ALLOW_HTTP_ARG, value),
+            None => Ok(false),
         }
     }
 
@@ -554,11 +659,12 @@ impl BmcAccess {
             .map_err(|e| format!("Failed to build HTTP client: {e}"))
     }
 
-    /// Build a [`reqwest::Client`] with certificate validation disabled by default.
+    /// Build a [`reqwest::Client`] for BMC/NVUE HTTPS requests.
     ///
-    /// Operators can opt in by passing `verify_tls=true` in the target
-    /// arguments. Passing `bmc_ca_cert=/path/to/ca.pem` also enables validation
-    /// and adds that PEM CA as a trusted root.
+    /// TLS certificate verification and SSH host-key verification are
+    /// implemented and ready for NVFWUPD, but default CLI enablement is pending
+    /// customer discussions. Passing a CA certificate or explicitly enabling
+    /// verification keeps the opt-in path available.
     fn build_client(
         timeout_secs: u64,
         arg_dict: &HashMap<String, String>,
@@ -591,6 +697,8 @@ impl BmcAccess {
     fn new_login(arg_dict: &HashMap<String, String>) -> Result<Self, String> {
         let client = Self::build_client(DEFAULT_TIMEOUT_SECS, arg_dict)?;
         let ssh_host_key_options = ssh_options::parse_ssh_options(arg_dict)?;
+        let allow_http =
+            Self::should_allow_http_fallback(arg_dict.get(ALLOW_HTTP_ARG).map(String::as_str))?;
         let mut ip = arg_dict.get("ip").cloned().unwrap_or_default();
 
         // IPv6 addresses require brackets.
@@ -612,6 +720,7 @@ impl BmcAccess {
             servertype: arg_dict.get("servertype").cloned().unwrap_or_default(),
             base_url,
             transport_type,
+            allow_http,
             access_type: AccessType::Login,
             ssh_known_hosts: ssh_host_key_options.known_hosts,
             ssh_host_key_mode: ssh_host_key_options.mode,
@@ -637,6 +746,8 @@ impl BmcAccess {
     fn new_nvswitch(arg_dict: &HashMap<String, String>) -> Result<Self, String> {
         let client = Self::build_client(1200, arg_dict)?;
         let ssh_host_key_options = ssh_options::parse_ssh_options(arg_dict)?;
+        let allow_http =
+            Self::should_allow_http_fallback(arg_dict.get(ALLOW_HTTP_ARG).map(String::as_str))?;
         let mut ip = arg_dict.get("ip").cloned().unwrap_or_default();
 
         if ip.contains(':') && !ip.starts_with('[') {
@@ -661,6 +772,7 @@ impl BmcAccess {
             servertype: arg_dict.get("servertype").cloned().unwrap_or_default(),
             base_url,
             transport_type: "https".to_string(),
+            allow_http,
             access_type: AccessType::NVSwitch,
             ssh_known_hosts: ssh_host_key_options.known_hosts,
             ssh_host_key_mode: ssh_host_key_options.mode,
@@ -852,6 +964,9 @@ impl BmcAccess {
                         connection_failure_message = Some(message);
                         break;
                     }
+                    if !message.is_empty() && connection_failure_message.is_none() {
+                        connection_failure_message = Some(message);
+                    }
                     continue;
                 }
 
@@ -982,10 +1097,9 @@ impl BmcAccess {
 
     /// Redfish reachability check (Login / PortForward).
     ///
-    /// On HTTPS failure, falls back to HTTP.  When the HTTP probe succeeds
-    /// the transport type is **persisted** via [`update_transport_type`] so
-    /// that all subsequent requests use `http://` — matching the Python
-    /// `BMCLoginAccess.is_reachable` behaviour.
+    /// On HTTPS failure, fails closed by default. If `allow_http=true` was
+    /// explicitly supplied, falls back to HTTP and persists that transport via
+    /// [`update_transport_type`] so subsequent requests use `http://`.
     async fn is_reachable_redfish_async(&mut self, trace: TraceFlags) -> (bool, String) {
         let url = format!("{}/redfish/v1/Chassis", self.base_url);
         let result = self
@@ -999,17 +1113,46 @@ impl BmcAccess {
 
         match result {
             Ok(resp) if resp.status().is_success() => (true, String::new()),
-            https_result => {
-                let https_failure_message = match &https_result {
-                    Err(e) => tls_certificate_verification_message_for_detail(
-                        &url,
-                        &error_chain_message(e),
-                    ),
-                    _ => None,
-                };
+            Ok(resp) => {
+                let status = resp.status();
+                tracing::debug!(
+                    cli_verbose = trace.cli_verbose,
+                    json_mode = trace.json_mode,
+                    "HTTPS reachability returned non-success status: {status}"
+                );
+                (
+                    false,
+                    format!("Failed to connect to the system via HTTPS ({status})"),
+                )
+            }
+            Err(e) => {
+                let https_failure_message =
+                    tls_certificate_verification_message_for_detail(&url, &error_chain_message(&e));
                 if let Some(message) = https_failure_message {
                     return (false, message);
                 }
+
+                if !self.allow_http {
+                    tracing::debug!(
+                        cli_verbose = trace.cli_verbose,
+                        json_mode = trace.json_mode,
+                        "Failed to connect to the system via HTTPS; HTTP fallback is disabled"
+                    );
+                    return (
+                        false,
+                        format!(
+                            "Failed to connect to the system via HTTPS. Cleartext HTTP fallback \
+                             is disabled by default; pass {ALLOW_HTTP_ARG}=true only for trusted \
+                             HTTP-only targets or port-forwarding cases."
+                        ),
+                    );
+                }
+
+                tracing::warn!(
+                    cli_verbose = trace.cli_verbose,
+                    json_mode = trace.json_mode,
+                    "Cleartext HTTP fallback is enabled for Redfish reachability"
+                );
 
                 // Try HTTP fallback.
                 let http_url = url.replacen("https://", "http://", 1);
@@ -1497,8 +1640,16 @@ impl BmcAccess {
         suppress_err: bool,
         json_prints: Option<&mut Value>,
     ) -> (bool, Value) {
-        let full_url = format!("{}{}", self.base_url, url);
         let empty = Value::Object(serde_json::Map::new());
+        let full_url = match self.same_origin_request_url(url, "Redfish request URI") {
+            Ok(full_url) => full_url,
+            Err(message) => {
+                if !suppress_err {
+                    Util::bail_nvfwupd(1, &message, BailAction::DoNothing, json_prints.as_deref());
+                }
+                return (false, json!({ "error": message }));
+            }
+        };
 
         match method {
             "GET" => {
@@ -1994,6 +2145,17 @@ impl BmcAccess {
         extra_headers: Option<&HashMap<String, String>>,
     ) -> (bool, Value) {
         let empty = Value::Object(serde_json::Map::new());
+        let full_url = match self.same_origin_request_url(url, "HTTP push update URI") {
+            Ok(full_url) => full_url,
+            Err(message) => {
+                tracing::warn!(
+                    parallel_update,
+                    json_mode = json_output.is_some(),
+                    "{message}"
+                );
+                return (false, json!({ "error": message }));
+            }
+        };
 
         let file = match tokio::fs::File::open(input_data).await {
             Ok(file) => file,
@@ -2041,7 +2203,7 @@ impl BmcAccess {
 
         let mut req = self
             .client
-            .post(&format!("{}{}", self.base_url, url))
+            .post(&full_url)
             .basic_auth(&self.user, Some(&self.password))
             .header("Content-Type", "application/octet-stream")
             .header("Expect", "100-continue")
@@ -2255,6 +2417,18 @@ impl BmcAccess {
     ) -> (bool, Value) {
         let empty = Value::Null;
 
+        let full_url = match self.same_origin_request_url(url, "multipart update URI") {
+            Ok(full_url) => full_url,
+            Err(message) => {
+                Self::report_multipart_preflight_failure(
+                    &message,
+                    options.bail_on_failure,
+                    parallel_update,
+                );
+                return (false, empty);
+            }
+        };
+
         let pkg_reader = match tokio::fs::File::open(pkg_file).await {
             Ok(file) => file,
             Err(e) => {
@@ -2345,7 +2519,6 @@ impl BmcAccess {
             );
         }
 
-        let full_url = format!("{}{}", self.base_url, url);
         let result = self
             .client
             .post(&full_url)
@@ -2536,6 +2709,18 @@ impl BmcAccess {
             }
         }
 
+        if status {
+            let image_url = format!("{}{}", self.base_url, nvos_image::SYSTEM_IMAGE_URI);
+            let (image_status, image_response) =
+                self.dispatch_get_async(trace, &image_url, true).await;
+            if image_status {
+                if let Some(entry) = nvos_image::inventory_entry_from_system_image(&image_response)
+                {
+                    inv_dict.insert(nvos_image::NVOS_AP_NAME.to_string(), entry);
+                }
+            }
+        }
+
         (status, 0, inv_dict)
     }
 
@@ -2580,7 +2765,15 @@ impl BmcAccess {
         }
 
         for inv_url in &members {
-            let full_url = format!("{}{}", self.base_url, inv_url);
+            let full_url =
+                match self.same_origin_request_url(inv_url, "FirmwareInventory member URI") {
+                    Ok(full_url) => full_url,
+                    Err(message) => {
+                        inv_error = 1;
+                        tracing::warn!("{message}");
+                        continue;
+                    }
+                };
             let (ok, fd_dict) = self.dispatch_get_async(trace, &full_url, true).await;
             if ok {
                 inv_dict.insert(inv_url.clone(), fd_dict);
@@ -2703,7 +2896,14 @@ impl BmcAccess {
         let members = self.get_resource_members(trace, &sw_inv_url).await;
         let mut inv_dict = serde_json::Map::new();
         for inv_url in &members {
-            let full_url = format!("{}{}", self.base_url, inv_url);
+            let full_url =
+                match self.same_origin_request_url(inv_url, "SoftwareInventory member URI") {
+                    Ok(full_url) => full_url,
+                    Err(message) => {
+                        tracing::warn!("{message}");
+                        continue;
+                    }
+                };
             let (ok, fd_dict) = self.dispatch_get_async(trace, &full_url, true).await;
             if ok {
                 inv_dict.insert(inv_url.clone(), fd_dict);
@@ -2743,7 +2943,16 @@ impl BmcAccess {
             .map(|members| {
                 members
                     .iter()
-                    .filter_map(|m| m.get("@odata.id").and_then(Value::as_str).map(String::from))
+                    .filter_map(|m| {
+                        let uri = m.get("@odata.id").and_then(Value::as_str)?;
+                        match self.same_origin_request_path(uri, "Redfish collection member URI") {
+                            Ok(path) => Some(path),
+                            Err(message) => {
+                                tracing::warn!("{message}");
+                                None
+                            }
+                        }
+                    })
                     .collect()
             })
             .unwrap_or_default();
@@ -2794,7 +3003,14 @@ impl BmcAccess {
 
         for member in members {
             if let Some(device_uri) = member.get("@odata.id").and_then(Value::as_str) {
-                let full_url = format!("{}{}", self.base_url, device_uri);
+                let full_url =
+                    match self.same_origin_request_url(device_uri, "LiteOn PowerUnit member URI") {
+                        Ok(full_url) => full_url,
+                        Err(message) => {
+                            tracing::warn!("{message}");
+                            continue;
+                        }
+                    };
                 let (ok, device_resp) = self.dispatch_get_async(trace, &full_url, true).await;
                 if ok {
                     if let Some(version) = device_resp.get("Version").and_then(Value::as_str) {
@@ -2835,7 +3051,14 @@ impl BmcAccess {
         time_out: u64,
         print_json: Option<&mut Value>,
     ) -> (bool, Value) {
-        let transport_url = format!("{}{}", self.base_url, url);
+        let empty = Value::Object(serde_json::Map::new());
+        let transport_url = match self.same_origin_request_url(url, "NVUE REST request URI") {
+            Ok(transport_url) => transport_url,
+            Err(message) => {
+                Util::bail_nvfwupd(1, &message, BailAction::DoNothing, print_json.as_deref());
+                return (false, empty);
+            }
+        };
         self.dispatch_get_with_timeout_async(trace, &transport_url, time_out, false)
             .await
     }
@@ -2863,8 +3086,14 @@ impl BmcAccess {
         time_out: u64,
         print_json: Option<&mut Value>,
     ) -> (bool, Value, String) {
-        let transport_url = format!("{}{}", self.base_url, url);
         let empty = Value::Object(serde_json::Map::new());
+        let transport_url = match self.same_origin_request_url(url, "NVUE REST request URI") {
+            Ok(transport_url) => transport_url,
+            Err(message) => {
+                Util::bail_nvfwupd(1, &message, BailAction::DoNothing, print_json.as_deref());
+                return (false, empty, String::new());
+            }
+        };
 
         let result = self
             .client
@@ -3040,6 +3269,25 @@ impl BmcAccess {
         remote_filename: &str,
         print_json: bool,
     ) -> std::result::Result<String, String> {
+        self.scp_upload_async_result_with_timeout(
+            local_path,
+            remote_dir,
+            remote_filename,
+            print_json,
+            SWITCH_SSH_UPLOAD_TIMEOUT_SECS,
+        )
+        .await
+    }
+
+    /// Async SFTP upload helper that allows callers to use a larger upload timeout.
+    pub(crate) async fn scp_upload_async_result_with_timeout(
+        &self,
+        local_path: &str,
+        remote_dir: &str,
+        remote_filename: &str,
+        print_json: bool,
+        upload_timeout_secs: u64,
+    ) -> std::result::Result<String, String> {
         let ip_clean = self.ip.replace('[', "").replace(']', "");
         let remote_dir = remote_dir.trim();
         let remote_path = switch_remote_upload_path(remote_dir, remote_filename)?;
@@ -3049,7 +3297,9 @@ impl BmcAccess {
         ];
         let local_path_buf = Path::new(local_path).to_path_buf();
         let started = Instant::now();
-        let retry_window = Duration::from_secs(SWITCH_SSH_UPLOAD_RETRY_WINDOW_SECS);
+        let attempt_timeout_secs = SWITCH_SSH_CONNECT_TIMEOUT_SECS + upload_timeout_secs;
+        let retry_window =
+            Duration::from_secs((2 * attempt_timeout_secs) + SWITCH_SSH_UPLOAD_RETRY_INTERVAL_SECS);
         let retry_interval = Duration::from_secs(SWITCH_SSH_UPLOAD_RETRY_INTERVAL_SECS);
         let mut attempt = 0_u32;
 
@@ -3061,7 +3311,7 @@ impl BmcAccess {
                 &self.user,
                 &self.password,
                 SWITCH_SSH_CONNECT_TIMEOUT_SECS,
-                SWITCH_SSH_UPLOAD_TIMEOUT_SECS,
+                upload_timeout_secs,
                 &setup_commands,
                 local_path_buf.clone(),
                 remote_path.clone(),
@@ -3083,6 +3333,7 @@ impl BmcAccess {
                             elapsed,
                             retry_interval,
                             retry_window,
+                            attempt_timeout_secs,
                         )
                     {
                         let msg = format!(
@@ -3111,6 +3362,38 @@ impl BmcAccess {
             }
         }
     }
+
+    /// Remove a single switch-side file that was previously staged for upload.
+    pub(crate) async fn scp_remove_remote_file_async_result(
+        &self,
+        remote_path: &str,
+    ) -> std::result::Result<(), String> {
+        let remote_path = switch_remote_cleanup_path(remote_path)?;
+        let ip_clean = self.ip.replace('[', "").replace(']', "");
+        let command = format!("rm -f {}", switch_shell_quote(remote_path));
+        let output = ssh_transport::execute_command_async(
+            &ip_clean,
+            22,
+            &self.user,
+            &self.password,
+            SWITCH_SSH_CONNECT_TIMEOUT_SECS,
+            &command,
+            None,
+            self.ssh_host_key_policy(),
+        )
+        .await
+        .map_err(|e| NvUtils::sanitize_log(&format!("SSH cleanup command failed: {e}")))?;
+
+        if output.success {
+            Ok(())
+        } else {
+            Err(NvUtils::sanitize_log(&format!(
+                "SSH cleanup command failed: stdout='{}', stderr='{}'",
+                output.stdout.trim(),
+                output.stderr.trim()
+            )))
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3132,6 +3415,7 @@ impl BmcAccess {
             servertype: String::new(),
             base_url: "https://127.0.0.1".into(),
             transport_type: "https".into(),
+            allow_http: false,
             access_type: AccessType::Login,
             ssh_known_hosts: None,
             ssh_host_key_mode: SSH_HOST_KEY_MODE_TOFU.to_string(),
@@ -3164,6 +3448,7 @@ impl BmcAccess {
             servertype: String::new(),
             base_url: base_url.into(),
             transport_type: "http".into(),
+            allow_http: false,
             access_type,
             ssh_known_hosts: None,
             ssh_host_key_mode: SSH_HOST_KEY_MODE_TOFU.to_string(),
@@ -3239,6 +3524,57 @@ mod tests {
     }
 
     #[test]
+    fn same_origin_request_url_accepts_paths_and_same_origin_absolute_urls() {
+        let access = BmcAccess::mock_with_base_url("https://10.0.0.1:8443", "mock");
+
+        assert_eq!(
+            access
+                .same_origin_request_url("/redfish/v1/Systems/0", "test URI")
+                .unwrap(),
+            "https://10.0.0.1:8443/redfish/v1/Systems/0"
+        );
+        assert_eq!(
+            access
+                .same_origin_request_url(
+                    "https://10.0.0.1:8443/redfish/v1/Systems/0?expand=1",
+                    "test URI",
+                )
+                .unwrap(),
+            "https://10.0.0.1:8443/redfish/v1/Systems/0?expand=1"
+        );
+        assert_eq!(
+            access
+                .same_origin_request_path(
+                    "https://10.0.0.1:8443/redfish/v1/Systems/0?expand=1",
+                    "test URI",
+                )
+                .unwrap(),
+            "/redfish/v1/Systems/0?expand=1"
+        );
+    }
+
+    #[test]
+    fn same_origin_request_url_rejects_unsafe_or_off_origin_urls() {
+        let access = BmcAccess::mock_with_base_url("https://10.0.0.1", "mock");
+
+        for uri in [
+            "",
+            "redfish/v1/Systems/0",
+            "https://attacker.example/redfish/v1/Systems/0",
+            "http://10.0.0.1/redfish/v1/Systems/0",
+            "https://user:pass@10.0.0.1/redfish/v1/Systems/0",
+            "//attacker.example/redfish/v1/Systems/0",
+            "/redfish/v1/Systems/0\nX-Test: yes",
+            "/redfish/v1/Systems/0\u{7}",
+        ] {
+            let err = access
+                .same_origin_request_url(uri, "test URI")
+                .expect_err("unsafe or off-origin URI should be rejected");
+            assert!(err.contains("test URI"), "unexpected error: {err}");
+        }
+    }
+
+    #[test]
     fn bmc_tls_verification_defaults_to_disabled_mode() {
         assert!(!BmcAccess::should_verify_bmc_tls(None, None).unwrap());
         assert!(BmcAccess::build_client_from_tls_options(1, None, None).is_ok());
@@ -3263,7 +3599,94 @@ mod tests {
     }
 
     #[test]
-    fn bmc_ca_cert_path_enables_verification_when_verify_arg_is_unset() {
+    fn bmc_http_fallback_defaults_to_disabled() {
+        assert!(!BmcAccess::should_allow_http_fallback(None).unwrap());
+        assert!(BmcAccess::should_allow_http_fallback(Some("true")).unwrap());
+        assert!(!BmcAccess::should_allow_http_fallback(Some("off")).unwrap());
+
+        let err = BmcAccess::should_allow_http_fallback(Some("maybe")).unwrap_err();
+        assert!(err.contains(ALLOW_HTTP_ARG));
+        assert!(err.contains("true/false"));
+    }
+
+    #[tokio::test]
+    async fn redfish_reachability_does_not_fallback_to_http_by_default() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/redfish/v1/Chassis"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .mount(&server)
+            .await;
+
+        let port = server.address().port();
+        let mut access =
+            BmcAccess::mock_with_base_url(format!("https://127.0.0.1:{port}"), "127.0.0.1");
+        access.port = port.to_string();
+        access.transport_type = "https".to_string();
+
+        let (reachable, message) = access
+            .is_reachable_redfish_async(TraceFlags::default())
+            .await;
+
+        assert!(!reachable);
+        assert!(message.contains("HTTP fallback is disabled"));
+        assert!(message.contains("allow_http=true"));
+        assert_eq!(access.transport_type, "https");
+        assert_eq!(access.base_url, format!("https://127.0.0.1:{port}"));
+    }
+
+    #[tokio::test]
+    async fn redfish_reachability_fallbacks_to_http_when_explicitly_allowed() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/redfish/v1/Chassis"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .mount(&server)
+            .await;
+
+        let port = server.address().port();
+        let mut access =
+            BmcAccess::mock_with_base_url(format!("https://127.0.0.1:{port}"), "127.0.0.1");
+        access.port = port.to_string();
+        access.transport_type = "https".to_string();
+        access.allow_http = true;
+
+        let (reachable, message) = access
+            .is_reachable_redfish_async(TraceFlags::default())
+            .await;
+
+        assert!(reachable, "{message}");
+        assert_eq!(message, "");
+        assert_eq!(access.transport_type, "http");
+        assert_eq!(access.base_url, format!("http://127.0.0.1:{port}"));
+    }
+
+    #[tokio::test]
+    async fn redfish_reachability_does_not_fallback_on_https_status_failure() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/redfish/v1/Chassis"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(json!({})))
+            .mount(&server)
+            .await;
+
+        let mut access = BmcAccess::mock_with_base_url(server.uri(), "127.0.0.1");
+        access.transport_type = "https".to_string();
+        access.allow_http = true;
+
+        let (reachable, message) = access
+            .is_reachable_redfish_async(TraceFlags::default())
+            .await;
+
+        assert!(!reachable);
+        assert!(message.contains("Failed to connect to the system via HTTPS (401"));
+        assert!(!message.contains("HTTP fallback is disabled"));
+        assert_eq!(access.transport_type, "https");
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn bmc_ca_cert_path_keeps_verification_enabled_when_verify_arg_is_unset() {
         assert!(BmcAccess::should_verify_bmc_tls(None, Some("/tmp/bmc-ca.pem")).unwrap());
         assert!(!BmcAccess::should_verify_bmc_tls(None, Some("   ")).unwrap());
     }
@@ -3393,8 +3816,9 @@ mod tests {
         .expect("certificate detail should be classified");
 
         assert!(message.contains("TLS certificate verification failed"));
-        assert!(message.contains("bmc_ca_cert=/path/to/ca.pem"));
-        assert!(message.contains("verify_tls=true"));
+        assert!(message.contains("Certificate validation is enabled for this connection"));
+        assert!(!message.contains("bmc_ca_cert=/path/to/ca.pem"));
+        assert!(!message.contains("verify_tls=false"));
         assert!(message.contains("UnknownIssuer"));
     }
 
@@ -3424,17 +3848,20 @@ mod tests {
         assert!(switch_ssh_upload_has_retry_budget(
             Duration::ZERO,
             retry_interval,
-            retry_window
+            retry_window,
+            SWITCH_SSH_UPLOAD_ATTEMPT_TIMEOUT_SECS
         ));
         assert!(switch_ssh_upload_has_retry_budget(
             last_valid_elapsed,
             retry_interval,
-            retry_window
+            retry_window,
+            SWITCH_SSH_UPLOAD_ATTEMPT_TIMEOUT_SECS
         ));
         assert!(!switch_ssh_upload_has_retry_budget(
             last_valid_elapsed + Duration::from_secs(1),
             retry_interval,
-            retry_window
+            retry_window,
+            SWITCH_SSH_UPLOAD_ATTEMPT_TIMEOUT_SECS
         ));
     }
 
@@ -3525,6 +3952,32 @@ mod tests {
             .any(|call| call.command.contains("/*")));
     }
 
+    #[tokio::test]
+    async fn scp_remove_remote_file_sanitizes_transport_errors() {
+        let mock_host = "mock-switch-cleanup-transport-error";
+        ssh_transport::install_mock_exec_error_for_host(
+            mock_host,
+            "connect failed for ip=10.85.14.105 password=plain_secret",
+        );
+        let access = BmcAccess::mock_with_base_url_and_type(
+            "http://127.0.0.1",
+            mock_host,
+            AccessType::NVSwitch,
+        );
+
+        let err = access
+            .scp_remove_remote_file_async_result("/host/nos-images/nvos.bin")
+            .await
+            .expect_err("cleanup transport errors should be returned");
+
+        assert!(err.contains("SSH cleanup command failed"));
+        assert!(err.contains("ip=XXXX"));
+        assert!(err.contains("password=XXXX"));
+        assert!(!err.contains("10.85.14.105"));
+        assert!(!err.contains("plain_secret"));
+        let _ = ssh_transport::take_mock_snapshot(mock_host);
+    }
+
     #[test]
     fn test_debug_redacts_password() {
         let mut access = BmcAccess::default_stub();
@@ -3548,6 +4001,7 @@ mod tests {
             servertype: String::new(),
             base_url: "https://10.0.0.1".to_string(),
             transport_type: "https".to_string(),
+            allow_http: false,
             access_type: AccessType::Login,
             ssh_known_hosts: None,
             ssh_host_key_mode: SSH_HOST_KEY_MODE_TOFU.to_string(),
@@ -3572,6 +4026,7 @@ mod tests {
             servertype: String::new(),
             base_url: "https://[::1]".to_string(),
             transport_type: "https".to_string(),
+            allow_http: false,
             access_type: AccessType::Login,
             ssh_known_hosts: None,
             ssh_host_key_mode: SSH_HOST_KEY_MODE_TOFU.to_string(),
@@ -3596,6 +4051,7 @@ mod tests {
             servertype: String::new(),
             base_url: "https://not-an-ip".to_string(),
             transport_type: "https".to_string(),
+            allow_http: false,
             access_type: AccessType::Login,
             ssh_known_hosts: None,
             ssh_host_key_mode: SSH_HOST_KEY_MODE_TOFU.to_string(),
@@ -3714,15 +4170,121 @@ mod tests {
         LAST_TEST_DISPATCH_GET_TIMEOUT_SECS.store(0, Ordering::SeqCst);
         let trace = TraceFlags::default();
         let mut access = BmcAccess::default_stub();
-        access.base_url = "not a valid url".to_string();
+        access.base_url = "http://127.0.0.1:1".to_string();
 
         let _ = access
-            .dispatch_rest_request_get(trace, "", TEST_TIMEOUT_SENTINEL_SECS, None)
+            .dispatch_rest_request_get(trace, "/nvue_v1/platform", TEST_TIMEOUT_SENTINEL_SECS, None)
             .await;
 
         assert_eq!(
             LAST_TEST_DISPATCH_GET_TIMEOUT_SECS.load(Ordering::SeqCst),
             TEST_TIMEOUT_SENTINEL_SECS
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_request_full_rejects_off_origin_before_request() {
+        let access = BmcAccess::mock_with_base_url("http://127.0.0.1:1", "mock");
+
+        let (ok, response) = access
+            .dispatch_request_full(
+                "GET",
+                "https://attacker.example/redfish/v1",
+                None,
+                None,
+                30,
+                true,
+                None,
+            )
+            .await;
+
+        assert!(!ok);
+        assert!(response["error"]
+            .as_str()
+            .unwrap()
+            .contains("must stay on the selected target origin"));
+    }
+
+    #[tokio::test]
+    async fn dispatch_request_full_accepts_same_origin_absolute_url() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/redfish/v1/Systems/0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "Id": "System_0"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let access = BmcAccess::mock_with_base_url(server.uri(), "mock");
+        let uri = format!("{}/redfish/v1/Systems/0", server.uri());
+        let (ok, response) = access
+            .dispatch_request_full("GET", &uri, None, None, 30, true, None)
+            .await;
+
+        assert!(ok);
+        assert_eq!(response["Id"], "System_0");
+    }
+
+    #[tokio::test]
+    async fn file_upload_rejects_off_origin_uri_before_file_read() {
+        let access = BmcAccess::mock_with_base_url("http://127.0.0.1:1", "mock");
+        let missing_package = "/tmp/nvfwupd-missing-fw-image.fwpkg";
+
+        let (ok, response) = access
+            .dispatch_file_upload(
+                "https://attacker.example/upload",
+                missing_package,
+                30,
+                None,
+                false,
+                None,
+            )
+            .await;
+
+        assert!(!ok);
+        assert_eq!(
+            response["error"],
+            "HTTP push update URI must stay on the selected target origin: https://attacker.example/upload"
+        );
+        assert_ne!(response["error"], "Failed to read given file");
+    }
+
+    #[tokio::test]
+    async fn resource_members_are_normalized_and_off_origin_members_skipped() {
+        let server = MockServer::start().await;
+        let same_origin_absolute = format!("{}/redfish/v1/Systems/System_1", server.uri());
+        let same_origin_userinfo = server.uri().replacen("http://", "http://user:pass@", 1);
+        Mock::given(method("GET"))
+            .and(path("/redfish/v1/Systems"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "Members": [
+                    {"@odata.id": "/redfish/v1/Systems/System_0"},
+                    {"@odata.id": same_origin_absolute},
+                    {"@odata.id": "https://attacker.example/redfish/v1/Systems/System_2"},
+                    {"@odata.id": format!("{same_origin_userinfo}/redfish/v1/Systems/System_3")},
+                    {"@odata.id": "/redfish/v1/Systems/System_4\nX-Test: yes"}
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let access = BmcAccess::mock_with_base_url(server.uri(), "mock");
+        let members = access
+            .get_resource_members(
+                TraceFlags::default(),
+                &format!("{}/redfish/v1/Systems", server.uri()),
+            )
+            .await;
+
+        assert_eq!(
+            members,
+            vec![
+                "/redfish/v1/Systems/System_0".to_string(),
+                "/redfish/v1/Systems/System_1".to_string(),
+            ]
         );
     }
 
@@ -3823,6 +4385,44 @@ mod tests {
             multipart_field_position(body, "UpdateParameters")
                 < multipart_field_position(body, "UpdateFile")
         );
+    }
+
+    #[tokio::test]
+    async fn multipart_upload_rejects_off_origin_uri_before_file_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing_package = tmp.path().join("missing.fwpkg");
+        let writer = CapturedWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(Level::WARN)
+            .with_writer(writer.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let access = BmcAccess::mock_with_base_url("http://127.0.0.1:1".to_string(), "mock");
+
+        let (status, response) = access
+            .multipart_file_upload_with_options(
+                "https://attacker.example/upload",
+                missing_package.to_str().unwrap(),
+                None,
+                30,
+                None,
+                None,
+                None,
+                None,
+                false,
+                MultipartUploadOptions {
+                    bail_on_failure: false,
+                },
+            )
+            .await;
+
+        assert!(!status);
+        assert!(response.is_null());
+        let output = writer.contents();
+        assert!(output.contains("multipart update URI must stay on the selected target origin"));
+        assert!(!output.contains("Failed to read package file"));
     }
 
     #[tokio::test]
@@ -4055,6 +4655,45 @@ mod tests {
         assert!(!status);
         assert_eq!(err_code, 1);
         assert!(present.is_empty());
+    }
+
+    #[tokio::test]
+    async fn nvswitch_inventory_includes_nvos_system_image() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/nvue_v1/platform/firmware"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "BMC": {"actual-firmware": "88.0002.1979"}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/nvue_v1/system/image"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "current": "1",
+                "next": "partition2",
+                "partition1": {"build-id": "nvos-25.02.4440"},
+                "partition2": {"build-id": "nvos-25.02.5555"}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let access = BmcAccess::mock_with_base_url_and_type(
+            server.uri(),
+            "mock-switch",
+            AccessType::NVSwitch,
+        );
+        let (status, err_code, inventory) = access
+            .get_firmware_inventory(TraceFlags::default(), None, None)
+            .await;
+
+        assert!(status);
+        assert_eq!(err_code, 0);
+        assert_eq!(inventory["NVOS"]["Id"], "NVOS");
+        assert_eq!(inventory["NVOS"]["Version"], "nvos-25.02.4440");
+        assert_eq!(inventory["NVOS"]["NextBootVersion"], "nvos-25.02.5555");
     }
 
     #[tokio::test]

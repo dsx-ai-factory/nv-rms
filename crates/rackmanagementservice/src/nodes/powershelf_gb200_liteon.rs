@@ -24,7 +24,7 @@ use serde_json::Value;
 use crate::domain::node::*;
 use crate::domain::rack::{Endpoint, EndpointConfig, EndpointCredentials, NodeConfig};
 use crate::nodes::nvfwupd_adapter;
-use crate::transport::http_client::HttpClient;
+use crate::transport::http_client::{HttpClient, REDFISH_V1_ROOT};
 use crate::utilities::error::{Result, RmsError};
 
 /// Concrete node for LiteOn GB200 powershelf (PDB) BMCs (Redfish).
@@ -115,7 +115,8 @@ impl PowershelfGb200Liteon {
             password,
             dangerously_accept_invalid_certs,
             true,
-        )?;
+        )?
+        .require_path_prefix(REDFISH_V1_ROOT);
         Ok(Self {
             id,
             rack_id,
@@ -159,7 +160,8 @@ impl PowershelfGb200Liteon {
             password,
             bmc_endpoint.dangerously_accept_invalid_certs,
             true,
-        )?;
+        )?
+        .require_path_prefix(REDFISH_V1_ROOT);
         Ok(Self {
             id: config.id.clone(),
             rack_id: rack_id.to_owned(),
@@ -202,6 +204,12 @@ impl PowershelfGb200Liteon {
             .get_or_try_init(|| discover_chassis_url(http))
             .await
             .map(String::as_str)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replace_http_for_test(&mut self, base_url: &str) {
+        self.http = HttpClient::for_test(base_url);
+        self.chassis_url = tokio::sync::OnceCell::new();
     }
 }
 
@@ -628,15 +636,18 @@ async fn fetch_psu_power_states(http: &HttpClient, chassis: &Value) -> Vec<Optio
     let mut out = Vec::with_capacity(members.len());
     for member in members {
         let Some(uri) = member.get("@odata.id").and_then(|v| v.as_str()) else {
+            out.push(None);
             continue;
         };
         if uri.is_empty() {
+            out.push(None);
             continue;
         }
         match http.get(uri, HttpClient::DEFAULT_TIMEOUT).await {
             Ok(psu) => out.push(decode_psu_power_state(psu.get("PowerState"))),
             Err(e) => {
                 tracing::warn!(uri, error = %e.message, "failed to fetch PowerSupply");
+                out.push(None);
             }
         }
     }
@@ -1257,6 +1268,247 @@ mod tests {
         assert!(power_supplies_url(&serde_json::json!({})).is_none());
         assert!(
             power_supplies_url(&serde_json::json!({"PowerSubsystem": {"@odata.id": ""}})).is_none()
+        );
+    }
+
+    const LITEON_TEST_SUBSYSTEM_PATH: &str = "/redfish/v1/Chassis/powershelf/PowerSubsystem";
+    const LITEON_TEST_SUPPLIES_PATH: &str =
+        "/redfish/v1/Chassis/powershelf/PowerSubsystem/PowerSupplies";
+
+    /// Minimal chassis document whose `PowerSubsystem` link points at the tree
+    /// mounted by [`mount_liteon_supplies_collection`], for driving
+    /// `fetch_psu_power_states` directly.
+    fn liteon_test_chassis() -> Value {
+        serde_json::json!({
+            "@odata.id": "/redfish/v1/Chassis/powershelf",
+            "PowerSubsystem": { "@odata.id": LITEON_TEST_SUBSYSTEM_PATH }
+        })
+    }
+
+    /// Mounts only the `PowerSubsystem` -> `PowerSupplies` collection layers so a
+    /// test can exercise `fetch_psu_power_states` with an arbitrary `Members`
+    /// array (including malformed or absent `@odata.id`s). Individual PSU
+    /// documents are left to the caller so failure paths can be driven.
+    async fn mount_liteon_supplies_collection(server: &MockServer, members: Value) {
+        Mock::given(method("GET"))
+            .and(path(LITEON_TEST_SUBSYSTEM_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "PowerSupplies": { "@odata.id": LITEON_TEST_SUPPLIES_PATH }
+            })))
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(LITEON_TEST_SUPPLIES_PATH))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "Members": members })),
+            )
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn fetch_psu_power_states_yields_one_entry_per_member_none_on_failure() {
+        const PSU_ON: &str = "/redfish/v1/Chassis/powershelf/PowerSubsystem/PowerSupplies/on";
+        const PSU_OFF: &str = "/redfish/v1/Chassis/powershelf/PowerSubsystem/PowerSupplies/off";
+        const PSU_UNREACHABLE: &str =
+            "/redfish/v1/Chassis/powershelf/PowerSubsystem/PowerSupplies/unreachable";
+
+        let server = MockServer::start().await;
+        mount_liteon_supplies_collection(
+            &server,
+            serde_json::json!([
+                { "@odata.id": PSU_ON },          // readable, powered on   -> Some(true)
+                { "@odata.id": PSU_OFF },         // readable, powered off  -> Some(false)
+                { "@odata.id": PSU_UNREACHABLE }, // fetch fails (503)      -> None
+                { "Name": "no-odata-id" },        // member without @odata.id -> None
+                { "@odata.id": "" },              // member with empty uri  -> None
+            ]),
+        )
+        .await;
+        Mock::given(method("GET"))
+            .and(path(PSU_ON))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "PowerState": "On" })),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(PSU_OFF))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "PowerState": "Off" })),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(PSU_UNREACHABLE))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+
+        let http = HttpClient::for_test(&server.uri());
+        let states = fetch_psu_power_states(&http, &liteon_test_chassis()).await;
+
+        // One positional entry per member: Some(_) when the PSU is readable,
+        // None when it is missing an @odata.id, has an empty URI, or fails to
+        // fetch. Regression guard: unreadable PSUs must not be dropped.
+        assert_eq!(states, vec![Some(true), Some(false), None, None, None]);
+        assert_eq!(
+            aggregate_psu_power_states(&states),
+            PowerState::Off,
+            "a Some(false) still forces Off even alongside unreadable PSUs"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_psu_power_states_unreadable_psu_downgrades_on_to_unknown() {
+        const PSU_ON: &str = "/redfish/v1/Chassis/powershelf/PowerSubsystem/PowerSupplies/on";
+        const PSU_UNREACHABLE: &str =
+            "/redfish/v1/Chassis/powershelf/PowerSubsystem/PowerSupplies/unreachable";
+
+        let server = MockServer::start().await;
+        mount_liteon_supplies_collection(
+            &server,
+            serde_json::json!([
+                { "@odata.id": PSU_ON },
+                { "@odata.id": PSU_UNREACHABLE },
+            ]),
+        )
+        .await;
+        Mock::given(method("GET"))
+            .and(path(PSU_ON))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "PowerState": "On" })),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(PSU_UNREACHABLE))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+
+        let http = HttpClient::for_test(&server.uri());
+        let states = fetch_psu_power_states(&http, &liteon_test_chassis()).await;
+
+        assert_eq!(states, vec![Some(true), None]);
+        assert_eq!(
+            aggregate_psu_power_states(&states),
+            PowerState::Unknown,
+            "an unreadable PSU must prevent a false On aggregate"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_psu_power_states_is_empty_without_power_subsystem() {
+        let server = MockServer::start().await;
+        let http = HttpClient::for_test(&server.uri());
+
+        // Chassis with no PowerSubsystem link at all.
+        let chassis = serde_json::json!({ "@odata.id": "/redfish/v1/Chassis/powershelf" });
+        let states = fetch_psu_power_states(&http, &chassis).await;
+
+        assert!(states.is_empty());
+        assert_eq!(aggregate_psu_power_states(&states), PowerState::Unknown);
+    }
+
+    #[tokio::test]
+    async fn fetch_psu_power_states_is_empty_without_power_supplies_link() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(LITEON_TEST_SUBSYSTEM_PATH))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "Id": "PowerSubsystem" })),
+            )
+            .mount(&server)
+            .await;
+
+        let http = HttpClient::for_test(&server.uri());
+        let states = fetch_psu_power_states(&http, &liteon_test_chassis()).await;
+
+        assert!(states.is_empty());
+        assert_eq!(aggregate_psu_power_states(&states), PowerState::Unknown);
+    }
+
+    fn test_node(base_url: &str) -> PowershelfGb200Liteon {
+        let mut ps = PowershelfGb200Liteon::new(
+            "ps-01".into(),
+            "rack-01".into(),
+            "10.0.0.5".into(),
+            443,
+            "admin",
+            "pass",
+            "aa:bb:cc:dd:ee:ff".into(),
+            true,
+        )
+        .unwrap();
+        ps.replace_http_for_test(base_url);
+        ps
+    }
+
+    /// Mounts the chassis-collection -> chassis-document discovery layers that
+    /// `get_power_state` walks before reaching the PowerSubsystem. The chassis
+    /// `PowerSubsystem` link points at [`LITEON_TEST_SUBSYSTEM_PATH`], so this
+    /// composes with [`mount_liteon_supplies_collection`].
+    async fn mount_liteon_chassis_discovery(server: &MockServer) {
+        Mock::given(method("GET"))
+            .and(path(RMS_CHASSIS_COLLECTION_ENDPOINT))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Members": [
+                    { "@odata.id": "/redfish/v1/Chassis/powershelf" }
+                ]
+            })))
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/redfish/v1/Chassis/powershelf"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "@odata.id": "/redfish/v1/Chassis/powershelf",
+                "Id": "powershelf",
+                "PowerSubsystem": { "@odata.id": LITEON_TEST_SUBSYSTEM_PATH }
+            })))
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn get_power_state_reports_unknown_when_a_liteon_psu_is_unreadable() {
+        const PSU_ON: &str = "/redfish/v1/Chassis/powershelf/PowerSubsystem/PowerSupplies/1";
+        const PSU_UNREACHABLE: &str =
+            "/redfish/v1/Chassis/powershelf/PowerSubsystem/PowerSupplies/2";
+
+        let server = MockServer::start().await;
+        mount_liteon_chassis_discovery(&server).await;
+        mount_liteon_supplies_collection(
+            &server,
+            serde_json::json!([
+                { "@odata.id": PSU_ON },
+                { "@odata.id": PSU_UNREACHABLE },
+            ]),
+        )
+        .await;
+        Mock::given(method("GET"))
+            .and(path(PSU_ON))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "PowerState": "On" })),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(PSU_UNREACHABLE))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+
+        let powershelf = test_node(&server.uri());
+
+        // End-to-end through get_power_state: one readable "on" PSU alongside one
+        // unreadable PSU must report Unknown, not On. Before the fix the
+        // unreadable PSU was dropped and the shelf falsely reported On.
+        assert_eq!(
+            powershelf.get_power_state().await.unwrap(),
+            PowerState::Unknown
         );
     }
 

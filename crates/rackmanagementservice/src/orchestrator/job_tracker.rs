@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
@@ -42,6 +42,23 @@ pub use crate::orchestrator::job_lifecycle::JobType;
 pub(crate) struct RmsJobDomain;
 
 pub(crate) type RmsJobHandle = JobHandle<RmsJobDomain>;
+
+/// A batch target that was admitted by [`JobTracker::create_batch_jobs`]: the
+/// caller's payload for that target, the child job reserved for it, and the
+/// state the caller's check built for it.
+pub(crate) type AdmittedBatchJob<P, S> = (P, RmsJobHandle, S);
+
+/// A batch target that [`JobTracker::create_batch_jobs`] refused, with the
+/// reason it was refused.
+///
+/// The `rack_id` is carried alongside the `node_id` because a batch may span
+/// racks, so a bare `node_id` does not identify the refused target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RejectedBatchTarget {
+    pub(crate) rack_id: String,
+    pub(crate) node_id: String,
+    pub(crate) error_message: String,
+}
 
 impl JobDomain for RmsJobDomain {
     fn dropped_failure() -> JobFailure {
@@ -354,6 +371,12 @@ impl JobTracker {
 
     /// Creates an owned job handle without checking for an active job on the
     /// same node.
+    ///
+    /// Test-only: every production path admits through a node-idle create, so
+    /// nothing bypasses per-node exclusion on the way in. Tests keep this to
+    /// occupy a node deliberately. Note the record is still indexed like any
+    /// other, so a job made this way does block later node-idle admissions.
+    #[cfg(test)]
     pub(crate) fn create_job(
         &self,
         rack_id: &str,
@@ -367,21 +390,14 @@ impl JobTracker {
         )?;
 
         self.record_job_id_in_span(&job);
-        tracing::info!(
-            job_id = %job.id(),
-            rack_id,
-            node_id,
-            "job created"
-        );
         Ok(job)
     }
 
-    /// Create a firmware job only when the target node has no active job.
+    /// Create a job only when the target node has no active job.
     ///
-    /// Fails with a [`JobError::UpdateInProgress`] failure when a queued or running
-    /// leaf job already targets the same `(rack_id, node_id)`, or
+    /// Fails with a [`JobError::UpdateInProgress`] failure when any non-terminal
+    /// job already targets the same `(rack_id, node_id)`, or
     /// [`JobError::Internal`] when the tracker is full.
-    #[cfg(test)]
     pub(crate) fn create_job_if_node_idle(
         &self,
         rack_id: &str,
@@ -395,15 +411,21 @@ impl JobTracker {
         )?;
 
         self.record_job_id_in_span(&job);
-        tracing::info!(
-            job_id = %job.id(),
-            rack_id,
-            node_id,
-            "job created"
-        );
         Ok(job)
     }
 
+    /// Removes a still-queued leaf job (an unstarted reservation), releasing
+    /// its `(rack_id, node_id)` for other operations. No-op once the job has
+    /// started running or reached a terminal state.
+    pub(crate) fn remove_queued_job(&self, job_id: &str) -> bool {
+        self.registry.remove_queued_leaf(&JobId::from(job_id))
+    }
+
+    /// Creates a child of `parent_job_id` only when the target node has no
+    /// active job.
+    /// Fails with a [`JobError::UpdateInProgress`] failure when any non-terminal
+    /// job already targets the same `(rack_id, node_id)`, or
+    /// [`JobError::Internal`] when the tracker is full.
     pub(crate) fn create_child_job(
         &self,
         parent_job_id: &str,
@@ -420,48 +442,70 @@ impl JobTracker {
                 job_span(job_type, parent_job_id),
             ),
             Some(&parent_id),
-            false,
+            true,
         )?;
         self.record_job_id_in_span(&job);
-        tracing::info!(
-            job_id = %job.id(),
-            parent_job_id,
-            rack_id,
-            node_id,
-            "child job created"
-        );
         refresh_parent_state(self, &parent_id);
         Ok(job)
     }
 
-    pub(crate) fn create_child_job_if_node_idle(
+    /// Reserves one child job per batch target, in request order.
+    ///
+    /// A target is admitted only when it is the first target for its
+    /// `(rack_id, node_id)` in this batch, the caller's `check` accepts its
+    /// payload, and [`Self::create_child_job`] finds the node idle
+    pub(crate) fn create_batch_jobs<P, S>(
         &self,
         parent_job_id: &str,
-        rack_id: &str,
-        node_id: &str,
         job_type: JobType,
-    ) -> std::result::Result<RmsJobHandle, JobFailure> {
-        let parent_id = JobId::from(parent_job_id);
-        let job = self.registry.create_job(
-            JobSpec::new(
-                rack_id,
-                node_id,
-                "Queued",
-                job_span(job_type, parent_job_id),
-            ),
-            Some(&parent_id),
-            true,
-        )?;
-        self.record_job_id_in_span(&job);
-        tracing::info!(
-            job_id = %job.id(),
-            parent_job_id,
-            rack_id,
-            node_id,
-            "child job created"
-        );
-        refresh_parent_state(self, &parent_id);
-        Ok(job)
+        targets: Vec<(String, String, P)>,
+        mut check: impl FnMut(&P) -> std::result::Result<S, String>,
+    ) -> (Vec<AdmittedBatchJob<P, S>>, Vec<RejectedBatchTarget>) {
+        let mut admitted = Vec::with_capacity(targets.len());
+        let mut rejected = Vec::new();
+        let mut seen_nodes = HashSet::with_capacity(targets.len());
+
+        for (rack_id, node_id, payload) in targets {
+            let admission = if seen_nodes.insert((rack_id.clone(), node_id.clone())) {
+                check(&payload).and_then(|state| {
+                    self.create_child_job(parent_job_id, &rack_id, &node_id, job_type)
+                        .map(|job| (job, state))
+                        .map_err(|failure| {
+                            tracing::warn!(
+                                operation = job_type.batch_noun(),
+                                node = %node_id,
+                                rack = %rack_id,
+                                error = %failure.message,
+                                "batch job rejected"
+                            );
+
+                            failure.message
+                        })
+                })
+            } else {
+                tracing::warn!(
+                    operation = job_type.batch_noun(),
+                    node = %node_id,
+                    rack = %rack_id,
+                    "batch job rejected: duplicate target"
+                );
+
+                Err(format!(
+                    "duplicate target rack_id/node_id: {rack_id}/{node_id}"
+                ))
+            };
+
+            match admission {
+                Ok((job, state)) => admitted.push((payload, job, state)),
+                Err(error_message) => rejected.push(RejectedBatchTarget {
+                    rack_id,
+                    node_id,
+                    error_message,
+                }),
+            }
+        }
+
+        (admitted, rejected)
     }
 
     /// Creates a leaf job when the target node is idle and registers it as an
@@ -480,12 +524,6 @@ impl JobTracker {
         )?;
 
         self.record_job_id_in_span(&job);
-        tracing::info!(
-            job_id = %job.id(),
-            rack_id,
-            node_id,
-            "job created"
-        );
         // Started/in-flight metrics are emitted by the registry's creation
         // observer because the spec carries a `workflow_type`.
         Ok(job)
@@ -496,13 +534,16 @@ impl JobTracker {
         F: FnOnce(RmsJobHandle) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = ()> + Send + 'static,
     {
-        let weak = Arc::downgrade(self);
-        let job_id = job.id().clone();
+        let refresh = RefreshParentOnWorkerExit {
+            tracker: Arc::downgrade(self),
+            job_id: job.id().clone(),
+        };
         self.registry.spawn_job(job, move |job| async move {
+            // Bound before the await so it drops after `run`'s future, and with
+            // it the job handle, has been dropped: the parent then always
+            // aggregates a child that has reached its terminal state.
+            let _refresh = refresh;
             run(job).await;
-            if let Some(tracker) = weak.upgrade() {
-                tracker.after_job_terminal(&job_id);
-            }
         })
     }
 
@@ -552,11 +593,6 @@ impl JobTracker {
             span.record("job_id", job_id.as_str());
         }
 
-        tracing::info!(
-            job_id = %job_id,
-            rack_id,
-            "parent job created"
-        );
         Some(job_id)
     }
 
@@ -601,12 +637,6 @@ impl JobTracker {
             };
 
         if transitioned {
-            let span = self
-                .registry
-                .span_for_job(&job_id)
-                .unwrap_or_else(tracing::Span::none);
-            let _entered = span.enter();
-            tracing::info!("job completed");
             self.after_job_terminal(&job_id);
         } else {
             tracing::error!(%job_id, "mark_completed called for unknown or terminal job");
@@ -646,12 +676,6 @@ impl JobTracker {
             };
 
         if transitioned {
-            let span = self
-                .registry
-                .span_for_job(&job_id)
-                .unwrap_or_else(tracing::Span::none);
-            let _entered = span.enter();
-            tracing::error!(error_message, "job failed");
             self.after_job_terminal(&job_id);
         } else {
             tracing::error!(%job_id, "mark_failed called for unknown or terminal job");
@@ -994,6 +1018,16 @@ fn job_span(job_type: JobType, parent_job_id: &str) -> tracing::Span {
             job_id = tracing::field::Empty,
             parent_job_id
         ),
+        (JobType::ColdRebootSequence, true) => tracing::info_span!(
+            "cold_reboot_sequence",
+            job_id = tracing::field::Empty,
+            parent_job_id = tracing::field::Empty
+        ),
+        (JobType::ColdRebootSequence, false) => tracing::info_span!(
+            "cold_reboot_sequence",
+            job_id = tracing::field::Empty,
+            parent_job_id
+        ),
     }
 }
 
@@ -1009,6 +1043,34 @@ pub(crate) fn job_failure(error_code: JobError, error_message: impl Display) -> 
     let error_message = error_message.to_string();
     JobFailure::new(error_code, error_message.clone())
         .with_result_json(default_failure_result_json(error_code, &error_message))
+}
+
+/// Refreshes a spawned job's parent when the worker task exits, whatever the
+/// outcome: a normal return, a return that never sealed the handle, or a panic.
+///
+/// This lives in `Drop` rather than after `run(job).await` because a panic
+/// unwinds past the tail of the future, which left the parent `Running` until
+/// an external `get_job` or the next reaper sweep aggregated it.
+struct RefreshParentOnWorkerExit {
+    tracker: Weak<JobTracker>,
+    job_id: JobId,
+}
+
+impl Drop for RefreshParentOnWorkerExit {
+    fn drop(&mut self) {
+        let Some(tracker) = self.tracker.upgrade() else {
+            return;
+        };
+
+        // On the panic path this runs while unwinding, where panicking again
+        // aborts the process instead of unwinding. Aggregation takes locks it
+        // unwraps, so contain a poisoned-lock panic and let the original one
+        // continue: the reaper still aggregates this parent later.
+        let refresh = std::panic::AssertUnwindSafe(|| tracker.after_job_terminal(&self.job_id));
+        if std::panic::catch_unwind(refresh).is_err() {
+            tracing::error!(job_id = %self.job_id, "parent refresh panicked after worker exit");
+        }
+    }
 }
 
 impl JobTracker {
@@ -1167,7 +1229,7 @@ fn refresh_parent_state(tracker: &JobTracker, parent_id: &JobId) {
     let Some(parent) = registry.get(parent_id) else {
         return;
     };
-    if !parent.is_parent() {
+    if !parent.is_parent() || parent.state.is_terminal() {
         return;
     }
     let Some(job_type) = parent.workflow_type else {
@@ -1294,9 +1356,16 @@ fn fail_parent(tracker: &JobTracker, parent_id: &JobId, counts: ParentCounts, jo
     // resulting transition.
     if let Some(handle) = tracker.parent_job_handles.lock().unwrap().remove(parent_id) {
         handle.fail(failure);
-    } else {
+    } else if !parent_already_sealed(tracker, parent_id) {
         tracing::error!(%parent_id, "parent job handle missing during failure aggregation");
     }
+}
+
+fn parent_already_sealed(tracker: &JobTracker, parent_id: &JobId) -> bool {
+    tracker
+        .registry
+        .get(parent_id)
+        .is_some_and(|parent| parent.state.is_terminal())
 }
 
 fn parent_failure_result_json(
@@ -1324,18 +1393,17 @@ fn parent_failure_result_json(
         | JobType::SwitchFactoryDefaultReset
         | JobType::SwitchSystemPasswordUpdate
         | JobType::SwitchSystemImageUpdate
-        | JobType::ConfigureScaleUpFabricManagerV2 => {
-            serialize_result_json(&SwitchParentFailureResult {
-                completed,
-                failed,
-                missing,
-                total,
-                failed_jobs: failed_children
-                    .into_iter()
-                    .map(switch_failed_child_detail)
-                    .collect(),
-            })
-        }
+        | JobType::ConfigureScaleUpFabricManagerV2
+        | JobType::ColdRebootSequence => serialize_result_json(&SwitchParentFailureResult {
+            completed,
+            failed,
+            missing,
+            total,
+            failed_jobs: failed_children
+                .into_iter()
+                .map(switch_failed_child_detail)
+                .collect(),
+        }),
     }
 }
 
@@ -1367,7 +1435,7 @@ fn complete_parent(
     // resulting transition.
     if let Some(handle) = tracker.parent_job_handles.lock().unwrap().remove(parent_id) {
         handle.complete(description, "");
-    } else {
+    } else if !parent_already_sealed(tracker, parent_id) {
         tracing::error!(%parent_id, "parent job handle missing during completion aggregation");
     }
 }
@@ -1540,6 +1608,16 @@ mod tests {
         (parent_id, children)
     }
 
+    /// A batch target whose payload identifies the node it came from, so tests
+    /// can tell which target each admitted job belongs to.
+    fn batch_target(rack_id: &str, node_id: &str) -> (String, String, String) {
+        (
+            rack_id.to_owned(),
+            node_id.to_owned(),
+            format!("payload for {node_id}"),
+        )
+    }
+
     fn complete_child_and_refresh(tracker: &JobTracker, child: RmsJobHandle, result_json: &str) {
         let child_id = child.id().clone();
         child.complete("Completed", result_json);
@@ -1550,6 +1628,19 @@ mod tests {
         let child_id = child.id().clone();
         child.fail(failure);
         tracker.refresh_parent_for_child(&child_id);
+    }
+
+    fn captured_logs(run: impl FnOnce()) -> String {
+        let writer = TestWriter::new();
+        let cloned_writer = writer.clone();
+        let layer = crate::logging::logfmt::layer()
+            .with_writer(Arc::new(move || Box::new(cloned_writer.clone())))
+            .with_span_logs(false);
+        let subscriber = tracing_subscriber::registry().with(layer);
+
+        tracing::subscriber::with_default(subscriber, run);
+
+        writer.text()
     }
 
     #[test]
@@ -1729,6 +1820,157 @@ mod tests {
     }
 
     #[test]
+    fn create_batch_jobs_admits_every_checked_target() {
+        let tracker = JobTracker::new();
+        let parent_id = tracker
+            .create_parent_job("rack-01", JobType::FirmwareUpdate)
+            .unwrap();
+
+        let (admitted, rejected) = tracker.create_batch_jobs(
+            &parent_id,
+            JobType::FirmwareUpdate,
+            vec![
+                batch_target("rack-01", "node-01"),
+                batch_target("rack-01", "node-02"),
+            ],
+            |payload| Ok(payload.len()),
+        );
+
+        assert!(rejected.is_empty());
+        assert_eq!(admitted.len(), 2);
+        assert_eq!(admitted[0].0, "payload for node-01");
+        assert_eq!(admitted[0].2, "payload for node-01".len());
+        assert_eq!(admitted[1].0, "payload for node-02");
+
+        let parent = tracker.get_job(&parent_id).unwrap();
+        assert_eq!(parent.child_job_ids.len(), 2);
+    }
+
+    #[test]
+    fn create_batch_jobs_rejects_a_repeated_target_before_checking_it() {
+        let tracker = JobTracker::new();
+        let parent_id = tracker
+            .create_parent_job("rack-01", JobType::FirmwareUpdate)
+            .unwrap();
+        let mut checked = Vec::new();
+
+        let (admitted, rejected) = tracker.create_batch_jobs(
+            &parent_id,
+            JobType::FirmwareUpdate,
+            vec![
+                batch_target("rack-01", "node-01"),
+                batch_target("rack-01", "node-01"),
+            ],
+            |payload| {
+                checked.push(payload.clone());
+                Ok(())
+            },
+        );
+
+        // The duplicate is refused without running the caller's check, so it is
+        // reported as a duplicate rather than as busy behind its own sibling.
+        assert_eq!(checked, ["payload for node-01"]);
+        assert_eq!(admitted.len(), 1);
+        assert_eq!(
+            rejected,
+            [RejectedBatchTarget {
+                rack_id: "rack-01".to_owned(),
+                node_id: "node-01".to_owned(),
+                error_message: "duplicate target rack_id/node_id: rack-01/node-01".to_owned(),
+            }]
+        );
+
+        let parent = tracker.get_job(&parent_id).unwrap();
+        assert_eq!(parent.child_job_ids.len(), 1);
+    }
+
+    #[test]
+    fn create_batch_jobs_admits_the_same_node_id_in_another_rack() {
+        let tracker = JobTracker::new();
+        let parent_id = tracker
+            .create_parent_job("rack-01", JobType::FirmwareUpdate)
+            .unwrap();
+
+        let (admitted, rejected) = tracker.create_batch_jobs(
+            &parent_id,
+            JobType::FirmwareUpdate,
+            vec![
+                batch_target("rack-01", "node-01"),
+                batch_target("rack-02", "node-01"),
+            ],
+            |_| Ok(()),
+        );
+
+        assert_eq!(admitted.len(), 2);
+        assert!(rejected.is_empty());
+    }
+
+    #[test]
+    fn create_batch_jobs_reports_check_failures_without_creating_a_job() {
+        let tracker = JobTracker::new();
+        let parent_id = tracker
+            .create_parent_job("rack-01", JobType::FirmwareUpdate)
+            .unwrap();
+
+        let (admitted, rejected) = tracker.create_batch_jobs(
+            &parent_id,
+            JobType::FirmwareUpdate,
+            vec![
+                batch_target("rack-01", "node-01"),
+                batch_target("rack-01", "node-02"),
+            ],
+            |payload| match payload.ends_with("node-01") {
+                true => Err("node-01 is not a switch".to_owned()),
+                false => Ok(()),
+            },
+        );
+
+        assert_eq!(admitted.len(), 1);
+        assert_eq!(admitted[0].0, "payload for node-02");
+        assert_eq!(
+            rejected,
+            [RejectedBatchTarget {
+                rack_id: "rack-01".to_owned(),
+                node_id: "node-01".to_owned(),
+                error_message: "node-01 is not a switch".to_owned(),
+            }]
+        );
+
+        let parent = tracker.get_job(&parent_id).unwrap();
+        assert_eq!(parent.child_job_ids.len(), 1);
+    }
+
+    #[test]
+    fn create_batch_jobs_reports_the_refusal_when_a_node_is_busy() {
+        let tracker = JobTracker::new();
+
+        // Own the node with an unrelated job so no child can be admitted for it.
+        let busy = tracker
+            .create_job("rack-01", "node-01", JobType::FirmwareUpdate)
+            .unwrap();
+        let parent_id = tracker
+            .create_parent_job("rack-01", JobType::FirmwareUpdate)
+            .unwrap();
+
+        let (admitted, rejected) = tracker.create_batch_jobs(
+            &parent_id,
+            JobType::FirmwareUpdate,
+            vec![batch_target("rack-01", "node-01")],
+            |_| Ok(()),
+        );
+
+        assert!(admitted.is_empty());
+        assert_eq!(rejected.len(), 1);
+        assert_eq!(rejected[0].rack_id, "rack-01");
+        assert_eq!(rejected[0].node_id, "node-01");
+        assert!(
+            rejected[0].error_message.contains(busy.id().as_ref()),
+            "expected a node-busy refusal naming the active job, got: {}",
+            rejected[0].error_message
+        );
+    }
+
+    #[test]
     fn mark_running() {
         let tracker = JobTracker::new();
         let id = tracker
@@ -1875,6 +2117,88 @@ mod tests {
         assert_eq!(snapshot_state(&parent.state), JobState::Completed);
     }
 
+    /// A panicking worker still terminalizes its child through the RAII drop
+    /// guard, so the parent must aggregate without waiting for an external
+    /// `get_job` or the next reaper sweep. The refresh runs from the registry's
+    /// worker-exit hook; appending it to the worker future skipped it here,
+    /// because the panic unwound past the tail of the future.
+    #[tokio::test]
+    async fn panicking_child_refreshes_parent_without_polling() {
+        let tracker = Arc::new(JobTracker::new());
+        let (parent_id, mut children) = create_test_batch(
+            tracker.as_ref(),
+            "rack-01",
+            &["n-01"],
+            JobType::FirmwareUpdate,
+        );
+        let child = children.pop().expect("child job should be created");
+        let child_id = child.id().clone();
+
+        // The supervisor catches the panic as a JoinError, so `wait` resolves.
+        tracker
+            .spawn_job(child, |_job| async move {
+                panic!("worker exploded");
+            })
+            .wait()
+            .await
+            .expect("the supervisor should survive a panicking worker");
+
+        let child = tracker
+            .registry
+            .get(&child_id)
+            .expect("child job should exist");
+        assert_eq!(
+            snapshot_state(&child.state),
+            JobState::Failed,
+            "the drop guard should seal a panicking child"
+        );
+
+        // Read through the registry, not `get_job`, so the assertion cannot be
+        // satisfied by the refresh that polling would itself trigger.
+        let parent = tracker
+            .registry
+            .get(&JobId::from(parent_id.as_str()))
+            .expect("parent job should exist");
+        assert_eq!(
+            snapshot_state(&parent.state),
+            JobState::Failed,
+            "the parent must not still be Running after its only child panicked"
+        );
+    }
+
+    /// Handlers that seal an admitted child directly -- rather than spawning a
+    /// worker for it -- must call `refresh_parent_for_child`, because only the
+    /// spawn path aggregates the parent on its own. Batch handlers rely on this
+    /// to skip their "nothing was created" fallback once any child was admitted.
+    #[test]
+    fn directly_sealed_children_seal_the_parent_once_refreshed() {
+        let tracker = JobTracker::new();
+        let (parent_id, children) = create_test_batch(
+            &tracker,
+            "rack-01",
+            &["n-01", "n-02"],
+            JobType::SwitchSystemImageUpdate,
+        );
+
+        for child in children {
+            let child_id = JobId::from(child.id().as_ref());
+            child.fail(JobFailure::new(JobError::ClientError, "nvue setup failed"));
+            tracker.refresh_parent_for_child(&child_id);
+        }
+
+        // Read through the registry, not `get_job`, so the assertion cannot be
+        // satisfied by the refresh that polling would itself trigger.
+        let parent = tracker
+            .registry
+            .get(&JobId::from(parent_id.as_str()))
+            .expect("parent job should exist");
+        assert_eq!(
+            snapshot_state(&parent.state),
+            JobState::Failed,
+            "a parent whose children were all sealed directly must not stay Running"
+        );
+    }
+
     #[test]
     fn parent_aggregates_with_failures() {
         let tracker = JobTracker::new();
@@ -1910,6 +2234,123 @@ mod tests {
         assert_eq!(
             child_result.error_message.as_deref(),
             Some("connection lost")
+        );
+    }
+
+    #[test]
+    fn repeated_refresh_of_failed_parent_does_not_log_missing_handle() {
+        let tracker = JobTracker::new();
+        let (parent_id, mut children) = create_test_batch(
+            &tracker,
+            "rack-01",
+            &["n-01"],
+            JobType::SwitchSystemImageUpdate,
+        );
+        let child = children.pop().expect("child job should be created");
+
+        let logs = captured_logs(|| {
+            fail_child_and_refresh(
+                &tracker,
+                child,
+                JobFailure::new(JobError::ClientError, "connection lost"),
+            );
+
+            for _ in 0..3 {
+                tracker.get_job(&parent_id);
+                tracker.reaper_sweep();
+            }
+        });
+
+        assert!(
+            !logs.contains("parent job handle missing"),
+            "re-aggregating a sealed parent must not report a missing handle: {logs}"
+        );
+        let parent = tracker
+            .get_job(&parent_id)
+            .expect("parent job should exist");
+        assert_eq!(parent.state, JobState::Failed);
+        assert!(parent.result_json.contains("connection lost"));
+    }
+
+    #[test]
+    fn repeated_refresh_of_completed_parent_does_not_log_missing_handle() {
+        let tracker = JobTracker::new();
+        let (parent_id, mut children) =
+            create_test_batch(&tracker, "rack-01", &["n-01"], JobType::FirmwareUpdate);
+        let child = children.pop().expect("child job should be created");
+
+        let logs = captured_logs(|| {
+            complete_child_and_refresh(&tracker, child, "");
+
+            for _ in 0..3 {
+                tracker.get_job(&parent_id);
+                tracker.reaper_sweep();
+            }
+        });
+
+        assert!(
+            !logs.contains("parent job handle missing"),
+            "re-aggregating a sealed parent must not report a missing handle: {logs}"
+        );
+        assert_eq!(
+            tracker
+                .get_job(&parent_id)
+                .expect("parent job should exist")
+                .state,
+            JobState::Completed
+        );
+    }
+
+    #[test]
+    fn missing_handle_for_non_terminal_parent_is_still_reported() {
+        let tracker = JobTracker::new();
+        // Holding the handle here rather than in `parent_job_handles` leaves the
+        // parent non-terminal with no handle to seal it. Removing a map entry
+        // instead would drop the handle and seal the parent as failed.
+        let orphan_parent = tracker
+            .registry
+            .create_job(
+                JobSpec::new_parent(
+                    "rack-01",
+                    "Batch accepting child jobs",
+                    job_span(JobType::FirmwareUpdate, ""),
+                )
+                .with_workflow_type(JobType::FirmwareUpdate),
+                None,
+                false,
+            )
+            .expect("parent job should be created");
+        let parent_id = orphan_parent.id().clone();
+        let child = tracker
+            .registry
+            .create_job(
+                JobSpec::new(
+                    "rack-01",
+                    "n-01",
+                    "Queued",
+                    job_span(JobType::FirmwareUpdate, ""),
+                ),
+                Some(&parent_id),
+                false,
+            )
+            .expect("child job should be created");
+
+        let logs = captured_logs(|| {
+            child.fail(JobFailure::new(JobError::ClientError, "connection lost"));
+            refresh_parent_state(&tracker, &parent_id);
+        });
+
+        assert!(
+            logs.contains("parent job handle missing during failure aggregation"),
+            "a non-terminal parent with no handle must stay a reported invariant violation: {logs}"
+        );
+        assert!(
+            !tracker
+                .registry
+                .get(&parent_id)
+                .expect("parent job should exist")
+                .state
+                .is_terminal()
         );
     }
 

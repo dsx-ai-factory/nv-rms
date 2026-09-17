@@ -379,7 +379,7 @@ mod tests {
             port: 22,
             server_type: None,
             ssh_known_hosts: None,
-            ssh_host_key_mode: SSH_HOST_KEY_MODE_TOFU.to_string(),
+            ssh_host_key_mode: SSH_HOST_KEY_MODE_DISABLED.to_string(),
             invalid_port_raw: None,
             invalid_ssh_option: None,
         }
@@ -404,7 +404,7 @@ mod tests {
             port: 22,
             server_type: None,
             ssh_known_hosts: None,
-            ssh_host_key_mode: SSH_HOST_KEY_MODE_TOFU.to_string(),
+            ssh_host_key_mode: SSH_HOST_KEY_MODE_DISABLED.to_string(),
             invalid_port_raw: None,
             invalid_ssh_option: None,
         };
@@ -421,7 +421,7 @@ mod tests {
             port: 22,
             server_type: None,
             ssh_known_hosts: None,
-            ssh_host_key_mode: SSH_HOST_KEY_MODE_TOFU.to_string(),
+            ssh_host_key_mode: SSH_HOST_KEY_MODE_DISABLED.to_string(),
             invalid_port_raw: None,
             invalid_ssh_option: None,
         };
@@ -439,7 +439,7 @@ mod tests {
             port: 22,
             server_type: None,
             ssh_known_hosts: None,
-            ssh_host_key_mode: SSH_HOST_KEY_MODE_TOFU.to_string(),
+            ssh_host_key_mode: SSH_HOST_KEY_MODE_DISABLED.to_string(),
             invalid_port_raw: None,
             invalid_ssh_option: None,
         };
@@ -456,7 +456,7 @@ mod tests {
             port: 2222,
             server_type: Some("dgx".to_string()),
             ssh_known_hosts: None,
-            ssh_host_key_mode: SSH_HOST_KEY_MODE_TOFU.to_string(),
+            ssh_host_key_mode: SSH_HOST_KEY_MODE_DISABLED.to_string(),
             invalid_port_raw: None,
             invalid_ssh_option: None,
         };

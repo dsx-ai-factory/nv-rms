@@ -42,7 +42,7 @@ use crate::utils::Util as NvUtils;
 /// - A top-level `Targets` list (multi-target mode), or
 /// - Flat keys `BMC_IP`, `RF_USERNAME`, `RF_PASSWORD`, and optionally
 ///   `TUNNEL_TCP_PORT`, `VERIFY_TLS`, `BMC_CA_CERT`, `SSH_KNOWN_HOSTS`, and
-///   `SSH_HOST_KEY_MODE` (single-target shorthand).
+///   `SSH_HOST_KEY_MODE`, and `ALLOW_HTTP` (single-target shorthand).
 #[derive(Clone)]
 pub struct ConfigParser {
     /// The full parsed YAML content (as a JSON [`Value`] for uniform access).
@@ -150,8 +150,9 @@ impl ConfigParser {
     ///
     /// If a `Targets` key exists its value is used directly; otherwise a
     /// single target is synthesised from the flat `BMC_IP`, `RF_USERNAME`,
-    /// `RF_PASSWORD` (and optional `TUNNEL_TCP_PORT`, `VERIFY_TLS`, and
-    /// `BMC_CA_CERT`, `SSH_KNOWN_HOSTS`, and `SSH_HOST_KEY_MODE`) keys.
+    /// `RF_PASSWORD` (and optional `TUNNEL_TCP_PORT`, `VERIFY_TLS`,
+    /// `ALLOW_HTTP`, `BMC_CA_CERT`, `SSH_KNOWN_HOSTS`, and
+    /// `SSH_HOST_KEY_MODE`) keys.
     fn make_targets_list(&mut self) -> Result<(), String> {
         let config = match &self.config_dict {
             Some(c) => c,
@@ -186,6 +187,9 @@ impl ConfigParser {
         }
         if let Some(v) = config.get("VERIFY_TLS") {
             target.insert("VERIFY_TLS".to_string(), v.clone());
+        }
+        if let Some(v) = config.get("ALLOW_HTTP") {
+            target.insert("ALLOW_HTTP".to_string(), v.clone());
         }
         if let Some(v) = config.get("BMC_CA_CERT") {
             target.insert("BMC_CA_CERT".to_string(), v.clone());
@@ -364,6 +368,7 @@ BMC_IP: 192.0.2.20
 RF_USERNAME: admin
 RF_PASSWORD: password
 VERIFY_TLS: true
+ALLOW_HTTP: true
 BMC_CA_CERT: /tmp/bmc-ca.pem
 ",
         )
@@ -377,6 +382,7 @@ BMC_CA_CERT: /tmp/bmc-ca.pem
 
         assert_eq!(parser.targets.len(), 1);
         assert_eq!(parser.targets[0]["VERIFY_TLS"], true);
+        assert_eq!(parser.targets[0]["ALLOW_HTTP"], true);
         assert_eq!(parser.targets[0]["BMC_CA_CERT"], "/tmp/bmc-ca.pem");
     }
 

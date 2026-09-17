@@ -19,7 +19,9 @@ use std::path::Path;
 use std::sync::Arc;
 
 use super::server::{RackManagerServiceImpl, find_rack};
-use crate::api::grpc::conversions::proto_node_type_to_domain;
+use crate::api::grpc::conversions::{
+    batch_targets, failed_node_results, proto_node_type_to_domain,
+};
 use crate::api::grpc::firmware_handlers::{build_ephemeral_node, resolve_firmware_file};
 use crate::domain::node::NodeKind;
 use crate::nodes::switch_gb200_nvidia::config::MIN_FIRMWARE_FILE_SIZE;
@@ -94,40 +96,32 @@ fn build_factory_reset_target(
 fn reserve_factory_reset_jobs(
     service: &RackManagerServiceImpl,
     parent_id: &str,
-    targets: Vec<(rm::NodeInfo, Arc<NodeInstance>)>,
+    devices: Vec<rm::NodeInfo>,
     response: &mut rm::NodeBatchResponse,
 ) -> Vec<(RmsJobHandle, Arc<NodeInstance>)> {
-    let mut queued_jobs = Vec::new();
+    let (reserved, rejected) = service.job_tracker.create_batch_jobs(
+        parent_id,
+        JobType::SwitchFactoryDefaultReset,
+        batch_targets(devices),
+        build_factory_reset_target,
+    );
 
-    for (device, node) in targets {
-        let pending = match service.job_tracker.create_child_job_if_node_idle(
-            parent_id,
-            &device.rack_id,
-            &device.node_id,
-            JobType::SwitchFactoryDefaultReset,
-        ) {
-            Ok(pending) => pending,
-            Err(failure) => {
-                response.node_results.push(rm::NodeOperationResult {
-                    node_id: device.node_id,
-                    status: rm::ReturnCode::Failure.into(),
-                    error_message: failure.message,
-                });
+    response.node_results.extend(failed_node_results(rejected));
 
-                continue;
-            }
-        };
+    // This response reports admitted nodes through `node_results`, not a
+    // per-node job list.
+    reserved
+        .into_iter()
+        .map(|(device, pending, node)| {
+            response.node_results.push(rm::NodeOperationResult {
+                node_id: device.node_id,
+                status: rm::ReturnCode::Success.into(),
+                error_message: String::new(),
+            });
 
-        response.node_results.push(rm::NodeOperationResult {
-            node_id: device.node_id,
-            status: rm::ReturnCode::Success.into(),
-            error_message: String::new(),
-        });
-
-        queued_jobs.push((pending, node));
-    }
-
-    queued_jobs
+            (pending, node)
+        })
+        .collect()
 }
 
 async fn submit_factory_reset(
@@ -255,31 +249,8 @@ impl RackManagerServiceImpl {
             ));
         }
 
-        let mut targets = Vec::new();
         let domain = request.domain;
-
-        for device in devices {
-            match build_factory_reset_target(&device) {
-                Ok(node) => targets.push((device, node)),
-                Err(error_message) => {
-                    response.node_results.push(rm::NodeOperationResult {
-                        node_id: device.node_id,
-                        status: rm::ReturnCode::Failure.into(),
-                        error_message,
-                    });
-                }
-            }
-        }
-
-        let Some((first, _)) = targets.first() else {
-            return Ok(factory_reset_failure(
-                response,
-                total_nodes,
-                "no switch factory-reset jobs created",
-            ));
-        };
-
-        let parent_rack_id = first.rack_id.clone();
+        let parent_rack_id = devices[0].rack_id.clone();
 
         let Some(parent_id) = self
             .job_tracker
@@ -289,15 +260,11 @@ impl RackManagerServiceImpl {
 
             response
                 .node_results
-                .extend(
-                    targets
-                        .into_iter()
-                        .map(|(device, _)| rm::NodeOperationResult {
-                            node_id: device.node_id,
-                            status: rm::ReturnCode::Failure.into(),
-                            error_message: message.to_owned(),
-                        }),
-                );
+                .extend(devices.into_iter().map(|device| rm::NodeOperationResult {
+                    node_id: device.node_id,
+                    status: rm::ReturnCode::Failure.into(),
+                    error_message: message.to_owned(),
+                }));
 
             return Ok(factory_reset_failure(response, total_nodes, message));
         };
@@ -306,7 +273,7 @@ impl RackManagerServiceImpl {
 
         // Reserve every node before spawning. This keeps duplicate targets and
         // concurrent destructive operations excluded for the complete batch.
-        let queued_jobs = reserve_factory_reset_jobs(self, &parent_id, targets, &mut response);
+        let queued_jobs = reserve_factory_reset_jobs(self, &parent_id, devices, &mut response);
 
         if queued_jobs.is_empty() {
             response.message = "no switch factory-reset jobs created".into();
@@ -891,6 +858,28 @@ mod tests {
             .count();
 
         assert_eq!(successful, 1);
+
+        // The duplicate is reported, not silently dropped, and it names the
+        // reason so a caller can tell it apart from a busy or invalid node.
+        let refused: Vec<_> = response
+            .node_results
+            .iter()
+            .filter(|result| result.status == rm::ReturnCode::Failure as i32)
+            .collect();
+        assert_eq!(refused.len(), 1);
+        assert_eq!(refused[0].node_id, "switch-01");
+        assert_eq!(
+            refused[0].error_message,
+            "duplicate target rack_id/node_id: rack-01/switch-01"
+        );
         assert_eq!(response.stats.unwrap().failed_nodes, 1);
+
+        // One child only: a second concurrent factory reset on the same switch
+        // would be a destructive double-mutation.
+        let parent = service
+            .job_tracker
+            .get_job(&response.job_id)
+            .expect("the batch parent job should be tracked");
+        assert_eq!(parent.child_job_ids.len(), 1);
     }
 }

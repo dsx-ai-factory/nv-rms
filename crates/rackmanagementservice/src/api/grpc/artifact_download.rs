@@ -79,7 +79,7 @@
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_tempfile::TempFile;
 use futures::StreamExt;
@@ -87,7 +87,7 @@ use reqwest::Method;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use super::firmware_artifact_paths::filename_from_location;
+use super::firmware_artifact_paths::{filename_from_location, redact_location_for_logging};
 
 const REMOTE_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(600);
 const FIRMWARE_TEMP_FILE_SUFFIX: &str = ".tmp";
@@ -290,6 +290,66 @@ fn apply_artifact_http_auth(
     }
 }
 
+/// Streams the body of `response` into `temp_file`, updating a SHA-256 hasher along the way.
+///
+/// Returns the total number of bytes written on success.
+///
+/// On failure returns `(bytes_written_so_far, error_message)` so the caller can include a
+/// partial byte count in structured error logs before discarding the temp file. Note that
+/// `bytes_written_so_far` may under-report when a [`tokio::io::AsyncWriteExt::write_all`]
+/// call fails mid-chunk, since partial chunk writes are not separately tracked.
+async fn stream_response_to_temp_file(
+    response: reqwest::Response,
+    temp_file: &mut TempFile,
+    temp_path: &Path,
+    url: &str,
+    expected_sha256: Option<&str>,
+    expected_len: Option<u64>,
+) -> std::result::Result<u64, (u64, String)> {
+    let mut total_written: u64 = 0;
+    let mut hasher = expected_sha256.is_some().then(Sha256::new);
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| {
+            (
+                total_written,
+                format!("failed to read response body from {url}: {e}"),
+            )
+        })?;
+        if chunk.is_empty() {
+            continue;
+        }
+        temp_file.write_all(&chunk).await.map_err(|e| {
+            (
+                total_written,
+                format!("failed to write {}: {e}", temp_path.display()),
+            )
+        })?;
+        if let Some(hasher) = hasher.as_mut() {
+            hasher.update(&chunk);
+        }
+        total_written += chunk.len() as u64;
+    }
+
+    temp_file.flush().await.map_err(|e| {
+        (
+            total_written,
+            format!("failed to flush {}: {e}", temp_path.display()),
+        )
+    })?;
+    validate_download_size(url, expected_len, total_written).map_err(|e| (total_written, e))?;
+    if let (Some(expected), Some(hasher)) = (expected_sha256, hasher) {
+        let actual = hex::encode(hasher.finalize());
+        if !sha256_matches(expected, &actual) {
+            return Err((
+                total_written,
+                format!("sha256 mismatch for {url}: expected {expected}, got {actual}"),
+            ));
+        }
+    }
+    Ok(total_written)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn download_http_file(
     client: &reqwest::Client,
@@ -306,73 +366,115 @@ async fn download_http_file(
         return Ok(());
     }
 
+    let safe_url = redact_location_for_logging(url);
     tracing::info!(
         component = %component,
         bundle = ?bundle,
         location_type = %location_type,
-        url = %url,
+        url = %safe_url,
         path = %dest_path.display(),
         "downloading firmware object artifact"
     );
+    let download_start = Instant::now();
     let response = apply_artifact_http_auth(client.request(Method::GET, url), &auth)
         .send()
         .await
-        .map_err(|e| format!("failed to download {url}: {e}"))?;
+        .map_err(|e| {
+            let error = format!("failed to download {url}: {e}");
+            tracing::error!(
+                component = %component,
+                bundle = ?bundle,
+                location_type = %location_type,
+                url = %safe_url,
+                path = %dest_path.display(),
+                elapsed_secs = truncate_f64(download_start.elapsed().as_secs_f64(), 2),
+                bytes_downloaded = 0u64,
+                error = %error,
+                "artifact download failed"
+            );
+            error
+        })?;
 
     if !response.status().is_success() {
-        return Err(format!(
-            "download failed with status {}: {url}",
-            response.status()
-        ));
+        let error = format!("download failed with status {}: {url}", response.status());
+        tracing::error!(
+            component = %component,
+            bundle = ?bundle,
+            location_type = %location_type,
+            url = %safe_url,
+            path = %dest_path.display(),
+            elapsed_secs = truncate_f64(download_start.elapsed().as_secs_f64(), 2),
+            bytes_downloaded = 0u64,
+            error = %error,
+            "artifact download failed"
+        );
+        return Err(error);
     }
 
     let expected_len = response.content_length();
+    if expected_len.is_none() {
+        // A well-behaved artifact server should always declare Content-Length;
+        // without it the post-stream size validation can only catch an empty
+        // body. Log so operators can spot a misbehaving/streaming endpoint. The
+        // download itself still fails gracefully on any write error below.
+        tracing::warn!(
+            component = %component,
+            bundle = ?bundle,
+            location_type = %location_type,
+            url = %safe_url,
+            "artifact response has no Content-Length"
+        );
+    }
     let mut temp_file = firmware_temp_file(&dest_path, filename).await?;
     let temp_path = temp_file.file_path().clone();
-    let write_result = async {
-        let mut total_written: u64 = 0;
-        let mut hasher = expected_sha256.is_some().then(Sha256::new);
-        let mut stream = response.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            let chunk =
-                chunk.map_err(|e| format!("failed to read response body from {url}: {e}"))?;
-            if chunk.is_empty() {
-                continue;
-            }
-            temp_file
-                .write_all(&chunk)
-                .await
-                .map_err(|e| format!("failed to write {}: {e}", temp_path.display()))?;
-            if let Some(hasher) = hasher.as_mut() {
-                hasher.update(&chunk);
-            }
-            total_written += chunk.len() as u64;
-        }
-
-        temp_file
-            .flush()
-            .await
-            .map_err(|e| format!("failed to flush {}: {e}", temp_path.display()))?;
-        validate_download_size(url, expected_len, total_written)?;
-        if let (Some(expected), Some(hasher)) = (expected_sha256, hasher) {
-            let actual = hex::encode(hasher.finalize());
-            if !sha256_matches(expected, &actual) {
-                return Err(format!(
-                    "sha256 mismatch for {url}: expected {expected}, got {actual}"
-                ));
-            }
-        }
-        Ok(())
-    }
+    let write_result = stream_response_to_temp_file(
+        response,
+        &mut temp_file,
+        &temp_path,
+        url,
+        expected_sha256,
+        expected_len,
+    )
     .await;
 
-    if let Err(e) = write_result {
-        temp_file.drop_async().await;
-        return Err(e);
-    }
+    let total_written = match write_result {
+        Err((bytes_downloaded, error)) => {
+            temp_file.drop_async().await;
+
+            // bytes_downloaded may under-report for partial downloads if a write_all() fails.
+            // In failure cases, we don't really care about the exact number of bytes written;
+            // we'll be discarding the temporarily file anyways. What's more important is the
+            // reason it failed.
+            tracing::error!(
+                component = %component,
+                bundle = ?bundle,
+                location_type = %location_type,
+                url = %safe_url,
+                path = %dest_path.display(),
+                elapsed_secs = truncate_f64(download_start.elapsed().as_secs_f64(), 2),
+                bytes_downloaded,
+                error = %error,
+                "artifact download failed"
+            );
+            return Err(error);
+        }
+        Ok(total_written) => total_written,
+    };
 
     match temp_file.persist(&dest_path).await {
-        Ok(_) => Ok(()),
+        Ok(_) => {
+            tracing::info!(
+                component = %component,
+                bundle = ?bundle,
+                location_type = %location_type,
+                url = %safe_url,
+                path = %dest_path.display(),
+                elapsed_secs = truncate_f64(download_start.elapsed().as_secs_f64(), 2),
+                bytes_downloaded = total_written,
+                "successfully downloaded artifact"
+            );
+            Ok(())
+        }
         Err(e) => {
             if let Err(cleanup_error) = tokio::fs::remove_file(&e.path).await {
                 tracing::warn!(
@@ -381,12 +483,24 @@ async fn download_http_file(
                     "failed to remove temporary firmware artifact after persist failure"
                 );
             }
-            Err(format!(
+            let error = format!(
                 "failed to move {} to {}: {}",
                 e.path.display(),
                 dest_path.display(),
                 e.error
-            ))
+            );
+            tracing::error!(
+                component = %component,
+                bundle = ?bundle,
+                location_type = %location_type,
+                url = %safe_url,
+                path = %dest_path.display(),
+                elapsed_secs = truncate_f64(download_start.elapsed().as_secs_f64(), 2),
+                bytes_downloaded = total_written,
+                error = %error,
+                "artifact download failed"
+            );
+            Err(error)
         }
     }
 }
@@ -727,6 +841,16 @@ async fn remote_content_length(
         ));
     }
     Ok(response.content_length())
+}
+
+/// Truncates `value` to `decimals` decimal places without rounding.
+///
+/// Used to keep floating-point log fields (e.g. `elapsed_secs`) compact and
+/// consistent — a 600-second download timeout does not need nanosecond
+/// precision in a structured log.
+fn truncate_f64(value: f64, decimals: u32) -> f64 {
+    let multiplier = 10_f64.powi(decimals as i32);
+    (value * multiplier).trunc() / multiplier
 }
 
 fn validate_download_size(

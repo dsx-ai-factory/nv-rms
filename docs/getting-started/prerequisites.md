@@ -8,22 +8,22 @@ deploy RMS on Kubernetes instead, see [Deployment](../deployment/prerequisites.m
 For a local (non-Docker) build:
 
 - **Rust** - the Rust version pinned by
-  [`rust-toolchain.toml`](https://github.com/NVIDIA/nv-rms/blob/main/rust-toolchain.toml)
+  [`rust-toolchain.toml`](https://github.com/dsx-ai-factory/nv-rms/blob/main/rust-toolchain.toml)
   (the crate uses `edition = "2024"`). Install via
   [rustup](https://rustup.rs/).
   > NOTE: On Ubuntu, do **not** use `apt install rustc` -
   the packaged compiler is too old.
 - **Protocol buffer compiler** (`protoc`) - required by `tonic-build` to compile
-  the `.proto` service definitions at build time. On Debian/Ubuntu, run
-  `sudo apt-get install -y protobuf-compiler libprotobuf-dev`. On macOS, run
-  `brew install protobuf`.
+  the `.proto` service definitions at build time.
+  - Debian/Ubuntu: `sudo apt-get install -y protobuf-compiler libprotobuf-dev`
+  - macOS: `brew install protobuf`
 - **`lld`** (Linux) - the default linker preference in `.cargo/config.toml`.
   Install with `sudo apt-get install -y lld` (or remove the `fuse-ld=lld` line
   for another linker).
 - A working SSL/CA bundle (any standard Linux/macOS install is fine; `rustls`
   with `aws-lc-rs` is statically linked).
 - **[`just`](https://github.com/casey/just)** (optional, recommended) - a command
-  runner used by the [`Justfile`](https://github.com/NVIDIA/nv-rms/blob/main/Justfile)
+  runner used by the [`Justfile`](https://github.com/dsx-ai-factory/nv-rms/blob/main/Justfile)
   build and Docker helpers. Install via `cargo install just` or `brew install just`.
 
 For a **Docker-based build**, only **Docker 24+** is needed - all toolchain
@@ -62,7 +62,7 @@ When running RMS against real hardware:
 ## The librms proto definitions
 
 The gRPC service definitions (`rack_manager.proto` and related types) are
-provided by the [`librms`](https://github.com/NVIDIA/nv-rms-client) crate, pinned
-by `rev` in [`Cargo.toml`](https://github.com/NVIDIA/nv-rms/blob/main/Cargo.toml).
+provided by the [`librms`](https://github.com/dsx-ai-factory/nv-rms-client) crate, pinned
+by `rev` in [`Cargo.toml`](https://github.com/dsx-ai-factory/nv-rms/blob/main/Cargo.toml).
 Cargo fetches it automatically during the build - no submodule init step is
 required.

@@ -39,5 +39,5 @@ structs. This table maps each Helm value to the `config.toml` key it produces:
 | `logLevel` | `[logging] log_level` | `info` + caps |
 
 See [Deployment](../deployment/kubernetes.md) for install/upgrade workflows and
-[`helm/README.md`](https://github.com/NVIDIA/nv-rms/blob/main/helm/README.md) for
+[`helm/README.md`](https://github.com/dsx-ai-factory/nv-rms/blob/main/helm/README.md) for
 the exhaustive values reference.

@@ -54,6 +54,7 @@ static IPMITOOL_AVAILABILITY: LazyLock<Mutex<HashMap<String, Result<(), String>>
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 const IPMITOOL_PROBE_TIMEOUT_SECS: u64 = 5;
+const DEFAULT_IPMITOOL_BIN: &str = "/usr/bin/ipmitool";
 
 /// Errors produced while invoking ipmitool for activation commands.
 #[derive(Debug, Error, Clone, PartialEq)]
@@ -96,8 +97,7 @@ impl IpmiToolActivation {
         conf.insert("BMC_PASSWORD".to_string(), String::new());
         Self {
             conf_dict: conf,
-            ipmitool_bin: std::env::var("NVFWUPD_IPMITOOL_BIN")
-                .unwrap_or_else(|_| "ipmitool".to_string()),
+            ipmitool_bin: DEFAULT_IPMITOOL_BIN.to_string(),
         }
     }
 
@@ -152,6 +152,7 @@ impl IpmiToolActivation {
             .arg(bmc_user)
             .arg("-E")
             .args(command.split_whitespace())
+            .env_clear()
             .env("IPMI_PASSWORD", bmc_pass)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -330,7 +331,7 @@ impl IpmiToolActivation {
 
     async fn probe_ipmitool_binary(&self) -> Result<(), String> {
         let mut cmd = Command::new(&self.ipmitool_bin);
-        cmd.arg("-V").kill_on_drop(true);
+        cmd.env_clear().arg("-V").kill_on_drop(true);
         let output = timeout(
             Duration::from_secs(IPMITOOL_PROBE_TIMEOUT_SECS),
             cmd.output(),
@@ -379,6 +380,44 @@ mod tests {
 
     static IPMI_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(value) = self.previous.take() {
+                std::env::set_var(self.key, value);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn env_var_guard_restores_previous_value() {
+        let _guard = IPMI_TEST_LOCK.lock().await;
+        const KEY: &str = "NVFWUPD_TEST_ENV_VAR_GUARD_RESTORE";
+        std::env::set_var(KEY, "original");
+
+        {
+            let _env_guard = EnvVarGuard::set(KEY, "temporary");
+            assert_eq!(std::env::var(KEY).unwrap(), "temporary");
+        }
+
+        assert_eq!(std::env::var(KEY).unwrap(), "original");
+        std::env::remove_var(KEY);
+    }
+
     fn write_executable(path: &Path, script: &str) {
         {
             let mut file = fs::File::create(path).unwrap();
@@ -417,6 +456,13 @@ mod tests {
         assert_eq!(IPMI_CMD_DICT.get("PWR_CYCLE"), Some(&"power cycle"));
         assert_eq!(IPMI_CMD_DICT.get("RESET_COLD"), Some(&"mc reset cold"));
         assert_eq!(IPMI_CMD_DICT.get("RESET_WARM"), Some(&"mc reset warm"));
+    }
+
+    #[test]
+    fn new_uses_trusted_absolute_default_ipmitool_path() {
+        let ipmi = IpmiToolActivation::new();
+
+        assert_eq!(ipmi.ipmitool_bin, DEFAULT_IPMITOOL_BIN);
     }
 
     #[test]
@@ -543,6 +589,34 @@ exit 0
             .find(|line| line.starts_with("args="))
             .unwrap();
         assert!(!args_line.contains("plain_secret"));
+    }
+
+    #[tokio::test]
+    async fn run_ipmi_command_subprocess_clears_child_environment() {
+        let _guard = IPMI_TEST_LOCK.lock().await;
+        let (_dir, bin) = fake_ipmitool(
+            r#"#!/bin/sh
+if [ "$1" = "-V" ]; then
+  echo "ipmitool version"
+  exit 0
+fi
+printf 'leaked=%s\n' "${NVFWUPD_ENV_LEAK_CHECK:-unset}"
+printf 'env_password=%s\n' "$IPMI_PASSWORD"
+exit 0
+"#,
+        );
+        let _env_guard = EnvVarGuard::set("NVFWUPD_ENV_LEAK_CHECK", "should_not_leak");
+        let ipmi = configured_ipmi(bin);
+
+        let (ok, output) = ipmi
+            .run_ipmi_command_subprocess("power status", true, Some(2.0))
+            .await
+            .unwrap();
+
+        assert!(ok);
+        assert!(output.contains("env_password=secret"));
+        assert!(output.contains("leaked=unset"));
+        assert!(!output.contains("should_not_leak"));
     }
 
     #[tokio::test]

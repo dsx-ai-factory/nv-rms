@@ -45,9 +45,9 @@ use crate::nodes::switch_gb200_nvidia::{
     is_install_reboot_transition_state, is_retryable_install_poll_error,
     is_retryable_steady_state_error, is_uninstall_poll_success, system_image_listing_contains,
 };
-use crate::orchestrator::job_lifecycle::{JobError, JobFailure};
+use crate::orchestrator::job_lifecycle::{JobError, JobFailure, JobId};
 use crate::orchestrator::job_tracker::{JobType, RmsJobHandle};
-use crate::orchestrator::stage_timeline::StageTimeline;
+use crate::orchestrator::stage_timeline::{Stage, StageTimeline, fail_job};
 use crate::transport::ssh::SftpUploadOptions;
 use crate::utilities::error::{ErrorCode, Result, RmsError};
 use crate::utilities::insert_json_field;
@@ -55,6 +55,22 @@ use librms::protos::rack_manager as rm;
 
 pub(crate) type SharedSwitchSystemImageNode =
     Arc<tokio::sync::Mutex<Box<dyn SwitchSystemImageNode + Send + Sync>>>;
+
+/// A switch that `UpdateSwitchSystemImage` admitted, carried from the admission
+/// pass through the NVUE setup pass to the worker that is spawned for it.
+///
+/// Only per-switch state lives here. The rest of what a worker needs is either
+/// the same for every switch in the batch (`image_filename`, `local_file_path`,
+/// `target_build_id`, `sftp_upload_options`) and so is cloned per worker at the
+/// spawn site, or is derived from `pending` (the cancellation token).
+struct AdmittedSwitchImageJob {
+    pending: RmsJobHandle,
+    switch: Box<dyn SwitchSystemImageNode + Send + Sync>,
+    rack_id: String,
+    node_id: String,
+    user: String,
+    pass: String,
+}
 
 /// Capability required by the switch system-image workflow.
 ///
@@ -491,10 +507,22 @@ async fn wait_for_target_steady_state_inner(
                             attempt = idx + 1,
                             "steady-state wait saw HTTP 401 after reboot; attempting admin password recovery"
                         );
+
                         password_recovery_attempted = true;
                         switch
                             .recover_admin_password_after_boot(target_password)
-                            .await?;
+                            .await
+                            .map_err(|e| {
+                                if e.code == ErrorCode::Unauthenticated {
+                                    RmsError::new(
+                                        e.code,
+                                        "post-boot admin recovery failed: recovery credential mismatch",
+                                    )
+                                } else {
+                                    e
+                                }
+                            })?;
+
                         tracing::info!(
                             attempt = idx + 1,
                             "steady-state wait repaired post-reboot credentials"
@@ -659,6 +687,7 @@ impl RackManagerServiceImpl {
         batch.job_id = parent_id.clone();
 
         let mut skipped = 0u32;
+        let mut admitted = Vec::new();
         let mut queued_jobs = Vec::new();
 
         for node_info in nodes {
@@ -795,28 +824,6 @@ impl RackManagerServiceImpl {
                 }
             };
 
-            if let Err(e) = self
-                .initialize_nvue_client(switch.nvue_client(), None)
-                .await
-            {
-                tracing::warn!(
-                    node = %node_id,
-                    rack = %rack_id,
-                    error = %e.message,
-                    "skipping switch image update: failed to initialize NVUE client"
-                );
-                batch.node_results.push(rm::NodeOperationResult {
-                    node_id: node_id.clone(),
-                    status: rm::ReturnCode::Failure.into(),
-                    error_message: e.message,
-                });
-
-                skipped += 1;
-                continue;
-            }
-
-            let switch = Arc::new(tokio::sync::Mutex::new(switch));
-
             let pending = match self.job_tracker.create_child_job(
                 &parent_id,
                 &rack_id,
@@ -840,43 +847,74 @@ impl RackManagerServiceImpl {
                     continue;
                 }
             };
-            let job_id = pending.id().to_string();
-            jobs.push(rm::SwitchSystemImageUpdateJobInfo {
-                node_id: node_id.clone(),
-                job_id: job_id.clone(),
-            });
 
-            let image_filename = r.image_filename.clone();
-            let local_file_path = local_file_path.clone();
-            let target_build_id_spawn = target_build_id.clone();
-            let rack_id_spawn = rack_id.clone();
-            let node_id_spawn = node_id.clone();
-            let switch_username = user;
-            let switch_password = pass;
-            let sftp_upload_options = self.sftp_upload_options;
-            let cancel = pending.cancellation_token();
-
-            queued_jobs.push((
+            admitted.push(AdmittedSwitchImageJob {
                 pending,
                 switch,
-                image_filename,
-                local_file_path,
-                target_build_id_spawn,
-                switch_username,
-                switch_password,
-                rack_id_spawn,
-                node_id_spawn,
-                sftp_upload_options,
-                cancel,
-            ));
+                rack_id,
+                node_id,
+                user,
+                pass,
+            });
+        }
+
+        // NVUE setup runs only once the whole batch is admitted. Sealing a
+        // child inside the admission loop can leave the parent momentarily
+        // all-terminal (every switch admitted so far having failed setup); the
+        // reaper's parent refresh would seal it there, and every switch still
+        // waiting to be admitted would be refused with an internal "parent is
+        // terminal" error rather than being updated.
+        let admitted_count = admitted.len();
+        for admitted_job in admitted {
+            if let Err(e) = self
+                .initialize_nvue_client(admitted_job.switch.nvue_client(), None)
+                .await
+            {
+                tracing::warn!(
+                    node = %admitted_job.node_id,
+                    rack = %admitted_job.rack_id,
+                    error = %e.message,
+                    "skipping switch image update: failed to initialize NVUE client"
+                );
+                batch.node_results.push(rm::NodeOperationResult {
+                    node_id: admitted_job.node_id.clone(),
+                    status: rm::ReturnCode::Failure.into(),
+                    error_message: e.message.clone(),
+                });
+
+                let error_code = if e.code == ErrorCode::FailedPrecondition {
+                    JobError::FailedPrecondition
+                } else {
+                    JobError::ClientError
+                };
+                let child_id = JobId::from(admitted_job.pending.id().as_ref());
+                admitted_job
+                    .pending
+                    .fail(JobFailure::new(error_code, e.message));
+                self.job_tracker.refresh_parent_for_child(&child_id);
+
+                skipped += 1;
+                continue;
+            }
+
+            jobs.push(rm::SwitchSystemImageUpdateJobInfo {
+                node_id: admitted_job.node_id.clone(),
+                job_id: admitted_job.pending.id().to_string(),
+            });
+
+            queued_jobs.push(admitted_job);
         }
 
         let jobs_created = jobs.len() as u32;
         if jobs_created == 0 {
             batch.status = rm::ReturnCode::Failure.into();
             batch.message = "no switch system image jobs created".into();
-            self.job_tracker
-                .mark_failed_message(&parent_id, &batch.message);
+            // Admitted children that failed NVUE setup already drove the parent
+            // to a terminal state through child aggregation.
+            if admitted_count == 0 {
+                self.job_tracker
+                    .mark_failed_message(&parent_id, &batch.message);
+            }
             tracing::error!(total_nodes, "{}", batch.message);
             return Ok(tonic::Response::new(update_switch_system_image_response(
                 batch,
@@ -887,20 +925,25 @@ impl RackManagerServiceImpl {
             )));
         }
 
-        for (
-            pending,
-            switch,
-            image_filename,
-            local_file_path,
-            target_build_id_spawn,
-            switch_username,
-            switch_password,
-            rack_id_spawn,
-            node_id_spawn,
-            sftp_upload_options,
-            cancel,
-        ) in queued_jobs
-        {
+        for queued_job in queued_jobs {
+            let AdmittedSwitchImageJob {
+                pending,
+                switch,
+                rack_id,
+                node_id,
+                user,
+                pass,
+            } = queued_job;
+
+            // The worker outlives this handler, so it takes owned copies of the
+            // request values the whole batch shares.
+            let image_filename = r.image_filename.clone();
+            let local_file_path = local_file_path.clone();
+            let target_build_id = target_build_id.clone();
+            let sftp_upload_options = self.sftp_upload_options;
+            let switch = Arc::new(tokio::sync::Mutex::new(switch));
+            let cancel = pending.cancellation_token();
+
             // The switch workflow seals its own job through the tracked handle.
             // Running it under a tracked supervisor still records panic/abort
             // failures and avoids clobbering its terminal state on normal exit.
@@ -911,11 +954,11 @@ impl RackManagerServiceImpl {
                         switch,
                         &image_filename,
                         &local_file_path,
-                        &target_build_id_spawn,
-                        &switch_username,
-                        &switch_password,
-                        &rack_id_spawn,
-                        &node_id_spawn,
+                        &target_build_id,
+                        &user,
+                        &pass,
+                        &rack_id,
+                        &node_id,
                         sftp_upload_options,
                         &cancel,
                     )
@@ -1011,6 +1054,99 @@ fn update_switch_system_image_response(
 // Top-level per-node orchestrator for UpdateSwitchSystemImage.
 // `runSwitchSystemImageJob` function's stages: inspect state, stage image,
 // trigger install, wait for install handoff, wait for target steady state.
+
+/// Predefined, ordered stage sequence driving `run_switch_system_image_job`.
+/// Each `(name, description)` pair seeds a `Stage`'s name and immutable,
+/// imperative description once, here, instead of retyping either at every
+/// `timeline`/`job.progress`/`tracing` call site below.
+fn switch_system_image_job_stages() -> Vec<Stage> {
+    [
+        ("inspect_state", "Inspect current switch system image state"),
+        ("cleanup_old_partition", "Clean up unused partition image"),
+        (
+            "stage_image",
+            "Ensure switch system image is staged on target",
+        ),
+        ("trigger_install", "Trigger switch system image install"),
+        (
+            "wait_for_install_handoff",
+            "Wait for switch system image install to start reboot",
+        ),
+        (
+            "wait_for_target_steady_state",
+            "Wait for switch to return with target system image",
+        ),
+    ]
+    .into_iter()
+    .map(|(name, description)| Stage::new(name.to_owned(), description.to_owned()))
+    .collect()
+}
+
+/// Builds the `StageTimeline` driving `run_switch_system_image_job`, tagged
+/// with the node/rack it runs against so `StageTimeline`'s own stage
+/// transition logs carry them without repeating them at every call site.
+/// Factored out of `run_switch_system_image_job` so this wiring -- easy to
+/// silently drop when refactoring -- has a direct unit test.
+fn switch_system_image_job_timeline(job_id: &str, rack_id: &str, node_id: &str) -> StageTimeline {
+    StageTimeline::with_stages(job_id, switch_system_image_job_stages())
+        .with_node_rack(node_id, rack_id)
+}
+
+/// Fails the stage at `timeline`'s cursor, marks every stage after it
+/// `skipped` (since the job is about to exit early), builds the final
+/// `result_json` (with the full timing_summary) via `build_result_json`,
+/// and seals the job as failed. Collapses what would otherwise be a
+/// `timeline.fail` + `build_result_json` + `job.fail` block, repeated at
+/// every stage boundary, into a single call followed by `return`. A thin,
+/// job-specific wrapper around `stage_timeline::fail_job` -- see that
+/// function's docs for why the shared sequence lives there and not here.
+///
+/// `build_result_json` is threaded in rather than captured, since the
+/// caller's closure closes over job-specific context (`rack_id`,
+/// `image_filename`, `local_image_size_bytes`, etc.) that this
+/// job-control-flow helper has no need to know about.
+#[allow(clippy::too_many_arguments)]
+fn fail_stage(
+    timeline: &mut StageTimeline,
+    job: RmsJobHandle,
+    outcome: &str,
+    error: &str,
+    details: serde_json::Value,
+    install_job_id: &Option<String>,
+    before: &Option<SwitchSystemImageState>,
+    after: &Option<SwitchSystemImageState>,
+    image_visible_before_stage: bool,
+    image_visible_after_stage: bool,
+    build_result_json: &impl Fn(
+        &str,
+        &Option<String>,
+        &Option<SwitchSystemImageState>,
+        &Option<SwitchSystemImageState>,
+        bool,
+        bool,
+        &StageTimeline,
+    ) -> String,
+) {
+    fail_job(
+        timeline,
+        job,
+        outcome,
+        error,
+        details,
+        |outcome, timeline| {
+            build_result_json(
+                outcome,
+                install_job_id,
+                before,
+                after,
+                image_visible_before_stage,
+                image_visible_after_stage,
+                timeline,
+            )
+        },
+    );
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_switch_system_image_job(
     job: RmsJobHandle,
@@ -1030,7 +1166,7 @@ pub(crate) async fn run_switch_system_image_job(
     // seals its terminal state via `complete`/`fail`.
     let job_id_owned = job.id().to_string();
     let job_id = job_id_owned.as_str();
-    let mut timeline = StageTimeline::new();
+    let mut timeline = switch_system_image_job_timeline(job_id, rack_id, node_id);
     let local_image_size_bytes = std::fs::metadata(local_file_path).ok().map(|m| m.len());
 
     // Builds the final `result_json` embedded in the job's `complete` /
@@ -1070,20 +1206,14 @@ pub(crate) async fn run_switch_system_image_job(
         result.to_string()
     };
 
-    // Helper: bail out as a "cancelled" failure between stages. Records the
-    // cancellation in the timeline (marking the upcoming stage "failed") so
-    // dashboards can see which stage was pending. Returns the error message
-    // on cancellation so the caller can embed a result_json (with the full
-    // timing_summary) via `mark_failed_with_result`.
-    let check_cancel = |stage: &str, timeline: &mut StageTimeline| -> Option<String> {
+    // Returns a cancellation message for the stage at the timeline's cursor
+    // if `cancel` has fired, without touching the timeline itself --
+    // `fail_stage` below is the single place that actually records a
+    // failure, so cancellation and genuine errors both flow through it.
+    let check_cancel = |timeline: &StageTimeline| -> Option<String> {
         if cancel.is_cancelled() {
-            let msg = format!("switch system image job cancelled before {stage}");
-            timeline.fail(
-                stage,
-                &msg,
-                serde_json::json!({"cancelled_before_start": true}),
-            );
-            Some(msg)
+            let stage = timeline.current_name().unwrap_or("unknown_stage");
+            Some(format!("switch system image job cancelled before {stage}"))
         } else {
             None
         }
@@ -1101,19 +1231,54 @@ pub(crate) async fn run_switch_system_image_job(
     );
 
     // ── Stage 1: inspect current state ──
-    if let Some(err_msg) = check_cancel("inspect_state", &mut timeline) {
-        tracing::warn!(job_id, stage = "inspect_state", "stage cancelled");
-        let result_json =
-            build_result_json("cancelled", &None, &None, &None, false, false, &timeline);
-        job.fail(JobFailure::new(JobError::Other, &err_msg).with_result_json(result_json));
+    if let Some(err_msg) = check_cancel(&timeline) {
+        fail_stage(
+            &mut timeline,
+            job,
+            "cancelled",
+            &err_msg,
+            serde_json::json!({"cancelled_before_start": true}),
+            &None,
+            &None,
+            &None,
+            false,
+            false,
+            &build_result_json,
+        );
         return;
     }
-    timeline.start(
-        "inspect_state",
-        "Inspecting current switch system image state",
-    );
-    job.progress("Inspecting current switch system image state");
-    tracing::info!(job_id, stage = "inspect_state", "stage starting");
+    // Starts the next predefined stage, or fails the job and returns if
+    // the predefined stage list and this function's control flow have
+    // drifted out of sync -- a programming error, not a runtime condition.
+    // Without this, `start_stage()` running past the end of the list would
+    // panic through `.expect(...)`; the job supervisor's Drop-based safety
+    // net (see `JobHandle`'s `Drop` impl) still catches that and marks the
+    // job failed, but only with a generic "job abandoned" message and a
+    // noisy panic backtrace, dropping the timeline's partial progress that
+    // `fail_stage` would otherwise record.
+    //
+    // The `before`/`after`/image-visibility context `fail_stage` normally
+    // reports is deliberately left at its "unknown" default here rather
+    // than threaded in from each call site: this path only fires for an
+    // internal consistency bug, where a clean, low-detail failure is far
+    // more valuable than perfectly preserving in-flight state snapshots.
+    let Ok((stage, description)) = timeline.start_stage() else {
+        fail_stage(
+            &mut timeline,
+            job,
+            "failed",
+            "stage list exhausted",
+            serde_json::json!({}),
+            &None,
+            &None,
+            &None,
+            false,
+            false,
+            &build_result_json,
+        );
+        return;
+    };
+    job.progress(description);
 
     let before_state = {
         let sw = switch.lock().await;
@@ -1122,37 +1287,33 @@ pub(crate) async fn run_switch_system_image_job(
     let before_state = match before_state {
         Ok(s) => s,
         Err(e) => {
-            tracing::error!(
-                job_id,
-                stage = "inspect_state",
-                error = %e.message,
-                "stage failed: could not fetch /nvue_v1/system/image"
-            );
-            timeline.fail(
-                "inspect_state",
-                &e.message,
+            let error_message = format!("could not fetch /nvue_v1/system/image: {}", e.message);
+            fail_stage(
+                &mut timeline,
+                job,
+                "failed",
+                &error_message,
                 serde_json::json!({"error": e.message}),
+                &None,
+                &None,
+                &None,
+                false,
+                false,
+                &build_result_json,
             );
-            let result_json =
-                build_result_json("failed", &None, &None, &None, false, false, &timeline);
-            job.fail(JobFailure::new(JobError::Other, &e.message).with_result_json(result_json));
             return;
         }
     };
     tracing::info!(
         job_id,
-        stage = "inspect_state",
+        stage = %stage,
         current_build_id = %before_state.current_build_id,
         next_build_id = %before_state.next_build_id,
         current_partition = %before_state.current_partition,
         next_partition = %before_state.next_partition,
-        "stage completed: current switch system image state inspected"
+        "current switch system image state"
     );
-    timeline.complete(
-        "inspect_state",
-        "Current switch system image state inspected",
-        system_image_state_to_json(&before_state),
-    );
+    timeline.complete_current(system_image_state_to_json(&before_state));
 
     // ── Early-exit: already at target on both partitions ──
     if before_state.current_build_id == target_build_id
@@ -1163,6 +1324,7 @@ pub(crate) async fn run_switch_system_image_job(
             target_build_id,
             "switch is already up-to-date on both partitions; skipping install"
         );
+        timeline.skip_remaining();
         let result_json = build_result_json(
             "already_up_to_date",
             &None,
@@ -1177,25 +1339,39 @@ pub(crate) async fn run_switch_system_image_job(
     }
 
     // ── Stage 1.5: Clean up unused partition image ──
-    let cleanup_stage_name = "cleanup_old_partition";
-    if let Some(err_msg) = check_cancel(cleanup_stage_name, &mut timeline) {
-        tracing::warn!(job_id, stage = cleanup_stage_name, "stage cancelled");
-        job.fail(
-            JobFailure::new(JobError::Other, &err_msg).with_result_json(build_result_json(
-                "cancelled",
-                &None,
-                &Some(before_state.clone()),
-                &None,
-                false,
-                false,
-                &timeline,
-            )),
+    if let Some(err_msg) = check_cancel(&timeline) {
+        fail_stage(
+            &mut timeline,
+            job,
+            "cancelled",
+            &err_msg,
+            serde_json::json!({"cancelled_before_start": true}),
+            &None,
+            &Some(before_state.clone()),
+            &None,
+            false,
+            false,
+            &build_result_json,
         );
         return;
     }
-    timeline.start(cleanup_stage_name, "Cleaning up unused partition image");
-    job.progress("Cleaning up any unused partition images");
-    tracing::info!(job_id, stage = cleanup_stage_name, "stage starting");
+    let Ok((stage, description)) = timeline.start_stage() else {
+        fail_stage(
+            &mut timeline,
+            job,
+            "failed",
+            "stage list exhausted",
+            serde_json::json!({}),
+            &None,
+            &None,
+            &None,
+            false,
+            false,
+            &build_result_json,
+        );
+        return;
+    };
+    job.progress(description);
 
     // Determine the unused partition ID from the current partition
     let (unused_build_id, unused_partition) = match before_state.current_partition.as_str() {
@@ -1208,29 +1384,23 @@ pub(crate) async fn run_switch_system_image_job(
             NVOS_PARTITION_2_ID,
         ),
         _ => {
-            let message = "unrecognized current partition ID";
-            tracing::error!(
-                job_id,
-                stage = cleanup_stage_name,
-                partition_id = %before_state.current_partition.clone(),
-                message,
+            let error_message = format!(
+                "unrecognized current partition ID: {}",
+                before_state.current_partition
             );
-            timeline.fail(
-                cleanup_stage_name,
-                message,
+            fail_stage(
+                &mut timeline,
+                job,
+                "failed",
+                &error_message,
                 serde_json::json!({"job_id": job_id, "partition_id": before_state.current_partition.clone()}),
+                &None,
+                &Some(before_state),
+                &None,
+                false,
+                false,
+                &build_result_json,
             );
-            job.fail(JobFailure::new(JobError::Other, message).with_result_json(
-                build_result_json(
-                    "failed",
-                    &None,
-                    &Some(before_state),
-                    &None,
-                    false,
-                    false,
-                    &timeline,
-                ),
-            ));
             return;
         }
     };
@@ -1250,29 +1420,22 @@ pub(crate) async fn run_switch_system_image_job(
         let uninstall_job_id = match uninstall_job_id {
             Ok(id) => id,
             Err(e) => {
-                tracing::error!(
-                    job_id,
-                    stage = cleanup_stage_name,
-                    error = %e.message,
-                    "stage failed: NVUE rejected system image uninstall trigger"
+                let error_message = format!(
+                    "NVUE rejected system image uninstall trigger: {}",
+                    e.message
                 );
-                timeline.fail(
-                    cleanup_stage_name,
-                    &e.message,
+                fail_stage(
+                    &mut timeline,
+                    job,
+                    "failed",
+                    &error_message,
                     serde_json::json!({"error": e.message}),
-                );
-                job.fail(
-                    JobFailure::new(JobError::Other, &e.message).with_result_json(
-                        build_result_json(
-                            "failed",
-                            &None,
-                            &Some(before_state),
-                            &None,
-                            false,
-                            false,
-                            &timeline,
-                        ),
-                    ),
+                    &None,
+                    &Some(before_state),
+                    &None,
+                    false,
+                    false,
+                    &build_result_json,
                 );
                 return;
             }
@@ -1283,68 +1446,71 @@ pub(crate) async fn run_switch_system_image_job(
         if let Err(e) =
             wait_for_uninstall_completion(sw.as_ref(), &uninstall_job_id, cancel, job_id).await
         {
-            tracing::error!(
-                job_id,
-                stage = cleanup_stage_name,
-                error = %e.message,
-                "stage failed: NVUE system image uninstall failed"
-            );
-            timeline.fail(
-                cleanup_stage_name,
-                &e.message,
+            let error_message = format!("NVUE system image uninstall failed: {}", e.message);
+            fail_stage(
+                &mut timeline,
+                job,
+                "failed",
+                &error_message,
                 serde_json::json!({"error": e.message}),
-            );
-            job.fail(
-                JobFailure::new(JobError::Other, &e.message).with_result_json(build_result_json(
-                    "failed",
-                    &None,
-                    &Some(before_state),
-                    &None,
-                    false,
-                    false,
-                    &timeline,
-                )),
+                &None,
+                &Some(before_state),
+                &None,
+                false,
+                false,
+                &build_result_json,
             );
             return;
         }
+        timeline.complete_current(serde_json::json!({}));
     } else {
         tracing::info!(
             job_id,
-            "Stage {cleanup_stage_name} skipped; no unused partition image to clean up"
+            "Stage {stage} skipped; no unused partition image to clean up"
         );
+        timeline.skip_current(serde_json::json!({}));
     }
-    timeline.complete(
-        cleanup_stage_name,
-        "Unused partition image clean-up completed",
-        serde_json::json!({}),
-    );
 
     // ── Stage 2: pre-staging visibility + SFTP push ──
-    if let Some(err_msg) = check_cancel("stage_image", &mut timeline) {
-        tracing::warn!(job_id, stage = "stage_image", "stage cancelled");
-        let result_json = build_result_json(
+    if let Some(err_msg) = check_cancel(&timeline) {
+        fail_stage(
+            &mut timeline,
+            job,
             "cancelled",
+            &err_msg,
+            serde_json::json!({"cancelled_before_start": true}),
             &None,
             &Some(before_state.clone()),
             &None,
             false,
             false,
-            &timeline,
+            &build_result_json,
         );
-        job.fail(JobFailure::new(JobError::Other, &err_msg).with_result_json(result_json));
         return;
     }
-    timeline.start(
-        "stage_image",
-        "Ensuring switch system image is staged on target",
-    );
-    job.progress("Ensuring switch system image is staged on target");
+    let Ok((stage, description)) = timeline.start_stage() else {
+        fail_stage(
+            &mut timeline,
+            job,
+            "failed",
+            "stage list exhausted",
+            serde_json::json!({}),
+            &None,
+            &None,
+            &None,
+            false,
+            false,
+            &build_result_json,
+        );
+        return;
+    };
+    job.progress(description);
     tracing::info!(
         job_id,
-        stage = "stage_image",
+        stage = %stage,
         image_filename,
         local_file_path,
-        "stage starting"
+        "pre-staging image visibility"
     );
 
     let mut image_visible_before_stage = false;
@@ -1356,14 +1522,14 @@ pub(crate) async fn run_switch_system_image_job(
                     system_image_listing_contains(&listing, image_filename);
                 tracing::info!(
                     job_id,
-                    stage = "stage_image",
+                    stage = %stage,
                     image_visible_before_stage,
                     "pre-staging image listing checked"
                 );
             }
             Err(e) => tracing::warn!(
                 job_id,
-                stage = "stage_image",
+                stage = %stage,
                 error = %e.message,
                 "could not list system images before staging; continuing with upload"
             ),
@@ -1383,30 +1549,23 @@ pub(crate) async fn run_switch_system_image_job(
         {
             let was_cancelled = e.code == ErrorCode::Cancelled;
             let outcome = if was_cancelled { "cancelled" } else { "failed" };
-            tracing::warn!(
-                job_id,
-                stage = "stage_image",
-                outcome,
-                error = %e.message,
-                local_file_path,
-                image_filename,
-                "stage did not complete: SFTP upload / verification interrupted"
+            let error_message = format!(
+                "SFTP upload / verification interrupted (local_file_path={local_file_path}, image_filename={image_filename}): {}",
+                e.message
             );
-            timeline.fail(
-                "stage_image",
-                &e.message,
+            fail_stage(
+                &mut timeline,
+                job,
+                outcome,
+                &error_message,
                 serde_json::json!({"error": e.message, "cancelled": was_cancelled}),
-            );
-            let result_json = build_result_json(
-                outcome,
                 &None,
                 &Some(before_state),
                 &None,
                 image_visible_before_stage,
                 false,
-                &timeline,
+                &build_result_json,
             );
-            job.fail(JobFailure::new(JobError::Other, &e.message).with_result_json(result_json));
             return;
         }
     }
@@ -1419,7 +1578,7 @@ pub(crate) async fn run_switch_system_image_job(
             image_visible_after_stage = system_image_listing_contains(&listing, image_filename);
             tracing::info!(
                 job_id,
-                stage = "stage_image",
+                stage = %stage,
                 image_visible_after_stage,
                 "post-staging image listing checked"
             );
@@ -1452,35 +1611,43 @@ pub(crate) async fn run_switch_system_image_job(
             serde_json::json!(bytes_per_second / (1024.0 * 1024.0)),
         );
     }
-    timeline.complete(
-        "stage_image",
-        "Switch system image staged on target",
-        stage_image_details,
-    );
-    tracing::info!(
-        job_id,
-        stage = "stage_image",
-        "stage completed: image staged"
-    );
+    timeline.complete_current(stage_image_details);
+    tracing::info!(job_id, stage = %stage, "image staged");
 
     // ── Stage 3: trigger install ──
-    if let Some(err_msg) = check_cancel("trigger_install", &mut timeline) {
-        tracing::warn!(job_id, stage = "trigger_install", "stage cancelled");
-        let result_json = build_result_json(
+    if let Some(err_msg) = check_cancel(&timeline) {
+        fail_stage(
+            &mut timeline,
+            job,
             "cancelled",
+            &err_msg,
+            serde_json::json!({"cancelled_before_start": true}),
             &None,
             &Some(before_state.clone()),
             &None,
             image_visible_before_stage,
             image_visible_after_stage,
-            &timeline,
+            &build_result_json,
         );
-        job.fail(JobFailure::new(JobError::Other, &err_msg).with_result_json(result_json));
         return;
     }
-    timeline.start("trigger_install", "Triggering switch system image install");
-    job.progress("Triggering switch system image install");
-    tracing::info!(job_id, stage = "trigger_install", "stage starting");
+    let Ok((stage, description)) = timeline.start_stage() else {
+        fail_stage(
+            &mut timeline,
+            job,
+            "failed",
+            "stage list exhausted",
+            serde_json::json!({}),
+            &None,
+            &None,
+            &None,
+            false,
+            false,
+            &build_result_json,
+        );
+        return;
+    };
+    job.progress(description);
 
     let install_job_id = {
         let sw = switch.lock().await;
@@ -1489,71 +1656,70 @@ pub(crate) async fn run_switch_system_image_job(
     let install_job_id = match install_job_id {
         Ok(id) => id,
         Err(e) => {
-            tracing::error!(
-                job_id,
-                stage = "trigger_install",
-                error = %e.message,
-                "stage failed: NVUE install rejected trigger"
-            );
-            timeline.fail(
-                "trigger_install",
-                &e.message,
-                serde_json::json!({"error": e.message}),
-            );
-            let result_json = build_result_json(
+            let error_message = format!("NVUE install rejected trigger: {}", e.message);
+            fail_stage(
+                &mut timeline,
+                job,
                 "failed",
+                &error_message,
+                serde_json::json!({"error": e.message}),
                 &None,
                 &Some(before_state),
                 &None,
                 image_visible_before_stage,
                 image_visible_after_stage,
-                &timeline,
+                &build_result_json,
             );
-            job.fail(JobFailure::new(JobError::Other, &e.message).with_result_json(result_json));
             return;
         }
     };
-    timeline.complete(
-        "trigger_install",
-        "Triggered switch system image install",
-        serde_json::json!({"install_job_id": install_job_id}),
-    );
-    tracing::info!(
+    timeline.complete_current(serde_json::json!({"install_job_id": install_job_id}));
+    tracing::debug!(
         job_id,
-        stage = "trigger_install",
+        stage = %stage,
         install_job_id = %install_job_id,
         "stage completed: NVUE install triggered"
     );
 
     // ── Stage 4: wait for install to hand off to reboot ──
-    if let Some(err_msg) = check_cancel("wait_for_install_handoff", &mut timeline) {
-        tracing::warn!(
-            job_id,
-            stage = "wait_for_install_handoff",
-            "stage cancelled"
-        );
-        let result_json = build_result_json(
+    if let Some(err_msg) = check_cancel(&timeline) {
+        fail_stage(
+            &mut timeline,
+            job,
             "cancelled",
+            &err_msg,
+            serde_json::json!({"cancelled_before_start": true}),
             &Some(install_job_id.clone()),
             &Some(before_state.clone()),
             &None,
             image_visible_before_stage,
             image_visible_after_stage,
-            &timeline,
+            &build_result_json,
         );
-        job.fail(JobFailure::new(JobError::Other, &err_msg).with_result_json(result_json));
         return;
     }
-    timeline.start(
-        "wait_for_install_handoff",
-        "Waiting for switch system image install to start reboot",
-    );
-    job.progress("Waiting for switch system image install to start reboot");
+    let Ok((stage, description)) = timeline.start_stage() else {
+        fail_stage(
+            &mut timeline,
+            job,
+            "failed",
+            "stage list exhausted",
+            serde_json::json!({}),
+            &None,
+            &None,
+            &None,
+            false,
+            false,
+            &build_result_json,
+        );
+        return;
+    };
+    job.progress(description);
     tracing::info!(
         job_id,
-        stage = "wait_for_install_handoff",
+        stage = %stage,
         install_job_id = %install_job_id,
-        "stage starting"
+        "triggering install job"
     );
 
     {
@@ -1561,71 +1727,68 @@ pub(crate) async fn run_switch_system_image_job(
         if let Err(e) =
             wait_for_install_completion(sw.as_ref(), &install_job_id, cancel, job_id).await
         {
-            tracing::error!(
-                job_id,
-                stage = "wait_for_install_handoff",
-                error = %e.message,
-                install_job_id = %install_job_id,
-                "stage failed: NVUE install did not hand off cleanly"
+            let error_message = format!(
+                "NVUE install did not hand off cleanly (install_job_id={install_job_id}): {}",
+                e.message
             );
-            timeline.fail(
-                "wait_for_install_handoff",
-                &e.message,
-                serde_json::json!({"error": e.message}),
-            );
-            let result_json = build_result_json(
+            fail_stage(
+                &mut timeline,
+                job,
                 "failed",
+                &error_message,
+                serde_json::json!({"error": e.message}),
                 &Some(install_job_id),
                 &Some(before_state),
                 &None,
                 image_visible_before_stage,
                 image_visible_after_stage,
-                &timeline,
+                &build_result_json,
             );
-            job.fail(JobFailure::new(JobError::Other, &e.message).with_result_json(result_json));
             return;
         }
     }
-    timeline.complete(
-        "wait_for_install_handoff",
-        "Switch system image install handed off to reboot",
-        serde_json::json!({}),
-    );
-    tracing::info!(
-        job_id,
-        stage = "wait_for_install_handoff",
-        "stage completed: install handed off to reboot"
-    );
+    timeline.complete_current(serde_json::json!({}));
+    tracing::debug!(job_id, stage = %stage, "stage completed: install handed off to reboot");
 
     // ── Stage 5: wait for target steady state ──
-    if let Some(err_msg) = check_cancel("wait_for_target_steady_state", &mut timeline) {
-        tracing::warn!(
-            job_id,
-            stage = "wait_for_target_steady_state",
-            "stage cancelled"
-        );
-        let result_json = build_result_json(
+    if let Some(err_msg) = check_cancel(&timeline) {
+        fail_stage(
+            &mut timeline,
+            job,
             "cancelled",
+            &err_msg,
+            serde_json::json!({"cancelled_before_start": true}),
             &Some(install_job_id.clone()),
             &Some(before_state.clone()),
             &None,
             image_visible_before_stage,
             image_visible_after_stage,
-            &timeline,
+            &build_result_json,
         );
-        job.fail(JobFailure::new(JobError::Other, &err_msg).with_result_json(result_json));
         return;
     }
-    timeline.start(
-        "wait_for_target_steady_state",
-        "Waiting for switch to return with target system image",
-    );
-    job.progress("Waiting for switch to return with target system image");
+    let Ok((stage, description)) = timeline.start_stage() else {
+        fail_stage(
+            &mut timeline,
+            job,
+            "failed",
+            "stage list exhausted",
+            serde_json::json!({}),
+            &None,
+            &None,
+            &None,
+            false,
+            false,
+            &build_result_json,
+        );
+        return;
+    };
+    job.progress(description);
     tracing::info!(
         job_id,
-        stage = "wait_for_target_steady_state",
+        stage = %stage,
         target_build_id,
-        "stage starting"
+        "waiting for target steady state"
     );
 
     let after_state = {
@@ -1643,39 +1806,30 @@ pub(crate) async fn run_switch_system_image_job(
     let after_state = match after_state {
         Ok(s) => s,
         Err(e) => {
-            tracing::error!(
-                job_id,
-                stage = "wait_for_target_steady_state",
-                error = %e.message,
-                target_build_id,
-                "stage failed: switch did not converge to target build"
+            let error_message = format!(
+                "switch did not converge to target build {target_build_id}: {}",
+                e.message
             );
-            timeline.fail(
-                "wait_for_target_steady_state",
-                &e.message,
-                serde_json::json!({"error": e.message}),
-            );
-            let result_json = build_result_json(
+            fail_stage(
+                &mut timeline,
+                job,
                 "failed",
+                &error_message,
+                serde_json::json!({"error": e.message}),
                 &Some(install_job_id),
                 &Some(before_state),
                 &None,
                 image_visible_before_stage,
                 image_visible_after_stage,
-                &timeline,
+                &build_result_json,
             );
-            job.fail(JobFailure::new(JobError::Other, &e.message).with_result_json(result_json));
             return;
         }
     };
-    timeline.complete(
-        "wait_for_target_steady_state",
-        "Switch returned with target system image",
-        system_image_state_to_json(&after_state),
-    );
-    tracing::info!(
+    timeline.complete_current(system_image_state_to_json(&after_state));
+    tracing::debug!(
         job_id,
-        stage = "wait_for_target_steady_state",
+        stage = %stage,
         current_build_id = %after_state.current_build_id,
         next_build_id = %after_state.next_build_id,
         current_partition = %after_state.current_partition,
@@ -1692,7 +1846,6 @@ pub(crate) async fn run_switch_system_image_job(
         image_visible_after_stage,
         &timeline,
     );
-    tracing::info!(job_id, "switch system image job completed successfully");
     job.complete("Completed", result_json);
 }
 
@@ -1745,6 +1898,18 @@ mod tests {
                 .cloned()
                 .unwrap_or_else(|| ResponseTemplate::new(500))
         }
+    }
+
+    #[test]
+    fn switch_system_image_job_timeline_attaches_node_and_rack() {
+        // Regression test: `run_switch_system_image_job` builds its
+        // `StageTimeline` through this helper specifically so the
+        // node/rack it runs against are attached -- without this, the
+        // "stage starting"/"stage completed"/"stage failed" logs
+        // `StageTimeline` emits end up with empty node/rack fields.
+        let timeline = switch_system_image_job_timeline("job-1", "rack-01", "sw-01");
+        assert_eq!(timeline.node(), "sw-01");
+        assert_eq!(timeline.rack(), "rack-01");
     }
 
     // ── wait_for_uninstall tests ──────────────────────────────────────
@@ -2086,5 +2251,125 @@ mod tests {
             result["status"], "failed",
             "a genuine push failure should record a failed outcome"
         );
+    }
+
+    #[tokio::test]
+    async fn cleanup_stage_is_recorded_skipped_not_completed_when_no_unused_image() {
+        // Regression test: `StageTwoPushMock` reports an empty unused
+        // partition build ID, so stage 1.5 has nothing to clean up. It
+        // must show up in the timeline as "skipped" -- not "completed",
+        // which would misleadingly imply an uninstall actually ran.
+        let info = run_stage_two_push_job(PushFailureMode::GenuineFailure).await;
+
+        let result: serde_json::Value =
+            serde_json::from_str(&info.result_json).expect("result_json should parse");
+        let stages = result["timing_summary"]["stages"].as_array().unwrap();
+        let cleanup_stage = stages
+            .iter()
+            .find(|s| s["name"] == "cleanup_old_partition")
+            .expect("cleanup_old_partition stage should be present");
+        assert_eq!(cleanup_stage["status"], "skipped");
+    }
+
+    /// Mock switch node that always reports HTTP 401 on state reads and then
+    /// fails post-boot admin recovery with `recovery_error`.
+    struct SteadyStateRecoveryFailureMock {
+        recovery_error: RmsError,
+    }
+
+    #[async_trait]
+    impl SwitchSystemImageNode for SteadyStateRecoveryFailureMock {
+        fn nvue_client(&self) -> Option<&nvue_client::SharedClient> {
+            None
+        }
+
+        async fn get_normalized_system_image_state(&self) -> Result<SwitchSystemImageState> {
+            Err(RmsError::new(ErrorCode::Unauthenticated, "unauthorized"))
+        }
+
+        async fn poll_firmware_task(
+            &self,
+            _task_id: &str,
+        ) -> Result<crate::domain::node::FirmwareTaskStatus> {
+            unreachable!("poll_firmware_task should not be reached")
+        }
+
+        async fn uninstall_system_image(&self) -> Result<String> {
+            unreachable!("uninstall should not be reached")
+        }
+
+        async fn list_system_images(&self) -> Result<serde_json::Value> {
+            unreachable!("list_system_images should not be reached")
+        }
+
+        async fn push_system_image_file(
+            &self,
+            _local_file_path: &str,
+            _image_filename: &str,
+            _sftp_upload_options: SftpUploadOptions,
+            _cancel: &CancellationToken,
+        ) -> Result<()> {
+            unreachable!("push should not be reached")
+        }
+
+        async fn install_system_image(&self, _image_filename: &str) -> Result<String> {
+            unreachable!("install should not be reached")
+        }
+
+        async fn recover_admin_password_after_boot(
+            &mut self,
+            _target_password: &str,
+        ) -> Result<()> {
+            Err(RmsError::new(
+                self.recovery_error.code,
+                self.recovery_error.message.clone(),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn steady_state_wait_reports_recovery_credential_mismatch_on_ssh_auth_failure() {
+        let mut sw = SteadyStateRecoveryFailureMock {
+            recovery_error: RmsError::new(
+                ErrorCode::Unauthenticated,
+                "SSH credentials rejected by 10.0.0.1",
+            ),
+        };
+
+        let cancel = CancellationToken::new();
+
+        let err =
+            wait_for_target_steady_state_inner(&mut sw, "nvos-new", "admin", "newpass", &cancel)
+                .await
+                .expect_err("SSH auth failure during recovery should surface as an error");
+
+        assert_eq!(err.code, ErrorCode::Unauthenticated);
+
+        assert_eq!(
+            err.message,
+            "post-boot admin recovery failed: recovery credential mismatch"
+        );
+    }
+
+    /// An SSH authentication-exchange error must pass through unchanged, not
+    /// get relabeled as a credential mismatch.
+    #[tokio::test]
+    async fn steady_state_wait_passes_through_ssh_auth_exchange_failure() {
+        let mut sw = SteadyStateRecoveryFailureMock {
+            recovery_error: RmsError::new(
+                ErrorCode::InvalidArgument,
+                "SSH auth to 10.0.0.1: connection closed",
+            ),
+        };
+
+        let cancel = CancellationToken::new();
+
+        let err =
+            wait_for_target_steady_state_inner(&mut sw, "nvos-new", "admin", "newpass", &cancel)
+                .await
+                .expect_err("recovery failure should surface as an error");
+
+        assert_eq!(err.code, ErrorCode::InvalidArgument);
+        assert_eq!(err.message, "SSH auth to 10.0.0.1: connection closed");
     }
 }

@@ -59,13 +59,45 @@ tests:
     asserts:
       - matchRegex:
           path: data["config.toml"]
-          pattern: "\\[workflows.expected_inventory_profiles\\]"
+          pattern: "\\[workflows.expected_inventory_profiles.\"gb200-compute-variant-a\"\\]"
       - matchRegex:
           path: data["config.toml"]
-          pattern: '"gb200-compute-variant-a" = \\["FW_BMC_0","HGX_FW_GPU_0"\\]'
+          pattern: 'ap_names = \["FW_BMC_0","HGX_FW_GPU_0"\]'
       - matchRegex:
           path: data["config.toml"]
-          pattern: '"gb200-compute-variant-b" = \\["FW_BMC_0","HGX_FW_GPU_0","HGX_FW_GPU_1"\\]'
+          pattern: "\\[workflows.expected_inventory_profiles.\"gb200-compute-variant-b\"\\]"
+
+  - it: renders expected Flint device counts into config.toml
+    set:
+      global.image.tag: test
+      apiServer.expectedInventoryProfiles:
+        sku-gb200:
+          apNames:
+            - FW_BMC_0
+            - HGX_FW_GPU_0
+          flintDevices:
+            cx7: 4
+            cx8: 0
+            bf3Nic: 2
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: "\\[workflows.expected_inventory_profiles.\"sku-gb200\"\\]"
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'ap_names = \["FW_BMC_0","HGX_FW_GPU_0"\]'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: "\\[workflows.expected_inventory_profiles.\"sku-gb200\".flint_devices\\]"
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: "cx7 = 4"
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: "cx8 = 0"
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: "bf3_nic = 2"
 
   - it: sets insecure = true when allowInsecure is true
     set:

@@ -265,13 +265,13 @@ fn non_loopback_local_ip() -> IpAddr {
 }
 
 #[tokio::test]
-async fn matching_primary_waits_for_control_plane_convergence() {
+async fn matching_starting_primary_waits_for_control_plane_convergence() {
     let server = MockServer::start().await;
 
     Mock::given(method("GET"))
         .and(path("/nvue_v1/cluster"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "state": "enabled",
+            "state": "start",
         })))
         .expect(1)
         .mount(&server)

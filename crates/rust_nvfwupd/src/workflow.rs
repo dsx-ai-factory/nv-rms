@@ -17,6 +17,7 @@
 
 //! Public request and outcome types for library callers.
 
+use std::collections::BTreeMap;
 use std::fmt;
 
 use serde_json::Value;
@@ -47,6 +48,14 @@ pub enum NvFwUpdError {
         /// Sanitized reachability error message.
         message: String,
     },
+    /// Target host OS could not be reached over SSH.
+    #[error("host unreachable for {target}: {message}")]
+    HostUnreachable {
+        /// Target host address.
+        target: String,
+        /// Sanitized reachability error message.
+        message: String,
+    },
     /// Credentials were rejected by the target.
     #[error("authentication failed for {target}: {message}")]
     AuthFailed {
@@ -54,6 +63,34 @@ pub enum NvFwUpdError {
         target: String,
         /// Sanitized authentication failure message.
         message: String,
+    },
+    /// A command required by a host-side workflow is unavailable.
+    #[error("required host tool {tool} is unavailable: {message}")]
+    HostToolUnavailable {
+        /// Missing or unusable command name.
+        tool: String,
+        /// Sanitized command failure.
+        message: String,
+    },
+    /// The host credentials cannot run a required privileged command.
+    #[error("required sudo access is unavailable on the host: {message}")]
+    HostSudoUnavailable {
+        /// Sanitized sudo failure.
+        message: String,
+    },
+    /// Host-side firmware images do not form a safe update plan.
+    #[error("incompatible firmware selection for {component}: {message}")]
+    IncompatibleFirmware {
+        /// Logical device family being updated.
+        component: String,
+        /// Sanitized compatibility failure.
+        message: String,
+    },
+    /// A long-running workflow observed cooperative cancellation.
+    #[error("operation cancelled: {operation}")]
+    Cancelled {
+        /// Workflow phase that observed cancellation.
+        operation: &'static str,
     },
     /// Firmware package parsing failed before an update could be launched.
     #[error("package parse error for {path}: {message}")]
@@ -110,9 +147,9 @@ pub enum NvFwUpdError {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum SshHostKeyMode {
     /// Disable host-key validation. Use only when validation cannot be enabled.
+    #[default]
     Disabled,
     /// Learn the first host key for a target, then reject changed keys.
-    #[default]
     TrustOnFirstUse,
     /// Require the host key to already be present in known_hosts.
     Strict,
@@ -143,10 +180,127 @@ pub struct TargetConfig {
     pub server_type: ServerType,
     /// Whether TLS certificates should be verified for HTTPS requests.
     pub verify_tls: bool,
+    /// Whether Redfish may fall back to cleartext HTTP after HTTPS fails.
+    pub allow_http: bool,
     /// Optional known_hosts file for SSH/SFTP host-key verification.
     pub ssh_known_hosts: Option<String>,
     /// SSH/SFTP host-key verification mode.
     pub ssh_host_key_mode: SshHostKeyMode,
+}
+
+/// SSH connection information for host-side firmware workflows.
+#[derive(Clone, PartialEq, Eq)]
+pub struct HostTargetConfig {
+    /// Host OS IP address.
+    pub ip: String,
+    /// SSH username.
+    pub username: String,
+    /// SSH password, also supplied to `sudo -S` when needed.
+    pub password: String,
+    /// SSH port. Defaults to 22 when omitted.
+    pub port: Option<u16>,
+    /// Optional known_hosts file for SSH/SFTP verification.
+    pub ssh_known_hosts: Option<String>,
+    /// SSH/SFTP host-key verification mode.
+    pub ssh_host_key_mode: SshHostKeyMode,
+}
+
+impl fmt::Debug for HostTargetConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HostTargetConfig")
+            .field("ip", &self.ip)
+            .field("username", &self.username)
+            .field("password", &"<redacted>")
+            .field("port", &self.port)
+            .field("ssh_known_hosts", &self.ssh_known_hosts)
+            .field("ssh_host_key_mode", &self.ssh_host_key_mode)
+            .finish()
+    }
+}
+
+/// Mellanox/NVIDIA adapter family selected for a Flint workflow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum FlintDeviceFamily {
+    /// NVIDIA ConnectX-7 adapter.
+    ConnectX7,
+    /// NVIDIA ConnectX-8 adapter.
+    ConnectX8,
+    /// NVIDIA BlueField-3 DPU NIC firmware.
+    BlueField3,
+}
+
+/// Expected physical adapter counts keyed by Flint device family.
+///
+/// An absent family has no count expectation. A present zero count explicitly
+/// requires that the family not be enumerated by MST.
+pub type FlintExpectedDeviceCounts = BTreeMap<FlintDeviceFamily, usize>;
+
+impl FlintDeviceFamily {
+    /// Resolve a canonical component name or common Flint/MST family name.
+    pub fn from_component(component: &str) -> Option<Self> {
+        match component.trim().to_ascii_uppercase().as_str() {
+            "CX7" | "CONNECTX7" | "CONNECTX-7" => Some(Self::ConnectX7),
+            "CX8" | "CONNECTX8" | "CONNECTX-8" => Some(Self::ConnectX8),
+            "BF3" | "BF3_NIC" | "BLUEFIELD3" | "BLUEFIELD-3" => Some(Self::BlueField3),
+            _ => None,
+        }
+    }
+
+    /// Canonical RMS component name for the family.
+    pub const fn component(self) -> &'static str {
+        match self {
+            Self::ConnectX7 => "CX7",
+            Self::ConnectX8 => "CX8",
+            Self::BlueField3 => "BF3_NIC",
+        }
+    }
+
+    /// Device type prefix reported by `mst status -v`.
+    pub const fn mst_device_type(self) -> &'static str {
+        match self {
+            Self::ConnectX7 => "ConnectX7",
+            Self::ConnectX8 => "ConnectX8",
+            Self::BlueField3 => "BlueField3",
+        }
+    }
+}
+
+/// Candidate firmware images for one Flint device family.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlintFirmwareTarget {
+    /// Adapter family that may consume these images.
+    pub family: FlintDeviceFamily,
+    /// Local firmware images. Multiple entries support PSID-specific packages.
+    pub firmware_files: Vec<String>,
+}
+
+/// Request to update host-visible adapter firmware with Flint.
+#[derive(Debug, Clone)]
+pub struct FlintFirmwareUpdateRequest {
+    /// Device families and their candidate images.
+    pub targets: Vec<FlintFirmwareTarget>,
+    /// Preserve the public RMS force flag for result reporting. PSID safety is never bypassed.
+    pub force_update: bool,
+    /// Optional base timeout for host commands, in seconds.
+    ///
+    /// Setup and query commands use this value directly. Flint flashes use 20 times this value.
+    /// When omitted or zero, the workflow uses a 60-second base timeout.
+    pub timeout_secs: Option<u64>,
+    /// Optional cooperative cancellation token.
+    pub cancellation: Option<CancellationToken>,
+    /// Optional expected physical-device counts supplied by the deployment profile.
+    pub expected_device_counts: FlintExpectedDeviceCounts,
+}
+
+/// Request to verify host-visible adapter firmware against Flint images.
+#[derive(Debug, Clone)]
+pub struct FlintFirmwareVersionCheckRequest {
+    /// Device families and their candidate images.
+    pub targets: Vec<FlintFirmwareTarget>,
+    /// Optional cooperative cancellation token.
+    pub cancellation: Option<CancellationToken>,
+    /// Optional expected physical-device counts supplied by the deployment profile.
+    pub expected_device_counts: FlintExpectedDeviceCounts,
 }
 
 impl fmt::Debug for TargetConfig {
@@ -158,6 +312,7 @@ impl fmt::Debug for TargetConfig {
             .field("port", &self.port)
             .field("server_type", &self.server_type)
             .field("verify_tls", &self.verify_tls)
+            .field("allow_http", &self.allow_http)
             .field("ssh_known_hosts", &self.ssh_known_hosts)
             .field("ssh_host_key_mode", &self.ssh_host_key_mode)
             .finish()
@@ -296,32 +451,32 @@ pub enum ActivationMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActivationCommand {
     /// Power on the target.
-    RfPowerOn,
+    PowerOn,
     /// Power off the target.
-    RfPowerOff,
+    PowerOff,
     /// Power-cycle the target.
-    RfPowerCycle,
+    PowerCycle,
     /// Auxiliary power-cycle for platforms that require it.
-    RfAuxPowerCycle,
+    AuxPowerCycle,
     /// Query target power status.
-    RfPowerStatus,
+    PowerStatus,
     /// Gracefully reset a PowerShelf.
-    RfPowerShelfReset,
+    PowerShelfReset,
     /// Force reset a PowerShelf.
-    RfPowerShelfResetForce,
+    PowerShelfResetForce,
 }
 
 impl ActivationCommand {
     /// Return the CLI command string used by the existing NVFWUPD command path.
     pub fn as_cli_command(self) -> &'static str {
         match self {
-            Self::RfPowerOn => "RF_PWR_ON",
-            Self::RfPowerOff => "RF_PWR_OFF",
-            Self::RfPowerCycle => "RF_PWR_CYCLE",
-            Self::RfAuxPowerCycle => "RF_AUX_PWR_CYCLE",
-            Self::RfPowerStatus => "RF_PWR_STATUS",
-            Self::RfPowerShelfReset => "RF_PWRSHELF_RESET",
-            Self::RfPowerShelfResetForce => "RF_PWRSHELF_RESET_FORCE",
+            Self::PowerOn => "RF_PWR_ON",
+            Self::PowerOff => "RF_PWR_OFF",
+            Self::PowerCycle => "RF_PWR_CYCLE",
+            Self::AuxPowerCycle => "RF_AUX_PWR_CYCLE",
+            Self::PowerStatus => "RF_PWR_STATUS",
+            Self::PowerShelfReset => "RF_PWRSHELF_RESET",
+            Self::PowerShelfResetForce => "RF_PWRSHELF_RESET_FORCE",
         }
     }
 }

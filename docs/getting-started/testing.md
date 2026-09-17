@@ -17,7 +17,7 @@ real hardware is required, but the tests do bind local TCP ports.
 
 The `persistence` suite's Postgres backend requires a reachable Postgres 16 and a
 `DATABASE_URL`. The bundled
-[`docker-compose.yml`](https://github.com/NVIDIA/nv-rms/blob/main/docker-compose.yml)
+[`docker-compose.yml`](https://github.com/dsx-ai-factory/nv-rms/blob/main/docker-compose.yml)
 pulls `postgres:16-alpine`, listens on `localhost:5432`, and uses credentials
 `postgres / postgres / rms_test`:
 

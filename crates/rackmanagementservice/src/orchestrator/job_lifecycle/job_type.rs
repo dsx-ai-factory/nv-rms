@@ -26,6 +26,8 @@ pub enum JobType {
     SwitchSystemPasswordUpdate,
     SwitchSystemImageUpdate,
     ConfigureScaleUpFabricManagerV2,
+    /// Coordinator and per-node reservation holds for a rack cold reboot.
+    ColdRebootSequence,
 }
 
 impl JobType {
@@ -39,6 +41,7 @@ impl JobType {
             Self::SwitchSystemPasswordUpdate => "switch_system_password_update",
             Self::SwitchSystemImageUpdate => "switch_system_image_update",
             Self::ConfigureScaleUpFabricManagerV2 => "configure_scale_up_fabric_manager_v2",
+            Self::ColdRebootSequence => "cold_reboot_sequence",
         }
     }
 
@@ -54,6 +57,7 @@ impl JobType {
             Self::SwitchSystemPasswordUpdate => "switch system password update",
             Self::SwitchSystemImageUpdate => "switch system image update",
             Self::ConfigureScaleUpFabricManagerV2 => "scale-up fabric configuration",
+            Self::ColdRebootSequence => "cold reboot",
         }
     }
 
@@ -69,6 +73,7 @@ impl JobType {
             Self::SwitchSystemPasswordUpdate => "switch system password updates",
             Self::SwitchSystemImageUpdate => "switch system image updates",
             Self::ConfigureScaleUpFabricManagerV2 => "scale-up fabric configurations",
+            Self::ColdRebootSequence => "cold reboots",
         }
     }
 }

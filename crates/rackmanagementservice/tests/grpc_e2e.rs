@@ -43,6 +43,7 @@ use librms::protos::rack_manager_v2;
 use librms::protos::rack_manager_v2::rack_manager_v2_client::RackManagerV2Client;
 use rackmanagementservice::api::grpc::server::{GrpcServer, SwitchTlsRoots, TlsMode};
 use rackmanagementservice::config::{ExpectedInventoryCatalog, ExpectedInventoryProfiles};
+use rackmanagementservice::libnmxc::TlsMaterialStore;
 use rackmanagementservice::metrics;
 use rackmanagementservice::orchestrator::job_tracker::JobTracker;
 use rackmanagementservice::orchestrator::rack_manager::RackManager;
@@ -51,6 +52,10 @@ use redfish_test_support::RedfishSimulator;
 use tempfile::TempDir;
 
 use rack_manager::*;
+
+// ApplyFirmwareObject always activates; the GB200 SOP includes a three-minute
+// stabilization plus recovery and post-activation inventory verification.
+const GB200_FIRMWARE_OBJECT_APPLY_TIMEOUT: Duration = Duration::from_secs(6 * 60);
 
 // ══════════════════════════════════════════════════════════════════════════════
 //  Redfish simulator lifecycle (in-process Rust server)
@@ -200,6 +205,22 @@ async fn start_server_with_manager_and_catalog(
     rm: Arc<RackManager>,
     expected_inventory_catalog: ExpectedInventoryCatalog,
 ) -> (E2eServer, E2eClient) {
+    start_server_with_manager_catalog_and_switch_tls_roots(
+        rm,
+        expected_inventory_catalog,
+        SwitchTlsRoots {
+            insecure_switch: true,
+            ..SwitchTlsRoots::default()
+        },
+    )
+    .await
+}
+
+async fn start_server_with_manager_catalog_and_switch_tls_roots(
+    rm: Arc<RackManager>,
+    expected_inventory_catalog: ExpectedInventoryCatalog,
+    switch_tls_roots: SwitchTlsRoots,
+) -> (E2eServer, E2eClient) {
     let firmware_dir = TempDir::new().expect("create firmware TempDir");
     let jt = Arc::new(JobTracker::new());
 
@@ -207,10 +228,8 @@ async fn start_server_with_manager_and_catalog(
         .with_firmware_dir(firmware_dir.path())
         .with_expected_inventory_catalog(expected_inventory_catalog)
         .with_insecure_listener()
-        .with_switch_tls_roots(SwitchTlsRoots {
-            insecure_switch: true,
-            ..SwitchTlsRoots::default()
-        });
+        .with_switch_tls_roots(switch_tls_roots);
+
     let (incoming, port) = grpc_server.bind_localhost_ephemeral_port().unwrap();
 
     let _metrics_registry = metrics::init(&metrics::MetricsInfo {
@@ -246,6 +265,69 @@ async fn start_server_with_manager_and_catalog(
 
 async fn start_server() -> (E2eServer, E2eClient) {
     start_server_with_manager(Arc::new(RackManager::new())).await
+}
+
+async fn start_server_with_switch_tls_roots(
+    switch_tls_roots: SwitchTlsRoots,
+) -> (E2eServer, E2eClient) {
+    start_server_with_manager_catalog_and_switch_tls_roots(
+        Arc::new(RackManager::new()),
+        ExpectedInventoryCatalog::default(),
+        switch_tls_roots,
+    )
+    .await
+}
+
+/// A throwaway CA used to issue a server certificate for [`WiremockHttpsProxy`]
+/// and a client certificate for `TlsMaterialStore`, so the attestation
+/// happy-path test can exercise real certificate verification rather than
+/// the self-signed cert other NVUE tests use.
+struct NvueTestCa {
+    cert: rcgen::Certificate,
+    key: rcgen::KeyPair,
+}
+
+impl NvueTestCa {
+    fn new() -> Self {
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+
+        params.key_usages = vec![
+            rcgen::KeyUsagePurpose::KeyCertSign,
+            rcgen::KeyUsagePurpose::CrlSign,
+        ];
+
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key).unwrap();
+        Self { cert, key }
+    }
+
+    fn issue(&self, sans: Vec<String>) -> (rcgen::Certificate, rcgen::KeyPair) {
+        let params = rcgen::CertificateParams::new(sans).unwrap();
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = params.signed_by(&key, &self.cert, &self.key).unwrap();
+        (cert, key)
+    }
+}
+
+/// Writes `TlsMaterialStore`-shaped NVUE client TLS material under
+/// `root/domain/` and returns a CA-issued server certificate for the proxy
+/// fronting the mock NVUE server.
+fn write_nvue_client_tls_material(
+    root: &std::path::Path,
+    domain: &str,
+    ca: &NvueTestCa,
+) -> (rcgen::Certificate, rcgen::KeyPair) {
+    let (server_cert, server_key) = ca.issue(vec!["localhost".to_owned(), "127.0.0.1".to_owned()]);
+    let (client_cert, client_key) = ca.issue(vec!["rms-attestation-test-client".to_owned()]);
+
+    let domain_dir = root.join(domain);
+    std::fs::create_dir_all(&domain_dir).unwrap();
+    std::fs::write(domain_dir.join("ca.pem"), ca.cert.pem()).unwrap();
+    std::fs::write(domain_dir.join("client.pem"), client_cert.pem()).unwrap();
+    std::fs::write(domain_dir.join("client.key"), client_key.serialize_pem()).unwrap();
+
+    (server_cert, server_key)
 }
 
 struct E2eClient {
@@ -928,220 +1010,6 @@ async fn delete_node_removes_from_inventory() {
     server.stop();
 }
 
-// ── Power-on sequence ──
-
-#[tokio::test]
-async fn set_and_get_power_on_sequence() {
-    let (mut server, mut client) = start_server().await;
-
-    client
-        .create_nodes(CreateNodesRequest {
-            nodes: Some(NodeSet {
-                nodes: vec![mk_node_info(
-                    "c-01",
-                    "rack-01",
-                    "10.0.0.1",
-                    "aa:bb:cc:dd:ee:ff",
-                    443,
-                    Some("admin"),
-                    Some("pass"),
-                    NodeType::ComputeGb200Nvidia,
-                    vec![],
-                    vec![],
-                )],
-            }),
-        })
-        .await
-        .unwrap();
-
-    let set_resp = client
-        .set_rack_power_on_sequence(SetRackPowerOnSequenceRequest {
-            rack_id: "rack-01".into(),
-            power_on_order: vec![PowerOnOrderItem {
-                node_id: "c-01".into(),
-                completion_check: Some(CompletionCheck {
-                    enabled: true,
-                    timeout_seconds: 120,
-                }),
-            }],
-        })
-        .await
-        .unwrap()
-        .into_inner();
-
-    let set_response = operation_response(&set_resp.response);
-    assert_eq!(set_response.status, ReturnCode::Success as i32);
-
-    let get_resp = client
-        .get_rack_power_on_sequence(GetRackPowerOnSequenceRequest {
-            rack_id: "rack-01".into(),
-        })
-        .await
-        .unwrap()
-        .into_inner();
-
-    assert_eq!(get_resp.status, ReturnCode::Success as i32);
-    assert!(get_resp.is_valid);
-    assert_eq!(get_resp.power_on_order.len(), 1);
-    assert_eq!(get_resp.power_on_order[0].node_id, "c-01");
-
-    let check = get_resp.power_on_order[0]
-        .completion_check
-        .as_ref()
-        .unwrap();
-    assert!(check.enabled);
-    assert_eq!(check.timeout_seconds, 120);
-
-    server.stop();
-}
-
-#[tokio::test]
-async fn sequence_rack_power_off_uses_registered_switch_bmc_endpoint()
--> Result<(), Box<dyn std::error::Error>> {
-    let mockup = start_mockup().await;
-    let (mut server, mut client) = start_server().await;
-
-    let create_resp = client
-        .create_nodes(CreateNodesRequest {
-            nodes: Some(NodeSet {
-                nodes: vec![switch_power_node("sw-01", "rack-01", mockup.ports()[0])],
-            }),
-        })
-        .await?
-        .into_inner();
-
-    assert_eq!(
-        create_resp
-            .response
-            .as_ref()
-            .map(|response| response.status),
-        Some(ReturnCode::Success as i32)
-    );
-
-    let set_resp = client
-        .set_rack_power_on_sequence(SetRackPowerOnSequenceRequest {
-            rack_id: "rack-01".into(),
-            power_on_order: vec![PowerOnOrderItem {
-                node_id: "sw-01".into(),
-                completion_check: None,
-            }],
-        })
-        .await?
-        .into_inner();
-
-    assert_eq!(
-        set_resp.response.as_ref().map(|response| response.status),
-        Some(ReturnCode::Success as i32)
-    );
-
-    let power_resp = client
-        .sequence_rack_power(SequenceRackPowerRequest {
-            operation: RackPowerOperation::Off as i32,
-            rack_id: "rack-01".into(),
-        })
-        .await?
-        .into_inner();
-
-    assert_eq!(power_resp.status, ReturnCode::Success as i32);
-
-    server.stop();
-    Ok(())
-}
-
-#[tokio::test]
-async fn set_power_on_sequence_rejects_invalid_orders() -> Result<(), Box<dyn std::error::Error>> {
-    let (mut server, mut client) = start_server().await;
-
-    let create_resp = client
-        .create_nodes(CreateNodesRequest {
-            nodes: Some(NodeSet {
-                nodes: vec![compute_node("c-01", "rack-01", 443)],
-            }),
-        })
-        .await?
-        .into_inner();
-
-    assert_eq!(
-        create_resp
-            .response
-            .as_ref()
-            .map(|response| response.status),
-        Some(ReturnCode::Success as i32)
-    );
-
-    let order_item = |node_id: &str| PowerOnOrderItem {
-        node_id: node_id.into(),
-        completion_check: None,
-    };
-
-    let set_resp = client
-        .set_rack_power_on_sequence(SetRackPowerOnSequenceRequest {
-            rack_id: "rack-01".into(),
-            power_on_order: vec![order_item("c-01")],
-        })
-        .await?
-        .into_inner();
-
-    assert_eq!(
-        set_resp.response.as_ref().map(|response| response.status),
-        Some(ReturnCode::Success as i32)
-    );
-
-    let cases = [
-        (
-            "unknown node",
-            vec![order_item("missing-node")],
-            "unknown node",
-        ),
-        ("empty node", vec![order_item("")], "node_id is required"),
-        (
-            "duplicated nodes",
-            vec![order_item("c-01"), order_item("c-01")],
-            "duplicate node",
-        ),
-        ("empty sequence", Vec::new(), "power-on order is required"),
-    ];
-
-    for (case_name, power_on_order, expected_message) in cases {
-        let set_resp = client
-            .set_rack_power_on_sequence(SetRackPowerOnSequenceRequest {
-                rack_id: "rack-01".into(),
-                power_on_order,
-            })
-            .await?
-            .into_inner();
-
-        assert_eq!(
-            set_resp.response.as_ref().map(|response| response.status),
-            Some(ReturnCode::Failure as i32),
-            "{case_name}"
-        );
-        assert!(
-            set_resp
-                .response
-                .as_ref()
-                .is_some_and(|response| response.message.contains(expected_message)),
-            "{case_name}"
-        );
-
-        let get_resp = client
-            .get_rack_power_on_sequence(GetRackPowerOnSequenceRequest {
-                rack_id: "rack-01".into(),
-            })
-            .await?
-            .into_inner();
-
-        assert_eq!(get_resp.status, ReturnCode::Success as i32, "{case_name}");
-        assert!(get_resp.is_valid, "{case_name}");
-        assert_eq!(get_resp.power_on_order.len(), 1, "{case_name}");
-        assert_eq!(get_resp.power_on_order[0].node_id, "c-01", "{case_name}");
-    }
-
-    server.stop();
-
-    Ok(())
-}
-
 // ── Firmware job status ──
 
 #[tokio::test]
@@ -1385,6 +1253,65 @@ async fn compute_get_node_firmware_inventory() {
     assert!(names.contains(&"UEFI"), "missing UEFI in {names:?}");
 
     server.stop();
+}
+
+#[tokio::test]
+async fn batch_get_firmware_inventory_supports_unregistered_nodes_and_partial_failure()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mockup = start_mockup().await;
+    let (mut server, mut client) = start_server().await;
+    let mut invalid = compute_node("invalid-01", "rack-01", mockup.ports()[0]);
+    invalid.bmc_endpoint = None;
+
+    let resp = client
+        .batch_get_firmware_inventory(BatchGetFirmwareInventoryRequest {
+            nodes: Some(NodeSet {
+                nodes: vec![compute_node("c-01", "rack-01", mockup.ports()[0]), invalid],
+            }),
+        })
+        .await?
+        .into_inner();
+
+    let response = batch_response(&resp.response);
+    assert_eq!(response.status, ReturnCode::Failure as i32);
+    assert_batch_stats(response, 2, 1, 1);
+    assert_eq!(response.node_results.len(), 2);
+    assert_eq!(response.node_results[0].node_id, "c-01");
+    assert_eq!(response.node_results[0].status, ReturnCode::Success as i32);
+    assert_eq!(response.node_results[1].node_id, "invalid-01");
+    assert_eq!(response.node_results[1].status, ReturnCode::Failure as i32);
+    assert_eq!(resp.nodes.len(), 1);
+    assert_eq!(resp.nodes[0].node_id, "c-01");
+    let names: Vec<&str> = resp.nodes[0]
+        .firmware_list
+        .iter()
+        .map(|firmware| firmware.name.as_str())
+        .collect();
+    assert!(names.contains(&"FW_BMC_0"), "missing FW_BMC_0 in {names:?}");
+
+    server.stop();
+    Ok(())
+}
+
+#[tokio::test]
+async fn batch_get_firmware_inventory_rejects_empty_node_set()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (mut server, mut client) = start_server().await;
+
+    let resp = client
+        .batch_get_firmware_inventory(BatchGetFirmwareInventoryRequest { nodes: None })
+        .await?
+        .into_inner();
+
+    let response = batch_response(&resp.response);
+    assert_eq!(response.status, ReturnCode::Failure as i32);
+    assert_eq!(response.message, "No nodes specified in request");
+    assert_batch_stats(response, 0, 0, 0);
+    assert!(response.node_results.is_empty());
+    assert!(resp.nodes.is_empty());
+
+    server.stop();
+    Ok(())
 }
 
 // ── Compute rack-level firmware inventory ──
@@ -1836,6 +1763,83 @@ async fn compute_firmware_upload_file_not_found() {
 
     assert_eq!(resp.status, ReturnCode::Failure as i32);
     assert!(resp.message.contains("not found"));
+
+    server.stop();
+}
+
+#[tokio::test]
+async fn compute_inband_firmware_requires_activation() {
+    let mockup = start_mockup().await;
+    let (mut server, mut client) = start_server().await;
+    add_nodes(
+        &mut client,
+        vec![compute_node("c-01", "rack-01", mockup.ports()[0])],
+    )
+    .await;
+    let image = server.make_synthetic_compute_fwpkg("cx7-test.bin");
+
+    let resp = client
+        .update_firmware(UpdateFirmwareRequest {
+            node_id: "c-01".into(),
+            rack_id: "rack-01".into(),
+            filename: String::new(),
+            target: String::new(),
+            activate: false,
+            force_update: false,
+            firmware_targets: vec![FirmwareTarget {
+                target: "CX7".to_owned(),
+                filename: image.to_string_lossy().into_owned(),
+            }],
+        })
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert_eq!(resp.status, ReturnCode::Failure as i32);
+    assert!(resp.message.contains("require activation"));
+    assert!(resp.job_id.is_empty());
+
+    server.stop();
+}
+
+#[tokio::test]
+async fn compute_firmware_rejects_mixed_inband_and_oob_targets() {
+    let mockup = start_mockup().await;
+    let (mut server, mut client) = start_server().await;
+    add_nodes(
+        &mut client,
+        vec![compute_node("c-01", "rack-01", mockup.ports()[0])],
+    )
+    .await;
+    let image = server.make_synthetic_compute_fwpkg("mixed-fw.bin");
+    let filename = image.to_string_lossy().into_owned();
+
+    let resp = client
+        .update_firmware(UpdateFirmwareRequest {
+            node_id: "c-01".into(),
+            rack_id: "rack-01".into(),
+            filename: String::new(),
+            target: String::new(),
+            activate: true,
+            force_update: false,
+            firmware_targets: vec![
+                FirmwareTarget {
+                    target: "CX7".to_owned(),
+                    filename: filename.clone(),
+                },
+                FirmwareTarget {
+                    target: "BMC".to_owned(),
+                    filename,
+                },
+            ],
+        })
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert_eq!(resp.status, ReturnCode::Failure as i32);
+    assert!(resp.message.contains("cannot be mixed"));
+    assert!(resp.job_id.is_empty());
 
     server.stop();
 }
@@ -2343,9 +2347,12 @@ async fn apply_firmware_object_downloads_without_access_token() {
 
     // ApplyFirmwareObject enables activation and the post-activation version
     // check waits before reading inventory in the integration-test build.
-    let parent_job =
-        poll_job_until_terminal_within(&mut client, &response.job_id, Duration::from_secs(120))
-            .await;
+    let parent_job = poll_job_until_terminal_within(
+        &mut client,
+        &response.job_id,
+        GB200_FIRMWARE_OBJECT_APPLY_TIMEOUT,
+    )
+    .await;
     assert_eq!(
         parent_job.job_state,
         FirmwareJobState::Completed as i32,
@@ -2504,9 +2511,12 @@ async fn apply_firmware_object_downloads_from_artifactory_with_access_token() {
     let response = batch_response(&resp.response);
     assert_eq!(response.status, ReturnCode::Success as i32);
 
-    let parent_job =
-        poll_job_until_terminal_within(&mut client, &response.job_id, Duration::from_secs(120))
-            .await;
+    let parent_job = poll_job_until_terminal_within(
+        &mut client,
+        &response.job_id,
+        GB200_FIRMWARE_OBJECT_APPLY_TIMEOUT,
+    )
+    .await;
     assert_eq!(
         parent_job.job_state,
         FirmwareJobState::Completed as i32,
@@ -2553,9 +2563,12 @@ async fn apply_firmware_object_downloads_local_file_artifact() {
     let response = batch_response(&resp.response);
     assert_eq!(response.status, ReturnCode::Success as i32);
 
-    let parent_job =
-        poll_job_until_terminal_within(&mut client, &response.job_id, Duration::from_secs(120))
-            .await;
+    let parent_job = poll_job_until_terminal_within(
+        &mut client,
+        &response.job_id,
+        GB200_FIRMWARE_OBJECT_APPLY_TIMEOUT,
+    )
+    .await;
     assert_eq!(
         parent_job.job_state,
         FirmwareJobState::Completed as i32,
@@ -2820,21 +2833,52 @@ struct WiremockHttpsProxy {
 }
 
 impl WiremockHttpsProxy {
+    /// Fronts `upstream` with a throwaway self-signed certificate. Callers
+    /// that need `insecure_switch: false` (real certificate verification)
+    /// must use [`Self::start_with_certificate`] with a certificate chaining
+    /// to a CA the test's `TlsMaterialStore` trusts instead.
     async fn start(upstream: SocketAddr) -> Self {
-        use rcgen::generate_simple_self_signed;
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into(), "127.0.0.1".into()])
+            .expect("generate NVUE test certificate");
+
+        Self::start_with_certificate(upstream, cert.cert, cert.key_pair, None).await
+    }
+
+    async fn start_with_certificate(
+        upstream: SocketAddr,
+        cert: rcgen::Certificate,
+        key_pair: rcgen::KeyPair,
+        client_ca: Option<&rcgen::Certificate>,
+    ) -> Self {
         use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
         use tokio::io::copy_bidirectional;
         use tokio::net::{TcpListener, TcpStream};
         use tokio_rustls::TlsAcceptor;
 
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-        let cert = generate_simple_self_signed(vec!["localhost".into(), "127.0.0.1".into()])
-            .expect("generate NVUE test certificate");
 
-        let cert_der = CertificateDer::from(cert.cert.der().to_vec());
-        let key_der = PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
-        let mut tls_config = rustls::ServerConfig::builder()
-            .with_no_client_auth()
+        let cert_der = CertificateDer::from(cert.der().to_vec());
+        let key_der = PrivatePkcs8KeyDer::from(key_pair.serialize_der());
+
+        let tls_builder = rustls::ServerConfig::builder();
+
+        let tls_builder = match client_ca {
+            Some(client_ca) => {
+                let mut roots = rustls::RootCertStore::empty();
+                roots
+                    .add(CertificateDer::from(client_ca.der().to_vec()))
+                    .expect("add NVUE client CA certificate");
+
+                let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
+                    .build()
+                    .expect("build NVUE client certificate verifier");
+
+                tls_builder.with_client_cert_verifier(verifier)
+            }
+            None => tls_builder.with_no_client_auth(),
+        };
+
+        let mut tls_config = tls_builder
             .with_single_cert(vec![cert_der], key_der.into())
             .expect("build NVUE test TLS config");
 
@@ -3228,6 +3272,44 @@ async fn update_switch_system_image_creates_jobs_for_switches() {
 }
 
 #[tokio::test]
+async fn update_switch_system_image_admits_one_job_per_switch() {
+    let (mut server, mut client) = start_server().await;
+
+    let image = server.make_fake_firmware_file("rms_test_switch_sys_image_dup.bin");
+    let device = switch_device("sw-01", "rack-01", "10.0.0.11", "aa:bb:cc:00:00:11");
+
+    // A repeated switch must not get two concurrent image installs: the second
+    // occurrence is refused and reported, not silently dropped.
+    let resp = client
+        .update_switch_system_image(UpdateSwitchSystemImageRequest {
+            nodes: Some(NodeSet {
+                nodes: vec![device.clone(), device],
+            }),
+            image_filename: "nvos-1.2.3.bin".into(),
+            local_file_path: image.to_str().unwrap().into(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+
+    let response = batch_response(&resp.response);
+    assert_eq!(response.status, ReturnCode::Failure as i32);
+    assert_batch_stats(response, 2, 1, 1);
+    assert_eq!(resp.jobs.len(), 1);
+    assert_eq!(resp.jobs[0].node_id, "sw-01");
+
+    let rejected: Vec<&str> = response
+        .node_results
+        .iter()
+        .filter(|result| result.status == ReturnCode::Failure as i32)
+        .map(|result| result.node_id.as_str())
+        .collect();
+    assert_eq!(rejected, ["sw-01"]);
+
+    server.stop();
+}
+
+#[tokio::test]
 async fn batch_disable_switch_mtls_rejects_empty_services_over_grpc() {
     let (mut server, mut client) = start_server().await;
 
@@ -3346,6 +3428,327 @@ async fn update_switch_system_password_completes_parent_and_child_jobs() {
     assert_eq!(result["status"], "completed");
     assert_eq!(result["phase"], "password_update_persisted");
     assert_eq!(result["revision_id"], "55");
+
+    server.stop();
+}
+
+#[tokio::test]
+async fn switch_spdm_attestation_rpc_rejects_invalid_nonce_size() {
+    let (mut server, mut client) = start_server().await;
+
+    let error = client
+        .batch_collect_switch_spdm_attestation_evidence(
+            BatchCollectSwitchSpdmAttestationEvidenceRequest {
+                targets: vec![NodeInfo {
+                    rack_id: "rack-01".to_owned(),
+                    node_id: "sw-01".to_owned(),
+                    r#type: Some(NodeType::SwitchGb200Nvidia.into()),
+                    ..Default::default()
+                }],
+                nonce: vec![1; 31],
+                domain: None,
+            },
+        )
+        .await
+        .expect_err("invalid nonce size must be rejected");
+
+    assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    assert!(error.message().contains("exactly 32 bytes"));
+
+    server.stop();
+}
+
+#[tokio::test]
+async fn switch_spdm_attestation_rpc_rejects_duplicate_physical_target() {
+    let (mut server, mut client) = start_server().await;
+
+    let error = client
+        .batch_collect_switch_spdm_attestation_evidence(
+            BatchCollectSwitchSpdmAttestationEvidenceRequest {
+                targets: vec![
+                    switch_device("sw-01", "rack-01", "10.0.0.11", "aa:bb:cc:00:00:11"),
+                    switch_device("sw-alias", "rack-02", "10.0.0.11", "aa:bb:cc:00:00:11"),
+                ],
+                nonce: vec![1; 32],
+                domain: None,
+            },
+        )
+        .await
+        .expect_err("duplicate physical switch must be rejected");
+
+    assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    assert!(error.message().contains("duplicate physical switch"));
+
+    server.stop();
+}
+
+#[tokio::test]
+async fn switch_spdm_attestation_rpc_collects_evidence_over_insecure_nvue_https() {
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let nvue = MockServer::start().await;
+    let nvue_https = WiremockHttpsProxy::start(*nvue.address()).await;
+
+    Mock::given(method("GET"))
+        .and(path("/nvue_v1/system/security/spdm"))
+        .and(query_param("rev", "operational"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "ERoT_BMC_0": {}
+        })))
+        .mount(&nvue)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/nvue_v1/system/security/spdm/ERoT_BMC_0"))
+        .respond_with(ResponseTemplate::new(201).set_body_json("spdm-bmc"))
+        .mount(&nvue)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/nvue_v1/action/spdm-bmc"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "state": "action_success"
+        })))
+        .mount(&nvue)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path(
+            "/nvue_v1/system/security/spdm/ERoT_BMC_0/measurements",
+        ))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"signed_measurements": "value"})),
+        )
+        .mount(&nvue)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path(
+            "/nvue_v1/system/security/spdm/ERoT_BMC_0/certificates",
+        ))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"certificate_chain": "value"})),
+        )
+        .mount(&nvue)
+        .await;
+
+    // insecure_switch is an operator opt-out of switch mTLS, not a reason to
+    // block attestation: the RPC must run over unverified NVUE HTTPS exactly
+    // like every other switch RPC does under this flag.
+    let (mut server, mut client) = start_server().await;
+
+    let response = client
+        .batch_collect_switch_spdm_attestation_evidence(
+            BatchCollectSwitchSpdmAttestationEvidenceRequest {
+                targets: vec![switch_password_device(
+                    "sw-01",
+                    "rack-01",
+                    nvue_https.port(),
+                )],
+                nonce: vec![0xab; 32],
+                domain: None,
+            },
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert_eq!(response.status, ReturnCode::Success as i32);
+    assert_eq!(response.results.len(), 1);
+
+    let target = &response.results[0];
+
+    assert_eq!(target.status, ReturnCode::Success as i32);
+    assert_eq!(target.components.len(), 1);
+    assert_eq!(target.components[0].status, ReturnCode::Success as i32);
+
+    server.stop();
+}
+
+#[tokio::test]
+async fn switch_spdm_attestation_rpc_collects_evidence_over_verified_nvue_https() {
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let nvue = MockServer::start().await;
+
+    // The non-insecure NVUE client activation path probes readiness with a
+    // GET before any SPDM calls.
+    Mock::given(method("GET"))
+        .and(path("/nvue_v1/system"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+        .mount(&nvue)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/nvue_v1/system/security/spdm"))
+        .and(query_param("rev", "operational"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "ERoT_BMC_0": {}
+        })))
+        .mount(&nvue)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/nvue_v1/system/security/spdm/ERoT_BMC_0"))
+        .respond_with(ResponseTemplate::new(201).set_body_json("spdm-bmc"))
+        .mount(&nvue)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/nvue_v1/action/spdm-bmc"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "state": "action_success"
+        })))
+        .mount(&nvue)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path(
+            "/nvue_v1/system/security/spdm/ERoT_BMC_0/measurements",
+        ))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"signed_measurements": "value"})),
+        )
+        .mount(&nvue)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path(
+            "/nvue_v1/system/security/spdm/ERoT_BMC_0/certificates",
+        ))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"certificate_chain": "value"})),
+        )
+        .mount(&nvue)
+        .await;
+
+    let tls_root = TempDir::new().expect("create TLS material TempDir");
+    let ca = NvueTestCa::new();
+
+    let (server_cert, server_key) =
+        write_nvue_client_tls_material(tls_root.path(), "test-domain", &ca);
+
+    let nvue_https = WiremockHttpsProxy::start_with_certificate(
+        *nvue.address(),
+        server_cert,
+        server_key,
+        Some(&ca.cert),
+    )
+    .await;
+
+    let (mut server, mut client) = start_server_with_switch_tls_roots(SwitchTlsRoots {
+        client_tls: Some(TlsMaterialStore::new(tls_root.path())),
+        dns_domain: Some("localhost".to_owned()),
+        insecure_switch: false,
+        ..SwitchTlsRoots::default()
+    })
+    .await;
+
+    let response = client
+        .batch_collect_switch_spdm_attestation_evidence(
+            BatchCollectSwitchSpdmAttestationEvidenceRequest {
+                targets: vec![switch_password_device(
+                    "sw-01",
+                    "rack-01",
+                    nvue_https.port(),
+                )],
+                nonce: vec![0xab; 32],
+                domain: Some("test-domain".to_owned()),
+            },
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert_eq!(response.status, ReturnCode::Success as i32);
+    assert_eq!(response.results.len(), 1);
+
+    let target = &response.results[0];
+
+    assert_eq!(target.status, ReturnCode::Success as i32);
+    assert_eq!(target.node_id, "sw-01");
+    assert!(target.collection_timestamp.is_some());
+    assert_eq!(target.components.len(), 1);
+    assert_eq!(target.components[0].component_id, "ERoT_BMC_0");
+    assert_eq!(target.components[0].status, ReturnCode::Success as i32);
+    assert!(target.components[0].evidence.is_some());
+
+    server.stop();
+}
+
+#[tokio::test]
+async fn switch_spdm_attestation_rpc_rejects_untrusted_nvue_server_certificate() {
+    use wiremock::MockServer;
+
+    // No SPDM mocks are needed: the TLS handshake must fail before any HTTP
+    // request reaches wiremock.
+    let nvue = MockServer::start().await;
+
+    let tls_root = TempDir::new().expect("create TLS material TempDir");
+    let ca = NvueTestCa::new();
+
+    write_nvue_client_tls_material(tls_root.path(), "test-domain", &ca);
+
+    // The proxy's server certificate is signed by a CA the TlsMaterialStore
+    // above does not trust: this proves certificate verification is actually
+    // load-bearing on this path, not a no-op that the happy-path test alone
+    // couldn't distinguish from a broken "accept any cert" transport.
+    let untrusted_ca = NvueTestCa::new();
+
+    let (untrusted_server_cert, untrusted_server_key) =
+        untrusted_ca.issue(vec!["localhost".to_owned(), "127.0.0.1".to_owned()]);
+
+    let nvue_https = WiremockHttpsProxy::start_with_certificate(
+        *nvue.address(),
+        untrusted_server_cert,
+        untrusted_server_key,
+        Some(&ca.cert),
+    )
+    .await;
+
+    let (mut server, mut client) = start_server_with_switch_tls_roots(SwitchTlsRoots {
+        client_tls: Some(TlsMaterialStore::new(tls_root.path())),
+        dns_domain: Some("localhost".to_owned()),
+        insecure_switch: false,
+        ..SwitchTlsRoots::default()
+    })
+    .await;
+
+    let response = client
+        .batch_collect_switch_spdm_attestation_evidence(
+            BatchCollectSwitchSpdmAttestationEvidenceRequest {
+                targets: vec![switch_password_device(
+                    "sw-01",
+                    "rack-01",
+                    nvue_https.port(),
+                )],
+                nonce: vec![0xab; 32],
+                domain: Some("test-domain".to_owned()),
+            },
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert_eq!(response.status, ReturnCode::Failure as i32);
+    assert_eq!(response.results.len(), 1);
+    assert_eq!(response.results[0].status, ReturnCode::Failure as i32);
+
+    assert!(
+        response.results[0]
+            .error_message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("certificate"),
+        "expected a certificate-specific error, got: {:?}",
+        response.results[0].error_message
+    );
 
     server.stop();
 }
@@ -4389,9 +4792,72 @@ async fn batch_get_node_device_info_aggregates_per_node_failures() {
 }
 
 #[tokio::test]
-async fn batch_get_node_device_info_rejects_delta_powershelf_stateless() {
+async fn batch_get_node_device_info_assigns_results_across_phase_boundary() {
+    // The batch read is two-phase: nodes with no device info (powershelves)
+    // resolve synchronously in phase 1, while nodes that build a real instance
+    // (computes) are fanned out in phase 2 and reassembled by original index.
+    // Positioning the powershelf *between* the computes interleaves the two
+    // phases' index spaces, so this pins that phase-2 results land on the
+    // correct node and the stats account for the phase-1 success too — a path
+    // the powershelf-only test leaves unexercised (its `ready` set is empty).
+    let mockup = start_mockup().await;
     let (mut server, mut client) = start_server().await;
 
+    let devices = vec![
+        compute_node("c-01", "rack-01", mockup.ports()[0]),
+        powershelf_node("ps-mid", "rack-01", mockup.ports()[1]),
+        compute_node("c-02", "rack-01", mockup.ports()[0]),
+    ];
+
+    let resp = client
+        .batch_get_node_device_info(BatchGetNodeDeviceInfoRequest {
+            nodes: Some(NodeSet { nodes: devices }),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert_eq!(
+        resp.status,
+        ReturnCode::Success as i32,
+        "expected success, got {}: {}",
+        resp.status,
+        resp.message
+    );
+    // Powershelf is a success with no detail row; only the two computes have
+    // device info, so 3 total / 3 successful / 0 failed and 2 detail rows.
+    assert_stats(&resp.stats, 3, 3, 0);
+    assert_eq!(resp.node_device_details.len(), 2);
+
+    let mut ids: Vec<&str> = resp
+        .node_device_details
+        .iter()
+        .map(|n| n.node_id.as_str())
+        .collect();
+    ids.sort();
+    assert_eq!(
+        ids,
+        vec!["c-01", "c-02"],
+        "phase-2 results must be attributed to the compute nodes, not shifted by the phase-1 powershelf"
+    );
+
+    for info in &resp.node_device_details {
+        assert_eq!(info.chassis_sn, Some(COMPUTE_CHASSIS_SN));
+        assert_eq!(info.slot_number, Some(COMPUTE_SLOT_NUMBER));
+        assert_eq!(info.tray_index, Some(COMPUTE_TRAY_INDEX));
+    }
+
+    server.stop();
+}
+
+#[tokio::test]
+async fn batch_get_node_device_info_reports_delta_powershelf_as_no_device_info_stateless() {
+    let (mut server, mut client) = start_server().await;
+
+    // Powershelves expose no device info, so a stateless batch read short-
+    // circuits to "no device info" up front: a success with no details and no
+    // credential/endpoint validation, consistent with the single-node and
+    // list-by-type handlers and every powershelf kind.
     let devices = vec![mk_node_info(
         "ps-delta",
         "rack-01",
@@ -4413,15 +4879,9 @@ async fn batch_get_node_device_info_rejects_delta_powershelf_stateless() {
         .unwrap()
         .into_inner();
 
-    assert_eq!(resp.status, ReturnCode::Failure as i32);
-    assert!(
-        resp.message
-            .contains("build_ephemeral_node not supported for powershelf_gb200_delta nodes"),
-        "got: {}",
-        resp.message
-    );
+    assert_eq!(resp.status, ReturnCode::Success as i32);
     assert!(resp.node_device_details.is_empty());
-    assert_stats(&resp.stats, 1, 0, 1);
+    assert_stats(&resp.stats, 1, 1, 0);
 
     server.stop();
 }

@@ -8,7 +8,7 @@ Every key is optional; omitted keys - and omitted sections - fall back to the
 defaults documented below, so an empty file is a valid, all-defaults config.
 Unknown keys, at the top level or within a section, are **rejected at startup**.
 A documented template ships at
-[`docker/config.example.toml`](https://github.com/NVIDIA/nv-rms/blob/main/docker/config.example.toml).
+[`docker/config.example.toml`](https://github.com/dsx-ai-factory/nv-rms/blob/main/docker/config.example.toml).
 
 Beyond the top-level `port`, configuration is grouped into sections:
 `[metrics]`, `[tls]`, `[switches]`, `[postgres]`, `[workflows]`, and `[logging]`.
@@ -128,10 +128,11 @@ docker compose exec postgres psql -U postgres -d rms_test \
 | `sftp_step_timeout_seconds` | `30` | Stall timeout (seconds) for one SFTP step (setup/read/write/flush). Must be ≤ the upload timeout. |
 | `max_tracked_jobs` | `10000` | Max async job records the tracker retains, to bound resource usage. |
 | `terminal_job_ttl_seconds` | `86400` | Retention period (seconds) for completed and failed job records before eviction. |
-| `expected_inventory_profiles` | empty | Map of opaque profile identifiers to NVFWUPD AP names. |
+| `expected_inventory_profiles` | empty | Map of opaque profile identifiers to expected NVFWUPD AP names and physical Flint device counts. |
 
 Expected-inventory profiles are deployment controlled. RMS does not interpret
-the profile name or derive hardware properties from it:
+the profile name or derive hardware properties from it. Deployments can use the
+SKU ID supplied by NICo as the profile name:
 
 ```toml
 [workflows.expected_inventory_profiles]
@@ -146,12 +147,29 @@ the profile name or derive hardware properties from it:
 ]
 ```
 
+The legacy AP-name list remains supported. A structured profile can additionally
+declare the expected number of physical host adapters for GB200 in-band updates:
+
+```toml
+[workflows.expected_inventory_profiles."sku-gb200"]
+ap_names = ["FW_BMC_0", "HGX_FW_GPU_0"]
+
+[workflows.expected_inventory_profiles."sku-gb200".flint_devices]
+cx7 = 4
+cx8 = 0
+bf3_nic = 2
+```
+
+Omitting a Flint family disables its count check; setting it to zero requires
+that MST enumerate no physical devices of that family.
+
 A node selects a profile with
 `NodeDescriptor.attributes["inventory_profile"]`. Matching is exact and
 case-sensitive after surrounding whitespace is trimmed. Omitting the attribute
 keeps the legacy update behavior. An empty or unknown supplied value rejects
-the node before RMS creates its firmware job. RMS validates the configured map
-at startup; names and AP entries must be non-empty, and duplicate AP names are
+the node before RMS creates its firmware job. RMS validates the configured map at
+startup. Profile names must be non-empty; each profile must contain AP names,
+Flint counts, or both. AP entries must be non-empty, and duplicate AP names are
 removed case-insensitively.
 
 ## `[logging]`

@@ -20,7 +20,7 @@ a public issue or pull request.
 
 ## Before You Start
 
-Search the [existing issues](https://github.com/NVIDIA/nv-rms/issues) before
+Search the [existing issues](https://github.com/dsx-ai-factory/nv-rms/issues) before
 opening a new one. Use the repository's issue forms for bugs, feature requests,
 and documentation work. For a substantial behavior or API change, open an issue
 first so maintainers can confirm scope and direction before implementation.
@@ -105,7 +105,7 @@ By making a contribution to this project, I certify that:
 
 ### 1. Fork and clone the repository
 
-Fork [NVIDIA/nv-rms](https://github.com/NVIDIA/nv-rms), then clone your fork:
+Fork [dsx-ai-factory/nv-rms](https://github.com/dsx-ai-factory/nv-rms), then clone your fork:
 
 ```bash
 git clone https://github.com/<your-username>/nv-rms.git
@@ -115,7 +115,7 @@ cd nv-rms
 ### 2. Add the upstream remote
 
 ```bash
-git remote add upstream https://github.com/NVIDIA/nv-rms.git
+git remote add upstream https://github.com/dsx-ai-factory/nv-rms.git
 git fetch upstream
 ```
 
@@ -156,7 +156,7 @@ Examples include `fix/sftp-timeout`, `feature/new-rack-type`, and
 3. Add or update tests that exercise the changed behavior.
 4. Run formatting, linting, and relevant tests locally.
 5. Sign off every commit with the DCO trailer.
-6. Open a pull request against `NVIDIA/nv-rms:main` using the repository
+6. Open a pull request against `dsx-ai-factory/nv-rms:main` using the repository
    template.
 
 ## Engineering Guidelines
@@ -264,5 +264,5 @@ appear in a subsequent public release of this repository.
 ## Questions
 
 For contribution questions that are not security-sensitive, open an
-[issue](https://github.com/NVIDIA/nv-rms/issues) with the relevant context.
+[issue](https://github.com/dsx-ai-factory/nv-rms/issues) with the relevant context.
 Report vulnerabilities privately as described in [SECURITY.md](SECURITY.md).

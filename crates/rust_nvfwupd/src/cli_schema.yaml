@@ -66,9 +66,9 @@ Commands:
   - Name: show_version
     Class: ShowVersion
     RequireGlobalOption: true
-    Usage: "show_version -p/--package FWPKG [FWPKG ...] [-j] [-s] [-i]"
+    Usage: "show_version -p/--package FWPKG|NVOS_BIN [FWPKG|NVOS_BIN ...] [-j] [-s] [-i]"
     Options:
-     - Description: PLDM firmware package
+     - Description: PLDM firmware package; switch targets also accept NVOS .bin images
        Short: p
        Long: package
        Nargs: '+'
@@ -92,9 +92,9 @@ Commands:
   - Name: update_fw
     Class: UpdateFirmware
     RequireGlobalOption: true
-    Usage: "update_fw [-p FWPKG [FWPKG ...]] [-e EXPECTED_INVENTORY_JSON] [-y] [-b] [-s] [-o] [-t] [-j] [-d]"
+    Usage: "update_fw [-p FWPKG [FWPKG ...] | -p NVOS_BIN] [-e EXPECTED_INVENTORY_JSON] [-y] [-b] [-s] [-o] [-t] [-j] [-d]"
     Options:
-      - Description: PLDM firmware package
+      - Description: PLDM firmware package; switch targets also accept one NVOS .bin image
         Short: p
         Long: package
         Nargs: '+'

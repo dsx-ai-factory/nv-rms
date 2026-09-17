@@ -193,7 +193,7 @@ pub struct CLISchema {
 
 /// The CLI schema YAML embedded at compile time.
 ///
-///  Keeping this as `include_str!`
+/// Keeping this as `include_str!`
 /// (rather than loading from disk at startup) means:
 ///   1. The shipped binary is fully standalone — no external file required
 ///      at runtime.
@@ -301,7 +301,7 @@ impl CLISchema {
 /// Return the path to `cli_schema.yaml` located next to the running
 /// executable.
 ///
-/// The schema file is expected to live in the same directory as the binary
+/// The schema file is expected to live in the same directory as the binary.
 pub fn get_schema_path() -> String {
     let filename = "cli_schema.yaml";
 
@@ -315,6 +315,7 @@ pub fn get_schema_path() -> String {
         }
     }
 
+    // 2. Check a sibling nvfwupd source directory.
     if let Ok(exe) = std::env::current_exe() {
         // exe is e.g. .../rust_nvfwupd/target/release/nvfwupd
         // walk up until we find the nvfwupd/ sibling that has cli_schema.yaml

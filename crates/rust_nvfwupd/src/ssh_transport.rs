@@ -120,9 +120,7 @@ impl SshHostKeyPolicy {
         if known.is_empty() {
             return Err(format!(
                 "SSH host key verification failed for {host}:{port}: \
-                 no matching key found in {}. Use ssh_known_hosts=<path> with a trusted \
-                 known_hosts entry, use ssh_host_key_mode=tofu to learn the first key, \
-                 or pass ssh_host_key_mode=disabled only when host-key validation must be disabled. \
+                 no matching key found in the configured known_hosts file {}. \
                  Presented key: {algorithm} {fingerprint}",
                 path.display()
             ));
@@ -154,7 +152,7 @@ impl SshHostKeyPolicy {
         }
 
         let home = std::env::var_os("HOME").ok_or_else(|| {
-            "SSH host key verification requires ssh_known_hosts=<path> because HOME is not set"
+            "SSH host key verification requires a configured known_hosts path because HOME is not set"
                 .to_string()
         })?;
         Ok(PathBuf::from(home).join(DEFAULT_KNOWN_HOSTS_RELATIVE_PATH))
@@ -195,6 +193,7 @@ pub(crate) struct MockExecCall {
 pub(crate) struct MockUploadCall {
     pub(crate) local_path: PathBuf,
     pub(crate) remote_path: String,
+    pub(crate) timeout_secs: u64,
 }
 
 #[cfg(test)]
@@ -209,6 +208,7 @@ pub(crate) struct MockSshSnapshot {
 struct MockSshState {
     exec_calls: Vec<MockExecCall>,
     upload_calls: Vec<MockUploadCall>,
+    exec_result: Option<Result<SshExecOutput, String>>,
 }
 
 #[cfg(test)]
@@ -221,6 +221,17 @@ pub(crate) fn install_mock_for_host(host: &str) {
         .lock()
         .expect("mock ssh mutex poisoned")
         .insert(host.to_string(), MockSshState::default());
+}
+
+#[cfg(test)]
+pub(crate) fn install_mock_exec_error_for_host(host: &str, error: &str) {
+    MOCK_SSH.lock().expect("mock ssh mutex poisoned").insert(
+        host.to_string(),
+        MockSshState {
+            exec_result: Some(Err(error.to_string())),
+            ..MockSshState::default()
+        },
+    );
 }
 
 #[cfg(test)]
@@ -246,6 +257,9 @@ fn mock_exec_result(
     state.exec_calls.push(MockExecCall {
         command: command.to_string(),
     });
+    if let Some(result) = &state.exec_result {
+        return Some(result.clone());
+    }
     Some(Ok(SshExecOutput {
         success: true,
         stdout: String::new(),
@@ -258,12 +272,14 @@ fn mock_upload_result(
     host: &str,
     local_path: &PathBuf,
     remote_path: &str,
+    timeout_secs: u64,
 ) -> Option<Result<(), String>> {
     let mut mocks = MOCK_SSH.lock().expect("mock ssh mutex poisoned");
     let state = mocks.get_mut(host)?;
     state.upload_calls.push(MockUploadCall {
         local_path: local_path.clone(),
         remote_path: remote_path.to_string(),
+        timeout_secs,
     });
     Some(Ok(()))
 }
@@ -274,6 +290,7 @@ fn mock_upload_with_setup_result(
     setup_commands: &[String],
     local_path: &PathBuf,
     remote_path: &str,
+    timeout_secs: u64,
 ) -> Option<Result<(), String>> {
     let mut mocks = MOCK_SSH.lock().expect("mock ssh mutex poisoned");
     let state = mocks.get_mut(host)?;
@@ -285,6 +302,7 @@ fn mock_upload_with_setup_result(
     state.upload_calls.push(MockUploadCall {
         local_path: local_path.clone(),
         remote_path: remote_path.to_string(),
+        timeout_secs,
     });
     Some(Ok(()))
 }
@@ -458,7 +476,7 @@ pub(crate) async fn upload_file_async(
     host_key_policy: SshHostKeyPolicy,
 ) -> Result<(), String> {
     #[cfg(test)]
-    if let Some(result) = mock_upload_result(host, &local_path, &remote_path) {
+    if let Some(result) = mock_upload_result(host, &local_path, &remote_path, timeout_secs) {
         return result;
     }
 
@@ -532,9 +550,13 @@ pub(crate) async fn upload_file_with_setup_async(
     host_key_policy: SshHostKeyPolicy,
 ) -> Result<(), String> {
     #[cfg(test)]
-    if let Some(result) =
-        mock_upload_with_setup_result(host, setup_commands, &local_path, &remote_path)
-    {
+    if let Some(result) = mock_upload_with_setup_result(
+        host,
+        setup_commands,
+        &local_path,
+        &remote_path,
+        operation_timeout_secs,
+    ) {
         return result;
     }
 

@@ -15,13 +15,13 @@
  * limitations under the License.
  */
 
-use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, RwLock};
+use std::collections::HashMap;
+use std::sync::{Arc, PoisonError, RwLock};
 
 use secrecy::ExposeSecret;
 
 use crate::domain::node::{Node, NodeKind, NodeType, ProductFamily};
-use crate::domain::rack::{NodeConfig, PowerOnStep, Rack};
+use crate::domain::rack::{NodeConfig, Rack};
 use crate::nodes::NodeInstance;
 use crate::utilities::error::{Result, RmsError};
 
@@ -32,12 +32,10 @@ pub struct NvlGb200Rack {
     model: &'static str,
 
     // Serializes inventory-backed power mutations for this rack. Handlers may
-    // hold it across awaited Redfish calls to keep rack sequences and registered
-    // direct power RPCs from interleaving.
+    // hold it across awaited Redfish calls to keep registered power RPCs and
+    // inventory mutations from interleaving.
     power_operation_lock: Arc<tokio::sync::Mutex<()>>,
 
-    // Inventory and power_on_order are one locked state because the order is
-    // only valid for the inventory snapshot it was checked against.
     state: RwLock<RackState>,
 }
 
@@ -51,7 +49,6 @@ pub struct NvlVrnvl72Rack {
 
 struct RackState {
     nodes: HashMap<String, Arc<NodeInstance>>,
-    power_on_order: Vec<PowerOnStep>,
 }
 
 impl NvlGb200Rack {
@@ -71,7 +68,6 @@ impl NvlGb200Rack {
             power_operation_lock: Arc::new(tokio::sync::Mutex::new(())),
             state: RwLock::new(RackState {
                 nodes: HashMap::new(),
-                power_on_order: Vec::new(),
             }),
         }
     }
@@ -117,7 +113,7 @@ impl Rack for NvlGb200Rack {
     }
 
     fn get_info(&self) -> HashMap<String, String> {
-        let state = self.state.read().unwrap();
+        let state = self.state.read().unwrap_or_else(PoisonError::into_inner);
         HashMap::from([
             ("model".to_owned(), self.model.to_owned()),
             ("nodeCount".to_owned(), state.nodes.len().to_string()),
@@ -158,7 +154,7 @@ impl Rack for NvlGb200Rack {
             )));
         }
 
-        let mut state = self.state.write().unwrap();
+        let mut state = self.state.write().unwrap_or_else(PoisonError::into_inner);
         if state.nodes.contains_key(node_id) {
             return Err(RmsError::already_exists(format!(
                 "node {node_id} already exists in rack {}",
@@ -168,19 +164,11 @@ impl Rack for NvlGb200Rack {
 
         state.nodes.insert(node_id.to_owned(), node);
 
-        if !state.power_on_order.is_empty() {
-            state.power_on_order.clear();
-            tracing::info!(
-                rack = %self.id,
-                "power-on order invalidated due to node addition"
-            );
-        }
-
         Ok(())
     }
 
     fn remove_node(&self, node_id: &str) -> Result<()> {
-        let mut state = self.state.write().unwrap();
+        let mut state = self.state.write().unwrap_or_else(PoisonError::into_inner);
         if state.nodes.remove(node_id).is_none() {
             return Err(RmsError::not_found(format!(
                 "node {node_id} not found in rack {}",
@@ -188,24 +176,16 @@ impl Rack for NvlGb200Rack {
             )));
         }
 
-        if !state.power_on_order.is_empty() {
-            state.power_on_order.clear();
-            tracing::info!(
-                rack = %self.id,
-                "power-on order invalidated due to node removal"
-            );
-        }
-
         Ok(())
     }
 
     fn find_node(&self, node_id: &str) -> Option<Arc<NodeInstance>> {
-        let state = self.state.read().unwrap();
+        let state = self.state.read().unwrap_or_else(PoisonError::into_inner);
         state.nodes.get(node_id).cloned()
     }
 
     fn list_nodes(&self) -> Vec<Arc<NodeInstance>> {
-        let state = self.state.read().unwrap();
+        let state = self.state.read().unwrap_or_else(PoisonError::into_inner);
         state.nodes.values().cloned().collect()
     }
 
@@ -213,23 +193,6 @@ impl Rack for NvlGb200Rack {
         &self,
     ) -> std::result::Result<tokio::sync::OwnedMutexGuard<()>, tokio::sync::TryLockError> {
         self.power_operation_lock.clone().try_lock_owned()
-    }
-
-    fn set_power_on_order(&self, order: Vec<PowerOnStep>) -> Result<()> {
-        // Inventory and order share this lock because a power-on order is only
-        // executable relative to the same inventory snapshot. Holding the write
-        // lock through validation and assignment prevents add/remove from
-        // changing nodes between the check and the persisted update.
-        let mut state = self.state.write().unwrap();
-        validate_power_on_order(&state.nodes, &order)?;
-        state.power_on_order = order;
-
-        Ok(())
-    }
-
-    fn get_power_on_order(&self) -> Vec<PowerOnStep> {
-        let state = self.state.read().unwrap();
-        state.power_on_order.clone()
     }
 }
 
@@ -273,14 +236,6 @@ impl Rack for NvlGb300Rack {
     ) -> std::result::Result<tokio::sync::OwnedMutexGuard<()>, tokio::sync::TryLockError> {
         self.inner.try_power_operation_guard()
     }
-
-    fn set_power_on_order(&self, order: Vec<PowerOnStep>) -> Result<()> {
-        self.inner.set_power_on_order(order)
-    }
-
-    fn get_power_on_order(&self) -> Vec<PowerOnStep> {
-        self.inner.get_power_on_order()
-    }
 }
 
 impl Rack for NvlVrnvl72Rack {
@@ -323,49 +278,6 @@ impl Rack for NvlVrnvl72Rack {
     ) -> std::result::Result<tokio::sync::OwnedMutexGuard<()>, tokio::sync::TryLockError> {
         self.inner.try_power_operation_guard()
     }
-
-    fn set_power_on_order(&self, order: Vec<PowerOnStep>) -> Result<()> {
-        self.inner.set_power_on_order(order)
-    }
-
-    fn get_power_on_order(&self) -> Vec<PowerOnStep> {
-        self.inner.get_power_on_order()
-    }
-}
-
-/// Verifies that a submitted power-on order is executable for the rack inventory.
-fn validate_power_on_order(
-    nodes: &HashMap<String, Arc<NodeInstance>>,
-    order: &[PowerOnStep],
-) -> Result<()> {
-    if order.is_empty() {
-        return Err(RmsError::invalid_argument("power-on order is required"));
-    }
-
-    let mut node_ids = HashSet::with_capacity(order.len());
-    for step in order {
-        let node_id = &step.node_id;
-
-        if node_id.is_empty() {
-            return Err(RmsError::invalid_argument(
-                "node_id is required in power-on order",
-            ));
-        }
-
-        if !node_ids.insert(node_id.as_str()) {
-            return Err(RmsError::invalid_argument(format!(
-                "duplicate node in power-on order: {node_id}"
-            )));
-        }
-
-        if !nodes.contains_key(node_id) {
-            return Err(RmsError::invalid_argument(format!(
-                "unknown node in power-on order: {node_id}"
-            )));
-        }
-    }
-
-    Ok(())
 }
 
 fn validate_node_config(config: &NodeConfig) -> Result<()> {
@@ -766,89 +678,6 @@ mod tests {
     }
 
     #[test]
-    fn power_on_order_crud() -> Result<()> {
-        let rack = NvlGb200Rack::new("rack-01".into());
-        assert!(rack.get_power_on_order().is_empty());
-
-        let p = rack.create_node(&test_config("p-01", NodeType::PowershelfGb200Liteon))?;
-        let s = rack.create_node(&test_config("s-01", NodeType::SwitchGb200Nvidia))?;
-        let c = rack.create_node(&test_config("c-01", NodeType::ComputeGb200Nvidia))?;
-        rack.add_node("p-01", p)?;
-        rack.add_node("s-01", s)?;
-        rack.add_node("c-01", c)?;
-
-        let order = vec![
-            PowerOnStep::new(0, "p-01"),
-            PowerOnStep::new(1, "s-01"),
-            PowerOnStep::new(2, "c-01"),
-        ];
-        rack.set_power_on_order(order)?;
-        assert_eq!(rack.get_power_on_order().len(), 3);
-
-        Ok(())
-    }
-
-    #[test]
-    fn set_power_on_order_rejects_invalid_order_without_mutation() -> Result<()> {
-        let rack = NvlGb200Rack::new("rack-01".into());
-        let c = rack.create_node(&test_config("c-01", NodeType::ComputeGb200Nvidia))?;
-        rack.add_node("c-01", c)?;
-        rack.set_power_on_order(vec![PowerOnStep::new(0, "c-01")])?;
-
-        let invalid_orders = [
-            (vec![PowerOnStep::new(0, "missing-node")], "unknown node"),
-            (vec![PowerOnStep::new(0, "")], "node_id is required"),
-            (
-                vec![PowerOnStep::new(0, "c-01"), PowerOnStep::new(1, "c-01")],
-                "duplicate node",
-            ),
-            (Vec::new(), "power-on order is required"),
-        ];
-
-        for (order, expected_message) in invalid_orders {
-            let Err(err) = rack.set_power_on_order(order) else {
-                panic!("invalid power-on order was accepted");
-            };
-            assert!(err.message.contains(expected_message));
-
-            let saved = rack.get_power_on_order();
-            assert_eq!(saved.len(), 1);
-            assert_eq!(saved[0].node_id, "c-01");
-        }
-
-        Ok(())
-    }
-
-    #[test]
-    fn add_node_invalidates_power_on_order() -> Result<()> {
-        let rack = NvlGb200Rack::new("rack-01".into());
-        let c = rack.create_node(&test_config("c-01", NodeType::ComputeGb200Nvidia))?;
-        rack.add_node("c-01", c)?;
-
-        rack.set_power_on_order(vec![PowerOnStep::new(0, "c-01")])?;
-        assert_eq!(rack.get_power_on_order().len(), 1);
-
-        let s = rack.create_node(&test_config("s-01", NodeType::SwitchGb200Nvidia))?;
-        rack.add_node("s-01", s)?;
-        assert!(rack.get_power_on_order().is_empty());
-
-        Ok(())
-    }
-
-    #[test]
-    fn remove_node_invalidates_power_on_order() -> Result<()> {
-        let rack = NvlGb200Rack::new("rack-01".into());
-        let c = rack.create_node(&test_config("c-01", NodeType::ComputeGb200Nvidia))?;
-        rack.add_node("c-01", c)?;
-
-        rack.set_power_on_order(vec![PowerOnStep::new(0, "c-01")])?;
-        rack.remove_node("c-01")?;
-        assert!(rack.get_power_on_order().is_empty());
-
-        Ok(())
-    }
-
-    #[test]
     fn product_family_type_strings() {
         assert_eq!(ProductFamily::Gb200.rack_type(), "NVL_GB200");
         assert_eq!(ProductFamily::Gb300.rack_type(), "NVL_GB300");
@@ -900,5 +729,29 @@ mod tests {
 
         assert_eq!(node.node_type(), NodeType::ComputeGb300Nvidia);
         assert_eq!(rack.get_info()["model"], "GB300 NVL");
+    }
+
+    #[test]
+    fn recovers_from_poisoned_lock() {
+        let rack = NvlGb200Rack::new("rack-01".into());
+        let node = rack
+            .create_node(&test_config("c-01", NodeType::ComputeGb200Nvidia))
+            .unwrap();
+        rack.add_node("c-01", node).unwrap();
+
+        // Poison the state lock by panicking while holding the write guard.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = rack.state.write().unwrap();
+            panic!("boom while holding the write lock");
+        }));
+        assert!(result.is_err());
+
+        // Lock is poisoned, but reads and writes still succeed.
+        assert!(rack.find_node("c-01").is_some());
+        let node2 = rack
+            .create_node(&test_config("c-02", NodeType::ComputeGb200Nvidia))
+            .unwrap();
+        rack.add_node("c-02", node2).unwrap();
+        assert_eq!(rack.list_nodes().len(), 2);
     }
 }

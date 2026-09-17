@@ -320,9 +320,15 @@ fn ssh_error_conversion_preserves_rms_codes() {
         TestCase {
             error: SshError::AuthFailed {
                 host: "10.0.0.1".to_owned(),
-                details: "authentication failed".to_owned(),
+                details: "connection closed".to_owned(),
             },
             expected: ErrorCode::InvalidArgument,
+        },
+        TestCase {
+            error: SshError::AuthRejected {
+                host: "10.0.0.1".to_owned(),
+            },
+            expected: ErrorCode::Unauthenticated,
         },
         TestCase {
             error: SshError::Unavailable {

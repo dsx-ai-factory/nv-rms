@@ -22,7 +22,7 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 
 use super::ids::JobId;
-use super::registry::{JobLifecycleState, JobSnapshot};
+use super::registry::{JobLifecycleState, JobSnapshot, LifecycleTransition};
 
 /// Authoritative job records and the indexes derived from them.
 ///
@@ -63,10 +63,12 @@ impl JobStore {
         self.by_id.values()
     }
 
-    /// Returns any active leaf job ID for the supplied rack and node.
+    /// Returns any indexed active job ID for the supplied rack and node.
     ///
-    /// More than one ID may be indexed when callers use unrestricted leaf
-    /// creation for the same node.
+    /// The index is not restricted to leaves: any non-terminal job carrying
+    /// this node is a candidate, including a top-level job that has since
+    /// become a parent. More than one ID may be indexed when callers use
+    /// unrestricted creation for the same node.
     pub(super) fn active_job_for_node(&self, rack_id: &str, node_id: &str) -> Option<JobId> {
         self.active_by_node
             .get(rack_id)
@@ -121,18 +123,22 @@ impl JobStore {
     ///
     /// The transition returns `Some` with the replacement state when it should
     /// be applied, or `None` to leave the job unchanged. The result reports
-    /// whether the state changed and carries a snapshot for the first
-    /// non-terminal to terminal transition.
+    /// whether the state changed and classifies the change as a
+    /// [`LifecycleTransition`]: the first `Queued -> Running` move
+    /// (`Started`), a later `Running -> Running` description update
+    /// (`Progress`), or the first non-terminal to terminal move (`Terminal`).
     pub(super) fn transition_state(
         &mut self,
         job_id: &JobId,
         transition: impl FnOnce(&JobLifecycleState) -> Option<JobLifecycleState>,
-    ) -> (bool, Option<JobSnapshot>) {
-        let (index_change, terminal_snapshot) = {
+    ) -> (bool, Option<LifecycleTransition>) {
+        let (index_change, event) = {
             let Some(record) = self.by_id.get_mut(job_id) else {
                 return (false, None);
             };
             let was_indexed = should_index(record);
+            let was_queued = matches!(record.state, JobLifecycleState::Queued { .. });
+            let was_running = matches!(record.state, JobLifecycleState::Running { .. });
             let was_terminal = record.state.is_terminal();
             let Some(next_state) = transition(&record.state) else {
                 return (false, None);
@@ -150,9 +156,17 @@ impl JobStore {
                     is_indexed,
                 )
             });
-            let terminal_snapshot =
-                (!was_terminal && record.state.is_terminal()).then(|| record.clone());
-            (index_change, terminal_snapshot)
+            let is_running = matches!(record.state, JobLifecycleState::Running { .. });
+            let event = if was_queued && is_running {
+                Some(LifecycleTransition::Started(record.clone()))
+            } else if was_running && is_running {
+                Some(LifecycleTransition::Progress(record.clone()))
+            } else if !was_terminal && record.state.is_terminal() {
+                Some(LifecycleTransition::Terminal(record.clone()))
+            } else {
+                None
+            };
+            (index_change, event)
         };
 
         if let Some((rack_id, node_id, indexed_job_id, should_be_indexed)) = index_change {
@@ -168,7 +182,7 @@ impl JobStore {
             }
         }
 
-        (true, terminal_snapshot)
+        (true, event)
     }
 
     /// Evicts expired terminal jobs while preserving children of live parents.
@@ -202,7 +216,8 @@ impl JobStore {
         }
     }
 
-    /// Asserts that the active-node index exactly matches active leaf records.
+    /// Asserts that the active-node index exactly matches the records
+    /// [`should_index`] accepts.
     #[cfg(test)]
     pub(super) fn assert_consistent(&self) {
         let mut expected = HashMap::<String, HashMap<String, HashSet<JobId>>>::new();
@@ -286,6 +301,12 @@ impl JobStore {
 }
 
 /// Returns `true` when a job belongs in the active-node index.
+///
+/// Membership turns only on carrying a node and not being terminal. Being a
+/// leaf is deliberately not part of it: a top-level job that later gains
+/// children stays indexed against its own node, so it keeps blocking node-idle
+/// admission for as long as it is live. Parent-only records built with
+/// `JobSpec::new_parent` carry an empty `node_id` and so are never indexed.
 fn should_index(job: &JobSnapshot) -> bool {
     !job.node_id.is_empty() && !job.state.is_terminal()
 }
@@ -422,7 +443,7 @@ mod tests {
         let mut store = JobStore::default();
         let job = store.insert(leaf("queued"));
 
-        let (changed, terminal_snapshot) = store.transition_state(&job.job_id, |_| {
+        let (changed, event) = store.transition_state(&job.job_id, |_| {
             Some(JobLifecycleState::Completed {
                 description: "complete".to_string(),
                 result_json: String::new(),
@@ -430,9 +451,53 @@ mod tests {
         });
 
         assert!(changed);
-        assert_eq!(terminal_snapshot.unwrap().job_id, job.job_id);
+        let Some(LifecycleTransition::Terminal(terminal_snapshot)) = event else {
+            panic!("expected a Terminal transition event");
+        };
+        assert_eq!(terminal_snapshot.job_id, job.job_id);
         assert_eq!(store.by_id.len(), 1);
         assert!(store.active_by_node.is_empty());
         store.assert_consistent();
+    }
+
+    #[test]
+    fn queued_to_running_transition_reports_started() {
+        let mut store = JobStore::default();
+        let job = store.insert(leaf("queued"));
+
+        let (changed, event) = store.transition_state(&job.job_id, |_| {
+            Some(JobLifecycleState::Running {
+                description: "running".to_string(),
+            })
+        });
+
+        assert!(changed);
+        let Some(LifecycleTransition::Started(started_snapshot)) = event else {
+            panic!("expected a Started transition event");
+        };
+        assert_eq!(started_snapshot.job_id, job.job_id);
+    }
+
+    #[test]
+    fn running_to_running_transition_reports_progress() {
+        let mut store = JobStore::default();
+        let job = store.insert(leaf("queued"));
+        store.transition_state(&job.job_id, |_| {
+            Some(JobLifecycleState::Running {
+                description: "running".to_string(),
+            })
+        });
+
+        let (changed, event) = store.transition_state(&job.job_id, |_| {
+            Some(JobLifecycleState::Running {
+                description: "still running".to_string(),
+            })
+        });
+
+        assert!(changed);
+        let Some(LifecycleTransition::Progress(progress_snapshot)) = event else {
+            panic!("expected a Progress transition event");
+        };
+        assert_eq!(progress_snapshot.job_id, job.job_id);
     }
 }

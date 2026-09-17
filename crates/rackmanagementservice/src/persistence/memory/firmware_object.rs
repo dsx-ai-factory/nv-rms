@@ -194,6 +194,33 @@ impl FirmwareObjectStore for MemoryFirmwareObjectStore {
         Ok(fw.clone())
     }
 
+    async fn set_default_if_none(&self, id: &str) -> Result<FirmwareObject> {
+        // Hold the write lock across the check+set so the "is there a default?"
+        // decision and the write are one atomic step -- the in-process
+        // equivalent of the Postgres advisory-lock serialization.
+        let mut catalog = recover(self.catalog.write());
+        let target_hw = catalog
+            .get(id)
+            .ok_or_else(|| RmsError::not_found(format!("firmware object {id} not found")))?
+            .rack_hardware_type
+            .clone();
+
+        // Any row of this hardware type (including id itself) already default
+        // means the slot is full; leave it untouched.
+        let default_exists = catalog
+            .values()
+            .any(|fw| fw.rack_hardware_type == target_hw && fw.is_default);
+
+        let fw = catalog
+            .get_mut(id)
+            .ok_or_else(|| RmsError::not_found(format!("firmware object {id} not found")))?;
+        if !default_exists {
+            fw.is_default = true;
+            fw.updated = Utc::now();
+        }
+        Ok(fw.clone())
+    }
+
     async fn has_default(&self, hw: &RackHardwareType) -> Result<bool> {
         let catalog = recover(self.catalog.read());
         Ok(catalog
@@ -326,6 +353,17 @@ mod tests {
             .await
             .expect("find_by_id should succeed on a poisoned-but-recovered lock");
         assert_eq!(found.id, "fw-1");
+
+        // set_default_if_none must recover through the same path rather than
+        // panic on the poisoned catalog lock.
+        let defaulted = store
+            .set_default_if_none("fw-1")
+            .await
+            .expect("set_default_if_none should succeed on a poisoned-but-recovered lock");
+        assert!(
+            defaulted.is_default,
+            "set_default_if_none should fill the empty default slot"
+        );
     }
 
     /// Companion to `recovers_from_poisoned_lock` covering the history lock:

@@ -21,10 +21,12 @@ use std::collections::BTreeMap;
 
 use crate::action::SimpleAction;
 use crate::uri::{path_segment, query_value};
+use crate::util::deserialize_optional_lenient_string;
 use crate::{JsonNumber, NVUE_V1_SERVER};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 /// NVOS partition 1 identifier.
 pub const NVOS_PARTITION_1_ID: &str = "partition1";
@@ -46,6 +48,20 @@ pub const SYSTEM_IMAGE_FILES_ENDPOINT: &str = "/nvue_v1/system/image/files";
 
 /// Full endpoint for `GET/PATCH /system/gnmi-server`.
 pub const GNMI_SERVER_ENDPOINT: &str = "/nvue_v1/system/gnmi-server";
+
+/// Full endpoint for `GET/PATCH /system/api`.
+pub const SYSTEM_API_ENDPOINT: &str = "/nvue_v1/system/api";
+
+/// Full endpoint for `GET/PATCH /system/api/mtls`.
+pub const SYSTEM_API_MTLS_ENDPOINT: &str = "/nvue_v1/system/api/mtls";
+
+/// Full endpoint for `GET/PATCH /system/gnmi-server/mtls`.
+pub const GNMI_SERVER_MTLS_ENDPOINT: &str = "/nvue_v1/system/gnmi-server/mtls";
+
+pub const SPDM_ENDPOINT: &str = "/nvue_v1/system/security/spdm";
+
+/// Operational NVUE SPDM component inventory.
+pub const SPDM_OPERATIONAL_ENDPOINT: &str = "/nvue_v1/system/security/spdm?rev=operational";
 
 /// Request body for a forced full NVOS factory-default reset.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -93,6 +109,44 @@ pub fn user_endpoint_for_revision(user_id: &str, revision_id: &str) -> String {
 /// Builds `/system/gnmi-server?rev={revision-id}` for gNMI configuration.
 pub fn gnmi_server_endpoint_for_revision(revision_id: &str) -> String {
     format!("{GNMI_SERVER_ENDPOINT}?rev={}", query_value(revision_id))
+}
+
+/// Request body for NVUE SPDM measurement generation.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SpdmGenerateRequest {
+    #[serde(rename = "@generate")]
+    generate: SimpleAction<SpdmGenerateParameters>,
+}
+
+impl SpdmGenerateRequest {
+    /// Create a fresh SPDM measurement request using a hex-encoded nonce.
+    pub fn new(nonce: impl Into<String>) -> Self {
+        Self {
+            generate: SimpleAction::start(SpdmGenerateParameters {
+                nonce: nonce.into(),
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct SpdmGenerateParameters {
+    nonce: String,
+}
+
+/// Endpoint for one SPDM component.
+pub fn spdm_component_endpoint(component_id: &str) -> String {
+    format!("{SPDM_ENDPOINT}/{}", path_segment(component_id))
+}
+
+/// Endpoint for one SPDM component's measurements.
+pub fn spdm_measurements_endpoint(component_id: &str) -> String {
+    format!("{}/measurements", spdm_component_endpoint(component_id))
+}
+
+/// Endpoint for one SPDM component's certificate chain.
+pub fn spdm_certificates_endpoint(component_id: &str) -> String {
+    format!("{}/certificates", spdm_component_endpoint(component_id))
 }
 
 /// Request body for `POST /system` power-cycle.
@@ -415,6 +469,131 @@ pub struct GnmiServer {
     pub state: Option<String>,
 }
 
+/// Request body for `PATCH /system/gnmi-server`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GnmiServerUpdate {
+    /// gNMI server state (`enabled`/`disabled`).
+    pub state: String,
+}
+
+impl GnmiServerUpdate {
+    /// Create a gNMI server state update payload.
+    pub fn new(state: impl Into<String>) -> Self {
+        Self {
+            state: state.into(),
+        }
+    }
+}
+
+/// Returns the first of `direct`, `operational`, `applied` that is present, matching
+/// NVUE's revision-aware response layering.
+fn resolve_layered_field<'a>(
+    direct: Option<&'a str>,
+    operational: Option<&'a str>,
+    applied: Option<&'a str>,
+) -> Option<&'a str> {
+    direct.or(operational).or(applied)
+}
+
+/// NVUE API certificate configuration.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct SystemApi {
+    /// Configured entity certificate ID.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_lenient_string"
+    )]
+    pub certificate: Option<String>,
+
+    /// Operational values returned by revision-aware NVUE responses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    operational: Option<SystemApiFields>,
+
+    /// Applied values returned by revision-aware NVUE responses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    applied: Option<SystemApiFields>,
+}
+
+impl SystemApi {
+    /// Returns the configured entity certificate ID.
+    pub fn certificate(&self) -> Option<&str> {
+        resolve_layered_field(
+            self.certificate.as_deref(),
+            self.operational
+                .as_ref()
+                .and_then(|fields| fields.certificate.as_deref()),
+            self.applied
+                .as_ref()
+                .and_then(|fields| fields.certificate.as_deref()),
+        )
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+struct SystemApiFields {
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_lenient_string"
+    )]
+    certificate: Option<String>,
+}
+
+/// mTLS CA configuration shared by NVUE API and gNMI server endpoints.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct MtlsConfiguration {
+    /// Configured CA certificate ID.
+    #[serde(
+        default,
+        rename = "ca-certificate",
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_lenient_string"
+    )]
+    pub ca_certificate: Option<String>,
+
+    /// Operational values returned by revision-aware NVUE responses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    operational: Option<MtlsConfigurationFields>,
+
+    /// Applied values returned by revision-aware NVUE responses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    applied: Option<MtlsConfigurationFields>,
+
+    /// Additional NVUE fields retained when forwarding the status response.
+    #[serde(flatten)]
+    additional: BTreeMap<String, Value>,
+}
+
+impl MtlsConfiguration {
+    /// Returns the configured CA certificate ID.
+    pub fn ca_certificate(&self) -> Option<&str> {
+        resolve_layered_field(
+            self.ca_certificate.as_deref(),
+            self.operational
+                .as_ref()
+                .and_then(|fields| fields.ca_certificate.as_deref()),
+            self.applied
+                .as_ref()
+                .and_then(|fields| fields.ca_certificate.as_deref()),
+        )
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+struct MtlsConfigurationFields {
+    #[serde(
+        default,
+        rename = "ca-certificate",
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_lenient_string"
+    )]
+    ca_certificate: Option<String>,
+
+    #[serde(flatten)]
+    additional: BTreeMap<String, Value>,
+}
+
 fn normalize_partition_id(value: &str) -> String {
     match value {
         "1" | NVOS_PARTITION_1_ID => NVOS_PARTITION_1_ID.to_owned(),
@@ -469,6 +648,22 @@ mod tests {
     #[test]
     fn endpoints_use_nvue_v1_server() {
         assert_eq!(SYSTEM_ENDPOINT, "/nvue_v1/system");
+        assert_eq!(SPDM_ENDPOINT, "/nvue_v1/system/security/spdm");
+
+        assert_eq!(
+            spdm_component_endpoint("ERoT/BMC"),
+            "/nvue_v1/system/security/spdm/ERoT%2FBMC"
+        );
+
+        assert_eq!(
+            spdm_measurements_endpoint("ERoT_BMC_0"),
+            "/nvue_v1/system/security/spdm/ERoT_BMC_0/measurements"
+        );
+
+        assert_eq!(
+            spdm_certificates_endpoint("ERoT_BMC_0"),
+            "/nvue_v1/system/security/spdm/ERoT_BMC_0/certificates"
+        );
 
         assert_eq!(
             SYSTEM_FACTORY_DEFAULT_ENDPOINT,
@@ -501,6 +696,44 @@ mod tests {
     }
 
     #[test]
+    fn service_certificate_configuration_reads_direct_and_layered_values() {
+        let direct: SystemApi = serde_json::from_str(r#"{"certificate":"entity-direct"}"#).unwrap();
+
+        let layered: SystemApi = serde_json::from_str(
+            r#"{"operational":{"certificate":"entity-operational"},
+                "applied":{"certificate":"entity-applied"}}"#,
+        )
+        .unwrap();
+
+        let mtls: MtlsConfiguration = serde_json::from_str(
+            r#"{"status":"enabled","applied":{"ca-certificate":"ca-applied",
+                "state":"active"}}"#,
+        )
+        .unwrap();
+
+        let mtls_status = serde_json::to_value(&mtls).unwrap();
+
+        assert_eq!(direct.certificate(), Some("entity-direct"));
+        assert_eq!(layered.certificate(), Some("entity-operational"));
+        assert_eq!(mtls.ca_certificate(), Some("ca-applied"));
+        assert_eq!(mtls_status["status"], "enabled");
+        assert_eq!(mtls_status["applied"]["state"], "active");
+    }
+
+    #[test]
+    fn wrong_typed_certificate_fields_decode_as_absent() {
+        let system_api: SystemApi =
+            serde_json::from_str(r#"{"certificate":true,"operational":{"certificate":false}}"#)
+                .unwrap();
+
+        let mtls: MtlsConfiguration =
+            serde_json::from_str(r#"{"ca-certificate":["not","a","string"]}"#).unwrap();
+
+        assert_eq!(system_api.certificate(), None);
+        assert_eq!(mtls.ca_certificate(), None);
+    }
+
+    #[test]
     fn action_payloads_match_nvue_action_keys() {
         let power_cycle = serde_json::to_string(&SystemPowerCycleRequest::new(true)).unwrap();
 
@@ -513,12 +746,19 @@ mod tests {
 
         let uninstall = serde_json::to_string(&SystemImageUninstallRequest::new(true)).unwrap();
 
+        let spdm_generate = serde_json::to_string(&SpdmGenerateRequest::new("deadbeef")).unwrap();
+
         assert!(power_cycle.contains(r#""@power-cycle""#));
         assert!(fetch.contains(r#""@fetch""#));
         assert!(fetch.contains(r#""remote-url":"file:///tmp/a.bin""#));
         assert!(install.contains(r#""@install""#));
         assert!(install.contains(r#""image-file":"a.bin""#));
         assert!(uninstall.contains(r#""@uninstall""#));
+
+        assert_eq!(
+            spdm_generate,
+            r#"{"@generate":{"state":"start","parameters":{"nonce":"deadbeef"}}}"#
+        );
     }
 
     #[test]

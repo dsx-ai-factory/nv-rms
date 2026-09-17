@@ -24,6 +24,7 @@ mod optional_configs;
 
 use std::collections::HashSet;
 use std::future::Future;
+use std::net::IpAddr;
 use std::time::Duration;
 
 use crate::api::grpc::node_type_resolver::{
@@ -37,14 +38,16 @@ use crate::libnmxc::{
 use crate::nodes::SwitchScaleUpManagement;
 use crate::nodes::switch_gb200_nvidia::config;
 use crate::orchestrator::job_lifecycle::{JobError, JobFailure};
-use crate::orchestrator::job_tracker::{JobType, RmsJobHandle};
+use crate::orchestrator::job_tracker::{JobType, RmsJobHandle, job_error_of};
+use crate::utilities::error::{Result as RmsResult, RmsError};
 use crate::utilities::url::grpc_target_uri;
 
 use futures::future::join_all;
 use librms::protos::rack_manager as rm;
 use librms::protos::rack_manager_v2 as rm_v2;
 use nvue_client::cluster::{
-    ClusterNodeServerAddresses, InterfaceType, NMX_CONTROLLER_APP_NAME, NmxControlPlaneState,
+    ClusterNodeServerAddresses, ClusterState, InterfaceType, NMX_CONTROLLER_APP_NAME,
+    NmxControlPlaneState,
 };
 use nvue_client::{Client as NvueClient, DEFAULT_TIMEOUT as NVUE_DEFAULT_TIMEOUT};
 
@@ -143,23 +146,34 @@ async fn hello_nmx_controller(
     Err(format!("NMX Controller Hello failed: {last_error}"))
 }
 
+/// Node addresses managed through the primary and optional secondary interfaces.
+#[derive(Debug, PartialEq, Eq)]
+struct NodeIpAddresses {
+    primary: ClusterNodeServerAddresses,
+    secondary: Option<ClusterNodeServerAddresses>,
+}
+
+/// Retains the authenticated device and its address sets for rollback.
 struct NodeIpSnapshot {
     prepared_switch: EphemeralSwitch,
     node_ips: ClusterNodeServerAddresses,
+    secondary_node_ips: Option<ClusterNodeServerAddresses>,
 }
 
+/// Captures the original cluster state and optional node-interface state.
 struct SwitchSnapshot {
     node: rm::NodeInfo,
     enabled: bool,
     node_ip: Option<NodeIpSnapshot>,
 }
 
-/// Captures node IP state and retains the authenticated switch for mutation and
-/// rollback.
+/// Captures primary state and any secondary state the workflow will change while
+/// retaining the authenticated switch for mutation and rollback.
 async fn prepare_node_ip_snapshot(
     service: &RackManagerServiceImpl,
     node: &rm::NodeInfo,
     request_domain: Option<&str>,
+    include_secondary_interface: bool,
 ) -> std::result::Result<NodeIpSnapshot, String> {
     let mut normalized = node.clone();
 
@@ -193,14 +207,37 @@ async fn prepare_node_ip_snapshot(
             )
         })?;
 
+    let secondary_node_ips = if include_secondary_interface {
+        Some(
+            switch
+                .get_node_ips(InterfaceType::Secondary)
+                .await
+                .map_err(|error| {
+                    format!(
+                        "failed to read secondary node IP addresses from '{}': {}",
+                        node.node_id, error.message
+                    )
+                })?,
+        )
+    } else {
+        None
+    };
+
     Ok(NodeIpSnapshot {
         prepared_switch,
         node_ips,
+        secondary_node_ips,
     })
 }
 
-fn get_node_ips(nodes: &[rm::NodeInfo]) -> std::result::Result<ClusterNodeServerAddresses, String> {
-    let mut node_ips = ClusterNodeServerAddresses::new();
+/// Builds primary and optional secondary addresses for the node-IP path.
+///
+/// The first additional host endpoint supplies the secondary address. Later
+/// entries are ignored. Primary and secondary addresses must be distinct, and
+/// secondary addresses must be unique across nodes.
+fn get_node_ips(nodes: &[rm::NodeInfo]) -> std::result::Result<NodeIpAddresses, String> {
+    let mut primary = ClusterNodeServerAddresses::new();
+    let mut secondary = ClusterNodeServerAddresses::new();
 
     for node in nodes {
         let mut normalized = node.clone();
@@ -222,16 +259,51 @@ fn get_node_ips(nodes: &[rm::NodeInfo]) -> std::result::Result<ClusterNodeServer
             )
         })?;
 
-        node_ips.insert(switch.target_ip);
+        primary.insert(switch.target_ip);
+
+        let secondary_address = node
+            .additional_host_endpoints
+            .first()
+            .map(|endpoint| {
+                let interface = endpoint.interface.as_ref().ok_or_else(|| {
+                    format!(
+                        "secondary management interface for node '{}' must contain a network interface",
+                        node.node_id
+                    )
+                })?;
+
+                interface.ip_address.parse::<IpAddr>().map_err(|error| {
+                    format!(
+                        "secondary management interface for node '{}' has invalid IP address '{}': {}",
+                        node.node_id, interface.ip_address, error
+                    )
+                })
+            })
+            .transpose()?;
+
+        if let Some(address) = secondary_address
+            && !secondary.insert(address)
+        {
+            return Err(format!(
+                "nodes contains duplicate secondary management IP address {address}"
+            ));
+        }
     }
 
-    Ok(node_ips)
+    if !primary.is_disjoint(&secondary) {
+        return Err("primary and secondary management IP addresses overlap".to_owned());
+    }
+
+    Ok(NodeIpAddresses {
+        primary,
+        secondary: (!secondary.is_empty()).then_some(secondary),
+    })
 }
 
 fn get_node_ips_for_request(
     node_type: NodeType,
     nodes: &[rm::NodeInfo],
-) -> std::result::Result<Option<ClusterNodeServerAddresses>, String> {
+) -> std::result::Result<Option<NodeIpAddresses>, String> {
     // Scan every node before dispatching by selected type so a mixed topology
     // cannot bypass node IP compatibility validation.
     let mut requires_node_ips = false;
@@ -521,6 +593,64 @@ async fn set_scale_up_fabric_state_for_device(
             status: rm::ReturnCode::Failure.into(),
             error_message: error.message,
         },
+    }
+}
+
+/// Reads whether the switch currently exposes the `nmx-controller` external gRPC
+/// port (its administrative `summary.grpc_enabled` state).
+///
+/// Used to snapshot the primary before V2 opens the port so the job rollback can
+/// return it to the pre-request state. An unreadable state is reported as
+/// disabled so rollback fails closed: it never reports the port as open when it
+/// may still be exposed, and never leaves it exposed on a best-effort teardown.
+async fn read_external_grpc_enabled(
+    switch: &dyn SwitchScaleUpManagement,
+    switch_target: &str,
+) -> bool {
+    match switch
+        .check_grpc_status(NMX_CONTROLLER_APP_NAME, switch_target)
+        .await
+    {
+        Ok(status) => status
+            .get("summary")
+            .and_then(|summary| summary.get("grpc_enabled"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        Err(error) => {
+            tracing::warn!(
+                switch_target,
+                error = %error.message,
+                "failed to read external-client gRPC state before enforcing primary NMX \
+                 Controller security; assuming disabled so rollback fails closed"
+            );
+
+            false
+        }
+    }
+}
+
+/// Restores the primary's external-client gRPC exposure to `was_enabled` during
+/// V2 job rollback.
+///
+/// Best-effort: a failure is recorded in `rollback_errors` (which the caller
+/// appends to the job failure) rather than propagated, because the switch is
+/// frequently unreachable exactly when rollback runs. Unlike the V1
+/// `rollback_external_grpc` helper, which always disables, this targets the
+/// snapshotted pre-request state: a job that failed after reconciling an
+/// already-exposed fabric must not needlessly close a port that was legitimately
+/// open beforehand, while a job that opened the port from a closed state still
+/// tears it back down (`was_enabled == false`).
+async fn restore_primary_external_grpc(
+    switch: &dyn SwitchScaleUpManagement,
+    node_id: &str,
+    was_enabled: bool,
+    rollback_errors: &mut Vec<String>,
+) {
+    if let Err(error) = switch
+        .enable_grpc_for_external_clients(NMX_CONTROLLER_APP_NAME, was_enabled)
+        .await
+    {
+        rollback_errors.push(format!("{node_id} external gRPC state: {}", error.message));
     }
 }
 
@@ -854,8 +984,8 @@ impl RackManagerServiceImpl {
                 });
         }
 
-        if nodes.len() == 1 {
-            return Ok(nodes[0].clone());
+        if let [node] = nodes {
+            return Ok(node.clone());
         }
 
         // Node ID provides a stable tie-break when two switches report one tray.
@@ -887,34 +1017,28 @@ impl RackManagerServiceImpl {
                     )
                 })?;
 
-            let switch = ephemeral.switch.as_switch_gb200().ok_or_else(|| {
-                format!("switch '{}': chassis location is unavailable", node.node_id)
-            })?;
+            let nvue = ephemeral
+                .switch
+                .nvue_client()
+                .ok_or_else(|| format!("switch '{}': NVUE client is unavailable", node.node_id))?;
 
-            let location = switch.get_chassis_location_info().await.map_err(|error| {
-                format!(
-                    "switch '{}': failed to read tray index: {}",
-                    node.node_id, error.message
-                )
-            })?;
+            let location = nvue
+                .get_chassis_location(NVUE_DEFAULT_TIMEOUT)
+                .await
+                .map_err(|error| {
+                    format!(
+                        "switch '{}': failed to read tray index: {}",
+                        node.node_id, error
+                    )
+                })?;
 
-            let tray_index = location
-                .get("switch_info")
-                .and_then(|value| value.get("tray_index"))
-                .ok_or_else(|| format!("switch '{}': tray index is missing", node.node_id))?;
+            let tray_index = location.tray_index.as_deref().unwrap_or_default();
 
-            let tray_index = if let Some(value) = tray_index.as_u64() {
-                u32::try_from(value)
-                    .map_err(|_| format!("switch '{}': tray index is invalid", node.node_id))?
-            } else if let Some(value) = tray_index.as_str() {
-                value
-                    .parse::<u32>()
-                    .map_err(|_| format!("switch '{}': tray index is invalid", node.node_id))?
-            } else {
-                return Err(format!("switch '{}': tray index is invalid", node.node_id));
-            };
+            let tray_index = tray_index
+                .parse::<u32>()
+                .map_err(|_| format!("switch '{}': tray index is invalid", node.node_id))?;
 
-            Ok((tray_index, node))
+            Ok::<_, String>((tray_index, node))
         }))
         .await;
 
@@ -1030,7 +1154,7 @@ impl RackManagerServiceImpl {
         };
 
         let desired_node_ips = match get_node_ips_for_request(node_type, &nodes) {
-            Ok(node_ips) => node_ips,
+            Ok(addresses) => addresses,
             Err(message) => {
                 job.fail(JobFailure::new(JobError::Other, message));
 
@@ -1038,15 +1162,30 @@ impl RackManagerServiceImpl {
             }
         };
 
+        let configure_secondary_interface = desired_node_ips
+            .as_ref()
+            .is_some_and(|addresses| addresses.secondary.is_some());
+
         let snapshots = if desired_node_ips.is_some() {
             job.progress("Preparing node IP configuration");
 
-            // Enabled switches may retain addresses that must be cleared before
-            // disable. The selected switch also needs a snapshot for rollback.
+            // Read live interface state for rollback before clearing enabled
+            // non-selected switches or configuring the selected switch.
             let snapshots = join_all(snapshots.into_iter().map(|mut snapshot| async {
-                if snapshot.enabled || snapshot.node.node_id == primary.node_id {
-                    snapshot.node_ip =
-                        Some(prepare_node_ip_snapshot(self, &snapshot.node, request_domain).await?);
+                let is_selected = snapshot.node.node_id == primary.node_id;
+
+                if snapshot.enabled || is_selected {
+                    let include_secondary_interface = !is_selected || configure_secondary_interface;
+
+                    snapshot.node_ip = Some(
+                        prepare_node_ip_snapshot(
+                            self,
+                            &snapshot.node,
+                            request_domain,
+                            include_secondary_interface,
+                        )
+                        .await?,
+                    );
                 }
 
                 Ok(snapshot)
@@ -1068,7 +1207,7 @@ impl RackManagerServiceImpl {
         };
 
         let node_ip_update = match desired_node_ips.as_ref() {
-            Some(node_ips) => {
+            Some(desired_addresses) => {
                 let Some(snapshot) = snapshots
                     .iter()
                     .find(|snapshot| snapshot.node.node_id == primary.node_id)
@@ -1082,10 +1221,16 @@ impl RackManagerServiceImpl {
                     return;
                 };
 
-                Some((snapshot, node_ips))
+                Some((snapshot, desired_addresses))
             }
             None => None,
         };
+
+        // Captured before the security step opens the primary's external-client
+        // gRPC port, and consumed by the failure rollback below. `None` until
+        // the job reaches that step, so a failure before any exposure skips the
+        // gRPC teardown entirely.
+        let mut primary_external_grpc_snapshot: Option<bool> = None;
 
         let result: std::result::Result<String, JobFailure> = async {
             // Switches with node IP state need an ordered clear-and-disable.
@@ -1167,7 +1312,7 @@ impl RackManagerServiceImpl {
                 ));
             }
 
-            if let Some((snapshot, node_ips)) = &node_ip_update {
+            if let Some((snapshot, desired_addresses)) = &node_ip_update {
                 // This path only runs for switch types requiring node IP
                 // configuration. NVOS rejects that configuration while the
                 // cluster is disabled, so enable the selected switch first.
@@ -1188,7 +1333,7 @@ impl RackManagerServiceImpl {
                         )
                     })?;
 
-                job.progress("Configuring node IP addresses through NVUE");
+                job.progress("Configuring node IP addresses");
 
                 let switch = snapshot
                     .prepared_switch
@@ -1202,7 +1347,7 @@ impl RackManagerServiceImpl {
                     })?;
 
                 switch
-                    .reconcile_node_ips(InterfaceType::Primary, node_ips)
+                    .reconcile_node_ips(InterfaceType::Primary, &desired_addresses.primary)
                     .await
                     .map_err(|error| {
                         JobFailure::new(
@@ -1213,6 +1358,21 @@ impl RackManagerServiceImpl {
                             ),
                         )
                     })?;
+
+                if let Some(secondary) = &desired_addresses.secondary {
+                    switch
+                        .reconcile_node_ips(InterfaceType::Secondary, secondary)
+                        .await
+                        .map_err(|error| {
+                            JobFailure::new(
+                                JobError::Other,
+                                format!(
+                                    "failed to configure secondary node IP addresses on '{}': {}",
+                                    primary.node_id, error.message
+                                ),
+                            )
+                        })?;
+                }
             }
 
             job.progress("Enforcing NMX Controller security on the primary switch");
@@ -1239,6 +1399,17 @@ impl RackManagerServiceImpl {
             };
 
             let switch_target = prepared_switch.target_ip.to_string();
+
+            // Snapshot the primary's external-client gRPC exposure before the
+            // security step opens it. `enforce_primary_nmx_controller_security`
+            // (and the reused V1 primary configure in `reconcile_...`) enable the
+            // nmx-controller external gRPC port; if a later step fails, the job
+            // rollback restores this state instead of leaving the port open
+            // while reporting failure. Read here, immediately before the first
+            // exposure, so it reflects the pre-request state.
+            primary_external_grpc_snapshot = Some(
+                read_external_grpc_enabled(prepared_switch.switch.as_ref(), &switch_target).await,
+            );
 
             self.enforce_primary_nmx_controller_security(
                 prepared_switch.switch.as_ref(),
@@ -1303,49 +1474,125 @@ impl RackManagerServiceImpl {
             validate_reconciled_scale_up_fabric_status(&status, &primary.node_id, &config)
                 .map_err(|message| JobFailure::new(JobError::Other, message))?;
 
-            // Re-read node IPs after NMX-C reconciliation so later drift cannot
-            // pass the job's final checks.
-            if let Some((snapshot, expected_node_ips)) = &node_ip_update {
+            // Node IP verification and the SDN fabric state check both apply
+            // to VR NVL72 only: node IP reconciliation is only requested for
+            // this switch family (see get_node_ips_for_request), and the
+            // nv-bridge-state-report format and peer-matching semantics the
+            // SDN check relies on come from the VR NVL72 bring-up guide and
+            // have only been validated against VR NVL72 hardware. Gating the
+            // NVUE read itself, not just the SDN check, keeps this section a
+            // no-op for plain GB200/GB300 jobs instead of adding a failure
+            // surface neither consumer below would use.
+            let mut sdn_fabric_state = None;
+
+            if prepared_switch.switch.node_type() == NodeType::SwitchVrnvl72Nvidia {
+                let fabric_switch = prepared_switch.switch.as_switch_gb200().ok_or_else(|| {
+                    JobFailure::new(
+                        JobError::Internal,
+                        "primary switch target did not resolve to an NVIDIA switch",
+                    )
+                })?;
+
+                // Re-read node IPs after NMX-C reconciliation so later drift
+                // cannot pass the job's final checks. The same read also
+                // supplies the SDN fabric state check below with the peers
+                // it must confirm.
                 job.progress("Verifying node IP addresses");
 
-                let switch = snapshot
-                    .prepared_switch
-                    .switch
-                    .as_switch_gb200()
-                    .ok_or_else(|| {
+                let primary_server_ips = fabric_switch
+                    .get_node_ips(InterfaceType::Primary)
+                    .await
+                    .map_err(|error| {
                         JobFailure::new(
-                            JobError::Internal,
-                            "node IP target did not resolve to an NVIDIA switch",
+                            JobError::Other,
+                            format!(
+                                "failed to read primary-server addresses on '{}' for node IP \
+                                 and SDN fabric state verification: {}",
+                                primary.node_id, error.message
+                            ),
                         )
                     })?;
 
-                let observed_node_ips =
-                    switch
-                        .get_node_ips(InterfaceType::Primary)
+                if let Some((_, expected_addresses)) = &node_ip_update
+                    && primary_server_ips != expected_addresses.primary
+                {
+                    return Err(JobFailure::new(
+                        JobError::Other,
+                        format!(
+                            "node IP addresses on '{}' did not match: expected \
+                             {:?}, observed {primary_server_ips:?}",
+                            primary.node_id, expected_addresses.primary
+                        ),
+                    ));
+                }
+
+                if let Some((_, expected_addresses)) = &node_ip_update
+                    && let Some(expected_secondary) = &expected_addresses.secondary
+                {
+                    let observed_secondary = fabric_switch
+                        .get_node_ips(InterfaceType::Secondary)
                         .await
                         .map_err(|error| {
                             JobFailure::new(
                                 JobError::Other,
                                 format!(
-                                    "failed to verify node IP addresses on '{}': {}",
+                                    "failed to verify secondary node IP addresses on '{}': {}",
                                     primary.node_id, error.message
                                 ),
                             )
                         })?;
 
-                if observed_node_ips != **expected_node_ips {
-                    return Err(JobFailure::new(
-                        JobError::Other,
-                        format!(
-                            "node IP addresses on '{}' did not match: expected \
-                             {expected_node_ips:?}, observed {observed_node_ips:?}",
-                            primary.node_id
-                        ),
-                    ));
+                    if observed_secondary != *expected_secondary {
+                        return Err(JobFailure::new(
+                            JobError::Other,
+                            format!(
+                                "secondary node IP addresses on '{}' did not match: expected \
+                                 {expected_secondary:?}, observed {observed_secondary:?}",
+                                primary.node_id
+                            ),
+                        ));
+                    }
                 }
+
+                // Non-blocking by design: the SSH-command chain this depends
+                // on has no NVUE REST equivalent and no correlation to this
+                // job's own trigger, so a failure here does not necessarily
+                // mean the configuration is wrong. The outcome is reported
+                // in sdn_fabric_state on the result rather than failing the
+                // job, so a caller can act on it without an unproven check
+                // holding veto power over configuration completion.
+                job.progress("Verifying SDN fabric state");
+
+                sdn_fabric_state = Some(
+                    match fabric_switch.verify_sdn_fabric_state(&primary_server_ips).await {
+                        Ok(()) => "ok".to_owned(),
+                        Err(error) => {
+                            tracing::warn!(
+                                node = %primary.node_id,
+                                error = %error.message,
+                                "SDN fabric state verification failed; job proceeding without blocking"
+                            );
+
+                            error.message
+                        }
+                    },
+                );
             }
 
-            serde_json::to_string(&status).map_err(|error| {
+            let mut result_value = serde_json::to_value(&status).map_err(|error| {
+                JobFailure::new(
+                    JobError::Internal,
+                    format!("failed to convert scale-up fabric status to JSON: {error}"),
+                )
+            })?;
+
+            if let Some(sdn_fabric_state) = sdn_fabric_state
+                && let serde_json::Value::Object(map) = &mut result_value
+            {
+                map.insert("sdn_fabric_state".to_owned(), sdn_fabric_state.into());
+            }
+
+            serde_json::to_string(&result_value).map_err(|error| {
                 JobFailure::new(
                     JobError::Internal,
                     format!("failed to serialize scale-up fabric status: {error}"),
@@ -1387,10 +1634,9 @@ impl RackManagerServiceImpl {
                                     return errors;
                                 };
 
-                                if snapshot.enabled
-                                    && snapshot.node.node_id != primary.node_id
-                                    && let Err(error) = switch.update_cluster_config(true).await
-                                {
+                                // Node IP writes require an enabled cluster. This also covers a
+                                // selected primary that was disabled in the original snapshot.
+                                if let Err(error) = switch.set_cluster_state(true).await {
                                     errors.push(format!(
                                         "{} cluster state: {}",
                                         snapshot.node.node_id, error.message
@@ -1407,6 +1653,17 @@ impl RackManagerServiceImpl {
                                     ));
                                 }
 
+                                if let Some(secondary) = &node_ip.secondary_node_ips
+                                    && let Err(error) = switch
+                                        .reconcile_node_ips(InterfaceType::Secondary, secondary)
+                                        .await
+                                {
+                                    errors.push(format!(
+                                        "{} secondary node IP addresses: {}",
+                                        snapshot.node.node_id, error.message
+                                    ));
+                                }
+
                                 errors
                             }),
                     )
@@ -1414,6 +1671,33 @@ impl RackManagerServiceImpl {
                     .into_iter()
                     .flatten(),
                 );
+
+                // Restore the primary's external-client gRPC exposure to the
+                // pre-mutation state captured before the security step. Only the
+                // primary has its port opened by V2 (via
+                // enforce_primary_nmx_controller_security and the reused V1
+                // primary configure); the node-IP and cluster-state rollbacks
+                // never touch it. Run this before the cluster-state restore below
+                // so the primary is still cluster-enabled while the port toggles,
+                // matching the V1 helper's teardown. `None` means the job failed
+                // before any exposure, so there is nothing to undo.
+                if let Some(was_enabled) = primary_external_grpc_snapshot {
+                    match self.build_ephemeral_switch(&primary, request_domain).await {
+                        Ok(ephemeral) => {
+                            restore_primary_external_grpc(
+                                ephemeral.switch.as_ref(),
+                                &primary.node_id,
+                                was_enabled,
+                                &mut rollback_errors,
+                            )
+                            .await;
+                        }
+                        Err(error) => rollback_errors.push(format!(
+                            "{} external gRPC state: failed to prepare switch: {}",
+                            primary.node_id, error.message
+                        )),
+                    }
+                }
 
                 rollback_errors.extend(
                     join_all(snapshots.iter().map(|snapshot| async {
@@ -1499,15 +1783,27 @@ impl RackManagerServiceImpl {
             )
             .await?;
 
+        // Reconciliation mutates the primary switch, so it takes that node the
+        // way every other mutating RPC does. Skipping the check made exclusion
+        // one-way: the record still lands in the active-node index (any
+        // non-terminal job carrying a node does), so it blocked a later firmware
+        // update on that switch while itself being admitted on top of one.
+        //
+        // This guards the primary only. The other switches in `nodes` are still
+        // mutated without holding their own jobs, which is why callers must
+        // serialize requests.
         let pending = self
             .job_tracker
-            .create_job(
+            .create_visible_workflow_job_if_node_idle(
                 &job_primary.rack_id,
                 &job_primary.node_id,
                 JobType::ConfigureScaleUpFabricManagerV2,
             )
-            .map_err(|_| {
-                tonic::Status::internal("failed to create scale-up fabric reconciliation job")
+            .map_err(|failure| match job_error_of(&failure.error) {
+                // A busy primary is a caller-visible precondition, not a bug:
+                // surface the refusal with the job that owns the node.
+                JobError::UpdateInProgress => tonic::Status::failed_precondition(failure.message),
+                _ => tonic::Status::internal(failure.message),
             })?;
 
         let job_id = pending.id().to_string();
@@ -1646,15 +1942,19 @@ impl RackManagerServiceImpl {
     /// Reports whether a switch's scale-up fabric cluster state is enabled.
     ///
     /// NVUE exposes both `enabled` and `start` for an active cluster.
-    async fn cluster_state_is_enabled(
-        sw: &dyn SwitchScaleUpManagement,
-    ) -> std::result::Result<bool, String> {
-        let state = sw.get_cluster_state().await.map_err(|e| e.message)?;
+    async fn cluster_state_is_enabled(sw: &dyn SwitchScaleUpManagement) -> RmsResult<bool> {
+        let nvue = sw.nvue_client().ok_or_else(|| {
+            RmsError::failed_precondition(format!(
+                "NVUE client is unavailable for switch '{}'",
+                sw.id()
+            ))
+        })?;
 
-        Ok(matches!(
-            state.get("state").and_then(|value| value.as_str()),
-            Some("enabled" | "start")
-        ))
+        let cluster = nvue.get_cluster(NVUE_DEFAULT_TIMEOUT).await?;
+
+        Ok(cluster.state.as_deref().is_some_and(|state| {
+            state == "start" || ClusterState::try_from(state) == Ok(ClusterState::Enabled)
+        }))
     }
 
     /// Reports whether NMX Controller already holds all desired configuration.
@@ -1817,6 +2117,12 @@ impl RackManagerServiceImpl {
                         primary.node_id, error.message
                     )
                 })?;
+
+            tracing::info!(
+                node = %primary.node_id,
+                config_file_name = NMX_C_FM_CONFIG_FILE,
+                "restarted NMX Controller after static configuration reconciliation"
+            );
         }
 
         wait_for_nmx_controller_configured(switch.as_ref(), nvue.as_ref(), &primary.node_id).await
@@ -1912,15 +2218,24 @@ impl RackManagerServiceImpl {
         let connection = Some((target_ip.to_string(), tls_server_name));
 
         // Query cluster state and fabric manager app status concurrently.
-        let (enabled_result, apps_result) = tokio::join!(
-            Self::cluster_state_is_enabled(sw.as_ref()),
-            sw.get_cluster_apps_status(NMX_CONTROLLER_APP_NAME),
-        );
+        let (enabled_result, apps_result) =
+            tokio::join!(Self::cluster_state_is_enabled(sw.as_ref()), async {
+                let nvue = sw.nvue_client().ok_or_else(|| {
+                    RmsError::failed_precondition(format!(
+                        "NVUE client is unavailable for switch '{}'",
+                        sw.id()
+                    ))
+                })?;
+
+                nvue.get_cluster_app(NMX_CONTROLLER_APP_NAME, NVUE_DEFAULT_TIMEOUT)
+                    .await
+                    .map_err(RmsError::from)
+            },);
 
         match enabled_result {
             Ok(enabled) => entry.enabled = enabled,
-            Err(message) => {
-                entry.error_message = message;
+            Err(error) => {
+                entry.error_message = error.message;
                 return (entry, connection);
             }
         }
@@ -1928,12 +2243,16 @@ impl RackManagerServiceImpl {
         // Best-effort raw fabric manager app status reported by the switch.
         match apps_result {
             Ok(apps) => {
-                if let Some(app_status) = apps.get("status").and_then(|value| value.as_str()) {
+                if let Some(app_status) = apps.status {
                     entry.fabric_manager_status = app_status.to_string();
                 }
             }
-            Err(e) => {
-                tracing::debug!(node = %entry.node_id, error = %e.message, "nmx-controller status read failed");
+            Err(error) => {
+                tracing::debug!(
+                    node = %entry.node_id,
+                    error = %error.message,
+                    "nmx-controller status read failed"
+                );
             }
         }
 
@@ -1956,8 +2275,213 @@ mod tests {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    use std::sync::Mutex;
+
+    use serde_json::Value;
+
     use super::*;
+    use crate::domain::node::Node;
     use crate::libnmxc::test_support::FakeNmxc;
+
+    /// Minimal `SwitchScaleUpManagement` fake for the external-client gRPC
+    /// snapshot/rollback helpers.
+    ///
+    /// `check_grpc_status` returns the configured value, or an error when it is
+    /// `None`, and every `enable_grpc_for_external_clients` call is recorded so
+    /// the rollback's disable/re-enable decision can be asserted. All other
+    /// methods are unexpected: these helpers must touch only external gRPC.
+    struct FakeExternalGrpcSwitch {
+        grpc_status: Option<Value>,
+        fail_enable: bool,
+        enable_calls: Mutex<Vec<(String, bool)>>,
+    }
+
+    impl FakeExternalGrpcSwitch {
+        fn with_status(grpc_status: Option<Value>) -> Self {
+            Self {
+                grpc_status,
+                fail_enable: false,
+                enable_calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn recording(fail_enable: bool) -> Self {
+            Self {
+                grpc_status: None,
+                fail_enable,
+                enable_calls: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl Node for FakeExternalGrpcSwitch {
+        fn id(&self) -> &str {
+            "sw-01"
+        }
+
+        fn rack_id(&self) -> &str {
+            "rack-01"
+        }
+
+        fn node_type(&self) -> NodeType {
+            NodeType::SwitchGb200Nvidia
+        }
+
+        fn get_info(&self) -> HashMap<String, String> {
+            HashMap::new()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SwitchScaleUpManagement for FakeExternalGrpcSwitch {
+        fn nvue_client(&self) -> Option<&nvue_client::SharedClient> {
+            None
+        }
+
+        async fn set_cluster_state(&self, _enabled: bool) -> crate::utilities::error::Result<()> {
+            Err(RmsError::internal("unexpected set_cluster_state call"))
+        }
+
+        async fn get_cluster_state(&self) -> crate::utilities::error::Result<Value> {
+            Err(RmsError::internal("unexpected get_cluster_state call"))
+        }
+
+        async fn nvue_hello(&self) -> crate::utilities::error::Result<()> {
+            Err(RmsError::internal("unexpected nvue_hello call"))
+        }
+
+        async fn get_cluster_apps_status(
+            &self,
+            _app_name: &str,
+        ) -> crate::utilities::error::Result<Value> {
+            Err(RmsError::internal(
+                "unexpected get_cluster_apps_status call",
+            ))
+        }
+
+        async fn enable_grpc_for_external_clients(
+            &self,
+            app_name: &str,
+            enabled: bool,
+        ) -> crate::utilities::error::Result<Value> {
+            self.enable_calls
+                .lock()
+                .unwrap()
+                .push((app_name.to_owned(), enabled));
+
+            if self.fail_enable {
+                Err(RmsError::internal("switch unreachable"))
+            } else {
+                Ok(serde_json::json!({}))
+            }
+        }
+
+        async fn gnmi_service(&self, _enabled: bool) -> crate::utilities::error::Result<Value> {
+            Err(RmsError::internal("unexpected gnmi_service call"))
+        }
+
+        async fn check_grpc_status(
+            &self,
+            _app_name: &str,
+            _target_switch: &str,
+        ) -> crate::utilities::error::Result<Value> {
+            match &self.grpc_status {
+                Some(status) => Ok(status.clone()),
+                None => Err(RmsError::internal("switch unreachable")),
+            }
+        }
+
+        async fn restart_cluster_app(
+            &self,
+            _app_name: &str,
+        ) -> crate::utilities::error::Result<()> {
+            Err(RmsError::internal("unexpected restart_cluster_app call"))
+        }
+
+        async fn reset_sdn_factory_default(&self) -> crate::utilities::error::Result<String> {
+            Err(RmsError::internal(
+                "unexpected reset_sdn_factory_default call",
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn read_external_grpc_enabled_reports_admin_state() {
+        let enabled = FakeExternalGrpcSwitch::with_status(Some(serde_json::json!({
+            "summary": { "grpc_enabled": true },
+        })));
+
+        assert!(read_external_grpc_enabled(&enabled, "192.0.2.10").await);
+
+        let disabled = FakeExternalGrpcSwitch::with_status(Some(serde_json::json!({
+            "summary": { "grpc_enabled": false },
+        })));
+
+        assert!(!read_external_grpc_enabled(&disabled, "192.0.2.10").await);
+    }
+
+    #[tokio::test]
+    async fn read_external_grpc_enabled_fails_closed_on_missing_or_unreadable_state() {
+        // A missing field cannot prove the port is open, so report disabled.
+        let missing = FakeExternalGrpcSwitch::with_status(Some(serde_json::json!({
+            "summary": {},
+        })));
+
+        assert!(!read_external_grpc_enabled(&missing, "192.0.2.10").await);
+
+        // An unreachable switch fails closed so a later rollback still tears the
+        // port down rather than trusting it was already closed.
+        let unreadable = FakeExternalGrpcSwitch::with_status(None);
+
+        assert!(!read_external_grpc_enabled(&unreadable, "192.0.2.10").await);
+    }
+
+    #[tokio::test]
+    async fn restore_primary_external_grpc_tears_down_port_opened_from_disabled() {
+        let switch = FakeExternalGrpcSwitch::recording(false);
+        let mut errors = Vec::new();
+
+        // Pre-request state was disabled, so rollback must close the port V2 opened.
+        restore_primary_external_grpc(&switch, "sw-01", false, &mut errors).await;
+
+        assert!(errors.is_empty());
+        assert_eq!(
+            *switch.enable_calls.lock().unwrap(),
+            vec![("nmx-controller".to_owned(), false)],
+            "rollback must disable external-client gRPC when it was disabled before the request"
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_primary_external_grpc_preserves_previously_open_port() {
+        let switch = FakeExternalGrpcSwitch::recording(false);
+        let mut errors = Vec::new();
+
+        // Pre-request state was already exposed; rollback must not close it.
+        restore_primary_external_grpc(&switch, "sw-01", true, &mut errors).await;
+
+        assert!(errors.is_empty());
+        assert_eq!(
+            *switch.enable_calls.lock().unwrap(),
+            vec![("nmx-controller".to_owned(), true)],
+            "rollback must re-enable external-client gRPC when it was open before the request"
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_primary_external_grpc_records_error_without_panicking() {
+        let switch = FakeExternalGrpcSwitch::recording(true);
+        let mut errors = Vec::new();
+
+        // Best-effort: an unreachable switch (the common rollback trigger) must
+        // surface a recorded error instead of propagating or panicking.
+        restore_primary_external_grpc(&switch, "sw-01", false, &mut errors).await;
+
+        assert_eq!(switch.enable_calls.lock().unwrap().len(), 1);
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("sw-01"));
+        assert!(errors[0].contains("external gRPC state"));
+    }
 
     #[tokio::test]
     async fn hello_retries_transient_controller_startup_failure() {
@@ -2048,6 +2572,23 @@ mod tests {
         }
     }
 
+    fn secondary_management_endpoint(address: &str) -> rm::Endpoint {
+        rm::Endpoint {
+            interface: Some(rm::NetworkInterface {
+                ip_address: address.to_owned(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn with_secondary_management_endpoint(mut node: rm::NodeInfo, address: &str) -> rm::NodeInfo {
+        node.additional_host_endpoints
+            .push(secondary_management_endpoint(address));
+
+        node
+    }
+
     fn test_nvue_client(server: &MockServer) -> SharedNvueClient {
         NvueClient::new(NvueClientConfig {
             endpoint: NvueClientEndpoint::http(
@@ -2076,11 +2617,135 @@ mod tests {
 
         let node_ips = get_node_ips(&[first, second]).map_err(std::io::Error::other)?;
 
-        assert_eq!(node_ips.len(), 2);
-        assert!(node_ips.contains(&"192.0.2.101".parse()?));
-        assert!(node_ips.contains(&"192.0.2.102".parse()?));
+        assert_eq!(node_ips.primary.len(), 2);
+        assert!(node_ips.primary.contains(&"192.0.2.101".parse()?));
+        assert!(node_ips.primary.contains(&"192.0.2.102".parse()?));
+        assert_eq!(node_ips.secondary, None);
 
         Ok(())
+    }
+
+    #[test]
+    fn get_node_ips_includes_secondary_addresses() -> Result<(), Box<dyn std::error::Error>> {
+        let first = with_secondary_management_endpoint(
+            node_with_ip("sw-01", "192.0.2.101", false),
+            "198.51.100.101",
+        );
+
+        let second = with_secondary_management_endpoint(
+            node_with_ip("sw-02", "192.0.2.102", true),
+            "198.51.100.102",
+        );
+
+        let desired = get_node_ips_for_request(NodeType::SwitchVrnvl72Nvidia, &[first, second])
+            .map_err(std::io::Error::other)?
+            .ok_or_else(|| std::io::Error::other("node IP configuration should be required"))?;
+
+        assert_eq!(desired.primary.len(), 2);
+        assert!(desired.primary.contains(&"192.0.2.101".parse()?));
+        assert!(desired.primary.contains(&"192.0.2.102".parse()?));
+
+        let secondary = desired.secondary.ok_or("secondary addresses are missing")?;
+
+        assert_eq!(secondary.len(), 2);
+        assert!(secondary.contains(&"198.51.100.101".parse()?));
+        assert!(secondary.contains(&"198.51.100.102".parse()?));
+
+        Ok(())
+    }
+
+    #[test]
+    fn other_dispatch_paths_ignore_additional_host_endpoints()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut node = node_with_ip("sw-01", "192.0.2.101", false);
+        node.r#type = Some(rm::NodeType::SwitchGb200Nvidia as i32);
+        node.additional_host_endpoints = vec![rm::Endpoint::default(), rm::Endpoint::default()];
+
+        assert_eq!(
+            get_node_ips_for_request(NodeType::SwitchGb200Nvidia, &[node])?,
+            None
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn secondary_management_endpoint_requires_ip_interface() {
+        let cases = [
+            (
+                vec![rm::Endpoint::default()],
+                "must contain a network interface",
+            ),
+            (
+                vec![secondary_management_endpoint("not-an-ip")],
+                "has invalid IP address",
+            ),
+        ];
+
+        for (additional_host_endpoints, expected_message) in cases {
+            let mut node = node_with_ip("sw-01", "192.0.2.101", false);
+            node.additional_host_endpoints = additional_host_endpoints;
+
+            let error = get_node_ips(&[node]).unwrap_err();
+            assert!(error.contains(expected_message), "{error}");
+        }
+    }
+
+    #[test]
+    fn secondary_management_address_uses_first_additional_endpoint()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut node = node_with_ip("sw-01", "192.0.2.101", false);
+
+        node.additional_host_endpoints = vec![
+            secondary_management_endpoint("198.51.100.101"),
+            secondary_management_endpoint("198.51.100.102"),
+        ];
+
+        let desired = get_node_ips(&[node]).map_err(std::io::Error::other)?;
+
+        assert_eq!(
+            desired.secondary,
+            Some(ClusterNodeServerAddresses::from(
+                ["198.51.100.101".parse()?]
+            ))
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn secondary_management_addresses_reject_duplicates_and_primary_overlaps() {
+        let cases = [
+            (
+                vec![
+                    with_secondary_management_endpoint(
+                        node_with_ip("sw-01", "192.0.2.101", false),
+                        "198.51.100.101",
+                    ),
+                    with_secondary_management_endpoint(
+                        node_with_ip("sw-02", "192.0.2.102", false),
+                        "198.51.100.101",
+                    ),
+                ],
+                "duplicate secondary management IP address",
+            ),
+            (
+                vec![
+                    with_secondary_management_endpoint(
+                        node_with_ip("sw-01", "192.0.2.101", false),
+                        "192.0.2.102",
+                    ),
+                    node_with_ip("sw-02", "192.0.2.102", false),
+                ],
+                "primary and secondary management IP addresses overlap",
+            ),
+        ];
+
+        for (nodes, expected_message) in cases {
+            let error = get_node_ips(&nodes).unwrap_err();
+
+            assert!(error.contains(expected_message), "{error}");
+        }
     }
 
     #[test]

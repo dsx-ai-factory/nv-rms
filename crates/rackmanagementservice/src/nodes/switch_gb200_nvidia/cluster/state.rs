@@ -20,11 +20,10 @@
 use super::super::{SwitchGb200Nvidia, config};
 use super::RETRY_WAIT_DELAY;
 use crate::transport::http_client::HttpClient;
-use crate::transport::ssh_client::SshClient;
 use crate::utilities::error::{Result, RmsError};
 use crate::utilities::insert_json_field;
 
-use nvue_client::cluster::ClusterState;
+use nvue_client::cluster::{CLUSTER_ENDPOINT, Cluster, ClusterState, ClusterUpdate};
 use serde_json::Value;
 
 impl SwitchGb200Nvidia {
@@ -36,102 +35,111 @@ impl SwitchGb200Nvidia {
         }
     }
 
+    /// Enables/disables the cluster and waits for NVUE to report convergence.
+    ///
+    /// The transition is staged, applied, and saved through the typed NVUE
+    /// revision workflow. Two behaviors differ from the former SSH
+    /// implementation and callers should be aware of them:
+    ///
+    /// - It is a no-op when the cluster already reports the desired state: the
+    ///   operational `GET /nvue_v1/cluster` (no `rev`) is read first and, on a
+    ///   match, no revision is created, applied, or saved. The former code ran
+    ///   `nv set` / `nv config apply` / `nv config save` unconditionally.
+    /// - Persistence happens only on a real config diff: an apply that NVUE
+    ///   reports as "no config diff" is treated as success without a save,
+    ///   whereas the former `nv config save` persisted the running config on
+    ///   every call.
     pub async fn set_cluster_state(&self, enabled: bool) -> Result<()> {
         let _op_guard = self.op_lock.lock().await;
         self.set_cluster_state_unlocked(enabled).await
     }
 
+    /// Reads the cluster's current `state` string from NVUE.
+    ///
+    /// Errors when NVUE does not report a state, so callers can distinguish an
+    /// unreadable cluster from a known state value.
+    async fn current_cluster_state(&self) -> Result<String> {
+        let value = self
+            .nvue_http_get(CLUSTER_ENDPOINT, HttpClient::DEFAULT_TIMEOUT)
+            .await?;
+
+        let cluster: Cluster = serde_json::from_value(value)
+            .map_err(|e| RmsError::internal(format!("failed to parse cluster status: {e}")))?;
+
+        cluster
+            .state
+            .ok_or_else(|| RmsError::internal("unable to determine current cluster state"))
+    }
+
     /// Changes cluster state while the caller holds `op_lock`.
+    ///
+    /// The state transition is staged, applied, and saved entirely through the
+    /// typed NVUE revision workflow. RMS no longer shells into the switch to run
+    /// `nv set cluster state` / `nv config apply` / `nv config save`, removing
+    /// the dependency on nvCLI syntax, SSH availability, and CLI output parsing.
     pub(super) async fn set_cluster_state_unlocked(&self, enabled: bool) -> Result<()> {
         let state = Self::desired_cluster_state(enabled);
         let desired_state = state.as_str();
         tracing::info!(node = %self.id, enabled, desired_state, "set_cluster_state");
 
-        {
-            let cluster = self
-                .nvue_http_get("/nvue_v1/cluster", HttpClient::DEFAULT_TIMEOUT)
-                .await?;
+        let current_state = self.current_cluster_state().await?;
 
-            let current_state = cluster
-                .get("state")
-                .and_then(|value| value.as_str())
-                .ok_or_else(|| RmsError::internal("unable to determine current cluster state"))?;
+        tracing::info!(
+            node = %self.id,
+            enabled,
+            current_state = %current_state,
+            desired_state,
+            "scale-up fabric current state observed"
+        );
 
+        // Preserve the no-op behavior: skip the revision entirely when the
+        // cluster already holds the requested state. NVOS only ever reports the
+        // cluster `state` as `enabled` or `disabled` (unset defaults to
+        // `disabled`).
+        if current_state == desired_state {
             tracing::info!(
                 node = %self.id,
                 enabled,
-                current_state,
+                current_state = %current_state,
                 desired_state,
-                "scale-up fabric current state observed"
+                "scale-up fabric state already set; skipping NVUE revision"
             );
 
-            if current_state == desired_state || (enabled && current_state == "start") {
-                tracing::info!(
-                    node = %self.id,
-                    enabled,
-                    current_state,
-                    desired_state,
-                    "scale-up fabric state already set; skipping nv cli update"
-                );
-
-                return Ok(());
-            }
-        }
-
-        self.run_cluster_state_nv_commands(desired_state).await?;
-
-        self.wait_for_cluster_state(desired_state, enabled)
-            .await
-            .map(|_| ())
-    }
-
-    async fn run_cluster_state_nv_commands(&self, state: &str) -> Result<()> {
-        #[cfg(test)]
-        if let Some(exec) = &self.ssh_exec_for_test {
-            exec(&format!("nv set cluster state {state}"))?;
-            exec("nv config apply --assume-yes")?;
-            exec("nv config save")?;
             return Ok(());
         }
 
-        let ssh = SshClient::connect(self.ssh_endpoint()?, SshClient::DEFAULT_TIMEOUT).await?;
+        self.stage_cluster_state(state).await?;
 
-        ssh.exec(
-            &format!("nv set cluster state {state}"),
-            SshClient::DEFAULT_TIMEOUT,
-        )
-        .await?;
-
-        ssh.exec("nv config apply --assume-yes", SshClient::DEFAULT_TIMEOUT)
-            .await?;
-
-        ssh.exec("nv config save", SshClient::DEFAULT_TIMEOUT)
-            .await?;
-
-        Ok(())
+        // Verify the final operational state: wait until the cluster actually
+        // reports the desired `enabled`/`disabled` value rather than resolving on
+        // any intermediate reading.
+        self.wait_for_cluster_state(desired_state).await.map(|_| ())
     }
 
-    // Set cluster state via SSH then poll NVUE REST until it converges
-    pub async fn update_cluster_config(&self, enabled: bool) -> Result<()> {
-        let _op_guard = self.op_lock.lock().await;
-        let state = Self::desired_cluster_state(enabled);
-        let desired_state = state.as_str();
+    /// Stages, applies, and saves the desired cluster state through a single
+    /// NVUE configuration revision.
+    ///
+    /// Delegates to the shared revision workflow so revision failures and
+    /// timeouts are surfaced as actionable RMS errors, an idempotent apply
+    /// reported as "no config diff" is treated as success without an
+    /// unnecessary save, and a candidate revision left by a failed stage is
+    /// discarded rather than leaked on the switch.
+    async fn stage_cluster_state(&self, state: ClusterState) -> Result<()> {
+        let payload = serde_json::to_value(ClusterUpdate::new(state.as_str())).map_err(|e| {
+            RmsError::internal(format!("failed to serialize cluster state update: {e}"))
+        })?;
 
-        tracing::info!(node = %self.id, enabled, "update_cluster_config");
-        self.run_cluster_state_nv_commands(desired_state).await?;
-
-        self.wait_for_cluster_state(desired_state, enabled)
+        self.nvue_apply_config_patches(&[(CLUSTER_ENDPOINT, payload)])
             .await
-            .map(|_| ())
     }
 
-    async fn wait_for_cluster_state(&self, expected: &str, allow_start: bool) -> Result<Value> {
+    async fn wait_for_cluster_state(&self, expected: &str) -> Result<Value> {
         for attempt in 0..=config::MAX_RETRY_ATTEMPTS {
             if let Ok(cluster) = self
-                .nvue_http_get("/nvue_v1/cluster", HttpClient::DEFAULT_TIMEOUT)
+                .nvue_http_get(CLUSTER_ENDPOINT, HttpClient::DEFAULT_TIMEOUT)
                 .await
                 && let Some(state) = cluster.get("state").and_then(|v| v.as_str())
-                && (state == expected || (allow_start && state == "start"))
+                && state == expected
             {
                 return Ok(cluster);
             }
@@ -148,7 +156,7 @@ impl SwitchGb200Nvidia {
 
     pub async fn get_cluster_state(&self) -> Result<Value> {
         let mut result = self
-            .nvue_http_get("/nvue_v1/cluster", HttpClient::DEFAULT_TIMEOUT)
+            .nvue_http_get(CLUSTER_ENDPOINT, HttpClient::DEFAULT_TIMEOUT)
             .await?;
 
         let state = result
@@ -170,7 +178,7 @@ impl SwitchGb200Nvidia {
                 &mut result,
                 "recommendation",
                 serde_json::json!(
-                    "Enable cluster with update_cluster_config before performing cluster operations"
+                    "Enable the scale-up fabric cluster before performing cluster operations"
                 ),
             );
         } else {

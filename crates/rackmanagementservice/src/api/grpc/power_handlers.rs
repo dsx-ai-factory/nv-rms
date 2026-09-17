@@ -138,8 +138,7 @@ impl RackManagerServiceImpl {
             //
             // Batch power is the standalone trusted-admin direct endpoint path.
             // It intentionally does not look up inventory or join rack power
-            // serialization; inventory-backed callers use SetPowerState or
-            // SequenceRackPower instead.
+            // serialization; inventory-backed callers use SetPowerState instead.
             //
 
             let node = match build_ephemeral_power_node(&node_info) {
@@ -369,97 +368,6 @@ impl RackManagerServiceImpl {
         )))
     }
 
-    pub(crate) async fn handle_sequence_rack_power(
-        &self,
-        req: tonic::Request<rm::SequenceRackPowerRequest>,
-    ) -> std::result::Result<tonic::Response<rm::SequenceRackPowerResponse>, tonic::Status> {
-        let r = req.into_inner();
-        let mut resp = rm::SequenceRackPowerResponse {
-            status: rm::ReturnCode::Failure.into(),
-            message: String::new(),
-        };
-
-        let rack = match find_rack(&self.rack_manager, &r.rack_id) {
-            Ok(r) => r,
-            Err(_) => {
-                tracing::error!(rack = %r.rack_id, "rack not found");
-                resp.message = "rack not found".into();
-                return Ok(tonic::Response::new(resp));
-            }
-        };
-
-        // Hold the rack power lock for the full inventory-backed sequence so
-        // registered single-node power and inventory mutations cannot interleave
-        // with the ordered Redfish calls. Standalone batch power is a separate
-        // trusted-admin mode and is not mixed with inventory-backed operation.
-        let Ok(_power_guard) = rack.try_power_operation_guard() else {
-            tracing::warn!(rack = r.rack_id, "{}", RACK_POWER_BUSY_MESSAGE);
-            resp.message = RACK_POWER_BUSY_MESSAGE.to_owned();
-            return Ok(tonic::Response::new(resp));
-        };
-
-        let order = rack.get_power_on_order();
-        if order.is_empty() {
-            tracing::error!(rack = %r.rack_id, "power-on order not set");
-            resp.message = "power-on order not set".into();
-            return Ok(tonic::Response::new(resp));
-        }
-
-        let op = rm::RackPowerOperation::try_from(r.operation)
-            .ok()
-            .and_then(|op| PowerOp::try_from(op).ok())
-            .ok_or_else(|| {
-                tonic::Status::invalid_argument(format!("invalid operation: {}", r.operation))
-            })?;
-
-        // Execute power op on each node in the configured sequence order
-        let mut all_ok = true;
-        for step in &order {
-            if let Some(node) = rack.find_node(&step.node_id) {
-                if let Err(error) = self
-                    .initialize_power_nvue_client_if_needed(node.as_ref(), Some(op))
-                    .await
-                {
-                    tracing::error!(
-                        node = %step.node_id,
-                        rack = %r.rack_id,
-                        error = %error.message,
-                        "failed to configure NVUE client"
-                    );
-                    all_ok = false;
-                    continue;
-                }
-
-                if let Err(e) = node.set_power_state(op, PowerTargetType::System).await {
-                    tracing::error!(
-                        node = %step.node_id,
-                        rack = %r.rack_id,
-                        error = %e.message,
-                        "failed to set power state for node"
-                    );
-                    all_ok = false;
-                }
-            } else {
-                tracing::error!(
-                    node = %step.node_id,
-                    rack = %r.rack_id,
-                    "node not found in power sequence"
-                );
-                all_ok = false;
-            }
-        }
-
-        if all_ok {
-            tracing::info!(rack = %r.rack_id, ?op, "rack power operation completed");
-            resp.status = rm::ReturnCode::Success.into();
-            resp.message = "rack power operation completed".into();
-        } else {
-            resp.status = rm::ReturnCode::Failure.into();
-            resp.message = "some nodes failed".into();
-        }
-        Ok(tonic::Response::new(resp))
-    }
-
     async fn initialize_power_nvue_client_if_needed(
         &self,
         node: &NodeInstance,
@@ -481,7 +389,7 @@ impl RackManagerServiceImpl {
     }
 }
 
-fn build_ephemeral_power_node(
+pub(crate) fn build_ephemeral_power_node(
     node_info: &rm::NodeInfo,
 ) -> std::result::Result<Arc<NodeInstance>, String> {
     let node_type = resolve_node_info(node_info).map_err(|error| error.to_string())?;
@@ -620,7 +528,6 @@ mod tests {
 
     use super::super::server::SwitchTlsRoots;
     use crate::domain::node::{Node, NodeType, PowerState, ProductFamily};
-    use crate::domain::rack::PowerOnStep;
     use crate::orchestrator::job_tracker::JobTracker;
     use crate::orchestrator::rack_manager::RackManager;
     use crate::persistence::Backends;
@@ -724,13 +631,6 @@ mod tests {
         })
     }
 
-    fn sequence_power_request() -> tonic::Request<rm::SequenceRackPowerRequest> {
-        tonic::Request::new(rm::SequenceRackPowerRequest {
-            operation: rm::RackPowerOperation::On as i32,
-            rack_id: RACK_ID.to_owned(),
-        })
-    }
-
     #[tokio::test]
     async fn set_power_state_rejects_concurrent_request_for_same_rack() -> TestResult {
         let (rack_manager, rack) = rack_manager_with_rack()?;
@@ -763,49 +663,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sequence_rack_power_rejects_while_set_power_state_in_progress() -> TestResult {
+    async fn delete_node_rejected_while_set_power_state_in_progress() -> TestResult {
         let (rack_manager, rack) = rack_manager_with_rack()?;
         let (entered, state) = add_blocking_node(&rack)?;
-        rack.set_power_on_order(vec![PowerOnStep::new(0, NODE_ID)])?;
         let service = test_service(rack_manager);
 
         let power_service = service.clone();
         let power = tokio::spawn(async move {
             power_service
                 .handle_set_power_state(set_power_request())
-                .await
-        });
-
-        entered.await?;
-
-        let sequence = service
-            .handle_sequence_rack_power(sequence_power_request())
-            .await?
-            .into_inner();
-
-        assert_eq!(sequence.status, rm::ReturnCode::Failure as i32);
-        assert_eq!(sequence.message, RACK_POWER_BUSY_MESSAGE);
-        assert_eq!(state.calls.load(Ordering::SeqCst), 1);
-
-        state.release.notify_waiters();
-        let power = power.await??.into_inner();
-
-        assert_eq!(power.status, rm::ReturnCode::Success as i32);
-        assert_eq!(state.calls.load(Ordering::SeqCst), 1);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn sequence_rack_power_rejects_delete_while_sequence_in_progress() -> TestResult {
-        let (rack_manager, rack) = rack_manager_with_rack()?;
-        let (entered, state) = add_blocking_node(&rack)?;
-        rack.set_power_on_order(vec![PowerOnStep::new(0, NODE_ID)])?;
-        let service = test_service(rack_manager);
-
-        let sequence_service = service.clone();
-        let sequence = tokio::spawn(async move {
-            sequence_service
-                .handle_sequence_rack_power(sequence_power_request())
                 .await
         });
 
@@ -827,9 +693,9 @@ mod tests {
         assert_eq!(state.calls.load(Ordering::SeqCst), 1);
 
         state.release.notify_waiters();
-        let sequence = sequence.await??.into_inner();
+        let power = power.await??.into_inner();
 
-        assert_eq!(sequence.status, rm::ReturnCode::Success as i32);
+        assert_eq!(power.status, rm::ReturnCode::Success as i32);
         assert_eq!(state.calls.load(Ordering::SeqCst), 1);
         Ok(())
     }

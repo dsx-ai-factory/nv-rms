@@ -91,6 +91,7 @@ pub(crate) trait SwitchScaleUpManagement: Node {
 
     async fn set_cluster_state(&self, enabled: bool) -> Result<()>;
     async fn get_cluster_state(&self) -> Result<Value>;
+    async fn nvue_hello(&self) -> Result<()>;
     async fn get_cluster_apps_status(&self, app_name: &str) -> Result<Value>;
     async fn enable_grpc_for_external_clients(
         &self,
@@ -296,7 +297,24 @@ impl NodeInstance {
             | Self::PowershelfGb300Liteon(_)
             | Self::PowershelfGb300Delta(_) => Ok(None),
             #[cfg(test)]
-            Self::Test(_) => Ok(None),
+            Self::Test(node) => {
+                // Real nodes bound their device-info I/O inside the leaf (after
+                // the op-lock); test mocks have no op-lock, so apply the same
+                // per-kind backstop here to keep the fan-out timeout paths
+                // exercised. A kind with no device-info I/O (powershelf) returns
+                // `None` and is awaited unwrapped, mirroring production.
+                match crate::domain::node::device_info_fetch_timeout(node.node_type()) {
+                    Some(timeout) => tokio::time::timeout(timeout, node.get_device_info())
+                        .await
+                        .map_err(|_elapsed| {
+                            RmsError::internal(format!(
+                                "device-info read exceeded {}s deadline",
+                                timeout.as_secs()
+                            ))
+                        })?,
+                    None => node.get_device_info().await,
+                }
+            }
         }
     }
 
@@ -380,6 +398,11 @@ impl SwitchScaleUpManagement for SwitchGb200Nvidia {
         SwitchGb200Nvidia::get_cluster_state(self).await
     }
 
+    async fn nvue_hello(&self) -> Result<()> {
+        let _op_guard = self.op_lock.lock().await;
+        self.verify_nvue_api_hello().await
+    }
+
     async fn get_cluster_apps_status(&self, app_name: &str) -> Result<Value> {
         let _op_guard = self.op_lock.lock().await;
         SwitchGb200Nvidia::get_cluster_apps_status(self, app_name).await
@@ -395,7 +418,9 @@ impl SwitchScaleUpManagement for SwitchGb200Nvidia {
     }
 
     async fn gnmi_service(&self, enabled: bool) -> Result<Value> {
-        let _op_guard = self.op_lock.lock().await;
+        // The inherent `gnmi_service` acquires `op_lock` itself (mirroring
+        // `set_cluster_state`), so this wrapper must NOT also lock it -- the
+        // tokio mutex is not reentrant and a second acquire here deadlocks.
         SwitchGb200Nvidia::gnmi_service(self, enabled).await
     }
 
@@ -418,7 +443,18 @@ impl SwitchScaleUpManagement for SwitchGb200Nvidia {
 impl SwitchDeviceInfo for SwitchGb200Nvidia {
     async fn get_chassis_location_info(&self) -> Result<Value> {
         let _op_guard = self.op_lock.lock().await;
-        SwitchGb200Nvidia::get_chassis_location_info(self).await
+        // Bound only the NVUE I/O; the op-lock wait above is intentionally left
+        // unbounded so contention with another node operation queues instead of
+        // being charged against the device-info deadline.
+        let timeout = crate::domain::node::SWITCH_DEVICE_INFO_FETCH_TIMEOUT;
+        tokio::time::timeout(timeout, SwitchGb200Nvidia::get_chassis_location_info(self))
+            .await
+            .map_err(|_elapsed| {
+                RmsError::internal(format!(
+                    "chassis location read exceeded {}s deadline",
+                    timeout.as_secs()
+                ))
+            })?
     }
 }
 
@@ -470,6 +506,15 @@ impl Node for NodeInstance {
         options: FirmwareUpdateOptions,
     ) -> Result<FirmwareUpdateOutcome> {
         match_node_instance!(self, node => node.update_firmware(target, force_update, options).await)
+    }
+
+    async fn update_firmware_group(
+        &self,
+        targets: &[FirmwareTarget],
+        force_update: bool,
+        options: FirmwareUpdateOptions,
+    ) -> Result<FirmwareUpdateOutcome> {
+        match_node_instance!(self, node => node.update_firmware_group(targets, force_update, options).await)
     }
 
     async fn start_firmware_upload(
@@ -664,5 +709,38 @@ mod tests {
             .unwrap();
 
         assert_eq!(state["state"], "disabled");
+    }
+
+    #[tokio::test]
+    async fn gnmi_service_via_capability_trait_does_not_deadlock() {
+        // Regression: the SwitchScaleUpManagement::gnmi_service wrapper must not
+        // acquire op_lock, because the inherent SwitchGb200Nvidia::gnmi_service
+        // already does. A second acquire on the non-reentrant tokio mutex
+        // deadlocks the RPC before any NVUE request is issued (the production
+        // path only reaches gnmi_service through this trait object, so the
+        // switch-node unit tests -- which call the inherent method directly --
+        // do not exercise it). Drive the no-op (already-disabled) path through
+        // the trait and require it to finish well within a timeout.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/nvue_v1/system/gnmi-server"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "state": "disabled"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let switch = SwitchGb200Nvidia::for_test(&server.uri());
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            SwitchScaleUpManagement::gnmi_service(&switch, false),
+        )
+        .await
+        .expect("gnmi_service via capability trait deadlocked (op_lock acquired twice)")
+        .expect("gnmi_service returned an error");
+
+        assert_eq!(result["state"], "disabled");
     }
 }

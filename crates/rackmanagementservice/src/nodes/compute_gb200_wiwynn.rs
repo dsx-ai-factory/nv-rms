@@ -108,6 +108,17 @@ impl Node for WiwynnGb200Compute {
             .await
     }
 
+    async fn update_firmware_group(
+        &self,
+        targets: &[FirmwareTarget],
+        force_update: bool,
+        options: FirmwareUpdateOptions,
+    ) -> Result<FirmwareUpdateOutcome> {
+        self.inner
+            .update_firmware_group(targets, force_update, options)
+            .await
+    }
+
     async fn start_firmware_upload(
         &self,
         target: &FirmwareTarget,
@@ -182,5 +193,35 @@ mod tests {
             error.message,
             "create_node not supported for compute_gb200_nvidia nodes"
         );
+    }
+
+    #[tokio::test]
+    async fn grouped_flint_updates_delegate_to_shared_gb200_implementation() {
+        let compute =
+            WiwynnGb200Compute::from_config(&config(NodeType::ComputeGb200Wiwynn), "rack-01")
+                .unwrap();
+        let targets = [
+            FirmwareTarget {
+                component: "CX7".to_owned(),
+                firmware_file: "/tmp/cx7-a.bin".to_owned(),
+                expected_version: None,
+            },
+            FirmwareTarget {
+                component: "CX7".to_owned(),
+                firmware_file: "/tmp/cx7-b.bin".to_owned(),
+                expected_version: None,
+            },
+        ];
+
+        let error = compute
+            .update_firmware_group(&targets, false, FirmwareUpdateOptions::default())
+            .await
+            .expect_err("missing host endpoint should fail before Flint access");
+
+        assert_eq!(
+            error.code,
+            crate::utilities::error::ErrorCode::FailedPrecondition
+        );
+        assert!(error.message.contains("host_endpoint is required"));
     }
 }

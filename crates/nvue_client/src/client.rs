@@ -29,13 +29,18 @@ use serde::Serialize;
 use serde_json::Value;
 use tokio::sync::Mutex as AsyncMutex;
 
-use crate::ClientTls;
 use crate::cluster::{
     CLUSTER_ENDPOINT, Cluster, ClusterApp, ClusterNodeServer, ClusterNodeServerAddresses,
     ClusterNodeServerMap, InterfaceType, app_endpoint, cluster_node_endpoint_for_revision,
     cluster_node_server_endpoint_for_revision,
 };
+use crate::platform::{CHASSIS_LOCATION_ENDPOINT, ChassisLocation};
+use crate::system::{
+    GNMI_SERVER_MTLS_ENDPOINT, MtlsConfiguration, SYSTEM_API_ENDPOINT, SYSTEM_API_MTLS_ENDPOINT,
+    SystemApi,
+};
 use crate::tls::{TlsSnapshot, load_stable_snapshot};
+use crate::{ClientTls, NVUE_V1_SERVER};
 
 const DEFAULT_MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -424,7 +429,13 @@ pub enum ClientError {
     ForeignPreparedTransport,
 
     /// A request or response-body read failed.
-    #[error("{operation}: {source}")]
+    ///
+    /// `reqwest::Error`'s `Display` is intentionally terse (for example
+    /// `error sending request for url (...)`) and omits the underlying
+    /// cause, such as a TLS certificate validation failure. Render the full
+    /// `source()` chain so operators see *why* the request failed, not just
+    /// that it failed.
+    #[error("{operation}: {}", describe_reqwest_error(source))]
     Request {
         /// Request operation being performed.
         operation: String,
@@ -559,6 +570,27 @@ enum ResponseMode {
     ImportedLegacy,
 }
 
+/// Resolve a request `path` against an authority-only `base_url`, refusing any
+/// path that would move the request off the base's origin or outside the
+/// `/nvue_v1` API tree. Delegates resolution and the same-origin / absolute-path
+/// / dot-segment / prefix guard to [`common::net::resolve_same_origin`]; see
+/// [`Transport::resolve_url`] for the rationale.
+fn resolve_request_url(base_url: &str, path: &str) -> Result<reqwest::Url, ClientError> {
+    common::net::resolve_same_origin(base_url, path, Some(NVUE_V1_SERVER)).map_err(|rejection| {
+        match rejection {
+            common::net::EndpointRejection::UnparseableBase(error) => {
+                ClientError::InvalidEndpoint(format!("invalid NVUE base URL: {error}"))
+            }
+            // Keep the (potentially attacker-controlled) path out of the error.
+            common::net::EndpointRejection::OffOriginOrMalformed => ClientError::InvalidEndpoint(
+                "NVUE endpoint must resolve to an absolute path under /nvue_v1 on the \
+                 client's own origin"
+                    .into(),
+            ),
+        }
+    })
+}
+
 struct Transport {
     client: reqwest::Client,
     base_url: String,
@@ -568,6 +600,22 @@ struct Transport {
 }
 
 impl Transport {
+    /// Resolve a request `path` against `base_url`, refusing anything that
+    /// would move the request off the client's origin or outside `/nvue_v1`.
+    ///
+    /// `base_url` is authority-only (`scheme://host:port`), so string
+    /// concatenation would let a crafted path such as `//evil/x`, `@evil/x`,
+    /// or `https://evil/x` reopen the URL authority and redirect the request --
+    /// and its Basic-auth credentials -- to an attacker-chosen host. Resolving
+    /// with the `url` crate (the same parser reqwest uses) and requiring the
+    /// result to keep the base's origin is the authoritative host-swap guard;
+    /// the `/nvue_v1` prefix and dot-segment rejection add protocol and
+    /// path-traversal fences. Every NVUE endpoint is built under `/nvue_v1`, so
+    /// this is transparent for legitimate callers.
+    fn resolve_url(&self, path: &str) -> Result<reqwest::Url, ClientError> {
+        resolve_request_url(&self.base_url, path)
+    }
+
     async fn send<T: Serialize + ?Sized>(
         &self,
         method: Method,
@@ -577,9 +625,10 @@ impl Transport {
         timeout: Duration,
     ) -> Result<NvueResponse, ClientError> {
         let method_name = method_name(&method);
+
         let mut request = self
             .client
-            .request(method, format!("{}{path}", self.base_url))
+            .request(method, self.resolve_url(path)?)
             .header(CONTENT_TYPE, "application/json")
             .timeout(timeout);
 
@@ -606,7 +655,7 @@ impl Transport {
     async fn probe(&self, path: &str, timeout: Duration) -> Result<u16, ClientError> {
         let mut request = self
             .client
-            .get(format!("{}{path}", self.base_url))
+            .get(self.resolve_url(path)?)
             .header(CONTENT_TYPE, "application/json")
             .timeout(timeout);
 
@@ -792,6 +841,75 @@ impl Client {
         serde_json::from_value(response).map_err(|error| {
             ClientError::invalid_response(format!(
                 "invalid NVUE cluster application response for '{app_name}': {error}"
+            ))
+        })
+    }
+
+    /// Reads and decodes the NVUE chassis location.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request fails or the successful response does
+    /// not match the NVUE chassis-location schema.
+    pub async fn get_chassis_location(
+        &self,
+        timeout: Duration,
+    ) -> Result<ChassisLocation, ClientError> {
+        let response = self.get_json(CHASSIS_LOCATION_ENDPOINT, timeout).await?;
+
+        serde_json::from_value(response).map_err(|error| {
+            ClientError::invalid_response(format!(
+                "invalid NVUE chassis-location response: {error}"
+            ))
+        })
+    }
+
+    /// Reads and decodes the NVUE API certificate configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request fails or the successful response does
+    /// not match the NVUE API schema.
+    pub async fn get_system_api(&self, timeout: Duration) -> Result<SystemApi, ClientError> {
+        let response = self.get_json(SYSTEM_API_ENDPOINT, timeout).await?;
+
+        serde_json::from_value(response).map_err(|error| {
+            ClientError::invalid_response(format!("invalid NVUE system API response: {error}"))
+        })
+    }
+
+    /// Reads and decodes the NVUE API mTLS configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request fails or the successful response does
+    /// not match the NVUE API mTLS schema.
+    pub async fn get_system_api_mtls(
+        &self,
+        timeout: Duration,
+    ) -> Result<MtlsConfiguration, ClientError> {
+        let response = self.get_json(SYSTEM_API_MTLS_ENDPOINT, timeout).await?;
+
+        serde_json::from_value(response).map_err(|error| {
+            ClientError::invalid_response(format!("invalid NVUE system API mTLS response: {error}"))
+        })
+    }
+
+    /// Reads and decodes the NVUE gNMI server mTLS configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request fails or the successful response does
+    /// not match the NVUE gNMI server mTLS schema.
+    pub async fn get_gnmi_server_mtls(
+        &self,
+        timeout: Duration,
+    ) -> Result<MtlsConfiguration, ClientError> {
+        let response = self.get_json(GNMI_SERVER_MTLS_ENDPOINT, timeout).await?;
+
+        serde_json::from_value(response).map_err(|error| {
+            ClientError::invalid_response(format!(
+                "invalid NVUE gNMI server mTLS response: {error}"
             ))
         })
     }
@@ -1496,6 +1614,27 @@ fn format_url_host(host: &str) -> String {
     }
 }
 
+/// Render a `reqwest::Error` together with its full `source()` chain.
+///
+/// `reqwest::Error::Display` only shows the top-level context (e.g. `error
+/// sending request for url (...)`), which hides the actual cause (DNS
+/// failure, TLS certificate rejection, connection refused, etc.) one or more
+/// levels down the `source()` chain. Surfacing the chain here means callers
+/// (and operators reading logs) see the real reason a request failed instead
+/// of a generic, unhelpful message.
+fn describe_reqwest_error(source: &reqwest::Error) -> String {
+    use std::error::Error as _;
+
+    let mut description = source.to_string();
+    let mut current: Option<&(dyn std::error::Error + 'static)> = source.source();
+    while let Some(error) = current {
+        description.push_str(": ");
+        description.push_str(&error.to_string());
+        current = error.source();
+    }
+    description
+}
+
 fn method_name(method: &Method) -> &'static str {
     match *method {
         Method::GET => "GET",
@@ -1511,6 +1650,11 @@ async fn send_request(
     method: &'static str,
     path: &str,
 ) -> Result<reqwest::Response, ClientError> {
+    // Debug-only so the raw NVUE request sequence (revision create/patch/apply/
+    // save, GET polls) is visible when troubleshooting without adding noise at
+    // the default info level.
+    tracing::debug!(method, path, "sending NVUE request");
+
     request.send().await.map_err(|source| ClientError::Request {
         operation: format!("NVUE {method} {path}"),
         source,
@@ -1524,6 +1668,10 @@ async fn read_response(
     mode: ResponseMode,
 ) -> Result<NvueResponse, ClientError> {
     let status = response.status().as_u16();
+
+    // Pairs with the `send_request` debug line to record the response status of
+    // every NVUE call. Debug-only to stay silent at the default info level.
+    tracing::debug!(method, path, status, "received NVUE response");
 
     if matches!(mode, ResponseMode::ImportedLegacy) {
         let bytes = if method == "GET" && status != 200 {
@@ -1620,6 +1768,60 @@ mod tests {
         config.endpoint = ClientEndpoint::http(host, port);
 
         config
+    }
+
+    #[test]
+    fn resolve_request_url_accepts_nvue_paths() {
+        let base = "https://10.0.0.1:8443";
+        // A plain endpoint, a nested one, and one carrying a `rev` query all
+        // resolve on-origin and inside the /nvue_v1 tree.
+        assert_eq!(
+            resolve_request_url(base, "/nvue_v1/system")
+                .unwrap()
+                .as_str(),
+            "https://10.0.0.1:8443/nvue_v1/system"
+        );
+        assert_eq!(
+            resolve_request_url(base, "/nvue_v1/system/gnmi-server?rev=changeset%2f42")
+                .unwrap()
+                .as_str(),
+            "https://10.0.0.1:8443/nvue_v1/system/gnmi-server?rev=changeset%2f42"
+        );
+        // The tree root itself is allowed.
+        assert_eq!(
+            resolve_request_url(base, "/nvue_v1").unwrap().path(),
+            "/nvue_v1"
+        );
+    }
+
+    #[test]
+    fn resolve_request_url_rejects_origin_and_tree_escapes() {
+        let base = "https://10.0.0.1:8443";
+        for path in [
+            "@evil.com/x",                  // userinfo-style, not an absolute path
+            "//evil.com/nvue_v1/x",         // protocol-relative authority (origin swap)
+            "https://evil.com/nvue_v1/x",   // absolute URL with scheme (origin swap)
+            "\\evil.com/nvue_v1/x",         // backslash normalization
+            "/redfish/v1/Systems",          // same origin but off the /nvue_v1 tree
+            "/",                            // service root, off tree
+            "/nvue_v10/system",             // sibling: prefix is not a path boundary
+            "/nvue_v1beta/system",          // sibling: prefix is not a path boundary
+            "/nvue_v1/../redfish/v1/x",     // literal traversal escaping the tree
+            "/nvue_v1/%2e%2e/redfish/v1/x", // percent-encoded traversal escaping the tree
+            "",                             // empty
+        ] {
+            let err = resolve_request_url(base, path)
+                .expect_err(&format!("path {path:?} must be rejected"));
+            assert!(
+                matches!(err, ClientError::InvalidEndpoint(_)),
+                "path {path:?} -> {err:?}"
+            );
+            // The rejected (attacker-controlled) value must not leak into the error.
+            assert!(
+                !err.to_string().contains("evil.com"),
+                "error must not echo the path: {err}"
+            );
+        }
     }
 
     async fn write_test_tls_material(dir: &Path) -> ClientTls {
@@ -1768,6 +1970,36 @@ mod tests {
         let cluster = client.get_cluster(Duration::from_secs(1)).await.unwrap();
 
         assert!(cluster.is_disabled());
+    }
+
+    #[tokio::test]
+    async fn chassis_location_get_decodes_typed_nvue_response() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/nvue_v1/platform/chassis-location"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "chassis-sn": "switch-serial",
+                "slot-number": "4",
+                "topology-id": "rack-a",
+                "tray-index": "7",
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let config = test_http_config("127.0.0.1", server.address().port());
+        let client = Client::new(config).unwrap();
+
+        let location = client
+            .get_chassis_location(Duration::from_secs(1))
+            .await
+            .unwrap();
+
+        assert_eq!(location.chassis_sn.as_deref(), Some("switch-serial"));
+        assert_eq!(location.slot_number.as_deref(), Some("4"));
+        assert_eq!(location.topology_id.as_deref(), Some("rack-a"));
+        assert_eq!(location.tray_index.as_deref(), Some("7"));
     }
 
     #[tokio::test]
@@ -2108,6 +2340,33 @@ mod tests {
 
         assert!(matches!(&error, ClientError::Request { .. }));
         assert!(error.is_server_certificate_validation_error());
+    }
+
+    #[tokio::test]
+    async fn request_error_display_includes_full_cause_chain() {
+        // `reqwest::Error`'s own `Display` only says "error sending request
+        // for url (...)" here, hiding the certificate failure. The
+        // `ClientError::Request` message must surface it so operators do not
+        // have to go digging for the real cause.
+        let certificate_error =
+            rustls::Error::InvalidCertificate(rustls::CertificateError::BadEncoding);
+        let io_error = io::Error::other(certificate_error);
+        let body = reqwest::Body::wrap_stream(futures::stream::once(async {
+            Err::<Vec<u8>, _>(io_error)
+        }));
+
+        let server = MockServer::start().await;
+        let request = reqwest::Client::new().post(server.uri()).body(body);
+
+        let error = send_request(request, "POST", "/nvue_v1/system")
+            .await
+            .unwrap_err();
+
+        let message = error.to_string();
+        assert!(
+            message.contains("BadEncoding"),
+            "expected the underlying certificate error to appear in: {message}"
+        );
     }
 
     #[tokio::test]

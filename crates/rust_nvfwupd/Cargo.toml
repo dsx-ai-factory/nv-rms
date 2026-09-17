@@ -37,6 +37,7 @@ tokio-util = { workspace = true, features = ["io", "rt"] }
 tracing = { workspace = true }
 tracing-appender = { workspace = true }
 tracing-subscriber = { workspace = true }
+common = { workspace = true }
 tar = { workspace = true }
 tempfile = { workspace = true }
 russh = { workspace = true }

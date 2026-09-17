@@ -27,7 +27,7 @@ use tokio_util::io::{ReaderStream, StreamReader};
 use crate::utilities::error::{ErrorCode, Result, RmsError};
 use crate::utilities::url::http_target_uri;
 
-/// Cap for one BMC Redfish/NVUE response body before JSON parsing.
+/// Cap for one BMC Redfish response body before JSON parsing.
 ///
 /// These endpoints return control-plane JSON such as inventory, task status,
 /// and action results. Firmware images are uploaded as request bodies, not
@@ -37,10 +37,20 @@ pub const DEFAULT_MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 
 const DEFAULT_RESPONSE_BODY_CAPACITY: usize = 4 * 1024;
 
+/// Redfish API root. Every BMC endpoint (including device-supplied action
+/// targets and `@odata.id` links) lives under this tree, so Redfish clients
+/// pass this to [`HttpClient::require_path_prefix`] to fence requests to it as
+/// SSRF/confused-deputy defense in depth. Shared here so every Redfish client
+/// inherits the same fence rather than redeclaring the literal.
+pub const REDFISH_V1_ROOT: &str = "/redfish/v1";
+
 /// Async HTTP client for communicating with BMC / switch REST APIs over HTTP or HTTPS.
 ///
-/// Wraps `reqwest::Client` with Redfish/NVUE conventions: JSON request/response,
-/// error code mapping, basic auth, TLS verify toggle, and firmware upload support.
+/// Wraps `reqwest::Client` with Redfish conventions: JSON request/response,
+/// error code mapping, basic auth, TLS verify toggle, and firmware upload
+/// support. Used by the BMC/powershelf Redfish callers and for plain switch
+/// reachability probes; the switch NVUE API is driven by the separate
+/// `nvue_client` crate, not this client.
 ///
 /// The underlying reqwest client reuses TCP+TLS connections across calls,
 /// so repeated requests to the same BMC skip the TLS handshake.
@@ -52,6 +62,14 @@ pub struct HttpClient {
     username: String,
     password: SecretString,
     max_response_bytes: usize,
+    /// Optional API tree every request must stay within (e.g. `/redfish/v1`).
+    ///
+    /// The same-origin guard in [`Self::url`] already blocks a host swap; this
+    /// adds a second, protocol-aware fence so a compromised/MITM'd device that
+    /// hands back a same-origin but off-tree `target`/`@odata.id` cannot steer a
+    /// request (and its Basic-auth) to an unrelated endpoint on that host. Left
+    /// `None` for protocol-agnostic uses such as the plain reachability probe.
+    required_path_prefix: Option<String>,
 }
 
 impl HttpClient {
@@ -127,7 +145,28 @@ impl HttpClient {
             username: username.to_owned(),
             password: SecretString::from(password.to_owned()),
             max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
+            required_path_prefix: None,
         })
+    }
+
+    /// Constrain every request to an API subtree (e.g. `/redfish/v1`).
+    ///
+    /// Callers that only ever talk one protocol should set this so that
+    /// device-supplied endpoints (e.g. Redfish action `target`s and
+    /// `@odata.id` links) are fenced to that tree in addition to the
+    /// mandatory same-origin check. The prefix must itself be an absolute
+    /// path; a leading `/` is added if missing and any trailing `/` trimmed so
+    /// the boundary match is unambiguous.
+    #[must_use]
+    pub fn require_path_prefix(mut self, prefix: impl AsRef<str>) -> Self {
+        let prefix = prefix.as_ref().trim_end_matches('/');
+        let normalized = if prefix.starts_with('/') {
+            prefix.to_owned()
+        } else {
+            format!("/{prefix}")
+        };
+        self.required_path_prefix = Some(normalized);
+        self
     }
 
     pub fn host(&self) -> &str {
@@ -139,7 +178,7 @@ impl HttpClient {
     }
 
     pub async fn get(&self, endpoint: &str, timeout: Duration) -> Result<Value> {
-        let req = self.client.get(self.url(endpoint)).timeout(timeout);
+        let req = self.client.get(self.url(endpoint)?).timeout(timeout);
 
         let resp = self
             .apply_auth(req)
@@ -153,7 +192,7 @@ impl HttpClient {
     pub async fn post(&self, endpoint: &str, payload: &Value, timeout: Duration) -> Result<Value> {
         let req = self
             .client
-            .post(self.url(endpoint))
+            .post(self.url(endpoint)?)
             .json(payload)
             .timeout(timeout);
 
@@ -169,7 +208,7 @@ impl HttpClient {
     pub async fn patch(&self, endpoint: &str, payload: &Value, timeout: Duration) -> Result<Value> {
         let req = self
             .client
-            .patch(self.url(endpoint))
+            .patch(self.url(endpoint)?)
             .json(payload)
             .timeout(timeout);
 
@@ -191,7 +230,7 @@ impl HttpClient {
     ) -> Result<Value> {
         let req = self
             .client
-            .patch(self.url(endpoint))
+            .patch(self.url(endpoint)?)
             .header("If-Match", if_match)
             .json(payload)
             .timeout(timeout);
@@ -248,7 +287,7 @@ impl HttpClient {
 
         let req = self
             .client
-            .post(self.url(endpoint))
+            .post(self.url(endpoint)?)
             .multipart(form)
             .timeout(timeout);
 
@@ -266,8 +305,51 @@ impl HttpClient {
         .await
     }
 
-    fn url(&self, endpoint: &str) -> String {
-        format!("{}{endpoint}", self.base_url)
+    /// Resolve a request endpoint against the client's `base_url`, refusing any
+    /// endpoint that would move the request off the client's own origin.
+    ///
+    /// Redfish action targets are frequently read verbatim from device
+    /// responses (`target`, `@Redfish.ActionInfo`, `@odata.id`). Since
+    /// `base_url` is authority-only (`scheme://host:port`, no path), naive
+    /// concatenation would let a crafted value such as `//evil.com/x`,
+    /// `https://evil.com/x`, or `@evil.com/x` reopen the URL authority and make
+    /// reqwest connect to -- and attach the device's Basic-auth credentials to
+    /// -- an attacker-chosen host.
+    ///
+    /// Rather than hand-parse, resolution and the same-origin / absolute-path /
+    /// dot-segment / prefix checks are delegated to
+    /// [`common::net::resolve_same_origin`]; this method only maps its rejection
+    /// to an [`RmsError`] and logs the (host-controlled) detail for forensics.
+    fn url(&self, endpoint: &str) -> Result<reqwest::Url> {
+        common::net::resolve_same_origin(
+            &self.base_url,
+            endpoint,
+            self.required_path_prefix.as_deref(),
+        )
+        .map_err(|rejection| match rejection {
+            common::net::EndpointRejection::UnparseableBase(error) => {
+                // The base URL is derived from the caller-supplied host/port, not
+                // from RMS-controlled invariants, so an unparseable base is a
+                // bad-input condition rather than an internal fault. Log the cause
+                // for diagnostics but keep the (host-derived) detail out of the error.
+                tracing::warn!(host = %self.host, error = %error, "client base URL is not parseable");
+                RmsError::invalid_argument("client base URL is not a valid absolute URL")
+            }
+            common::net::EndpointRejection::OffOriginOrMalformed => {
+                // Log the offending value (debug-escaped) for forensics, but keep
+                // it out of the returned error: a compromised device controls it.
+                tracing::warn!(
+                    host = %self.host,
+                    ?endpoint,
+                    "refusing HTTP request to unsafe endpoint; it must resolve to an \
+                     absolute path on the client's own origin"
+                );
+
+                RmsError::invalid_argument(
+                    "HTTP endpoint must resolve to an absolute path on the client's own origin",
+                )
+            }
+        })
     }
 
     fn apply_auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
@@ -381,6 +463,7 @@ impl HttpClient {
             username: String::new(),
             password: SecretString::from(String::new()),
             max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
+            required_path_prefix: None,
         }
     }
 
@@ -393,6 +476,7 @@ impl HttpClient {
             username: username.to_owned(),
             password: SecretString::from(password.to_owned()),
             max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
+            required_path_prefix: None,
         }
     }
 }
@@ -420,10 +504,173 @@ mod tests {
     #[test]
     fn url_construction() {
         let client = HttpClient::new("10.0.0.1", 443, "admin", "pass", false, true).unwrap();
+        // The url crate normalizes away the default https port (443).
         assert_eq!(
-            client.url("/redfish/v1/Systems/System_0"),
-            "https://10.0.0.1:443/redfish/v1/Systems/System_0"
+            client.url("/redfish/v1/Systems/System_0").unwrap().as_str(),
+            "https://10.0.0.1/redfish/v1/Systems/System_0"
         );
+    }
+
+    #[test]
+    fn url_accepts_nested_absolute_paths() {
+        let client = HttpClient::new("10.0.0.1", 8443, "admin", "pass", false, true).unwrap();
+        // Device-supplied Redfish action targets are absolute and must keep
+        // working, including ones carrying `@`/`:` in the path: these resolve
+        // to the same origin, so they are not host swaps.
+        assert_eq!(
+            client
+                .url("/redfish/v1/Chassis/powershelf/Actions/Chassis.ForceOff")
+                .unwrap()
+                .as_str(),
+            "https://10.0.0.1:8443/redfish/v1/Chassis/powershelf/Actions/Chassis.ForceOff"
+        );
+        assert_eq!(
+            client.url("/redfish/v1/Managers/BMC@0").unwrap().as_str(),
+            "https://10.0.0.1:8443/redfish/v1/Managers/BMC@0"
+        );
+    }
+
+    #[test]
+    fn url_result_stays_on_client_origin() {
+        let client = HttpClient::new("10.0.0.5", 8443, "admin", "pass", false, true).unwrap();
+        let base = reqwest::Url::parse(&client.base_url).unwrap();
+        assert_eq!(client.url("/redfish/v1").unwrap().origin(), base.origin());
+    }
+
+    #[test]
+    fn url_rejects_percent_encoded_traversal_without_prefix_fence() {
+        // A client with no required_path_prefix (the general case a future
+        // caller might build) must still reject dot-segment traversal on its
+        // own. `Url::join` normalizes percent-encoded dot segments to a path
+        // pop, so these carry no literal `..` yet would climb the tree.
+        let client = HttpClient::new("10.0.0.1", 8443, "admin", "pass", false, true).unwrap();
+        assert!(client.required_path_prefix.is_none());
+
+        for endpoint in [
+            "/redfish/v1/../admin",       // literal parent segment
+            "/redfish/v1/%2e%2e/admin",   // fully encoded `..`
+            "/redfish/v1/%2E%2E/admin",   // encoded, upper-case hex
+            "/redfish/v1/.%2e/admin",     // half-encoded `..`
+            "/redfish/v1/%2e./admin",     // half-encoded `..`, other half
+            "/a/b/%2e%2e/%2e%2e/etc/pwd", // stacked encoded traversal
+        ] {
+            let err = client
+                .url(endpoint)
+                .expect_err(&format!("traversal endpoint {endpoint:?} must be rejected"));
+            assert_eq!(
+                err.code,
+                ErrorCode::InvalidArgument,
+                "endpoint {endpoint:?}"
+            );
+        }
+
+        // A `%2e` that is only *part* of a segment (a real filename, not a dot
+        // segment) must not be mistaken for traversal.
+        assert!(
+            client.url("/redfish/v1/firmware%2ebin").is_ok(),
+            "an encoded dot inside a longer segment is not traversal"
+        );
+    }
+
+    #[test]
+    fn url_enforces_required_path_prefix() {
+        let client = HttpClient::new("10.0.0.1", 8443, "admin", "pass", false, true)
+            .unwrap()
+            .require_path_prefix("/redfish/v1");
+
+        // Endpoints inside the fenced tree resolve normally...
+        assert_eq!(
+            client.url("/redfish/v1").unwrap().path(),
+            "/redfish/v1",
+            "the prefix itself must be allowed"
+        );
+        assert_eq!(
+            client
+                .url("/redfish/v1/Chassis/powershelf/Actions/Chassis.ForceOff")
+                .unwrap()
+                .path(),
+            "/redfish/v1/Chassis/powershelf/Actions/Chassis.ForceOff"
+        );
+
+        // ...while same-origin but off-tree endpoints (a compromised device
+        // returning a crafted `target`/`@odata.id`) are refused. This includes
+        // sibling paths that merely share the prefix as a substring.
+        for endpoint in [
+            "/",                    // service root probe, wrong client
+            "/redfish",             // parent of the fenced tree
+            "/redfish/v10/Systems", // sibling: prefix is not a path boundary
+            "/redfish/v1beta/x",    // sibling: prefix is not a path boundary
+            "/nvue_v1/system",      // different protocol tree
+            "/admin/backdoor",      // unrelated same-host endpoint
+        ] {
+            let err = client
+                .url(endpoint)
+                .expect_err(&format!("off-tree endpoint {endpoint:?} must be rejected"));
+            assert_eq!(
+                err.code,
+                ErrorCode::InvalidArgument,
+                "endpoint {endpoint:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn require_path_prefix_normalizes_slashes() {
+        // A missing leading slash is added and a trailing slash trimmed so the
+        // boundary match is unambiguous regardless of how the caller spells it.
+        let client = HttpClient::new("10.0.0.1", 8443, "admin", "pass", false, true)
+            .unwrap()
+            .require_path_prefix("redfish/v1/");
+        assert_eq!(client.required_path_prefix.as_deref(), Some("/redfish/v1"));
+        assert!(client.url("/redfish/v1/Chassis").is_ok());
+        assert!(client.url("/other").is_err());
+    }
+
+    #[test]
+    fn url_reports_unparseable_base_as_invalid_argument() {
+        let mut client = HttpClient::new("10.0.0.1", 443, "admin", "pass", false, true).unwrap();
+        // A base derived from a malformed host is a bad-input condition, not an
+        // RMS-internal fault, so it must not be reported as ErrorCode::Internal.
+        client.base_url = "not a url".to_owned();
+        let err = client.url("/redfish/v1").unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidArgument);
+    }
+
+    #[test]
+    fn url_rejects_authority_reopening_endpoints() {
+        let client = HttpClient::new("10.0.0.1", 443, "admin", "pass", false, true).unwrap();
+
+        // Each of these would otherwise redirect the request (and its Basic-auth)
+        // to another host, or is otherwise not a well-formed absolute path. The
+        // same-origin check is the authoritative guard; the absolute-path and
+        // `..` checks add well-formedness/traversal hygiene.
+        for endpoint in [
+            "@evil.com/x",           // userinfo-style: not an absolute path
+            "evil.com/x",            // relative -> not an absolute path
+            "//evil.com/x",          // protocol-relative authority (origin swap)
+            "///evil.com/x",         // authority via extra slashes (origin swap)
+            "https://evil.com/x",    // absolute URL with scheme (origin swap)
+            "http://evil.com/x",     // scheme + host swap
+            "\\evil.com/x",          // backslash normalization
+            "/\\evil.com/x",         // slash-then-backslash authority trick
+            "",                      // empty
+            "/redfish/../../secret", // path traversal
+        ] {
+            let err = client
+                .url(endpoint)
+                .expect_err(&format!("endpoint {endpoint:?} must be rejected"));
+            assert_eq!(
+                err.code,
+                ErrorCode::InvalidArgument,
+                "endpoint {endpoint:?}"
+            );
+            // The rejected (attacker-controlled) value must not leak into the error.
+            assert!(
+                !err.message.contains("evil.com"),
+                "error must not echo the endpoint: {}",
+                err.message
+            );
+        }
     }
 
     #[test]
@@ -444,9 +691,10 @@ mod tests {
             true,
         )
         .unwrap();
+        // The url crate normalizes away the default https port (443).
         assert_eq!(
-            client.url("/nvue_v1/system"),
-            "https://switch.example.com:443/nvue_v1/system"
+            client.url("/nvue_v1/system").unwrap().as_str(),
+            "https://switch.example.com/nvue_v1/system"
         );
         assert_eq!(client.host(), "10.0.0.5");
     }
@@ -455,7 +703,7 @@ mod tests {
     fn url_with_custom_port() {
         let client = HttpClient::new("bmc.local", 8443, "", "", false, true).unwrap();
         assert_eq!(
-            client.url("/redfish/v1"),
+            client.url("/redfish/v1").unwrap().as_str(),
             "https://bmc.local:8443/redfish/v1"
         );
     }
@@ -463,9 +711,10 @@ mod tests {
     #[test]
     fn url_construction_formats_ipv6_literal() {
         let client = HttpClient::new("fd00::1", 443, "admin", "pass", false, true).unwrap();
+        // The url crate normalizes away the default https port (443).
         assert_eq!(
-            client.url("/nvue_v1/system"),
-            "https://[fd00::1]:443/nvue_v1/system"
+            client.url("/nvue_v1/system").unwrap().as_str(),
+            "https://[fd00::1]/nvue_v1/system"
         );
     }
 

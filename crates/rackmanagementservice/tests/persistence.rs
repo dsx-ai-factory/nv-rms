@@ -281,6 +281,53 @@ async fn set_default_clears_previous_default<S: FirmwareObjectStore>(store: &S) 
     assert!(b.is_default);
 }
 
+async fn set_default_if_none_only_fills_empty_slot<S: FirmwareObjectStore>(store: &S) {
+    let hw = RackHardwareType::from("if-none-type");
+    store
+        .create("fw-a", hw.clone(), json!({"Id": "fw-a"}), None)
+        .await
+        .unwrap();
+    store
+        .create("fw-b", hw.clone(), json!({"Id": "fw-b"}), None)
+        .await
+        .unwrap();
+
+    // Empty slot -> fw-a becomes the default.
+    let a = store.set_default_if_none("fw-a").await.unwrap();
+    assert!(a.is_default);
+    assert!(store.has_default(&hw).await.unwrap());
+
+    // Slot now full -> fw-b must NOT take over, and its returned row reflects
+    // that it did not become default.
+    let b = store.set_default_if_none("fw-b").await.unwrap();
+    assert!(
+        !b.is_default,
+        "set_default_if_none must not clobber an existing default"
+    );
+    assert_eq!(
+        store.find_default_by_hw_type(&hw).await.unwrap().id,
+        "fw-a",
+        "existing default must be preserved"
+    );
+
+    // Idempotent for the row that is already the default.
+    let a2 = store.set_default_if_none("fw-a").await.unwrap();
+    assert!(a2.is_default);
+    assert_eq!(store.find_default_by_hw_type(&hw).await.unwrap().id, "fw-a");
+}
+
+async fn set_default_if_none_missing_returns_not_found<S: FirmwareObjectStore>(store: &S) {
+    // The Postgres impl resolves the hardware type inside the advisory-lock
+    // statement; a missing id makes that subquery NULL and acquires no lock,
+    // so the subsequent row read must still surface NotFound. The in-memory
+    // impl must agree.
+    let err = store
+        .set_default_if_none("does-not-exist")
+        .await
+        .expect_err("missing id must not silently succeed");
+    assert_eq!(err.code, ErrorCode::NotFound);
+}
+
 async fn set_default_does_not_affect_other_hardware_types<S: FirmwareObjectStore>(store: &S) {
     let type_a = RackHardwareType::from("type-a");
     let type_b = RackHardwareType::from("type-b");
@@ -493,6 +540,8 @@ mod memory {
     memory_test!(has_default_returns_false_when_none_set);
     memory_test!(set_default_and_has_default);
     memory_test!(set_default_clears_previous_default);
+    memory_test!(set_default_if_none_only_fills_empty_slot);
+    memory_test!(set_default_if_none_missing_returns_not_found);
     memory_test!(set_default_does_not_affect_other_hardware_types);
     memory_test!(find_default_by_hw_type_not_found);
     memory_test!(list_filters_by_only_available_and_hw_type);
@@ -562,6 +611,186 @@ mod postgres {
         );
     }
 
+    /// Contention: fire many `set_default_if_none` calls for distinct bundles
+    /// of the same hardware type at once. The per-hardware-type advisory lock
+    /// must serialize them so exactly one wins the empty slot and none fail
+    /// with a unique-constraint violation. Skips when `DATABASE_URL` is unset.
+    #[sqlx::test(migrations = "src/persistence/postgres/migrations")]
+    async fn concurrent_set_default_if_none_elects_single_default(pool: sqlx::PgPool) {
+        use std::sync::Arc;
+
+        let store = Arc::new(PostgresFirmwareObjectStore::new(pool));
+        let hw = RackHardwareType::from("concurrent-if-none-type");
+
+        const N: usize = 16;
+        for i in 0..N {
+            store
+                .create(
+                    &format!("fw-{i}"),
+                    hw.clone(),
+                    json!({"Id": format!("fw-{i}")}),
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+
+        // All N calls race; the advisory lock decides the single winner.
+        let mut set = tokio::task::JoinSet::new();
+        for i in 0..N {
+            let store = Arc::clone(&store);
+            set.spawn(async move { store.set_default_if_none(&format!("fw-{i}")).await });
+        }
+
+        let mut became_default = 0usize;
+        while let Some(joined) = set.join_next().await {
+            let row = joined
+                .expect("task panicked")
+                .expect("set_default_if_none must not error under contention");
+            if row.is_default {
+                became_default += 1;
+            }
+        }
+
+        // Exactly one call claimed the slot, and the store agrees.
+        assert_eq!(
+            became_default, 1,
+            "exactly one concurrent call should have become default"
+        );
+        let defaults: Vec<_> = store
+            .list(FirmwareObjectSearchFilter {
+                rack_hardware_type: Some(hw.clone()),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|fw| fw.is_default)
+            .collect();
+        assert_eq!(
+            defaults.len(),
+            1,
+            "exactly one row must be default: {defaults:?}"
+        );
+    }
+
+    /// Contention: fire many forcing `set_default` calls for distinct bundles
+    /// of the same hardware type at once. Each clears the previous default and
+    /// sets its own; the advisory lock must keep them from colliding on the
+    /// partial unique index, so none error and exactly one row is left default.
+    /// Skips when `DATABASE_URL` is unset.
+    #[sqlx::test(migrations = "src/persistence/postgres/migrations")]
+    async fn concurrent_set_default_force_leaves_single_default(pool: sqlx::PgPool) {
+        use std::sync::Arc;
+
+        let store = Arc::new(PostgresFirmwareObjectStore::new(pool));
+        let hw = RackHardwareType::from("concurrent-force-type");
+
+        const N: usize = 16;
+        for i in 0..N {
+            store
+                .create(
+                    &format!("fw-{i}"),
+                    hw.clone(),
+                    json!({"Id": format!("fw-{i}")}),
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+
+        let mut set = tokio::task::JoinSet::new();
+        for i in 0..N {
+            let store = Arc::clone(&store);
+            set.spawn(async move { store.set_default(&format!("fw-{i}")).await });
+        }
+        while let Some(joined) = set.join_next().await {
+            joined
+                .expect("task panicked")
+                .expect("set_default must not error under contention");
+        }
+
+        let defaults: Vec<_> = store
+            .list(FirmwareObjectSearchFilter {
+                rack_hardware_type: Some(hw.clone()),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|fw| fw.is_default)
+            .collect();
+        assert_eq!(
+            defaults.len(),
+            1,
+            "force contention must leave exactly one default: {defaults:?}"
+        );
+    }
+
+    /// Contention across both code paths: race forcing `set_default` calls
+    /// against non-clobbering `set_default_if_none` calls for the same hardware
+    /// type. Both paths take only the per-hardware-type advisory lock (the row
+    /// `FOR UPDATE` was removed from `set_default_if_none`), so they must still
+    /// serialize against each other and never collide on the partial unique
+    /// index. Skips when `DATABASE_URL` is unset.
+    #[sqlx::test(migrations = "src/persistence/postgres/migrations")]
+    async fn concurrent_mixed_default_setters_leave_single_default(pool: sqlx::PgPool) {
+        use std::sync::Arc;
+
+        let store = Arc::new(PostgresFirmwareObjectStore::new(pool));
+        let hw = RackHardwareType::from("concurrent-mixed-type");
+
+        const N: usize = 16;
+        for i in 0..N {
+            store
+                .create(
+                    &format!("fw-{i}"),
+                    hw.clone(),
+                    json!({"Id": format!("fw-{i}")}),
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+
+        // Interleave the two paths: even ids force a default, odd ids only
+        // fill an empty slot. Whatever the interleaving, the invariant must
+        // hold and no call may error on the unique index.
+        let mut set = tokio::task::JoinSet::new();
+        for i in 0..N {
+            let store = Arc::clone(&store);
+            set.spawn(async move {
+                let id = format!("fw-{i}");
+                if i % 2 == 0 {
+                    store.set_default(&id).await
+                } else {
+                    store.set_default_if_none(&id).await
+                }
+            });
+        }
+        while let Some(joined) = set.join_next().await {
+            joined
+                .expect("task panicked")
+                .expect("mixed default setters must not error under contention");
+        }
+
+        let defaults: Vec<_> = store
+            .list(FirmwareObjectSearchFilter {
+                rack_hardware_type: Some(hw.clone()),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|fw| fw.is_default)
+            .collect();
+        assert_eq!(
+            defaults.len(),
+            1,
+            "mixed contention must leave exactly one default: {defaults:?}"
+        );
+    }
+
     postgres_test!(create_then_find_by_id_round_trip);
     postgres_test!(create_duplicate_fails);
     postgres_test!(find_by_id_missing_returns_not_found);
@@ -572,6 +801,8 @@ mod postgres {
     postgres_test!(has_default_returns_false_when_none_set);
     postgres_test!(set_default_and_has_default);
     postgres_test!(set_default_clears_previous_default);
+    postgres_test!(set_default_if_none_only_fills_empty_slot);
+    postgres_test!(set_default_if_none_missing_returns_not_found);
     postgres_test!(set_default_does_not_affect_other_hardware_types);
     postgres_test!(find_default_by_hw_type_not_found);
     postgres_test!(list_filters_by_only_available_and_hw_type);

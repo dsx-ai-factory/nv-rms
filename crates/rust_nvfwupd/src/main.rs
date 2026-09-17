@@ -127,7 +127,7 @@ async fn main() {
     });
 
     // Load the CLI schema from the compile-time-embedded YAML so the binary
-    // is fully standalone at runtime
+    // is fully standalone at runtime.
     // This is a hard dependency: the source file `src/cli_schema.yaml` must
     // exist at build time or `cargo build` fails with a clear error.
     let mut schema = CLISchema::new();

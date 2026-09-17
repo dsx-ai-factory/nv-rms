@@ -61,6 +61,7 @@ impl std::ops::DerefMut for Client {
   rack_manager_client localhost 8801 switch gnmi_service /tmp/sw01.csv 1
   rack_manager_client localhost 8801 switch configure_certificate /tmp/switches.csv --service nvue-api --service scale-up-fabric-manager --domain site-wide
   rack_manager_client localhost 8801 switch configure_certificate_status <job_id>
+  rack_manager_client localhost 8801 switch disable_mtls /tmp/switches.csv --service nvue-api
   rack_manager_client localhost 8801 firmware_object add gb200 /tmp/firmware-manifest.json $ARTIFACTORY_TOKEN --set-default
   rack_manager_client localhost 8801 firmware_object apply rack-1 /tmp/nodes.csv prod gb200 --component-filter 2:BMC
   rack_manager_client localhost 8801 firmware_object apply_stored_switch_system_image rack-1 /tmp/switches.csv prod gb200
@@ -135,18 +136,6 @@ enum Command {
     #[command(name = "list_racks")]
     ListRacks,
 
-    /// Get the configured rack power-on order
-    #[command(name = "get_power_on_order")]
-    GetPowerOnOrder { rack_id: String },
-
-    /// Set rack power-on order as node [timeout_seconds] pairs
-    #[command(name = "set_power_on_order")]
-    SetPowerOnOrder {
-        rack_id: String,
-        #[arg(required = true)]
-        items: Vec<String>,
-    },
-
     /// Set power state for caller-supplied nodes from a CSV.
     /// CSV: node_id,rack_id,ip,port,username,password,mac,type[,endpoint_role][,host_name][,bmc_ip,bmc_port,bmc_username,bmc_password[,bmc_mac]]
     #[command(name = "batch_set_power_state")]
@@ -161,18 +150,6 @@ enum Command {
     /// CSV: node_id,rack_id,ip,port,username,password,mac,type[,endpoint_role][,host_name][,bmc_ip,bmc_port,bmc_username,bmc_password[,bmc_mac]]
     #[command(name = "batch_get_power_state")]
     BatchGetPowerState { nodes_csv: PathBuf },
-
-    /// Power on all nodes in a rack using the configured sequence
-    #[command(name = "rack_power_on")]
-    RackPowerOn { rack_id: String },
-
-    /// Power off all nodes in a rack
-    #[command(name = "rack_power_off")]
-    RackPowerOff { rack_id: String },
-
-    /// Power cycle all nodes in a rack using the configured sequence
-    #[command(name = "rack_power_cycle")]
-    RackPowerCycle { rack_id: String },
 
     /// Start async firmware update for one inventory node
     #[command(name = "update_firmware")]
@@ -201,6 +178,9 @@ enum Command {
     },
 
     /// Start async firmware update for caller-supplied nodes
+    /// Node CSV: node_id,rack_id,ip,port,username,password,mac,type[,endpoint_role][,host_name][,bmc_ip,bmc_port,bmc_username,bmc_password[,bmc_mac]].
+    /// For compute in-band updates, the main endpoint is the host SSH endpoint
+    /// and the explicit BMC columns provide the Redfish/power endpoint.
     #[command(name = "batch_update_firmware")]
     BatchUpdateFirmware {
         nodes_csv: PathBuf,
@@ -227,11 +207,18 @@ enum Command {
     #[command(name = "firmware_inventory_node")]
     FirmwareInventoryNode { rack_id: String, node_id: String },
 
+    /// Get firmware inventory for caller-supplied, unregistered nodes
+    #[command(name = "batch_get_firmware_inventory")]
+    BatchGetFirmwareInventory { nodes_csv: PathBuf },
+
     /// Get firmware inventory for all nodes in a rack
     #[command(name = "firmware_inventory_rack")]
     FirmwareInventoryRack { rack_id: String },
 
-    /// Start async switch system image update for caller-supplied switches
+    /// Start async switch system image update for caller-supplied switches.
+    /// CSV: node_id,rack_id,ip,port,username,password[,mac_address][,host_name][,node_type]
+    /// Also accepts the longer node-list layout used by add_nodes
+    /// (type/endpoint_role/host_name/BMC columns); BMC columns are ignored here.
     #[command(name = "update_switch_system_image")]
     UpdateSwitchSystemImage {
         targets_csv: PathBuf,
@@ -450,6 +437,26 @@ enum SwitchCommand {
     )]
     ConfigureCertificateStatus { job_id: String },
 
+    /// Disable (unset) mTLS on caller-supplied switches for selected services.
+    /// This drives the RMS SSH backstop (host SSH endpoint), so it works even
+    /// when no valid switch client certificates are installed.
+    #[command(name = "disable_mtls")]
+    DisableMtls {
+        targets_csv: PathBuf,
+        /// Switch service to move back to non-mTLS mode (repeatable): nvue-api,
+        /// scale-up-fabric-telemetry, scale-up-fabric-manager,
+        /// scale-up-fabric-telemetry-interface
+        #[arg(long = "service", required = true)]
+        services: Vec<String>,
+        /// Seconds to wait for the disable jobs to reach a terminal state
+        /// (0 = submit and print the parent job id without waiting).
+        #[arg(long, default_value_t = 180)]
+        wait_secs: u64,
+        /// Seconds between job-status polls while waiting.
+        #[arg(long, default_value_t = 3)]
+        poll_secs: u64,
+    },
+
     /// Get tray/chassis location (chassis SN, slot, tray index) for one inventory node
     #[command(name = "device_info")]
     DeviceInfo { rack_id: String, node_id: String },
@@ -594,25 +601,12 @@ async fn run(cli: Cli) -> ClientResult<()> {
         Command::AddNodes { devices_csv } => add_nodes(&mut client, &devices_csv).await?,
         Command::ListNodeInventory => list_node_inventory(&mut client).await?,
         Command::ListRacks => list_racks(&mut client).await?,
-        Command::GetPowerOnOrder { rack_id } => get_power_on_order(&mut client, rack_id).await?,
-        Command::SetPowerOnOrder { rack_id, items } => {
-            set_power_on_order(&mut client, rack_id, items).await?
-        }
         Command::BatchSetPowerState {
             nodes_csv,
             operation,
         } => batch_set_power_state(&mut client, &nodes_csv, operation).await?,
         Command::BatchGetPowerState { nodes_csv } => {
             batch_get_power_state(&mut client, &nodes_csv).await?
-        }
-        Command::RackPowerOn { rack_id } => {
-            rack_power(&mut client, rack_id, rm::RackPowerOperation::On).await?
-        }
-        Command::RackPowerOff { rack_id } => {
-            rack_power(&mut client, rack_id, rm::RackPowerOperation::Off).await?
-        }
-        Command::RackPowerCycle { rack_id } => {
-            rack_power(&mut client, rack_id, rm::RackPowerOperation::Cycle).await?
         }
         Command::UpdateFirmware {
             rack_id,
@@ -651,6 +645,9 @@ async fn run(cli: Cli) -> ClientResult<()> {
         } => job_status(&mut client, job_id, include_child_job_states).await?,
         Command::FirmwareInventoryNode { rack_id, node_id } => {
             firmware_inventory_node(&mut client, rack_id, node_id).await?
+        }
+        Command::BatchGetFirmwareInventory { nodes_csv } => {
+            batch_get_firmware_inventory(&mut client, &nodes_csv).await?
         }
         Command::FirmwareInventoryRack { rack_id } => {
             firmware_inventory_rack(&mut client, rack_id).await?
@@ -859,6 +856,12 @@ async fn switch_command(client: &mut Client, command: SwitchCommand) -> ClientRe
         SwitchCommand::ConfigureCertificateStatus { job_id } => {
             configure_certificate_status(client, job_id).await
         }
+        SwitchCommand::DisableMtls {
+            targets_csv,
+            services,
+            wait_secs,
+            poll_secs,
+        } => disable_switch_mtls(client, &targets_csv, services, wait_secs, poll_secs).await,
         SwitchCommand::DeviceInfo { rack_id, node_id } => {
             get_node_device_info(client, rack_id, node_id).await
         }
@@ -1021,62 +1024,6 @@ async fn batch_get_node_device_info(client: &mut Client, targets_csv: &Path) -> 
     ensure_success(response.status, "batch_get_node_device_info failed")
 }
 
-async fn get_power_on_order(client: &mut Client, rack_id: String) -> ClientResult<()> {
-    let response = client
-        .get_rack_power_on_sequence(rm::GetRackPowerOnSequenceRequest { rack_id })
-        .await?
-        .into_inner();
-
-    print_status(response.status);
-    println!(
-        "Power on order is {}",
-        if response.is_valid {
-            "VALID"
-        } else {
-            "INVALID"
-        }
-    );
-    println!(
-        "Power on order contains {} items:",
-        response.power_on_order.len()
-    );
-    for (index, item) in response.power_on_order.iter().enumerate() {
-        let check = item.completion_check.as_ref();
-        let enabled = check.map(|c| c.enabled).unwrap_or(false);
-        let timeout = check.map(|c| c.timeout_seconds).unwrap_or_default();
-        println!(
-            "  {}. Node: {}, Completion Check: {}, Timeout: {}s",
-            index + 1,
-            item.node_id,
-            if enabled { "enabled" } else { "disabled" },
-            timeout
-        );
-    }
-    ensure_success(response.status, "get_power_on_order failed")
-}
-
-async fn set_power_on_order(
-    client: &mut Client,
-    rack_id: String,
-    items: Vec<String>,
-) -> ClientResult<()> {
-    let power_on_order = parse_power_on_order(items)?;
-    let response = client
-        .set_rack_power_on_sequence(rm::SetRackPowerOnSequenceRequest {
-            rack_id,
-            power_on_order,
-        })
-        .await?
-        .into_inner();
-
-    let common = response
-        .response
-        .ok_or("set_power_on_order response missing common response")?;
-    print_status(common.status);
-    println!("Message: {}", common.message);
-    ensure_success(common.status, "set_power_on_order failed")
-}
-
 async fn batch_set_power_state(
     client: &mut Client,
     nodes_csv: &Path,
@@ -1128,24 +1075,6 @@ async fn batch_get_power_state(client: &mut Client, nodes_csv: &Path) -> ClientR
     print_common_node_results(&common.node_results);
     print_node_power_states(&node_power_states);
     ensure_success(common.status, "batch_get_power_state failed")
-}
-
-async fn rack_power(
-    client: &mut Client,
-    rack_id: String,
-    operation: rm::RackPowerOperation,
-) -> ClientResult<()> {
-    let response = client
-        .sequence_rack_power(rm::SequenceRackPowerRequest {
-            rack_id,
-            operation: operation as i32,
-        })
-        .await?
-        .into_inner();
-
-    print_status(response.status);
-    println!("Message: {}", response.message);
-    ensure_success(response.status, "rack power command failed")
 }
 
 async fn update_firmware(
@@ -1374,6 +1303,32 @@ async fn firmware_inventory_node(
     print_status(response.status);
     print_firmware_inventory(&response.firmware_list);
     ensure_success(response.status, "firmware_inventory_node failed")
+}
+
+async fn batch_get_firmware_inventory(client: &mut Client, nodes_csv: &Path) -> ClientResult<()> {
+    let nodes = parse_node_list_csv(nodes_csv)?
+        .into_iter()
+        .map(|node| node_list_entry_to_proto(node, NodeListEndpointMode::DirectOperation))
+        .collect();
+    let response = client
+        .batch_get_firmware_inventory(rm::BatchGetFirmwareInventoryRequest {
+            nodes: Some(rm::NodeSet { nodes }),
+        })
+        .await?
+        .into_inner();
+
+    let common = response
+        .response
+        .ok_or("batch_get_firmware_inventory response missing common response")?;
+    print_status(common.status);
+    println!("Message: {}", common.message);
+    print_node_operation_stats(&common.stats);
+    print_common_node_results(&common.node_results);
+    for node in &response.nodes {
+        println!("Node: {}", node.node_id);
+        print_firmware_inventory(&node.firmware_list);
+    }
+    ensure_success(common.status, "batch_get_firmware_inventory failed")
 }
 
 async fn firmware_inventory_rack(client: &mut Client, rack_id: String) -> ClientResult<()> {
@@ -2116,6 +2071,131 @@ async fn configure_certificate_status(client: &mut Client, job_id: String) -> Cl
     Ok(())
 }
 
+async fn disable_switch_mtls(
+    client: &mut Client,
+    targets_csv: &Path,
+    service_names: Vec<String>,
+    wait_secs: u64,
+    poll_secs: u64,
+) -> ClientResult<()> {
+    let services = parse_switch_service_names(&service_names)?;
+    let nodes = parse_switch_targets_csv(targets_csv)?
+        .into_iter()
+        .map(switch_target_to_node)
+        .collect();
+    let response = client
+        .batch_disable_switch_mtls(rm::BatchDisableSwitchMtlsRequest {
+            nodes: Some(rm::NodeSet { nodes }),
+            services,
+        })
+        .await?
+        .into_inner();
+
+    let common = response
+        .response
+        .ok_or("batch_disable_switch_mtls response missing common response")?;
+    print_status(common.status);
+    println!("Message: {}", common.message);
+    println!("Parent Job ID: {}", common.job_id);
+    print_node_operation_stats(&common.stats);
+    print_common_node_results(&common.node_results);
+    ensure_success(common.status, "switch disable_mtls submission failed")?;
+
+    let job_id = common.job_id;
+    if wait_secs == 0 || job_id.is_empty() {
+        return Ok(());
+    }
+
+    poll_switch_mtls_disable_jobs(client, job_id, wait_secs, poll_secs).await
+}
+
+// Poll the parent job (and its child jobs) until every job reaches a terminal
+// state (completed/failed) or the wait budget elapses. Returns an error if any
+// job failed or the wait timed out, so a test gets a synchronous pass/fail.
+async fn poll_switch_mtls_disable_jobs(
+    client: &mut Client,
+    job_id: String,
+    wait_secs: u64,
+    poll_secs: u64,
+) -> ClientResult<()> {
+    let poll = Duration::from_secs(poll_secs.max(1));
+    let start = std::time::Instant::now();
+    // Saturate rather than panic on an absurd --wait-secs.
+    let deadline = start
+        .checked_add(Duration::from_secs(wait_secs))
+        .unwrap_or_else(|| start + Duration::from_secs(u64::from(u32::MAX)));
+
+    let timeout_err = || -> Box<dyn std::error::Error + Send + Sync> {
+        format!("timed out after {wait_secs}s waiting for switch mTLS disable job {job_id}").into()
+    };
+
+    loop {
+        // Honor wait_secs as a hard ceiling: the get_job_status RPC is otherwise
+        // only bounded by the client's per-request timeout (default 1800s), so
+        // bound each call to the remaining budget and give up once it is spent.
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(timeout_err());
+        }
+
+        let response = match tokio::time::timeout(
+            remaining,
+            client.get_job_status(rm::GetJobStatusRequest {
+                job_id: job_id.clone(),
+                include_child_job_states: true,
+            }),
+        )
+        .await
+        {
+            Ok(result) => result?.into_inner(),
+            Err(_elapsed) => return Err(timeout_err()),
+        };
+
+        if response.job_states.is_empty() {
+            return Err("job_status returned no job states".into());
+        }
+
+        let terminal = response.job_states.iter().all(|job| {
+            job.execution_state == rm::JobExecutionState::Completed as i32
+                || job.execution_state == rm::JobExecutionState::Failed as i32
+        });
+
+        if terminal {
+            for (index, job) in response.job_states.iter().enumerate() {
+                if index > 0 {
+                    println!();
+                }
+                println!("Job ID: {}", job.job_id);
+                println!("State: {}", job_execution_state_name(job.execution_state));
+                if !job.state_description.is_empty() {
+                    println!("Description: {}", job.state_description);
+                }
+                if let Some(node_id) = &job.node_id {
+                    println!("Node: {node_id}");
+                }
+                if !job.error_message.is_empty() {
+                    println!("Error: {}", job.error_message);
+                }
+                if !job.result_json.is_empty() {
+                    println!("Result: {}", job.result_json);
+                }
+            }
+
+            if let Some(message) = failed_job_status_message(&response.job_states) {
+                return Err(message.into());
+            }
+            return Ok(());
+        }
+
+        // Clamp the sleep to whatever budget remains so we never overrun.
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(timeout_err());
+        }
+        tokio::time::sleep(poll.min(remaining)).await;
+    }
+}
+
 fn parse_switch_service_names(names: &[String]) -> ClientResult<Vec<i32>> {
     if names.is_empty() {
         return Err("at least one --service is required".into());
@@ -2154,31 +2234,6 @@ fn parse_switch_service_name(name: &str) -> ClientResult<i32> {
     Ok(service)
 }
 
-fn parse_power_on_order(items: Vec<String>) -> ClientResult<Vec<rm::PowerOnOrderItem>> {
-    let mut parsed = Vec::new();
-    let mut index = 0;
-    while index < items.len() {
-        let node_id = items[index].clone();
-        let mut timeout_seconds = 5;
-        if let Some(next) = items.get(index + 1)
-            && let Ok(timeout) = next.parse::<u32>()
-            && timeout > 0
-        {
-            timeout_seconds = timeout;
-            index += 1;
-        }
-        parsed.push(rm::PowerOnOrderItem {
-            node_id,
-            completion_check: Some(rm::CompletionCheck {
-                enabled: true,
-                timeout_seconds,
-            }),
-        });
-        index += 1;
-    }
-    Ok(parsed)
-}
-
 fn parse_firmware_targets(args: &[String]) -> ClientResult<Vec<rm::FirmwareTarget>> {
     let mut targets = Vec::new();
     for arg in args {
@@ -2201,7 +2256,7 @@ fn parse_switch_targets_csv(path: &Path) -> ClientResult<Vec<SwitchTarget>> {
     for (line_number, fields) in csv_records(path)?.into_iter().enumerate() {
         if fields.len() < 6 {
             return Err(format!(
-                "invalid CSV format on line {}. Expected node_id,rack_id,ip,port,username,password[,mac_address][,host_name][,node_type]",
+                "invalid CSV format on line {}. Expected node_id,rack_id,ip,port,username,password[,mac_address][,host_name][,node_type] (or the longer node-list layout with type/endpoint_role/host_name/BMC columns)",
                 line_number + 1
             )
             .into());
@@ -2215,22 +2270,66 @@ fn parse_switch_targets_csv(path: &Path) -> ClientResult<Vec<SwitchTarget>> {
                 .map_err(|_| format!("invalid port on line {}", line_number + 1))?
         };
         let ip_address = fields[2].clone();
-        let host_name = fields
-            .get(7)
-            .filter(|name| !name.is_empty())
-            .cloned()
-            .unwrap_or_else(|| ip_address.clone());
-        let node_type = fields
-            .get(8)
-            .filter(|node_type| !node_type.is_empty())
-            .map(|node_type| parse_node_type_field(node_type, &format!("line {}", line_number + 1)))
-            .transpose()?
-            .unwrap_or(rm::NodeType::SwitchGb200Nvidia as i32);
+        // Detect the longer add_nodes / node-list layout where field[7] is the
+        // required node type (e.g. `3` or `SwitchGb200Nvidia`), followed by
+        // optional endpoint_role, host_name, and BMC columns. Without this,
+        // the type value is misread as TLS host_name and NVUE rejects it as
+        // an invalid DNS name.
+        //
+        // The short layout tops out at 9 fields (mac, host_name, and node
+        // type are all optional), so 10+ fields is an unambiguous node-list
+        // signal on its own, checked before field[7] is even parsed. With
+        // 9 or fewer fields the two layouts can't be told apart by shape
+        // alone, so this falls back to whether field[7] parses as *any*
+        // node type (switch or not -- the `is_switch_node_type` check below
+        // rejects non-switch rows) to tell a node-list type value apart
+        // from a short-layout host_name.
+        //
+        // Deciding the layout this way, instead of solely from whether
+        // field[7] happens to parse, means a typo'd node-list type value
+        // (e.g. `SwithcGb200Nvidia`) in an otherwise unambiguous node-list
+        // row is reported as an invalid node type instead of silently
+        // being misread as a host_name with the type defaulted away.
+        let is_node_list_layout = fields.len() > 9
+            || fields
+                .get(7)
+                .filter(|value| !value.is_empty())
+                .is_some_and(|value| parse_node_type_field(value, "probe").is_ok());
+        let (host_name, node_type, node_type_field) = if is_node_list_layout {
+            let node_type_field = fields.get(7).cloned().unwrap_or_default();
+            let node_type = parse_node_type_field(
+                &node_type_field,
+                &format!("line {} node-list type", line_number + 1),
+            )?;
+            let host_name = fields
+                .get(9)
+                .filter(|name| !name.is_empty())
+                .cloned()
+                .unwrap_or_else(|| ip_address.clone());
+            (host_name, node_type, node_type_field)
+        } else {
+            let host_name = fields
+                .get(7)
+                .filter(|name| !name.is_empty())
+                .cloned()
+                .unwrap_or_else(|| ip_address.clone());
+            let node_type_field = fields.get(8).cloned().unwrap_or_default();
+            let node_type = fields
+                .get(8)
+                .filter(|node_type| !node_type.is_empty())
+                .map(|node_type| {
+                    parse_node_type_field(node_type, &format!("line {}", line_number + 1))
+                })
+                .transpose()?
+                .unwrap_or(rm::NodeType::SwitchGb200Nvidia as i32);
+            (host_name, node_type, node_type_field)
+        };
         if !is_switch_node_type(node_type) {
             return Err(format!(
-                "invalid switch node type '{}' on line {}",
-                fields.get(8).map(String::as_str).unwrap_or_default(),
-                line_number + 1
+                "invalid switch node type on line {} (got host_name='{}', node_type field='{}')",
+                line_number + 1,
+                host_name,
+                node_type_field,
             )
             .into());
         }
@@ -2566,6 +2665,14 @@ fn parse_firmware_object_component_target(node_type: i32, value: &str) -> Client
                 "INFOROM_GPU_2" => "INFOROM_GPU_2",
                 "INFOROM_GPU_3" => "INFOROM_GPU_3",
                 "PCIE_SWITCH_CONFIG_0" => "PCIE_SWITCH_CONFIG_0",
+                "CX7" if node_type == rm::NodeType::ComputeGb200Nvidia => "CX7",
+                "CX8" if node_type == rm::NodeType::ComputeGb200Nvidia => "CX8",
+                "BF3" | "BF3_NIC" if node_type == rm::NodeType::ComputeGb200Nvidia => "BF3_NIC",
+                "BF3_BFB" if node_type == rm::NodeType::ComputeGb200Nvidia => {
+                    return Err(
+                        "BF3_BFB and Arm OS installation are not supported; use BF3_NIC".into(),
+                    );
+                }
                 _ => {
                     return Err(format!(
                         "unknown firmware object target '{value}' for node type {node_type:?}"
@@ -2684,6 +2791,7 @@ fn switch_target_to_node(target: SwitchTarget) -> rm::NodeInfo {
             credentials: Some(user_pass(target.username, target.password)),
         }),
         node_descriptor: None,
+        additional_host_endpoints: Vec::new(),
     }
 }
 
@@ -2703,39 +2811,43 @@ fn node_list_entry_to_proto(node: NodeListEntry, mode: NodeListEndpointMode) -> 
         port: node.port,
         credentials: Some(user_pass(node.username.clone(), node.password.clone())),
     };
-    if is_switch_node_type(node.node_type) {
-        let host_endpoint_proto = rm::Endpoint {
+    let host_endpoint_proto = if is_switch_node_type(node.node_type) {
+        rm::Endpoint {
             interface: Some(rm::NetworkInterface {
                 ip_address: node.ip_address.clone(),
                 mac_address: node.mac_address.clone(),
                 host_name: Some(switch_host_name),
             }),
-            port: node.port,
-            credentials: Some(user_pass(node.username.clone(), node.password.clone())),
-        };
-        // When explicit BMC columns are present, always populate both endpoints:
-        // main fields → host_endpoint, BMC columns → bmc_endpoint.
-        // endpoint_role and mode are ignored in this case.
-        if let Some(bmc) = node.bmc_endpoint {
-            let bmc_endpoint_proto = rm::Endpoint {
-                interface: Some(rm::NetworkInterface {
-                    ip_address: bmc.ip_address,
-                    mac_address: bmc.mac_address,
-                    host_name: None,
-                }),
-                port: bmc.port,
-                credentials: Some(user_pass(bmc.username, bmc.password)),
-            };
-            return rm::NodeInfo {
-                node_id: node.node_id,
-                rack_id: node.rack_id,
-                r#type: Some(node.node_type),
-                bmc_endpoint: Some(bmc_endpoint_proto),
-                host_endpoint: Some(host_endpoint_proto),
-                node_descriptor: None,
-            };
+            ..endpoint_proto.clone()
         }
+    } else {
+        endpoint_proto.clone()
+    };
 
+    // Explicit BMC columns mean the main columns describe the host for every
+    // node type. This lets compute firmware requests carry both the in-band
+    // SSH endpoint and the Redfish endpoint used for power cycling.
+    if let Some(bmc) = node.bmc_endpoint {
+        let bmc_endpoint_proto = rm::Endpoint {
+            interface: Some(rm::NetworkInterface {
+                ip_address: bmc.ip_address,
+                mac_address: bmc.mac_address,
+                host_name: None,
+            }),
+            port: bmc.port,
+            credentials: Some(user_pass(bmc.username, bmc.password)),
+        };
+        return rm::NodeInfo {
+            node_id: node.node_id,
+            rack_id: node.rack_id,
+            r#type: Some(node.node_type),
+            bmc_endpoint: Some(bmc_endpoint_proto),
+            host_endpoint: Some(host_endpoint_proto),
+            node_descriptor: None,
+            additional_host_endpoints: Vec::new(),
+        };
+    }
+    if is_switch_node_type(node.node_type) {
         let (bmc_endpoint, host_endpoint) = match (mode, node.endpoint_role) {
             (_, Some(NodeListEndpointRole::Bmc)) => (Some(endpoint_proto), None),
             (_, Some(NodeListEndpointRole::Host)) => (None, Some(host_endpoint_proto)),
@@ -2753,6 +2865,7 @@ fn node_list_entry_to_proto(node: NodeListEntry, mode: NodeListEndpointMode) -> 
             bmc_endpoint,
             host_endpoint,
             node_descriptor: None,
+            additional_host_endpoints: Vec::new(),
         }
     } else {
         let (bmc_endpoint, host_endpoint) = match node.endpoint_role {
@@ -2767,6 +2880,7 @@ fn node_list_entry_to_proto(node: NodeListEntry, mode: NodeListEndpointMode) -> 
             bmc_endpoint,
             host_endpoint,
             node_descriptor: None,
+            additional_host_endpoints: Vec::new(),
         }
     }
 }
@@ -3687,6 +3801,90 @@ mod tests {
     }
 
     #[test]
+    fn parse_switch_targets_accepts_node_list_layout_with_host_name_and_bmc() -> ClientResult<()> {
+        let csv = tempfile::NamedTempFile::new()?;
+        // Same layout as add_nodes / the user's switch_list.csv:
+        // type at field[7], empty endpoint_role, host_name, then BMC columns.
+        std::fs::write(
+            csv.path(),
+            "sw100,rack-01,10.85.160.23,443,admin,secret,50:00:E6:79:A2:E0,3,,10-85-160-23.ipp6-dev1.dev.dsx.nvidia.com,10.85.160.69,443,root,bmc-secret,64:33:AA:26:D0:3E\n",
+        )?;
+
+        let targets = parse_switch_targets_csv(csv.path())?;
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(
+            targets[0].host_name,
+            "10-85-160-23.ipp6-dev1.dev.dsx.nvidia.com"
+        );
+        assert_eq!(targets[0].node_type, rm::NodeType::SwitchGb200Nvidia as i32);
+        assert_eq!(targets[0].ip_address, "10.85.160.23");
+        assert_eq!(targets[0].mac_address, "50:00:E6:79:A2:E0");
+
+        Ok(())
+    }
+
+    #[test]
+    fn parse_switch_targets_rejects_non_switch_node_list_type() {
+        let csv = tempfile::NamedTempFile::new().expect("temp file");
+        // field[7]=ComputeGb200Nvidia is a valid node type but not a switch
+        // one, and field[8] is empty: this must be rejected outright, not
+        // silently fall back to the short layout's SwitchGb200Nvidia default.
+        std::fs::write(
+            csv.path(),
+            "c-01,rack-01,10.0.1.1,443,admin,secret,aa:bb:cc:dd:ee:ff,ComputeGb200Nvidia,\n",
+        )
+        .expect("write csv");
+
+        let error = parse_switch_targets_csv(csv.path())
+            .expect_err("non-switch node type should be rejected");
+
+        assert!(
+            error.to_string().contains("invalid switch node type"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn parse_switch_targets_rejects_unparseable_node_list_type() {
+        let csv = tempfile::NamedTempFile::new().expect("temp file");
+        // 15 fields (mac, type, endpoint_role, host_name, and a full BMC
+        // block) is unambiguously the node-list layout -- the short layout
+        // tops out at 9 fields -- so a typo'd field[7] like "BadType" must
+        // be reported as an invalid node type, not silently misread as a
+        // host_name with the type defaulted to SwitchGb200Nvidia.
+        std::fs::write(
+            csv.path(),
+            "sw100,rack-01,10.85.160.23,443,admin,secret,50:00:E6:79:A2:E0,BadType,,10-85-160-23.ipp6-dev1.dev.dsx.nvidia.com,10.85.160.69,443,root,bmc-secret,64:33:AA:26:D0:3E\n",
+        )
+        .expect("write csv");
+
+        let error = parse_switch_targets_csv(csv.path())
+            .expect_err("unparseable node-list type should be rejected");
+
+        assert!(
+            error.to_string().contains("invalid node type"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn parse_switch_targets_node_list_layout_does_not_use_type_as_host_name() -> ClientResult<()> {
+        let csv = tempfile::NamedTempFile::new()?;
+        std::fs::write(
+            csv.path(),
+            "sw-01,rack-01,10.0.1.1,443,admin,secret,aa:bb:cc:dd:ee:ff,3\n",
+        )?;
+
+        let targets = parse_switch_targets_csv(csv.path())?;
+
+        assert_eq!(targets[0].host_name, "10.0.1.1");
+        assert_eq!(targets[0].node_type, rm::NodeType::SwitchGb200Nvidia as i32);
+
+        Ok(())
+    }
+
+    #[test]
     fn parse_switch_targets_accepts_vrnvl72_node_type() -> ClientResult<()> {
         let csv = tempfile::NamedTempFile::new()?;
         std::fs::write(
@@ -3937,6 +4135,46 @@ mod tests {
     }
 
     #[test]
+    fn compute_with_explicit_bmc_endpoint_populates_host_and_bmc() {
+        let entry = NodeListEntry {
+            node_id: "compute-01".to_owned(),
+            rack_id: "rack-01".to_owned(),
+            ip_address: "10.0.0.10".to_owned(),
+            port: 22,
+            username: "host-user".to_owned(),
+            password: "host-pass".to_owned(),
+            mac_address: "aa:bb:cc:dd:ee:ff".to_owned(),
+            node_type: rm::NodeType::ComputeGb200Nvidia as i32,
+            endpoint_role: None,
+            host_name: String::new(),
+            bmc_endpoint: Some(NodeListBmcEndpoint {
+                ip_address: "192.168.1.10".to_owned(),
+                port: 443,
+                username: "bmc-user".to_owned(),
+                password: "bmc-pass".to_owned(),
+                mac_address: "11:22:33:44:55:66".to_owned(),
+            }),
+        };
+
+        let node = node_list_entry_to_proto(entry, NodeListEndpointMode::DirectOperation);
+
+        assert_eq!(
+            node.host_endpoint
+                .as_ref()
+                .and_then(|endpoint| endpoint.interface.as_ref())
+                .map(|interface| interface.ip_address.as_str()),
+            Some("10.0.0.10")
+        );
+        assert_eq!(
+            node.bmc_endpoint
+                .as_ref()
+                .and_then(|endpoint| endpoint.interface.as_ref())
+                .map(|interface| interface.ip_address.as_str()),
+            Some("192.168.1.10")
+        );
+    }
+
+    #[test]
     fn switch_with_explicit_bmc_endpoint_ignores_mode_and_role() {
         // Even in InventoryRegistration mode with a Bmc role, explicit BMC columns win.
         let entry = NodeListEntry {
@@ -3992,6 +4230,23 @@ mod tests {
     }
 
     #[test]
+    fn batch_get_firmware_inventory_command_parses() {
+        let cli = Cli::try_parse_from([
+            "rack_manager_client",
+            "localhost",
+            "8801",
+            "batch_get_firmware_inventory",
+            "/tmp/nodes.csv",
+        ])
+        .expect("expected batch_get_firmware_inventory to parse");
+
+        let Command::BatchGetFirmwareInventory { nodes_csv } = cli.command else {
+            panic!("expected batch_get_firmware_inventory command");
+        };
+        assert_eq!(nodes_csv, PathBuf::from("/tmp/nodes.csv"));
+    }
+
+    #[test]
     fn configure_certificate_status_command_parses() {
         let cli = Cli::try_parse_from([
             "rack_manager_client",
@@ -4010,5 +4265,59 @@ mod tests {
             panic!("expected switch configure_certificate_status command");
         };
         assert_eq!(job_id, "job-123");
+    }
+
+    #[test]
+    fn disable_mtls_command_parses() {
+        let cli = Cli::try_parse_from([
+            "rack_manager_client",
+            "localhost",
+            "8801",
+            "switch",
+            "disable_mtls",
+            "/tmp/switches.csv",
+            "--service",
+            "nvue-api",
+            "--service",
+            "scale-up-fabric-manager",
+            "--wait-secs",
+            "90",
+            "--poll-secs",
+            "5",
+        ])
+        .expect("expected disable_mtls to parse");
+
+        let Command::Switch {
+            command:
+                SwitchCommand::DisableMtls {
+                    targets_csv,
+                    services,
+                    wait_secs,
+                    poll_secs,
+                },
+        } = cli.command
+        else {
+            panic!("expected switch disable_mtls command");
+        };
+        assert_eq!(targets_csv, PathBuf::from("/tmp/switches.csv"));
+        assert_eq!(services, vec!["nvue-api", "scale-up-fabric-manager"]);
+        assert_eq!(wait_secs, 90);
+        assert_eq!(poll_secs, 5);
+    }
+
+    #[test]
+    fn disable_mtls_command_requires_a_service() {
+        let result = Cli::try_parse_from([
+            "rack_manager_client",
+            "localhost",
+            "8801",
+            "switch",
+            "disable_mtls",
+            "/tmp/switches.csv",
+        ]);
+        assert!(
+            result.is_err(),
+            "disable_mtls must require at least one --service"
+        );
     }
 }

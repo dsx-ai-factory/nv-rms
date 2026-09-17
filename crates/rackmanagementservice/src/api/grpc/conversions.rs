@@ -18,12 +18,41 @@
 use crate::domain::node::{NodeType as DomainNodeType, PowerOp, PowerState};
 use crate::domain::rack::{Endpoint, EndpointConfig, EndpointCredentials};
 use crate::orchestrator::job_lifecycle::{JobError, JobState};
-use crate::orchestrator::job_tracker::JobInfo;
+use crate::orchestrator::job_tracker::{JobInfo, RejectedBatchTarget};
 use crate::utilities::error::{Result as RmsResult, RmsError};
 use chrono::{DateTime, Utc};
 use librms::protos::rack_manager as pb;
 use secrecy::{ExposeSecret, SecretString};
 use thiserror::Error;
+
+// ── Batch node results ──
+
+/// Keys each device of a batch request by its `(rack_id, node_id)` for
+/// [`JobTracker::create_batch_jobs`](crate::orchestrator::job_tracker::JobTracker::create_batch_jobs),
+/// which hands the device back with the job it reserves.
+pub(crate) fn batch_targets(devices: Vec<pb::NodeInfo>) -> Vec<(String, String, pb::NodeInfo)> {
+    devices
+        .into_iter()
+        .map(|device| (device.rack_id.clone(), device.node_id.clone(), device))
+        .collect()
+}
+
+/// Turns the rejections of
+/// [`JobTracker::create_batch_jobs`](crate::orchestrator::job_tracker::JobTracker::create_batch_jobs)
+/// into the failure entries of a `NodeBatchResponse`.
+///
+/// `NodeOperationResult` keys results by node alone, so the target's `rack_id`
+/// is dropped here; it stays on [`RejectedBatchTarget`] for callers that need to
+/// correlate a refusal back to the rack it came from.
+pub(crate) fn failed_node_results(
+    rejected: Vec<RejectedBatchTarget>,
+) -> impl Iterator<Item = pb::NodeOperationResult> {
+    rejected.into_iter().map(|target| pb::NodeOperationResult {
+        node_id: target.node_id,
+        status: pb::ReturnCode::Failure.into(),
+        error_message: target.error_message,
+    })
+}
 
 // ── Power conversions ──
 
@@ -51,21 +80,6 @@ impl TryFrom<pb::PowerOperation> for PowerOp {
             pb::PowerOperation::GracefulShutdown => Ok(Self::GracefulShutdown),
             pb::PowerOperation::GracefulRestart => Ok(Self::GracefulRestart),
             pb::PowerOperation::ForceRestart => Ok(Self::ForceRestart),
-        }
-    }
-}
-
-impl TryFrom<pb::RackPowerOperation> for PowerOp {
-    type Error = PowerOperationConversionError;
-
-    fn try_from(op: pb::RackPowerOperation) -> Result<Self, Self::Error> {
-        match op {
-            // UNSPECIFIED is a valid protobuf value, but not a domain power
-            // operation. Treating it as Err is the required-field validation.
-            pb::RackPowerOperation::Unspecified => Err(PowerOperationConversionError::Unspecified),
-            pb::RackPowerOperation::On => Ok(Self::On),
-            pb::RackPowerOperation::Off => Ok(Self::Off),
-            pb::RackPowerOperation::Cycle => Ok(Self::PowerCycle),
         }
     }
 }
@@ -209,6 +223,21 @@ impl FlatEndpoint {
         };
 
         Self::endpoint_from_config("host", endpoint, false).map(Some)
+    }
+
+    /// Return the optional compute host endpoint used by SSH-based workflows.
+    /// An omitted port means the standard SSH port instead of the management
+    /// API default used by the existing generic endpoint conversion.
+    pub fn optional_compute_host_ssh_endpoint(&self) -> RmsResult<Option<EndpointConfig>> {
+        let Some(endpoint) = self.host.as_ref() else {
+            return Ok(None);
+        };
+
+        let mut endpoint = endpoint.clone();
+        if endpoint.port == 0 {
+            endpoint.port = 22;
+        }
+        Self::endpoint_from_config("host", &endpoint, false).map(Some)
     }
 
     /// Return the required switch host endpoint for NVUE/HTTPS management.
@@ -1075,6 +1104,43 @@ mod tests {
     }
 
     #[test]
+    fn optional_compute_host_ssh_endpoint_defaults_to_port_22() {
+        let flat = FlatEndpoint {
+            host: Some(FlatEndpointConfig {
+                ip_address: "10.0.1.1".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let endpoint = flat
+            .optional_compute_host_ssh_endpoint()
+            .expect("compute host endpoint should be valid")
+            .expect("compute host endpoint should exist");
+
+        assert_eq!(endpoint.endpoint.port, 22);
+    }
+
+    #[test]
+    fn optional_compute_host_ssh_endpoint_preserves_explicit_port() {
+        let flat = FlatEndpoint {
+            host: Some(FlatEndpointConfig {
+                ip_address: "10.0.1.1".into(),
+                port: 2222,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let endpoint = flat
+            .optional_compute_host_ssh_endpoint()
+            .expect("compute host endpoint should be valid")
+            .expect("compute host endpoint should exist");
+
+        assert_eq!(endpoint.endpoint.port, 2222);
+    }
+
+    #[test]
     fn resolve_bmc_port_rejects_out_of_range() {
         let flat = FlatEndpoint {
             bmc: Some(FlatEndpointConfig {
@@ -1270,24 +1336,6 @@ mod tests {
 
         assert_eq!(
             PowerOp::try_from(pb::PowerOperation::Unspecified),
-            Err(PowerOperationConversionError::Unspecified)
-        );
-    }
-
-    #[test]
-    fn rack_power_op_conversions() {
-        let cases = [
-            (pb::RackPowerOperation::On, PowerOp::On),
-            (pb::RackPowerOperation::Off, PowerOp::Off),
-            (pb::RackPowerOperation::Cycle, PowerOp::PowerCycle),
-        ];
-
-        for (proto, domain) in cases {
-            assert_eq!(PowerOp::try_from(proto), Ok(domain));
-        }
-
-        assert_eq!(
-            PowerOp::try_from(pb::RackPowerOperation::Unspecified),
             Err(PowerOperationConversionError::Unspecified)
         );
     }

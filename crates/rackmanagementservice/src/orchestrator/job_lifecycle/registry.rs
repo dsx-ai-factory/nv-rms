@@ -202,6 +202,19 @@ pub const MAX_TRACKED_JOBS: usize = 10_000;
 /// [`JobRegistry::set_terminal_observer`]).
 pub type JobObserver = Arc<dyn Fn(&JobSnapshot) + Send + Sync>;
 
+/// Classification of a state change applied by [`JobStore::transition_state`].
+///
+/// Used only to select which chokepoint log line [`JobRegistry::update`]
+/// emits; each variant carries the post-transition snapshot.
+pub(super) enum LifecycleTransition {
+    /// The first `Queued -> Running` move: the workflow has actually started.
+    Started(JobSnapshot),
+    /// A later `Running -> Running` description update (progress reporting).
+    Progress(JobSnapshot),
+    /// The first non-terminal to terminal move (`Completed` or `Failed`).
+    Terminal(JobSnapshot),
+}
+
 /// Shared in-memory registry for asynchronous jobs.
 ///
 /// Job records are stored domain-agnostically; the `D` parameter only selects
@@ -258,9 +271,11 @@ impl<D: JobDomain> JobRegistry<D> {
         self.terminal_observer = Some(observer);
     }
 
-    /// Fires the creation observer, if configured. Called after the write lock
-    /// is released so a panic in the callback cannot poison the registry lock.
+    /// Logs the job-created chokepoint event, then fires the creation
+    /// observer, if configured. Called after the write lock is released so a
+    /// panic in the callback cannot poison the registry lock.
     fn notify_created(&self, snapshot: &JobSnapshot) {
+        log_created(snapshot);
         if let Some(observer) = &self.created_observer {
             observer(snapshot);
         }
@@ -550,19 +565,29 @@ impl<D: JobDomain> JobRegistry<D> {
         });
     }
 
-    /// Applies a lifecycle-state transition and notifies the terminal observer.
+    /// Applies a lifecycle-state transition, logs the resulting chokepoint
+    /// event (`job started`/`job progress`/`job completed`/`job failed`), and
+    /// notifies the terminal observer.
     fn update(
         &self,
         job_id: &JobId,
         transition: impl FnOnce(&JobLifecycleState) -> Option<JobLifecycleState>,
     ) -> bool {
-        let (changed, terminal_snapshot) = {
+        let (changed, event) = {
             let mut jobs = self.jobs.write().unwrap();
             jobs.transition_state(job_id, transition)
         };
 
-        if let (Some(observer), Some(snapshot)) = (&self.terminal_observer, terminal_snapshot) {
-            observer(&snapshot);
+        match event {
+            Some(LifecycleTransition::Started(snapshot)) => log_started(&snapshot),
+            Some(LifecycleTransition::Progress(snapshot)) => log_progress(&snapshot),
+            Some(LifecycleTransition::Terminal(snapshot)) => {
+                log_terminal(&snapshot);
+                if let Some(observer) = &self.terminal_observer {
+                    observer(&snapshot);
+                }
+            }
+            None => {}
         }
 
         changed
@@ -575,5 +600,91 @@ fn failed_state(failure: JobFailure) -> JobLifecycleState {
         failure: Arc::new(failure.error),
         message: failure.message,
         result_json: failure.result_json.unwrap_or_default(),
+    }
+}
+
+/// Logs the create chokepoint event for every `JobRegistry::create_job` caller
+/// with a uniform field set (`parent_job_id` is `"None"` when absent).
+///
+/// Enters the job's own span first: the caller (e.g. an API handler) hasn't
+/// necessarily entered it yet, and doing so here lets this event carry the
+/// job's span ID rather than whatever span happened to be ambient at the call
+/// site.
+fn log_created(snapshot: &JobSnapshot) {
+    let _entered = snapshot.span.enter();
+    let description = snapshot.state.description();
+    let parent_job_id = snapshot
+        .parent_job_id
+        .as_ref()
+        .map(|id| id.to_string())
+        .unwrap_or_else(|| "None".to_string());
+    tracing::info!(
+        job_id = %snapshot.job_id,
+        parent_job_id = %parent_job_id,
+        rack_id = %snapshot.rack_id,
+        node_id = %snapshot.node_id,
+        description,
+        "job created"
+    );
+}
+
+/// Logs the first `Queued -> Running` transition: the workflow has started.
+///
+/// Enters the job's own span first so the event carries the job's span ID
+/// even when `update` is driven from a context that hasn't entered it (e.g.
+/// the tracker-compatibility path in `job_tracker.rs`).
+fn log_started(snapshot: &JobSnapshot) {
+    let _entered = snapshot.span.enter();
+    tracing::info!(
+        job_id = %snapshot.job_id,
+        rack_id = %snapshot.rack_id,
+        node_id = %snapshot.node_id,
+        description = snapshot.state.description(),
+        "job started"
+    );
+}
+
+/// Logs a later `Running -> Running` description update.
+///
+/// Enters the job's own span first so the event carries the job's span ID
+/// even when `update` is driven from a context that hasn't entered it.
+fn log_progress(snapshot: &JobSnapshot) {
+    let _entered = snapshot.span.enter();
+    tracing::info!(
+        job_id = %snapshot.job_id,
+        rack_id = %snapshot.rack_id,
+        node_id = %snapshot.node_id,
+        description = snapshot.state.description(),
+        "job progress"
+    );
+}
+
+/// Logs the first non-terminal to terminal transition. Failed jobs log
+/// `message` (the raw failure detail) rather than `description`, which
+/// defaults to the generic placeholder `"Failed"` unless a caller opts in to
+/// [`JobFailure::with_description`].
+///
+/// Enters the job's own span first so the event carries the job's span ID
+/// even when `update` is driven from a context that hasn't entered it (e.g.
+/// the tracker-compatibility path in `job_tracker.rs`, which drives a
+/// previously created `JobHandle` from an unrelated call site).
+fn log_terminal(snapshot: &JobSnapshot) {
+    let _entered = snapshot.span.enter();
+    match &snapshot.state {
+        JobLifecycleState::Completed { description, .. } => tracing::info!(
+            job_id = %snapshot.job_id,
+            rack_id = %snapshot.rack_id,
+            node_id = %snapshot.node_id,
+            description,
+            "job completed"
+        ),
+        JobLifecycleState::Failed { message, .. } => tracing::info!(
+            job_id = %snapshot.job_id,
+            rack_id = %snapshot.rack_id,
+            node_id = %snapshot.node_id,
+            description = message,
+            "job failed"
+        ),
+        JobLifecycleState::Queued { .. } | JobLifecycleState::Running { .. } => {}
     }
 }

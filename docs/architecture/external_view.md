@@ -130,7 +130,7 @@ API - and several **southbound** (outgoing) interfaces it uses to reach hardware
 | Northbound | gRPC clients | gRPC over mTLS (TLS 1.3, rustls) | Single `RackManager` service; plaintext only in insecure dev mode. |
 | Northbound | Prometheus | HTTP(S) `/metrics` | Independent listener; optional TLS reusing the gRPC server cert. |
 | Southbound | Compute tray & power-shelf BMC | Redfish over HTTPS | Power, reset, device info, firmware inventory, multipart firmware upload. |
-| Southbound | NVSwitch tray (NVUE/NVOS) | NVUE REST over HTTPS, SSH, SFTP | Switch firmware, system images, passwords, certificates, config. SFTP uploads switch OS images. |
+| Southbound | NVSwitch tray (NVUE/NVOS) | NVUE REST over HTTPS, SSH, SFTP | Switch firmware, system images, passwords, certificates, config, and SPDM attestation evidence. SFTP uploads switch OS images. |
 | Southbound | NVSwitch tray (NMX-C) | NMX-C gRPC, gNMI | Scale-up fabric manager state and telemetry-interface control. |
 
 To see a more detailed internal view of RMS layers and components, see [Internal View](internal_view.md).

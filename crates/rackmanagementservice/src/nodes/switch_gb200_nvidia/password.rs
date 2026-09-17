@@ -88,7 +88,7 @@ fn redact_password_update_error(
         }
     }
 
-    nvfwupd::utils::Util::redact_secret_fields(&redacted)
+    common::redaction::redact_secret_fields(&redacted)
 }
 
 fn redact_password_update_rms_error(

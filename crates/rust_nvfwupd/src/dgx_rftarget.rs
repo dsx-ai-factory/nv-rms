@@ -20,7 +20,7 @@
 use serde_json::{json, Value};
 
 use crate::bmc_access::BmcAccess;
-use crate::rf_target::{CmdArgs, PkgParser, RFTarget};
+use crate::rf_target::{multipart_update_uri_from_service, CmdArgs, PkgParser, RFTarget};
 use crate::util::{BailAction, TraceFlags, Util};
 use crate::utils::Util as NvUtils;
 
@@ -521,11 +521,10 @@ impl RFTarget for DGXRFTarget {
 
     /// DGX `get_update_uri`: fallback is `/redfish/v1/UpdateService/upload`.
     fn get_update_uri(&self, update_service_response: &Value) -> String {
-        update_service_response
-            .get("MultipartHttpPushUri")
-            .and_then(|v| v.as_str())
-            .unwrap_or("/redfish/v1/UpdateService/upload")
-            .to_string()
+        multipart_update_uri_from_service(
+            update_service_response,
+            "/redfish/v1/UpdateService/upload",
+        )
     }
 
     /// DGX-specific component version lookup from nested PLDM dict.
@@ -812,6 +811,30 @@ mod tests {
 
     fn multipart_body(body: &[u8]) -> String {
         String::from_utf8_lossy(body).into_owned()
+    }
+
+    #[test]
+    fn get_update_uri_ignores_unsafe_device_supplied_values() {
+        let target = DGXRFTarget::new(BmcAccess::default_stub(), None);
+
+        assert_eq!(
+            target.get_update_uri(&json!({
+                "MultipartHttpPushUri": "/redfish/v1/UpdateService/custom-upload"
+            })),
+            "/redfish/v1/UpdateService/custom-upload"
+        );
+
+        for invalid_uri in [
+            "https://attacker.example/upload",
+            "http://attacker.example/upload",
+            "//attacker.example/upload",
+            "/redfish/v1/UpdateService/upload\nX-Injected: yes",
+        ] {
+            assert_eq!(
+                target.get_update_uri(&json!({ "MultipartHttpPushUri": invalid_uri })),
+                "/redfish/v1/UpdateService/upload"
+            );
+        }
     }
 
     #[tokio::test]

@@ -84,7 +84,7 @@ After accepting a declarative API call, RMS should determine whether the target 
 Whether an API successfully meets the declarative nature criteria can be measured as follows:
 
 - An RMS client should be able to call the respective API in a loop. E.g.
-  
+
     ```rust
     // Keep the fabric in the desired state - even across switch restarts or reinstalls
     loop {

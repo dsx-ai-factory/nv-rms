@@ -13,7 +13,7 @@ using the matrix below. Legacy `NodeType` values remain supported; when a reques
 sets a non-`NODE_TYPE_UNSPECIFIED` `NodeType`, that enum value overrides
 `node_descriptor` for dispatch.
 
-Last Updated: 2026-08-03
+Last Updated: 2026-08-05
 
 ## Supported Hardware
 
@@ -44,7 +44,8 @@ full RMS compatibility testing.
 RMS resolves a descriptor to the internal node type at the gRPC boundary. The
 required identity keys are `role`, `vendor`, and `product_family`. The optional
 `inventory_profile` key selects a deployment-defined expected firmware
-inventory and does not affect node-type resolution. RMS rejects descriptors
+inventory, including optional physical Flint device counts, and does not affect
+node-type resolution. RMS rejects descriptors
 with missing or empty required attributes and rejects unsupported attributes.
 
 `inventory_profile` is an opaque, case-sensitive identifier after trimming.
