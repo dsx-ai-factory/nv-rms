@@ -48,7 +48,8 @@
 //! provider merged with a narrowly scoped `Env` provider, then extracted into
 //! [`RmsConfig`]. Every field carries a serde default, so an empty or partial
 //! file (including one that omits a section entirely) yields a
-//! fully-populated config.
+//! fully-populated config. Unknown keys are not fatal; they are collected and
+//! reported by [`RmsConfig::load`] so the caller can warn about likely typos.
 
 use std::collections::BTreeMap;
 use std::num::{NonZeroU64, NonZeroUsize};
@@ -57,8 +58,11 @@ use std::sync::Arc;
 
 use figment::Figment;
 use figment::providers::{Env, Format, Toml};
-use serde::{Deserialize, Deserializer, Serialize};
+use figment::value::Value;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
+
+use nvfwupd::workflow::{FlintDeviceFamily, FlintExpectedDeviceCounts};
 
 use crate::domain::node::ExpectedInventoryPolicy;
 use crate::transport::ssh::SftpUploadOptions;
@@ -118,14 +122,80 @@ fn default_enable_timestamps() -> bool {
     false
 }
 
+/// One validated deployment-defined expected-inventory profile.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExpectedInventoryProfile {
+    /// Expected NVFWUPD AP names for out-of-band inventory validation.
+    pub ap_names: Vec<String>,
+    /// Expected host-visible physical adapter counts for Flint validation.
+    #[serde(serialize_with = "serialize_flint_device_counts")]
+    pub flint_devices: FlintExpectedDeviceCounts,
+}
+
+fn serialize_flint_device_counts<S>(
+    counts: &FlintExpectedDeviceCounts,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    let values: BTreeMap<_, _> = [
+        ("cx7", FlintDeviceFamily::ConnectX7),
+        ("cx8", FlintDeviceFamily::ConnectX8),
+        ("bf3_nic", FlintDeviceFamily::BlueField3),
+    ]
+    .into_iter()
+    .filter_map(|(name, family)| counts.get(&family).map(|count| (name, *count)))
+    .collect();
+    values.serialize(serializer)
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RawExpectedInventoryProfile {
+    Legacy(Vec<String>),
+    Detailed(RawDetailedExpectedInventoryProfile),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawDetailedExpectedInventoryProfile {
+    #[serde(default)]
+    ap_names: Vec<String>,
+    #[serde(default)]
+    flint_devices: RawFlintDeviceCounts,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawFlintDeviceCounts {
+    cx7: Option<usize>,
+    cx8: Option<usize>,
+    bf3_nic: Option<usize>,
+}
+
+impl RawFlintDeviceCounts {
+    fn into_expected_counts(self) -> FlintExpectedDeviceCounts {
+        [
+            (FlintDeviceFamily::ConnectX7, self.cx7),
+            (FlintDeviceFamily::ConnectX8, self.cx8),
+            (FlintDeviceFamily::BlueField3, self.bf3_nic),
+        ]
+        .into_iter()
+        .filter_map(|(family, count)| count.map(|count| (family, count)))
+        .collect()
+    }
+}
+
 /// Validated expected-inventory profiles loaded from `[workflows]`.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
-pub struct ExpectedInventoryProfiles(BTreeMap<String, Vec<String>>);
+pub struct ExpectedInventoryProfiles(BTreeMap<String, ExpectedInventoryProfile>);
 
 impl ExpectedInventoryProfiles {
     /// Return the validated configured profiles.
-    pub fn as_map(&self) -> &BTreeMap<String, Vec<String>> {
+    pub fn as_map(&self) -> &BTreeMap<String, ExpectedInventoryProfile> {
         &self.0
     }
 }
@@ -137,31 +207,60 @@ impl<'de> Deserialize<'de> for ExpectedInventoryProfiles {
     {
         use serde::de::Error as _;
 
-        let raw = BTreeMap::<String, Vec<String>>::deserialize(deserializer)?;
+        let raw = BTreeMap::<String, RawExpectedInventoryProfile>::deserialize(deserializer)?;
         let mut profiles = BTreeMap::new();
 
-        for (raw_name, raw_ap_names) in raw {
+        for (raw_name, raw_profile) in raw {
             let profile = raw_name.trim();
             if profile.is_empty() {
                 return Err(D::Error::custom(
                     "expected inventory profile names must not be empty",
                 ));
             }
+            let (raw_ap_names, flint_devices, legacy) = match raw_profile {
+                RawExpectedInventoryProfile::Legacy(ap_names) => {
+                    (ap_names, FlintExpectedDeviceCounts::new(), true)
+                }
+                RawExpectedInventoryProfile::Detailed(profile) => (
+                    profile.ap_names,
+                    profile.flint_devices.into_expected_counts(),
+                    false,
+                ),
+            };
             if raw_ap_names.iter().any(|ap_name| ap_name.trim().is_empty()) {
                 return Err(D::Error::custom(format!(
                     "expected inventory profile {profile:?} contains an empty AP name"
                 )));
             }
 
-            let value = serde_json::to_value(raw_ap_names).map_err(D::Error::custom)?;
-            let ap_names = nvfwupd::expected_inventory::parse_expected_inventory_value(&value)
-                .map_err(|message| {
-                    D::Error::custom(format!(
-                        "invalid expected inventory profile {profile:?}: {message}"
-                    ))
-                })?;
+            let ap_names = if raw_ap_names.is_empty() {
+                if legacy || flint_devices.is_empty() {
+                    return Err(D::Error::custom(format!(
+                        "expected inventory profile {profile:?} must contain AP names or Flint device counts"
+                    )));
+                }
+                Vec::new()
+            } else {
+                let value = serde_json::to_value(raw_ap_names).map_err(D::Error::custom)?;
+                nvfwupd::expected_inventory::parse_expected_inventory_value(&value).map_err(
+                    |message| {
+                        D::Error::custom(format!(
+                            "invalid expected inventory profile {profile:?}: {message}"
+                        ))
+                    },
+                )?
+            };
 
-            if profiles.insert(profile.to_owned(), ap_names).is_some() {
+            if profiles
+                .insert(
+                    profile.to_owned(),
+                    ExpectedInventoryProfile {
+                        ap_names,
+                        flint_devices,
+                    },
+                )
+                .is_some()
+            {
                 return Err(D::Error::custom(format!(
                     "duplicate expected inventory profile after trimming: {profile:?}"
                 )));
@@ -175,7 +274,13 @@ impl<'de> Deserialize<'de> for ExpectedInventoryProfiles {
 /// Immutable startup catalog used to resolve node descriptor profile names.
 #[derive(Clone, Debug, Default)]
 pub struct ExpectedInventoryCatalog {
-    profiles: Arc<BTreeMap<String, Arc<[String]>>>,
+    profiles: Arc<BTreeMap<String, ExpectedInventoryCatalogEntry>>,
+}
+
+#[derive(Clone, Debug)]
+struct ExpectedInventoryCatalogEntry {
+    ap_names: Arc<[String]>,
+    flint_device_counts: Arc<FlintExpectedDeviceCounts>,
 }
 
 impl From<&ExpectedInventoryProfiles> for ExpectedInventoryCatalog {
@@ -183,7 +288,15 @@ impl From<&ExpectedInventoryProfiles> for ExpectedInventoryCatalog {
         let profiles = config
             .as_map()
             .iter()
-            .map(|(profile, ap_names)| (profile.clone(), Arc::<[String]>::from(ap_names.clone())))
+            .map(|(profile, expected)| {
+                (
+                    profile.clone(),
+                    ExpectedInventoryCatalogEntry {
+                        ap_names: Arc::<[String]>::from(expected.ap_names.clone()),
+                        flint_device_counts: Arc::new(expected.flint_devices.clone()),
+                    },
+                )
+            })
             .collect();
         Self {
             profiles: Arc::new(profiles),
@@ -205,7 +318,7 @@ impl ExpectedInventoryCatalog {
         if profile.is_empty() {
             return Err(ExpectedInventoryProfileError::Empty);
         }
-        let ap_names = self
+        let expected = self
             .profiles
             .get(profile)
             .cloned()
@@ -213,7 +326,8 @@ impl ExpectedInventoryCatalog {
 
         Ok(Some(ExpectedInventoryPolicy {
             profile: Arc::from(profile),
-            ap_names,
+            ap_names: expected.ap_names,
+            flint_device_counts: expected.flint_device_counts,
         }))
     }
 }
@@ -229,7 +343,6 @@ pub enum ExpectedInventoryProfileError {
 
 /// `[metrics]` section: the Prometheus `/metrics` HTTP listener.
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
 pub struct RmsMetricsConfig {
     /// Metrics server port for the Prometheus `/metrics` endpoint.
     #[serde(default = "default_metrics_port")]
@@ -253,7 +366,6 @@ impl Default for RmsMetricsConfig {
 /// `[tls]` section: the gRPC API listener's TLS/mTLS material and the
 /// plaintext opt-out.
 #[derive(Clone, Debug, Deserialize, Serialize, Default)]
-#[serde(deny_unknown_fields)]
 pub struct RmsTlsConfig {
     /// Path to the X.509 certificate file for gRPC TLS.
     #[serde(default)]
@@ -277,7 +389,6 @@ pub struct RmsTlsConfig {
 
 /// `[switches]` section: outbound RMS-to-switch TLS material and identity.
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
 pub struct RmsSwitchConfig {
     /// Root directory of switch-side certificate material to install.
     #[serde(default)]
@@ -321,7 +432,6 @@ impl Default for RmsSwitchConfig {
 
 /// `[postgres]` section: the persistence-layer database connection.
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
 pub struct RmsPostgresConfig {
     /// Postgres connection URL for the persistence layer. If unset the service
     /// falls back to an in-memory store.
@@ -347,7 +457,6 @@ impl Default for RmsPostgresConfig {
 
 /// `[logging]` section: tracing output configuration.
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
 pub struct RmsLoggingConfig {
     /// Optional log level / filter directive (e.g. `info` or `info,carbide=debug`).
     /// When unset the compiled-in default (`info`) plus dependency caps apply.
@@ -374,7 +483,6 @@ impl Default for RmsLoggingConfig {
 
 /// `[workflows]` section: firmware staging and long-running job tracking.
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
 pub struct RmsWorkflowConfig {
     /// Directory where RMS stores and reads firmware artifacts.
     #[serde(default = "default_firmware_dir")]
@@ -396,8 +504,8 @@ pub struct RmsWorkflowConfig {
     #[serde(default = "default_terminal_job_ttl_seconds")]
     pub terminal_job_ttl_seconds: NonZeroU64,
 
-    /// Deployment-defined AP inventories selected by the
-    /// `inventory_profile` node descriptor attribute.
+    /// Deployment-defined AP inventories and Flint device counts selected by
+    /// the `inventory_profile` node descriptor attribute.
     #[serde(default)]
     pub expected_inventory_profiles: ExpectedInventoryProfiles,
 }
@@ -417,7 +525,6 @@ impl Default for RmsWorkflowConfig {
 
 /// Fully-parsed RMS runtime configuration.
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
 pub struct RmsConfig {
     /// gRPC server port.
     #[serde(default = "default_port")]
@@ -464,9 +571,13 @@ impl RmsConfig {
     /// Load configuration from the TOML file at `path`, then apply the
     /// `DATABASE_URL` environment override (if present).
     ///
-    /// Returns a human-readable error string suitable for logging to stderr on
+    /// Returns the config alongside the dotted paths of any keys the config
+    /// structs do not define. Unknown keys are usually typos, so the caller is
+    /// expected to warn about them once logging is initialized.
+    ///
+    /// Errors are human-readable strings suitable for logging to stderr on
     /// startup before the tracing subscriber is installed.
-    pub fn load(path: &Path) -> Result<Self, String> {
+    pub fn load(path: &Path) -> Result<(Self, Vec<String>), String> {
         // Read the file in a single syscall rather than checking for existence
         // and then letting figment open it separately. `Toml::file` silently
         // treats a missing file as an empty provider (yielding an all-default
@@ -482,9 +593,21 @@ impl RmsConfig {
             _ => format!("cannot access configuration file {}: {e}", path.display()),
         })?;
 
-        Self::figment(&contents)
+        let figment = Self::figment(&contents);
+        let config: Self = figment
             .extract()
-            .map_err(|e| format!("failed to load configuration from {}: {e}", path.display()))
+            .map_err(|e| format!("failed to load configuration from {}: {e}", path.display()))?;
+
+        // Second pass purely to name the keys no field claims; values were
+        // already validated above, and figment reports those errors better.
+        let mut unknown_keys = Vec::new();
+        if let Ok(merged) = figment.extract::<Value>() {
+            let _ = serde_ignored::deserialize::<_, _, Self>(&merged, |key| {
+                unknown_keys.push(key.to_string());
+            });
+        }
+
+        Ok((config, unknown_keys))
     }
 
     /// Build the figment used by [`Self::load`] from already-read TOML
@@ -509,6 +632,11 @@ mod tests {
     use super::*;
     use figment::Jail;
 
+    /// Load a config, discarding the unknown-key report.
+    fn load(path: &str) -> Result<RmsConfig, String> {
+        RmsConfig::load(Path::new(path)).map(|(config, _)| config)
+    }
+
     #[test]
     fn empty_file_yields_historical_defaults() {
         Jail::expect_with(|jail| {
@@ -516,7 +644,7 @@ mod tests {
             // loader would otherwise merge into `postgres.db_url`.
             jail.clear_env();
             jail.create_file("config.toml", "")?;
-            let config = RmsConfig::load(Path::new("config.toml")).expect("empty config loads");
+            let config = load("config.toml").expect("empty config loads");
 
             assert_eq!(config.port, 8801);
             assert_eq!(config.metrics.port, 8802);
@@ -575,7 +703,7 @@ mod tests {
         Jail::expect_with(|jail| {
             jail.clear_env();
             jail.create_file("config.toml", "")?;
-            let loaded = RmsConfig::load(Path::new("config.toml")).unwrap();
+            let loaded = load("config.toml").unwrap();
             let defaulted = RmsConfig::default();
             assert_eq!(loaded.port, defaulted.port);
             assert_eq!(defaulted.port, 8801);
@@ -637,7 +765,7 @@ mod tests {
                 enable_timestamps = true
                 "#,
             )?;
-            let config = RmsConfig::load(Path::new("config.toml")).expect("full config loads");
+            let config = load("config.toml").expect("full config loads");
 
             assert_eq!(config.port, 9001);
             assert_eq!(config.metrics.port, 9002);
@@ -688,8 +816,9 @@ mod tests {
                     .workflows
                     .expected_inventory_profiles
                     .as_map()
-                    .get("gb200-compute-variant-a"),
-                Some(&vec!["FW_BMC_0".to_owned(), "HGX_FW_GPU_0".to_owned()])
+                    .get("gb200-compute-variant-a")
+                    .map(|profile| profile.ap_names.as_slice()),
+                Some(["FW_BMC_0".to_owned(), "HGX_FW_GPU_0".to_owned()].as_slice())
             );
             assert_eq!(
                 config.workflows.expected_inventory_profiles.as_map().len(),
@@ -716,14 +845,60 @@ mod tests {
                 "#,
             )?;
 
-            let config = RmsConfig::load(Path::new("config.toml")).unwrap();
+            let config = load("config.toml").unwrap();
             assert_eq!(
                 config
                     .workflows
                     .expected_inventory_profiles
                     .as_map()
-                    .get("profile-a"),
-                Some(&vec!["FW_BMC_0".to_owned(), "HGX_FW_GPU_0".to_owned()])
+                    .get("profile-a")
+                    .map(|profile| profile.ap_names.as_slice()),
+                Some(["FW_BMC_0".to_owned(), "HGX_FW_GPU_0".to_owned()].as_slice())
+            );
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn expected_inventory_profile_accepts_flint_device_counts() {
+        Jail::expect_with(|jail| {
+            jail.clear_env();
+            jail.create_file(
+                "config.toml",
+                r#"
+                [workflows.expected_inventory_profiles."sku-gb200"]
+                ap_names = ["FW_BMC_0", "HGX_FW_GPU_0"]
+
+                [workflows.expected_inventory_profiles."sku-gb200".flint_devices]
+                cx7 = 4
+                cx8 = 0
+                bf3_nic = 2
+                "#,
+            )?;
+
+            let config = load("config.toml").unwrap();
+            let catalog =
+                ExpectedInventoryCatalog::from(&config.workflows.expected_inventory_profiles);
+            let policy = catalog.resolve(Some("sku-gb200")).unwrap().unwrap();
+
+            assert_eq!(policy.ap_names.as_ref(), ["FW_BMC_0", "HGX_FW_GPU_0"]);
+            assert_eq!(
+                policy
+                    .flint_device_counts
+                    .get(&FlintDeviceFamily::ConnectX7),
+                Some(&4)
+            );
+            assert_eq!(
+                policy
+                    .flint_device_counts
+                    .get(&FlintDeviceFamily::ConnectX8),
+                Some(&0)
+            );
+            assert_eq!(
+                policy
+                    .flint_device_counts
+                    .get(&FlintDeviceFamily::BlueField3),
+                Some(&2)
             );
             Ok(())
         });
@@ -752,15 +927,25 @@ mod tests {
                 "duplicate trimmed profile",
                 "[workflows.expected_inventory_profiles]\nprofile-a = [\"FW_BMC_0\"]\n\" profile-a \" = [\"HGX_FW_GPU_0\"]\n",
             ),
+            (
+                "empty detailed profile",
+                "[workflows.expected_inventory_profiles.profile-a]\nap_names = []\n",
+            ),
+            (
+                "unknown Flint family",
+                "[workflows.expected_inventory_profiles.profile-a.flint_devices]\ncx9 = 1\n",
+            ),
         ] {
             Jail::expect_with(|jail| {
                 jail.clear_env();
                 jail.create_file("config.toml", toml)?;
-                let error = RmsConfig::load(Path::new("config.toml")).unwrap_err();
+                let error = load("config.toml").unwrap_err();
                 assert!(
                     error.contains("expected inventory")
                         || error.contains("invalid type")
-                        || error.contains("AP name"),
+                        || error.contains("AP name")
+                        || error.contains("did not match")
+                        || error.contains("unknown field"),
                     "{name}: {error}"
                 );
                 Ok(())
@@ -779,13 +964,14 @@ mod tests {
                 profile-a = ["FW_BMC_0"]
                 "#,
             )?;
-            let config = RmsConfig::load(Path::new("config.toml")).unwrap();
+            let config = load("config.toml").unwrap();
             let catalog =
                 ExpectedInventoryCatalog::from(&config.workflows.expected_inventory_profiles);
 
             let policy = catalog.resolve(Some(" profile-a ")).unwrap().unwrap();
             assert_eq!(policy.profile.as_ref(), "profile-a");
             assert_eq!(policy.ap_names.as_ref(), ["FW_BMC_0"]);
+            assert!(policy.flint_device_counts.is_empty());
             assert_eq!(catalog.resolve(None), Ok(None));
             assert_eq!(
                 catalog.resolve(Some("")),
@@ -812,7 +998,7 @@ mod tests {
                 log_level = "warn"
                 "#,
             )?;
-            let config = RmsConfig::load(Path::new("config.toml")).unwrap();
+            let config = load("config.toml").unwrap();
             assert_eq!(config.logging.log_level.as_deref(), Some("warn"));
             assert!(!config.logging.enable_timestamps);
             Ok(())
@@ -824,7 +1010,7 @@ mod tests {
         Jail::expect_with(|jail| {
             jail.clear_env();
             jail.create_file("config.toml", "[logging]\nenable_timestamps = false\n")?;
-            let config = RmsConfig::load(Path::new("config.toml")).unwrap();
+            let config = load("config.toml").unwrap();
             assert!(!config.logging.enable_timestamps);
             Ok(())
         });
@@ -839,7 +1025,7 @@ mod tests {
                 "[postgres]\ndb_url = \"postgres://in-file/db\"\n",
             )?;
             jail.set_env(DATABASE_URL_ENV, "postgres://from-env/db");
-            let config = RmsConfig::load(Path::new("config.toml")).unwrap();
+            let config = load("config.toml").unwrap();
             assert_eq!(
                 config.postgres.db_url.as_deref(),
                 Some("postgres://from-env/db")
@@ -854,7 +1040,7 @@ mod tests {
             jail.clear_env();
             jail.create_file("config.toml", "")?;
             jail.set_env(DATABASE_URL_ENV, "postgres://from-env/db");
-            let config = RmsConfig::load(Path::new("config.toml")).unwrap();
+            let config = load("config.toml").unwrap();
             assert_eq!(
                 config.postgres.db_url.as_deref(),
                 Some("postgres://from-env/db")
@@ -866,8 +1052,7 @@ mod tests {
     #[test]
     fn missing_file_is_an_error() {
         Jail::expect_with(|_jail| {
-            let err = RmsConfig::load(Path::new("does-not-exist.toml"))
-                .expect_err("missing file must error");
+            let err = load("does-not-exist.toml").expect_err("missing file must error");
             assert!(err.contains("configuration file not found"), "got: {err}");
             assert!(err.contains("does-not-exist.toml"), "got: {err}");
             Ok(())
@@ -894,7 +1079,7 @@ mod tests {
             std::fs::set_permissions("locked", std::fs::Permissions::from_mode(0o000))
                 .map_err(io)?;
 
-            let result = RmsConfig::load(Path::new("locked/config.toml"));
+            let result = load("locked/config.toml");
 
             // Restore permissions so the jail temp dir can be cleaned up.
             std::fs::set_permissions("locked", std::fs::Permissions::from_mode(0o755))
@@ -915,33 +1100,27 @@ mod tests {
     }
 
     #[test]
-    fn unknown_key_is_rejected() {
-        Jail::expect_with(|jail| {
-            jail.create_file("config.toml", "not_a_real_key = 5\n")?;
-            let err =
-                RmsConfig::load(Path::new("config.toml")).expect_err("unknown key must error");
-            assert!(err.contains("not_a_real_key"), "got: {err}");
-            Ok(())
-        });
-    }
-
-    #[test]
-    fn unknown_key_in_section_is_rejected() {
-        Jail::expect_with(|jail| {
-            jail.create_file("config.toml", "[postgres]\nnot_a_real_key = 5\n")?;
-            let err = RmsConfig::load(Path::new("config.toml"))
-                .expect_err("unknown key in a section must error");
-            assert!(err.contains("not_a_real_key"), "got: {err}");
-            Ok(())
-        });
-    }
-
-    #[test]
     fn invalid_value_type_is_rejected() {
         Jail::expect_with(|jail| {
             jail.create_file("config.toml", "port = \"not-a-number\"\n")?;
-            let err = RmsConfig::load(Path::new("config.toml")).expect_err("bad type must error");
+            let err = load("config.toml").expect_err("bad type must error");
             assert!(err.contains("port"), "got: {err}");
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn unknown_keys_are_reported_but_accepted() {
+        Jail::expect_with(|jail| {
+            jail.clear_env();
+            jail.create_file(
+                "config.toml",
+                "prot = 9001\n\n[postgres]\ndb_pool_maxx = 42\n",
+            )?;
+            let (config, unknown_keys) = RmsConfig::load(Path::new("config.toml")).unwrap();
+
+            assert_eq!(config.port, 8801);
+            assert_eq!(unknown_keys, ["postgres.db_pool_maxx", "prot"]);
             Ok(())
         });
     }
@@ -950,8 +1129,7 @@ mod tests {
     fn db_pool_max_zero_is_rejected() {
         Jail::expect_with(|jail| {
             jail.create_file("config.toml", "[postgres]\ndb_pool_max = 0\n")?;
-            let err =
-                RmsConfig::load(Path::new("config.toml")).expect_err("zero pool size must error");
+            let err = load("config.toml").expect_err("zero pool size must error");
             assert!(err.contains("db_pool_max"), "got: {err}");
             Ok(())
         });

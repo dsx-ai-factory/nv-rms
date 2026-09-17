@@ -5,7 +5,7 @@ Make sure you have the [build prerequisites](prerequisites.md) installed first.
 ## Cloning the RMS repo
 
 ```bash
-git clone https://github.com/NVIDIA/nv-rms.git
+git clone https://github.com/dsx-ai-factory/nv-rms.git
 cd nv-rms
 ```
 
@@ -19,7 +19,7 @@ The workspace produces two binaries: `rackmanagementservice` (the service) and
 
 ### Release build
 
-Recommended, via the [`Justfile`](https://github.com/NVIDIA/nv-rms/blob/main/Justfile):
+Recommended, via the [`Justfile`](https://github.com/dsx-ai-factory/nv-rms/blob/main/Justfile):
 
 ```bash
 just build
@@ -58,7 +58,7 @@ just docs-api
 
 ## Container images
 
-RMS ships a multi-stage [`Dockerfile`](https://github.com/NVIDIA/nv-rms/blob/main/Dockerfile):
+RMS ships a multi-stage [`Dockerfile`](https://github.com/dsx-ai-factory/nv-rms/blob/main/Dockerfile):
 
 - **Stage 1 - `builder`** (`rust:1.96-bookworm`): the full build environment
   (Rust toolchain, `protoc`, linkers). Produces the workspace release binaries

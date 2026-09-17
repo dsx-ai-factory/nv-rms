@@ -33,7 +33,8 @@ use crate::gh_rftarget::GHRFTarget;
 use crate::hgxb100_rftarget::{HGXB100RFTarget, HGXRUBINRFTarget};
 use crate::powershelf_rftarget::PowerShelfRFTarget;
 use crate::rf_target::{
-    CmdArgs, PkgParser, RFTarget, UpdatePreconditionMode, SERVER_TYPE_CLASS_DICT,
+    same_origin_path_or_default, CmdArgs, PkgParser, RFTarget, UpdatePreconditionMode,
+    SERVER_TYPE_CLASS_DICT,
 };
 use crate::util::{BailAction, Util};
 
@@ -372,22 +373,27 @@ impl ConfigRFTarget {
             .unwrap_or("");
 
         match method {
-            "HttpPushUri" => self
-                .config_dict
-                .get("HttpPushUri")
-                .and_then(|v| v.as_str())
-                .unwrap_or("/redfish/v1/UpdateService")
-                .to_string(),
+            "HttpPushUri" => same_origin_path_or_default(
+                self.config_dict.get("HttpPushUri").and_then(Value::as_str),
+                "/redfish/v1/UpdateService",
+                "configured HttpPushUri",
+            ),
             "MultipartHttpPushUri" => {
                 let system_uri = update_service_response
                     .get("MultipartHttpPushUri")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("/redfish/v1/UpdateService/update-multipart");
-                self.config_dict
-                    .get("MultipartHttpPushUri")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or(system_uri)
-                    .to_string()
+                    .and_then(Value::as_str);
+                let default_uri = same_origin_path_or_default(
+                    system_uri,
+                    "/redfish/v1/UpdateService/update-multipart",
+                    "MultipartHttpPushUri from UpdateService",
+                );
+                same_origin_path_or_default(
+                    self.config_dict
+                        .get("MultipartHttpPushUri")
+                        .and_then(Value::as_str),
+                    &default_uri,
+                    "configured MultipartHttpPushUri",
+                )
             }
             _ => {
                 if let Some(ref target) = self.config_platform_target {
@@ -404,12 +410,13 @@ impl ConfigRFTarget {
     /// Uses `TaskServiceUri` from config if present, otherwise defaults
     /// to `/redfish/v1/TaskService/Tasks/`.
     pub fn get_task_service_uri(&self, task_id: &str) -> String {
-        let base = self
-            .config_dict
-            .get("TaskServiceUri")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .unwrap_or("/redfish/v1/TaskService/Tasks/");
+        let base = same_origin_path_or_default(
+            self.config_dict
+                .get("TaskServiceUri")
+                .and_then(Value::as_str),
+            "/redfish/v1/TaskService/Tasks/",
+            "configured TaskServiceUri",
+        );
 
         // Collapse duplicate slashes
         let raw = format!("{}/{}", base, task_id);
@@ -1040,6 +1047,21 @@ mod tests {
     }
 
     #[test]
+    fn test_get_task_service_uri_rejects_off_origin_config() {
+        let config = json!({"TaskServiceUri": "https://attacker.example/tasks"});
+        let crt = ConfigRFTarget {
+            target_access: BmcAccess::default_stub(),
+            fungible_components: Vec::new(),
+            update_completion_msg: String::new(),
+            progress_table_header_printed: false,
+            config_dict: config,
+            config_platform_target: None,
+        };
+        let uri = crt.get_task_service_uri("99");
+        assert_eq!(uri, "/redfish/v1/TaskService/Tasks/99");
+    }
+
+    #[test]
     fn test_get_update_uri_http_push() {
         let config = json!({
             "FwUpdateMethod": "HttpPushUri",
@@ -1055,6 +1077,64 @@ mod tests {
         };
         let uri = crt.get_update_uri(&json!({}));
         assert_eq!(uri, "/custom/push");
+    }
+
+    #[test]
+    fn test_get_update_uri_rejects_off_origin_http_push_config() {
+        let config = json!({
+            "FwUpdateMethod": "HttpPushUri",
+            "HttpPushUri": "https://attacker.example/push"
+        });
+        let crt = ConfigRFTarget {
+            target_access: BmcAccess::default_stub(),
+            fungible_components: Vec::new(),
+            update_completion_msg: String::new(),
+            progress_table_header_printed: false,
+            config_dict: config,
+            config_platform_target: None,
+        };
+        let uri = crt.get_update_uri(&json!({}));
+        assert_eq!(uri, "/redfish/v1/UpdateService");
+    }
+
+    #[test]
+    fn test_get_update_uri_rejects_off_origin_multipart_config_and_system_uri() {
+        let config = json!({
+            "FwUpdateMethod": "MultipartHttpPushUri",
+            "MultipartHttpPushUri": "//attacker.example/upload"
+        });
+        let crt = ConfigRFTarget {
+            target_access: BmcAccess::default_stub(),
+            fungible_components: Vec::new(),
+            update_completion_msg: String::new(),
+            progress_table_header_printed: false,
+            config_dict: config,
+            config_platform_target: None,
+        };
+        let uri = crt.get_update_uri(&json!({
+            "MultipartHttpPushUri": "https://attacker.example/system-upload"
+        }));
+        assert_eq!(uri, "/redfish/v1/UpdateService/update-multipart");
+    }
+
+    #[test]
+    fn test_get_update_uri_accepts_safe_config_multipart_path() {
+        let config = json!({
+            "FwUpdateMethod": "MultipartHttpPushUri",
+            "MultipartHttpPushUri": " /configured/multipart "
+        });
+        let crt = ConfigRFTarget {
+            target_access: BmcAccess::default_stub(),
+            fungible_components: Vec::new(),
+            update_completion_msg: String::new(),
+            progress_table_header_printed: false,
+            config_dict: config,
+            config_platform_target: None,
+        };
+        let uri = crt.get_update_uri(&json!({
+            "MultipartHttpPushUri": "/redfish/v1/UpdateService/system-multipart"
+        }));
+        assert_eq!(uri, "/configured/multipart");
     }
 
     #[tokio::test]

@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-//! GHRFTarget implementation for GH/HGX/MGX platforms
+//! GHRFTarget implementation for GH/HGX/MGX platforms.
 
 use regex::Regex;
 use serde_json::{json, Value};
@@ -36,7 +36,7 @@ const HGX_PLATFORM_TOKENS: &[&str] = &["HGX", "4059", "4764", "4974", "4975", "G
 // GHRFTarget
 // ---------------------------------------------------------------------------
 
-/// Platform-specific RFTarget for GH, HGX, MGX
+/// Platform-specific RFTarget for GH, HGX, and MGX systems.
 pub struct GHRFTarget {
     /// BMC connection handle.
     pub bmc_access: BmcAccess,

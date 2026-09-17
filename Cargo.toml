@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/common",
     "crates/nvue_client",
     "crates/rackmanagementservice",
     "crates/redfish_client",
@@ -30,7 +31,7 @@ http = "1.4.0"
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio", "server-auto", "client-legacy"] }
 indexmap = { version = "2", features = ["serde"] }
-librms = { git = "https://github.com/NVIDIA/nv-rms-client", rev = "4bbd502d3d9822fb1dcb8d205b7edaecabb497a6", default-features = false }
+librms = { git = "https://github.com/dsx-ai-factory/nv-rms-client", rev = "966d7a701d6b0f2b6a4c59a805b1b9c1cbeffb61", default-features = false }
 mimalloc = { version = "0.1", features = ["override"] }
 noyalib = { version = "0.0.8", features = ["compat-serde-yaml"] }
 nv-redfish = { version = "0.11.0", default-features = false }
@@ -45,6 +46,7 @@ rcgen = "0.13"
 redfish_client = { path = "crates/redfish_client" }
 redfish_test_support = { path = "crates/redfish_test_support" }
 regex = "1"
+common = { path = "crates/common" }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots", "rustls-tls-native-roots", "multipart", "stream"] }
 russh = "0.63.1"
 russh-sftp = "2"
@@ -52,6 +54,7 @@ rustls = "0.23"
 rustls-pemfile = "2"
 secrecy = "0.10"
 serde = { version = "1", features = ["derive"] }
+serde_ignored = "0.1"
 serde_json = "1"
 sha2 = "0.10"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "json", "chrono", "macros", "migrate"] }

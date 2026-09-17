@@ -1,7 +1,7 @@
 # Operations Overview
 
 RMS exposes a single gRPC service, **`RackManager`**, whose service definition
-comes from the external [`librms`](https://github.com/NVIDIA/nv-rms-client) crate.
+comes from the external [`librms`](https://github.com/dsx-ai-factory/nv-rms-client) crate.
 The RPCs are documented by capability across the pages in this section:
 [Power Control](power-control.md), [Inventory](inventory.md),
 [Firmware](firmware.md), [Switch Management](switch-management.md), and
@@ -47,9 +47,24 @@ clobbered by these fallbacks.
 
 A new job for a `(rack_id, node_id)` is refused while a non-terminal job already
 targets that node (`UpdateInProgress`) - this is the "node busy" rejection surfaced
-by the update RPCs. The registry retains at most `max_tracked_jobs` records
-(default 10,000); at capacity, new job creation fails until cleanup reopens space.
-During shutdown, new jobs are refused so RMS can drain in-flight work.
+by the update RPCs. There is no queue: the caller retries. The registry retains at
+most `max_tracked_jobs` records (default 10,000); at capacity, new job creation
+fails until cleanup reopens space. During shutdown, new jobs are refused so RMS
+can drain in-flight work.
+
+In a batch RPC, a node refused this way does not fail the request. It is reported
+in the response's `node_results` with the reason, and counted in
+`stats.failed_nodes`, while every node that *was* admitted still starts. A batch
+is failed outright only when no node was admitted at all - so a `Failure` status
+on a batch that also lists successful nodes means "some nodes were refused", not
+"nothing ran".
+
+A batch admits each `(rack_id, node_id)` only once per request. Naming the same
+node twice does not update it twice: the repeat is reported in `node_results`
+like any other refused node, either as `duplicate target rack_id/node_id:
+{rack_id}/{node_id}` where the batch admits its whole target list up front, or as
+the ordinary "node busy" rejection where nodes are admitted one at a time and the
+first occurrence already owns the node.
 
 ### Parent / child batches
 
@@ -61,14 +76,19 @@ Each child's `parent_job_id` is fixed when that child is created; only the
 parent's `child_job_ids` grows as children are added. A job is reported as a
 parent once its `child_job_ids` is non-empty.
 
-Parent state is **aggregated on read** (and on every reaper pass, so a batch
-whose children all finish still reaches a terminal state even if never polled):
+Parent state is **aggregated on read**, whenever a child's worker task exits
+(including when that worker panics), and on every reaper pass - so a batch whose
+children all finish still reaches a terminal state even if it is never polled:
 
 - All children terminal with no failures → parent `Completed`.
 - All children terminal with any failure → parent `Failed`, with a description
   like `Batch complete: {completed}/{total} succeeded, {failed} failed` and a
   `result_json` listing the failed children.
 - Otherwise → parent `Running` with a progress description.
+
+A parent's terminal state is final. Once aggregation seals a parent, later reads
+and reaper passes report the recorded state instead of re-deriving it, so a
+sealed parent's state and `result_json` cannot change while it is retained.
 
 `GetJobStatus` returns the parent plus each child; the firmware and switch-image
 status RPCs return the single, parent-aggregated job.

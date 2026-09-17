@@ -43,6 +43,7 @@ fn phase_4b1_workflow_module_is_the_canonical_public_import_path() {
         port: Some(443),
         server_type: nvfwupd::workflow::ServerType::GB200Switch,
         verify_tls: false,
+        allow_http: false,
         ssh_known_hosts: None,
         ssh_host_key_mode: nvfwupd::workflow::SshHostKeyMode::TrustOnFirstUse,
     };
@@ -220,7 +221,7 @@ fn phase_4b1_workflow_module_is_the_canonical_public_import_path() {
 
     let activation_modes = [
         nvfwupd::workflow::ActivationMode::SingleCommand(
-            nvfwupd::workflow::ActivationCommand::RfPowerCycle,
+            nvfwupd::workflow::ActivationCommand::PowerCycle,
         ),
         nvfwupd::workflow::ActivationMode::FullGb200Compute,
         nvfwupd::workflow::ActivationMode::SwitchPowerCycle,
@@ -229,13 +230,13 @@ fn phase_4b1_workflow_module_is_the_canonical_public_import_path() {
     assert_eq!(activation_modes.len(), 4);
 
     let activation_commands = [
-        nvfwupd::workflow::ActivationCommand::RfPowerOn,
-        nvfwupd::workflow::ActivationCommand::RfPowerOff,
-        nvfwupd::workflow::ActivationCommand::RfPowerCycle,
-        nvfwupd::workflow::ActivationCommand::RfAuxPowerCycle,
-        nvfwupd::workflow::ActivationCommand::RfPowerStatus,
-        nvfwupd::workflow::ActivationCommand::RfPowerShelfReset,
-        nvfwupd::workflow::ActivationCommand::RfPowerShelfResetForce,
+        nvfwupd::workflow::ActivationCommand::PowerOn,
+        nvfwupd::workflow::ActivationCommand::PowerOff,
+        nvfwupd::workflow::ActivationCommand::PowerCycle,
+        nvfwupd::workflow::ActivationCommand::AuxPowerCycle,
+        nvfwupd::workflow::ActivationCommand::PowerStatus,
+        nvfwupd::workflow::ActivationCommand::PowerShelfReset,
+        nvfwupd::workflow::ActivationCommand::PowerShelfResetForce,
     ];
     assert_eq!(activation_commands.len(), 7);
 }
@@ -249,6 +250,7 @@ fn phase_4b2_workflow_api_facade_functions_are_public_async_entrypoints() {
         port: Some(443),
         server_type: nvfwupd::workflow::ServerType::GB200,
         verify_tls: false,
+        allow_http: false,
         ssh_known_hosts: None,
         ssh_host_key_mode: nvfwupd::workflow::SshHostKeyMode::TrustOnFirstUse,
     };
@@ -338,7 +340,7 @@ fn phase_4b2_workflow_api_facade_functions_are_public_async_entrypoints() {
         target.clone(),
         nvfwupd::workflow::ActivationRequest {
             mode: nvfwupd::workflow::ActivationMode::SingleCommand(
-                nvfwupd::workflow::ActivationCommand::RfPowerStatus,
+                nvfwupd::workflow::ActivationCommand::PowerStatus,
             ),
             cancellation: None,
         },
@@ -366,6 +368,7 @@ fn public_workflow_types_are_constructible() {
         port: Some(443),
         server_type: ServerType::GB200,
         verify_tls: false,
+        allow_http: false,
         ssh_known_hosts: None,
         ssh_host_key_mode: nvfwupd::workflow::SshHostKeyMode::TrustOnFirstUse,
     };
@@ -403,16 +406,16 @@ fn public_workflow_types_are_constructible() {
     assert!(matches!(completed, FirmwareUpdateOutcome::Completed(_)));
 
     let activation = ActivationRequest {
-        mode: ActivationMode::SingleCommand(ActivationCommand::RfPowerCycle),
+        mode: ActivationMode::SingleCommand(ActivationCommand::PowerCycle),
         cancellation: None,
     };
     assert_eq!(
-        ActivationCommand::RfPowerCycle.as_cli_command(),
+        ActivationCommand::PowerCycle.as_cli_command(),
         "RF_PWR_CYCLE"
     );
     assert!(matches!(
         activation.mode,
-        ActivationMode::SingleCommand(ActivationCommand::RfPowerCycle)
+        ActivationMode::SingleCommand(ActivationCommand::PowerCycle)
     ));
 }
 
@@ -534,6 +537,7 @@ fn phase_2c_rftarget_async_contract_is_send_sync() {
         servertype: String::new(),
         base_url: "https://127.0.0.1".to_string(),
         transport_type: "https".to_string(),
+        allow_http: false,
         access_type: AccessType::Login,
         ssh_known_hosts: None,
         ssh_host_key_mode: "tofu".to_string(),

@@ -151,6 +151,20 @@ where
                 request_span.record("rpc.method", method);
             }
 
+            // Emit an entry event so that every gRPC call is visible in logs at the
+            // moment it is received, not only when the request span closes. rpc.method
+            // and rpc.service are explicit event fields because setup_logging only
+            // promotes job_id from spans onto event lines, not rpc.*.
+            if let (Some(method), Some(service)) = (&grpc_method, &grpc_service) {
+                request_span.in_scope(|| {
+                    tracing::info!(
+                        rpc.method = method,
+                        rpc.service = service,
+                        "request received"
+                    );
+                });
+            }
+
             let result = service.call(request).instrument(request_span.clone()).await;
 
             // Holds the overall outcome of the request as a single log message
@@ -229,7 +243,13 @@ where
 mod tests {
     use rcgen::{CertificateParams, DnType, KeyPair};
 
-    use super::cert_peer_identity;
+    use std::sync::{Arc, Mutex};
+
+    use tower::Layer as _;
+    use tower::Service as _;
+    use tracing_subscriber::prelude::*;
+
+    use super::{LogLayer, LogService, cert_peer_identity};
 
     #[test]
     fn cert_peer_identity_returns_subject_dn() {
@@ -271,6 +291,155 @@ mod tests {
         assert!(
             identity.starts_with("sha256:"),
             "expected fingerprint fallback, got {identity}"
+        );
+    }
+
+    // ── LogService entry-event tests ─────────────────────────────────────────
+
+    /// A `Clone`able, thread-safe byte buffer that implements `std::io::Write`.
+    /// Used to capture `LogFmtLayer` output inside tests without touching stdout.
+    #[derive(Clone)]
+    struct SharedBuffer(Arc<Mutex<Vec<u8>>>);
+
+    impl SharedBuffer {
+        fn new() -> Self {
+            Self(Arc::new(Mutex::new(Vec::new())))
+        }
+
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    impl std::io::Write for SharedBuffer {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Builds a `LogService` wrapping a no-op inner service, installs a
+    /// `LogFmtLayer` capturing all output into a `SharedBuffer`, dispatches
+    /// `request`, and returns the captured log lines.
+    async fn call_log_service(request: http::Request<tonic::body::Body>) -> Vec<String> {
+        let buf = SharedBuffer::new();
+        let buf_clone = buf.clone();
+
+        let fmt_layer = crate::logging::logfmt::layer().with_writer(Arc::new(
+            move || -> Box<dyn std::io::Write> { Box::new(buf_clone.clone()) },
+        ));
+        let _guard = tracing_subscriber::registry().with(fmt_layer).set_default();
+
+        let inner = tower::service_fn(|_req: http::Request<tonic::body::Body>| async {
+            Ok::<_, std::convert::Infallible>(http::Response::new(tonic::body::Body::default()))
+        });
+
+        let mut service: LogService<_> = LogLayer::default().layer(inner);
+        let _ = service.call(request).await;
+
+        buf.text().lines().map(str::to_string).collect()
+    }
+
+    fn grpc_post(uri: &str) -> http::Request<tonic::body::Body> {
+        http::Request::builder()
+            .method("POST")
+            .uri(uri)
+            .body(tonic::body::Body::default())
+            .unwrap()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn entry_event_is_emitted_for_grpc_request() {
+        let lines = call_log_service(grpc_post("/nvidia.rms.v1.RackManager/UpdateFirmware")).await;
+
+        let entry = lines
+            .iter()
+            .find(|l| l.contains("request received"))
+            .unwrap_or_else(|| panic!("entry event missing; lines: {lines:?}"));
+
+        assert!(
+            entry.contains("level=INFO"),
+            "expected level=INFO in entry event: {entry}"
+        );
+        // LogFmtLayer renders dots in field names as underscores.
+        assert!(
+            entry.contains("rpc_method=UpdateFirmware"),
+            "expected rpc_method in entry event: {entry}"
+        );
+        assert!(
+            entry.contains("rpc_service=nvidia.rms.v1.RackManager"),
+            "expected rpc_service in entry event: {entry}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn entry_event_is_not_emitted_for_non_post_requests() {
+        let request = http::Request::builder()
+            .method("GET")
+            .uri("/nvidia.rms.v1.RackManager/UpdateFirmware")
+            .body(tonic::body::Body::default())
+            .unwrap();
+
+        let lines = call_log_service(request).await;
+        assert!(
+            !lines.iter().any(|l| l.contains("request received")),
+            "GET request must not emit entry event; lines: {lines:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn entry_event_is_not_emitted_when_uri_has_query_string() {
+        let lines =
+            call_log_service(grpc_post("/nvidia.rms.v1.RackManager/UpdateFirmware?foo=1")).await;
+
+        assert!(
+            !lines.iter().any(|l| l.contains("request received")),
+            "request with query string must not emit entry event; lines: {lines:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn entry_event_is_not_emitted_for_non_grpc_path() {
+        // A path with more than two segments does not match the /<service>/<method> shape.
+        let lines = call_log_service(grpc_post("/some/extra/segments")).await;
+
+        assert!(
+            !lines.iter().any(|l| l.contains("request received")),
+            "non-gRPC path must not emit entry event; lines: {lines:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn entry_event_span_id_matches_closing_span() {
+        let lines = call_log_service(grpc_post("/nvidia.rms.v1.RackManager/GetVersion")).await;
+
+        let entry = lines
+            .iter()
+            .find(|l| l.contains("request received"))
+            .unwrap_or_else(|| panic!("entry event missing; lines: {lines:?}"));
+        let closing_span = lines
+            .iter()
+            .find(|l| l.contains("level=SPAN") && l.contains("span_name=request"))
+            .unwrap_or_else(|| panic!("closing span missing; lines: {lines:?}"));
+
+        // Both lines should carry the same span_id value.
+        fn span_id_from(line: &str) -> &str {
+            let start = line.find("span_id=").expect("span_id field") + "span_id=".len();
+            let end = line[start..]
+                .find(' ')
+                .map(|i| start + i)
+                .unwrap_or(line.len());
+            &line[start..end]
+        }
+
+        assert_eq!(
+            span_id_from(entry),
+            span_id_from(closing_span),
+            "entry event and closing span must share span_id"
         );
     }
 }

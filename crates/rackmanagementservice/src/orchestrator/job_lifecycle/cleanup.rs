@@ -26,10 +26,10 @@ use super::registry::JobRegistry;
 /// Async cleanup owned by a tracked job supervisor.
 #[derive(Debug, Clone)]
 pub enum CleanupPlan {
-    RemoveDir {
+    Immediate {
         path: PathBuf,
     },
-    RemoveDirAfterJobsTerminate {
+    AfterJobsTerminate {
         child_job_ids: Vec<JobId>,
         path: PathBuf,
         timeout: Option<Duration>,
@@ -44,7 +44,7 @@ pub enum CleanupPlan {
 impl CleanupPlan {
     /// Removes a directory after the worker exits.
     pub fn remove_dir(path: impl Into<PathBuf>) -> Self {
-        Self::RemoveDir { path: path.into() }
+        Self::Immediate { path: path.into() }
     }
 
     /// Removes a directory after all child jobs terminate.
@@ -53,7 +53,7 @@ impl CleanupPlan {
         path: impl Into<PathBuf>,
         timeout: Option<Duration>,
     ) -> Self {
-        Self::RemoveDirAfterJobsTerminate {
+        Self::AfterJobsTerminate {
             child_job_ids,
             path: path.into(),
             timeout,
@@ -62,8 +62,8 @@ impl CleanupPlan {
 
     pub(crate) async fn run<D: JobDomain>(self, registry: Arc<JobRegistry<D>>) -> CleanupReport {
         match self {
-            Self::RemoveDir { path } => remove_dir(path).await,
-            Self::RemoveDirAfterJobsTerminate {
+            Self::Immediate { path } => remove_dir(path).await,
+            Self::AfterJobsTerminate {
                 child_job_ids,
                 path,
                 timeout,

@@ -27,6 +27,7 @@ use nvue_client::Client as NvueClient;
 use serde_json::{json, Value};
 
 use crate::bmc_access::BmcAccess;
+use crate::nvos_image;
 use crate::rf_target::{CmdArgs, PkgParser, RFTarget, UpdatePreconditionMode};
 use crate::ssh_transport;
 use crate::util::{BailAction, Util};
@@ -47,6 +48,9 @@ const PER_COMPONENT_UPDATE_URL: &str = "/nvue_v1/platform/firmware";
 
 /// Job status URL for NVUE actions.
 const NVUE_ACTION_URL: &str = "/nvue_v1/action";
+
+/// Short request timeout for NVUE configuration and inventory calls.
+const NVUE_REQUEST_TIMEOUT_SECS: u64 = 120;
 
 /// Destination upload path on the switch filesystem.
 const DEST_UPLOAD_PATH: &str = "/host/fw-images/";
@@ -72,6 +76,19 @@ const PARALLEL_UPDATE_URL_PREFIX: &str = "/nvue_v1/platform/firmware/files";
 
 /// Temporary upload path for VRNVL72 parallel updates.
 const PARALLEL_UPLOAD_PATH: &str = "/tmp/";
+
+const ASIC_FIRMWARE_CONFIG_URI: &str = "/nvue_v1/platform/firmware/ASIC";
+const NVUE_REVISION_URI: &str = "/nvue_v1/revision";
+const NVUE_APPLIED_REVISION_URI: &str = "/nvue_v1/revision/applied";
+const ASIC_CONFIG_APPLY_TIMEOUT: Duration = Duration::from_secs(120);
+const ASIC_CONFIG_APPLY_POLL_INTERVAL: Duration = Duration::from_secs(10);
+const NVOS_SFTP_UPLOAD_TIMEOUT_SECS: u64 = 60 * 60;
+const DEFAULT_REBOOT_WAIT_MINUTES: u64 = 4;
+const NVOS_REBOOT_WAIT_MINUTES: u64 = 30;
+
+/// nvfwupd status/exit codes returned by firmware update workflows.
+const NVFWUPD_STATUS_OK: i32 = 0;
+const NVFWUPD_STATUS_ERR: i32 = 1;
 
 const POWER_CYCLE_COMMAND: &str = "NVUE_PWR_CYCLE";
 const POWER_CYCLE_POST_TIMEOUT_SECS: u64 = 120;
@@ -123,6 +140,39 @@ impl SwitchNvueAccess<'_> {
         }
     }
 
+    async fn get_suppressed(
+        &self,
+        legacy_access: &BmcAccess,
+        path: &str,
+        timeout_secs: u64,
+        json_output: Option<&mut Value>,
+    ) -> (bool, Value) {
+        match self {
+            Self::Legacy => {
+                legacy_access
+                    .dispatch_request_full("GET", path, None, None, timeout_secs, true, json_output)
+                    .await
+            }
+            Self::Hosted(client) => match client.get(path, Duration::from_secs(timeout_secs)).await
+            {
+                Ok(response) if response.status == 200 => {
+                    match serde_json::from_str::<Value>(&response.body) {
+                        Ok(value) => (true, value),
+                        Err(error) => {
+                            record_hosted_nvue_error(json_output, &error.to_string());
+                            (false, json!({"error": error.to_string()}))
+                        }
+                    }
+                }
+                Ok(response) => (false, response.value),
+                Err(error) => {
+                    record_hosted_nvue_error(json_output, &error.to_string());
+                    (false, json!({"error": error.to_string()}))
+                }
+            },
+        }
+    }
+
     async fn post(
         &self,
         legacy_access: &BmcAccess,
@@ -145,6 +195,46 @@ impl SwitchNvueAccess<'_> {
             }
             Self::Hosted(client) => match client
                 .post(path, payload, Duration::from_secs(timeout_secs))
+                .await
+            {
+                Ok(response) => (
+                    (200..300).contains(&response.status),
+                    response.value,
+                    response.body,
+                ),
+                Err(error) => {
+                    record_hosted_nvue_error(json_output, &error.to_string());
+                    (false, json!({"error": error.to_string()}), String::new())
+                }
+            },
+        }
+    }
+
+    async fn patch(
+        &self,
+        legacy_access: &BmcAccess,
+        path: &str,
+        payload: &Value,
+        timeout_secs: u64,
+        json_output: Option<&mut Value>,
+    ) -> (bool, Value, String) {
+        match self {
+            Self::Legacy => {
+                let (ok, response) = legacy_access
+                    .dispatch_request_full(
+                        "PATCH",
+                        path,
+                        Some(payload),
+                        None,
+                        timeout_secs,
+                        true,
+                        json_output,
+                    )
+                    .await;
+                (ok, response, String::new())
+            }
+            Self::Hosted(client) => match client
+                .patch(path, payload, Duration::from_secs(timeout_secs))
                 .await
             {
                 Ok(response) => (
@@ -607,6 +697,33 @@ impl GB200SwitchRFTarget {
         }
     }
 
+    /// Normalize a user-provided switch target and reject path-like values.
+    ///
+    /// Targets later become remote upload subdirectories and NVUE URL path
+    /// segments, so only simple AP labels are accepted here.
+    fn validate_switch_target_name(target: &str) -> Result<String, String> {
+        if target.chars().any(char::is_control) {
+            return Err(format!(
+                "Unsafe switch firmware target '{}': targets must be simple AP names, not paths",
+                NvUtils::sanitize_log(target)
+            ));
+        }
+
+        let trimmed = target.trim();
+        if trimmed.is_empty()
+            || !trimmed
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+        {
+            return Err(format!(
+                "Unsafe switch firmware target '{}': targets must be simple AP names, not paths",
+                NvUtils::sanitize_log(trimmed)
+            ));
+        }
+
+        Ok(trimmed.to_lowercase())
+    }
+
     /// Build the upload/install plan for a serial switch component update.
     ///
     /// CPLD uploads use a shared remote subdirectory while fwpkg-style targets
@@ -615,13 +732,18 @@ impl GB200SwitchRFTarget {
         target: &str,
         recipe_path: &str,
         unpack_dict: &HashMap<String, Vec<String>>,
-    ) -> Option<SwitchSerialUpdatePlan> {
-        let target_lower = target.to_lowercase();
+    ) -> Result<SwitchSerialUpdatePlan, String> {
+        let target_lower = Self::validate_switch_target_name(target)?;
         let file_ext_map = Self::ap_file_ext();
         let expected_ext = file_ext_map.get(target_lower.as_str()).unwrap_or(&".bin");
 
         let file_path = if *expected_ext != ".fwpkg" {
-            Self::get_update_file(&target_lower, unpack_dict)?
+            Self::get_update_file(&target_lower, unpack_dict).ok_or_else(|| {
+                format!(
+                    "Could not find a matching firmware file for {}",
+                    NvUtils::sanitize_log(target.trim())
+                )
+            })?
         } else {
             recipe_path.to_string()
         };
@@ -631,8 +753,8 @@ impl GB200SwitchRFTarget {
         let local_filename = file_path.rsplit('/').next().unwrap_or(&file_path);
         let remote_name = local_filename.replace(".bin", expected_ext);
 
-        Some(SwitchSerialUpdatePlan {
-            target: target.to_string(),
+        Ok(SwitchSerialUpdatePlan {
+            target: target.trim().to_string(),
             file_path,
             remote_dir,
             remote_name,
@@ -646,6 +768,759 @@ impl GB200SwitchRFTarget {
             "{}/{}/files/{}",
             PER_COMPONENT_UPDATE_URL, target, file_name
         )
+    }
+
+    /// Return the single NVOS image recipe when this update is an NVOS install.
+    fn nvos_image_recipe(recipe_list: &[String]) -> Result<Option<&str>, String> {
+        let nvos_recipes: Vec<&String> = recipe_list
+            .iter()
+            .filter(|recipe| nvos_image::is_nvos_image_path(recipe))
+            .collect();
+
+        if nvos_recipes.is_empty() {
+            return Ok(None);
+        }
+
+        if recipe_list.len() != 1 || nvos_recipes.len() != 1 {
+            return Err(
+                "NVOS image updates must pass exactly one NVOS .bin image and cannot be mixed with firmware packages"
+                    .to_string(),
+            );
+        }
+
+        Ok(Some(nvos_recipes[0].as_str()))
+    }
+
+    /// Return whether ASIC firmware settings already satisfy NVOS update preconditions.
+    fn asic_firmware_config_matches(config: &Value) -> bool {
+        config.get("auto-update").and_then(Value::as_str) == Some("enabled")
+            && config.get("fw-source").and_then(Value::as_str) == Some("default")
+    }
+
+    /// Describe ASIC firmware settings for human-readable precondition errors.
+    fn describe_asic_firmware_config(config: &Value) -> String {
+        let auto_update = config
+            .get("auto-update")
+            .and_then(Value::as_str)
+            .unwrap_or("missing");
+        let fw_source = config
+            .get("fw-source")
+            .and_then(Value::as_str)
+            .unwrap_or("missing");
+        format!("auto-update={auto_update}, fw-source={fw_source}")
+    }
+
+    /// Extract an NVUE revision id from the response shapes returned by `/revision`.
+    fn revision_id_from_response(details: &Value, body: &str) -> Option<String> {
+        if let Some(id) = details.as_str().map(str::trim).filter(|id| !id.is_empty()) {
+            return Some(id.to_string());
+        }
+
+        if let Some(id) = details.as_u64() {
+            return Some(id.to_string());
+        }
+
+        for key in ["revision-id", "revision_id", "revisionId", "id", "Id"] {
+            if let Some(id) = details.get(key).and_then(Value::as_str) {
+                let id = id.trim();
+                if !id.is_empty() {
+                    return Some(id.to_string());
+                }
+            }
+        }
+
+        if let Some(object) = details.as_object() {
+            if object.len() == 1 {
+                if let Some((id, _)) = object.iter().next() {
+                    if !id.trim().is_empty() {
+                        return Some(id.to_string());
+                    }
+                }
+            }
+        }
+
+        let body = body.trim().trim_matches('"');
+        if body.is_empty() || body.starts_with('{') || body.starts_with('[') {
+            None
+        } else {
+            Some(body.to_string())
+        }
+    }
+
+    /// Validate revision ids before using them in NVUE paths or query strings.
+    fn validate_revision_id(revision_id: &str) -> Result<(), String> {
+        if revision_id.is_empty()
+            || !revision_id
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.')
+        {
+            return Err(format!(
+                "NVUE returned unsafe revision id '{}'",
+                NvUtils::sanitize_log(revision_id)
+            ));
+        }
+        Ok(())
+    }
+
+    /// Return `/nvue_v1/platform/firmware/ASIC?rev=<revision>` for config edits.
+    fn asic_firmware_config_uri_for_revision(revision_id: &str) -> String {
+        format!("{ASIC_FIRMWARE_CONFIG_URI}?rev={revision_id}")
+    }
+
+    /// Return `/nvue_v1/revision/<revision>` for apply/poll operations.
+    fn revision_uri(revision_id: &str) -> String {
+        format!("{NVUE_REVISION_URI}/{revision_id}")
+    }
+
+    /// Extract a revision state from flat or revision-id-keyed NVUE responses.
+    fn revision_state(response: &Value, revision_id: &str) -> Option<String> {
+        response
+            .get(revision_id)
+            .and_then(|value| value.get("state"))
+            .or_else(|| response.get("state"))
+            .and_then(Value::as_str)
+            .map(|state| state.to_ascii_lowercase())
+    }
+
+    /// Return the next revision-poll request timeout without exceeding the deadline.
+    fn revision_poll_timeout_secs(deadline: std::time::Instant) -> Option<u64> {
+        let remaining = deadline.checked_duration_since(std::time::Instant::now())?;
+        Some(
+            remaining
+                .as_secs()
+                .clamp(1, ASIC_CONFIG_APPLY_POLL_INTERVAL.as_secs()),
+        )
+    }
+
+    /// Return the next revision-poll sleep interval without exceeding the deadline.
+    fn revision_poll_sleep(deadline: std::time::Instant) -> Option<std::time::Duration> {
+        let remaining = deadline.checked_duration_since(std::time::Instant::now())?;
+        if remaining.is_zero() {
+            return None;
+        }
+        Some(remaining.min(ASIC_CONFIG_APPLY_POLL_INTERVAL))
+    }
+
+    /// Wait for an NVUE revision to reach the applied state.
+    async fn wait_for_revision_applied(
+        &self,
+        access: SwitchNvueAccess<'_>,
+        revision_id: &str,
+        mut json_dict: Option<&mut Value>,
+    ) -> Result<(), String> {
+        let deadline = std::time::Instant::now() + ASIC_CONFIG_APPLY_TIMEOUT;
+        let revision_uri = Self::revision_uri(revision_id);
+        let mut last_state = "unknown".to_string();
+        let mut last_response = json!({});
+
+        loop {
+            let Some(request_timeout_secs) = Self::revision_poll_timeout_secs(deadline) else {
+                return Err(format!(
+                    "Timed out waiting for NVUE revision {revision_id} to apply ASIC firmware precondition config (last state: {last_state}, last response: {})",
+                    response_summary(&last_response, "")
+                ));
+            };
+
+            let (status, response) = access
+                .get_suppressed(
+                    &self.bmc_access,
+                    &revision_uri,
+                    request_timeout_secs,
+                    json_dict.as_deref_mut(),
+                )
+                .await;
+            if status {
+                last_response = response.clone();
+                if let Some(state) = Self::revision_state(&response, revision_id) {
+                    last_state = state;
+                }
+
+                match last_state.as_str() {
+                    "applied" => return Ok(()),
+                    "failed" | "error" | "invalid" => {
+                        return Err(format!(
+                            "NVUE revision {revision_id} failed while applying ASIC firmware precondition config: {}",
+                            response_summary(&response, "")
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+
+            let Some(sleep_duration) = Self::revision_poll_sleep(deadline) else {
+                return Err(format!(
+                    "Timed out waiting for NVUE revision {revision_id} to apply ASIC firmware precondition config (last state: {last_state}, last response: {})",
+                    response_summary(&last_response, "")
+                ));
+            };
+
+            tokio::time::sleep(sleep_duration).await;
+        }
+    }
+
+    /// Save the currently applied NVUE configuration so it persists after reboot.
+    ///
+    /// NVOS updates reboot the switch, and unsaved applied configuration can be
+    /// lost during that reboot. The primary path mirrors `nv config save` by
+    /// saving `/revision/applied`; when this call follows an explicit revision
+    /// apply, the concrete revision endpoint is tried as a compatibility
+    /// fallback for NVUE builds that do not accept `/revision/applied`.
+    async fn save_applied_nvue_config(
+        &self,
+        access: SwitchNvueAccess<'_>,
+        revision_id: Option<&str>,
+        mut json_dict: Option<&mut Value>,
+    ) -> Result<(), String> {
+        let is_json = json_dict.is_some();
+        let payload = json!({
+            "state": "save",
+            "auto-prompt": {"ays": "ays_yes"}
+        });
+        let (saved, save_response, save_body) = access
+            .patch(
+                &self.bmc_access,
+                NVUE_APPLIED_REVISION_URI,
+                &payload,
+                NVUE_REQUEST_TIMEOUT_SECS,
+                json_dict.as_deref_mut(),
+            )
+            .await;
+        if saved {
+            tracing::info!(
+                log_only = true,
+                json_mode = is_json,
+                "saved applied NVUE configuration before NVOS update"
+            );
+            return Ok(());
+        }
+
+        if let Some(revision_id) = revision_id {
+            let revision_uri = Self::revision_uri(revision_id);
+            let (fallback_saved, fallback_response, fallback_body) = access
+                .patch(
+                    &self.bmc_access,
+                    &revision_uri,
+                    &payload,
+                    NVUE_REQUEST_TIMEOUT_SECS,
+                    json_dict,
+                )
+                .await;
+            if fallback_saved {
+                tracing::info!(
+                    log_only = true,
+                    json_mode = is_json,
+                    revision_id,
+                    "saved applied NVUE configuration with concrete revision fallback before NVOS update"
+                );
+                return Ok(());
+            }
+
+            return Err(format!(
+                "Failed to save applied NVUE configuration before NVOS update: \
+                 {NVUE_APPLIED_REVISION_URI}: {}; {revision_uri}: {}",
+                response_summary(&save_response, &save_body),
+                response_summary(&fallback_response, &fallback_body)
+            ));
+        }
+
+        Err(format!(
+            "Failed to save applied NVUE configuration before NVOS update: {}",
+            response_summary(&save_response, &save_body)
+        ))
+    }
+
+    /// Ensure switch ASIC firmware config allows safe NVOS system-image updates.
+    async fn ensure_nvos_asic_firmware_config(
+        &self,
+        access: SwitchNvueAccess<'_>,
+        mut json_dict: Option<&mut Value>,
+    ) -> Result<(), String> {
+        let (status, current_config) = access
+            .get(
+                &self.bmc_access,
+                ASIC_FIRMWARE_CONFIG_URI,
+                NVUE_REQUEST_TIMEOUT_SECS,
+                json_dict.as_deref_mut(),
+            )
+            .await;
+        if !status {
+            return Err(format!(
+                "Failed to query {ASIC_FIRMWARE_CONFIG_URI} before NVOS update: {}",
+                response_summary(&current_config, "")
+            ));
+        }
+
+        if Self::asic_firmware_config_matches(&current_config) {
+            return self.save_applied_nvue_config(access, None, json_dict).await;
+        }
+
+        let before = Self::describe_asic_firmware_config(&current_config);
+        let create_payload = json!({});
+        let (created, revision_response, revision_body) = access
+            .post(
+                &self.bmc_access,
+                NVUE_REVISION_URI,
+                &create_payload,
+                NVUE_REQUEST_TIMEOUT_SECS,
+                json_dict.as_deref_mut(),
+            )
+            .await;
+        if !created {
+            return Err(format!(
+                "Failed to create NVUE revision for ASIC firmware precondition config: {}",
+                response_summary(&revision_response, &revision_body)
+            ));
+        }
+
+        let revision_id = Self::revision_id_from_response(&revision_response, &revision_body)
+            .ok_or_else(|| {
+                format!(
+                    "Failed to create NVUE revision for ASIC firmware precondition config: missing revision id in {}",
+                    response_summary(&revision_response, &revision_body)
+                )
+            })?;
+        Self::validate_revision_id(&revision_id)?;
+
+        let patch_payload = json!({
+            "auto-update": "enabled",
+            "fw-source": "default",
+        });
+        let patch_uri = Self::asic_firmware_config_uri_for_revision(&revision_id);
+        let (patched, patch_response, patch_body) = access
+            .patch(
+                &self.bmc_access,
+                &patch_uri,
+                &patch_payload,
+                NVUE_REQUEST_TIMEOUT_SECS,
+                json_dict.as_deref_mut(),
+            )
+            .await;
+        if !patched {
+            return Err(format!(
+                "Failed to set ASIC firmware precondition config from {before} to auto-update=enabled, fw-source=default: {}",
+                response_summary(&patch_response, &patch_body)
+            ));
+        }
+
+        let apply_payload = json!({
+            "state": "apply",
+            "auto-prompt": {"ays": "ays_yes"}
+        });
+        let revision_uri = Self::revision_uri(&revision_id);
+        let (applied, apply_response, apply_body) = access
+            .patch(
+                &self.bmc_access,
+                &revision_uri,
+                &apply_payload,
+                NVUE_REQUEST_TIMEOUT_SECS,
+                json_dict.as_deref_mut(),
+            )
+            .await;
+        if !applied {
+            return Err(format!(
+                "Failed to apply NVUE revision {revision_id} for ASIC firmware precondition config: {}",
+                response_summary(&apply_response, &apply_body)
+            ));
+        }
+
+        self.wait_for_revision_applied(access, &revision_id, json_dict.as_deref_mut())
+            .await?;
+
+        let (status, verified_config) = access
+            .get(
+                &self.bmc_access,
+                ASIC_FIRMWARE_CONFIG_URI,
+                NVUE_REQUEST_TIMEOUT_SECS,
+                json_dict.as_deref_mut(),
+            )
+            .await;
+        if !status {
+            return Err(format!(
+                "Failed to verify {ASIC_FIRMWARE_CONFIG_URI} after applying ASIC firmware precondition config: {}",
+                response_summary(&verified_config, "")
+            ));
+        }
+
+        if !Self::asic_firmware_config_matches(&verified_config) {
+            return Err(format!(
+                "ASIC firmware precondition config did not converge after NVUE revision {revision_id}; observed {}",
+                Self::describe_asic_firmware_config(&verified_config)
+            ));
+        }
+
+        self.save_applied_nvue_config(access, Some(&revision_id), json_dict)
+            .await?;
+
+        Ok(())
+    }
+
+    /// Best-effort cleanup for an NVOS image staged before NVUE accepts install.
+    async fn cleanup_nvos_staged_image(&self, remote_path: &str, is_json: bool) -> Option<String> {
+        match self
+            .bmc_access
+            .scp_remove_remote_file_async_result(remote_path)
+            .await
+        {
+            Ok(()) => None,
+            Err(error) => {
+                let message = NvUtils::sanitize_log(&format!(
+                    "Failed to remove staged NVOS image {remote_path}: {error}"
+                ));
+                tracing::warn!("{}", message);
+                if !is_json {
+                    println!("Warning: {}", message);
+                }
+                Some(message)
+            }
+        }
+    }
+
+    /// Start an NVOS system-image install from a staged `.bin` file.
+    #[allow(clippy::too_many_arguments)]
+    async fn start_nvos_image_update_with_access(
+        &mut self,
+        access: SwitchNvueAccess<'_>,
+        recipe: &str,
+        cmd_args: &CmdArgs,
+        parallel_update: bool,
+        mut json_dict: Option<&mut Value>,
+        update_delay: u64,
+        skip_pre_flight_checks: bool,
+    ) -> (i32, Vec<String>) {
+        let image_file_name = match nvos_image::safe_image_file_name(recipe) {
+            Ok(file_name) => file_name,
+            Err(message) => {
+                if let Some(ref mut jd) = json_dict {
+                    push_switch_update_failure(
+                        jd,
+                        &message,
+                        json!({"stage": "validate", "target": nvos_image::NVOS_AP_NAME}),
+                    );
+                }
+                Util::bail_nvfwupd(
+                    NVFWUPD_STATUS_ERR,
+                    &message,
+                    BailAction::DoNothing,
+                    json_dict.as_ref().map(|v| v as &Value),
+                );
+                return (NVFWUPD_STATUS_ERR, Vec::new());
+            }
+        };
+        let target_version =
+            nvos_image::package_version_from_image_path(recipe).unwrap_or_else(|| "unknown".into());
+        let is_json = json_dict.is_some();
+
+        if update_delay > 0 {
+            if !is_json {
+                println!(
+                    "Waiting {} seconds before beginning NVOS update",
+                    update_delay
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(update_delay)).await;
+        }
+
+        if !skip_pre_flight_checks {
+            if let Err(message) = self
+                .ensure_nvos_asic_firmware_config(access, json_dict.as_deref_mut())
+                .await
+            {
+                if let Some(ref mut jd) = json_dict {
+                    push_switch_update_failure(
+                        jd,
+                        &message,
+                        json!({
+                            "stage": "preflight",
+                            "target": nvos_image::NVOS_AP_NAME,
+                        }),
+                    );
+                }
+                Util::bail_nvfwupd(
+                    NVFWUPD_STATUS_ERR,
+                    &message,
+                    BailAction::DoNothing,
+                    json_dict.as_ref().map(|v| v as &Value),
+                );
+                return (NVFWUPD_STATUS_ERR, Vec::new());
+            }
+        }
+
+        if let Some(ref mut jd) = json_dict {
+            push_switch_progress_event(
+                jd,
+                "upload",
+                Some(nvos_image::NVOS_AP_NAME),
+                None,
+                Some("running"),
+                None,
+                Some(json!({
+                    "local_file": recipe,
+                    "remote_dir": nvos_image::NVOS_UPLOAD_DIR,
+                    "remote_name": image_file_name,
+                    "target_version": target_version,
+                })),
+            );
+        }
+        tracing::info!(
+            log_only = true,
+            json_mode = is_json,
+            target = nvos_image::NVOS_AP_NAME,
+            local_file = recipe,
+            remote_dir = nvos_image::NVOS_UPLOAD_DIR,
+            remote_name = image_file_name,
+            upload_timeout_secs = NVOS_SFTP_UPLOAD_TIMEOUT_SECS,
+            "uploading NVOS image via SFTP"
+        );
+        if !is_json {
+            println!(
+                "Uploading NVOS image via SFTP to {} (timeout: {} minutes). This may take several minutes.",
+                nvos_image::NVOS_UPLOAD_DIR,
+                NVOS_SFTP_UPLOAD_TIMEOUT_SECS / 60
+            );
+        }
+
+        let dest_path = match self
+            .bmc_access
+            .scp_upload_async_result_with_timeout(
+                recipe,
+                nvos_image::NVOS_UPLOAD_DIR,
+                &image_file_name,
+                is_json,
+                NVOS_SFTP_UPLOAD_TIMEOUT_SECS,
+            )
+            .await
+        {
+            Ok(path) => path,
+            Err(error) => {
+                let message = format!("NVOS image upload failed: {error}");
+                if let Some(ref mut jd) = json_dict {
+                    push_switch_update_failure(
+                        jd,
+                        &message,
+                        json!({
+                            "stage": "upload",
+                            "target": nvos_image::NVOS_AP_NAME,
+                            "local_file": recipe,
+                            "remote_dir": nvos_image::NVOS_UPLOAD_DIR,
+                            "remote_name": image_file_name,
+                        }),
+                    );
+                }
+                Util::bail_nvfwupd(
+                    NVFWUPD_STATUS_ERR,
+                    &message,
+                    BailAction::DoNothing,
+                    json_dict.as_ref().map(|v| v as &Value),
+                );
+                return (NVFWUPD_STATUS_ERR, Vec::new());
+            }
+        };
+
+        if let Some(ref mut jd) = json_dict {
+            push_switch_progress_event(
+                jd,
+                "upload",
+                Some(nvos_image::NVOS_AP_NAME),
+                None,
+                Some("success"),
+                None,
+                Some(json!({
+                    "local_file": recipe,
+                    "remote_path": dest_path,
+                    "target_version": target_version,
+                })),
+            );
+        }
+
+        let (files_ok, files_response) = access
+            .get(
+                &self.bmc_access,
+                nvos_image::SYSTEM_IMAGE_FILES_URI,
+                NVUE_REQUEST_TIMEOUT_SECS,
+                json_dict.as_deref_mut(),
+            )
+            .await;
+        if !files_ok || !nvos_image::response_contains_file_name(&files_response, &image_file_name)
+        {
+            let message = format!(
+                "NVOS image {image_file_name} was uploaded but is not visible in {}",
+                nvos_image::SYSTEM_IMAGE_FILES_URI
+            );
+            let cleanup_error = self.cleanup_nvos_staged_image(&dest_path, is_json).await;
+            if let Some(ref mut jd) = json_dict {
+                let mut details = json!({
+                    "stage": "verify_upload",
+                    "target": nvos_image::NVOS_AP_NAME,
+                    "remote_path": &dest_path,
+                    "response": files_response,
+                });
+                if let Some(cleanup_error) = cleanup_error {
+                    details["cleanup_error"] = json!(cleanup_error);
+                }
+                push_switch_update_failure(jd, &message, details);
+            }
+            Util::bail_nvfwupd(
+                NVFWUPD_STATUS_ERR,
+                &message,
+                BailAction::DoNothing,
+                json_dict.as_ref().map(|v| v as &Value),
+            );
+            return (NVFWUPD_STATUS_ERR, Vec::new());
+        }
+
+        if !is_json {
+            println!(
+                "Starting NVOS image update for: {}",
+                nvos_image::NVOS_AP_NAME
+            );
+        }
+
+        let install_url = format!("{}/{}", nvos_image::SYSTEM_IMAGE_FILES_URI, image_file_name);
+        let install_json = json!({
+            "@install": {
+                "state": "start",
+                "parameters": {
+                    "force": false,
+                    "reboot": "no",
+                    "image-file": image_file_name,
+                }
+            }
+        });
+
+        if let Some(ref mut jd) = json_dict {
+            push_switch_progress_event(
+                jd,
+                "install",
+                Some(nvos_image::NVOS_AP_NAME),
+                None,
+                Some("posting"),
+                None,
+                Some(json!({
+                    "url": install_url,
+                    "remote_path": dest_path,
+                    "target_version": target_version,
+                })),
+            );
+        }
+
+        let (post_status, post_details, resp_text) = access
+            .post(
+                &self.bmc_access,
+                &install_url,
+                &install_json,
+                1200,
+                json_dict.as_deref_mut(),
+            )
+            .await;
+        if !post_status {
+            let message = format!(
+                "NVOS image install failed: {}",
+                response_summary(&post_details, &resp_text)
+            );
+            let cleanup_error = self.cleanup_nvos_staged_image(&dest_path, is_json).await;
+            if let Some(ref mut jd) = json_dict {
+                let mut details = json!({
+                    "stage": "install",
+                    "target": nvos_image::NVOS_AP_NAME,
+                    "url": install_url,
+                    "remote_path": &dest_path,
+                    "response": post_details,
+                });
+                if let Some(cleanup_error) = cleanup_error {
+                    details["cleanup_error"] = json!(cleanup_error);
+                }
+                push_switch_update_failure(jd, &message, details);
+            }
+            Util::bail_nvfwupd(
+                NVFWUPD_STATUS_ERR,
+                &message,
+                BailAction::DoNothing,
+                json_dict.as_ref().map(|v| v as &Value),
+            );
+            return (NVFWUPD_STATUS_ERR, Vec::new());
+        }
+
+        let job_id = nvue_action_id(&post_details, &resp_text)
+            .unwrap_or_else(|| resp_text.trim().to_string());
+        if job_id.is_empty() {
+            let message = "No job ID in NVOS image install response";
+            let cleanup_error = self.cleanup_nvos_staged_image(&dest_path, is_json).await;
+            if let Some(ref mut jd) = json_dict {
+                let mut details = json!({
+                    "stage": "install",
+                    "target": nvos_image::NVOS_AP_NAME,
+                    "remote_path": &dest_path,
+                    "response": post_details,
+                });
+                if let Some(cleanup_error) = cleanup_error {
+                    details["cleanup_error"] = json!(cleanup_error);
+                }
+                push_switch_update_failure(jd, message, details);
+            }
+            Util::bail_nvfwupd(
+                NVFWUPD_STATUS_ERR,
+                message,
+                BailAction::DoNothing,
+                json_dict.as_ref().map(|v| v as &Value),
+            );
+            return (NVFWUPD_STATUS_ERR, Vec::new());
+        }
+
+        if let Some(ref mut jd) = json_dict {
+            push_switch_progress_event(
+                jd,
+                "install",
+                Some(nvos_image::NVOS_AP_NAME),
+                Some(&job_id),
+                Some("accepted"),
+                None,
+                Some(json!({
+                    "url": install_url,
+                    "target_version": target_version,
+                })),
+            );
+        }
+
+        if !is_json {
+            println!("NVOS update task was created with ID {}", job_id);
+        }
+
+        let task_id_list = vec![job_id.clone()];
+        if parallel_update || cmd_args.background {
+            return (NVFWUPD_STATUS_OK, task_id_list);
+        }
+
+        let (ret_code, final_state) = self
+            .monitor_task_completion(
+                access,
+                &job_id,
+                Some(nvos_image::NVOS_AP_NAME),
+                "",
+                "",
+                "",
+                cmd_args.background,
+                json_dict.as_deref_mut(),
+            )
+            .await;
+
+        if ret_code == NVFWUPD_STATUS_OK {
+            if let Some(ref mut jd) = json_dict {
+                push_switch_progress_event(
+                    jd,
+                    "complete",
+                    Some(nvos_image::NVOS_AP_NAME),
+                    Some(&job_id),
+                    Some("success"),
+                    None,
+                    Some(json!({
+                        "target_version": target_version,
+                        "state": final_state,
+                    })),
+                );
+            }
+        }
+
+        (ret_code, task_id_list)
     }
 
     /// Get task status from the NVUE action endpoint.
@@ -725,14 +1600,14 @@ impl GB200SwitchRFTarget {
     async fn get_nvue_firmware_inventory(
         &self,
         access: SwitchNvueAccess<'_>,
-        json_output: Option<&mut Value>,
+        mut json_output: Option<&mut Value>,
     ) -> (bool, i32, serde_json::Map<String, Value>) {
         let (status, response) = access
             .get(
                 &self.bmc_access,
                 "/nvue_v1/platform/firmware",
-                120,
-                json_output,
+                NVUE_REQUEST_TIMEOUT_SECS,
+                json_output.as_deref_mut(),
             )
             .await;
 
@@ -765,7 +1640,24 @@ impl GB200SwitchRFTarget {
             }
         }
 
-        (status, 0, inventory)
+        if status {
+            let (image_status, image_response) = access
+                .get_suppressed(
+                    &self.bmc_access,
+                    nvos_image::SYSTEM_IMAGE_URI,
+                    NVUE_REQUEST_TIMEOUT_SECS,
+                    json_output,
+                )
+                .await;
+            if image_status {
+                if let Some(entry) = nvos_image::inventory_entry_from_system_image(&image_response)
+                {
+                    inventory.insert(nvos_image::NVOS_AP_NAME.to_string(), entry);
+                }
+            }
+        }
+
+        (status, NVFWUPD_STATUS_OK, inventory)
     }
 
     /// Query task status and print results.
@@ -793,7 +1685,7 @@ impl GB200SwitchRFTarget {
                 }
             } else {
                 Util::bail_nvfwupd(
-                    1,
+                    NVFWUPD_STATUS_ERR,
                     &format!(
                         "Failure status for job {}: Error {}",
                         task_id,
@@ -803,7 +1695,7 @@ impl GB200SwitchRFTarget {
                     None,
                 );
             }
-            return (1, job_state, Some(resp_dict));
+            return (NVFWUPD_STATUS_ERR, job_state, Some(resp_dict));
         }
 
         if let Some(jd) = json_dict {
@@ -815,7 +1707,7 @@ impl GB200SwitchRFTarget {
             self.print_task_completion_inner(&resp_dict);
         }
 
-        (0, job_state, Some(resp_dict))
+        (NVFWUPD_STATUS_OK, job_state, Some(resp_dict))
     }
 
     fn print_task_completion_inner(&self, task_dict: &Value) {
@@ -859,6 +1751,18 @@ impl GB200SwitchRFTarget {
         lower.contains("reboot")
             || lower.contains("offline during reboot")
             || lower.contains("system is offline")
+    }
+
+    /// Return the reboot wait window to use after a task enters reboot handoff.
+    fn reboot_wait_minutes_for_target(target: Option<&str>) -> u64 {
+        if target
+            .map(|target| target.eq_ignore_ascii_case(nvos_image::NVOS_AP_NAME))
+            .unwrap_or(false)
+        {
+            NVOS_REBOOT_WAIT_MINUTES
+        } else {
+            DEFAULT_REBOOT_WAIT_MINUTES
+        }
     }
 
     /// Decide whether an NVUE task response should fail the firmware workflow.
@@ -906,7 +1810,7 @@ impl GB200SwitchRFTarget {
         let is_json = json_dict.is_some();
 
         if background {
-            return (0, final_state);
+            return (NVFWUPD_STATUS_OK, final_state);
         }
 
         if job_status.contains("error") {
@@ -921,15 +1825,17 @@ impl GB200SwitchRFTarget {
                     None,
                 );
             }
-            return (1, final_state);
+            return (NVFWUPD_STATUS_ERR, final_state);
         }
 
         if Self::task_state_is_success(task_state) {
-            return (0, final_state);
+            return (NVFWUPD_STATUS_OK, final_state);
         }
 
         if Self::task_status_indicates_reboot(task_status) {
-            let reboot_status = self.get_system_rebooted_status(access, 4).await;
+            let reboot_status = self
+                .get_system_rebooted_status(access, Self::reboot_wait_minutes_for_target(target))
+                .await;
 
             if !reboot_status {
                 if let Some(output) = json_dict.as_deref_mut() {
@@ -945,15 +1851,15 @@ impl GB200SwitchRFTarget {
                 }
                 if !is_json {
                     Util::bail_nvfwupd(
-                        1,
+                        NVFWUPD_STATUS_ERR,
                         &format!("Task {} reboot not complete", job_id),
                         BailAction::DoNothing,
                         None,
                     );
                 }
-                return (1, final_state);
+                return (NVFWUPD_STATUS_ERR, final_state);
             }
-            return (0, final_state);
+            return (NVFWUPD_STATUS_OK, final_state);
         }
 
         let mut last_progress_state = String::new();
@@ -979,13 +1885,13 @@ impl GB200SwitchRFTarget {
                 }
                 if !is_json {
                     Util::bail_nvfwupd(
-                        1,
+                        NVFWUPD_STATUS_ERR,
                         &format!("Task {} failed", job_id),
                         BailAction::DoNothing,
                         None,
                     );
                 }
-                return (1, final_state);
+                return (NVFWUPD_STATUS_ERR, final_state);
             }
 
             final_state = Self::task_state(&task_dict);
@@ -1022,21 +1928,26 @@ impl GB200SwitchRFTarget {
                 }
                 if !is_json {
                     Util::bail_nvfwupd(
-                        1,
+                        NVFWUPD_STATUS_ERR,
                         &format!("Task {} failed", job_id),
                         BailAction::DoNothing,
                         None,
                     );
                 }
-                return (1, final_state);
+                return (NVFWUPD_STATUS_ERR, final_state);
             }
 
             if Self::task_is_success(&task_dict) {
-                return (0, final_state);
+                return (NVFWUPD_STATUS_OK, final_state);
             }
 
             if Self::task_status_indicates_reboot(&current_status) {
-                let reboot_status = self.get_system_rebooted_status(access, 4).await;
+                let reboot_status = self
+                    .get_system_rebooted_status(
+                        access,
+                        Self::reboot_wait_minutes_for_target(target),
+                    )
+                    .await;
 
                 if !reboot_status {
                     if let Some(output) = json_dict.as_deref_mut() {
@@ -1044,15 +1955,15 @@ impl GB200SwitchRFTarget {
                     }
                     if !is_json {
                         Util::bail_nvfwupd(
-                            1,
+                            NVFWUPD_STATUS_ERR,
                             &format!("Task {} reboot not complete", job_id),
                             BailAction::DoNothing,
                             None,
                         );
                     }
-                    return (1, final_state);
+                    return (NVFWUPD_STATUS_ERR, final_state);
                 }
-                return (0, final_state);
+                return (NVFWUPD_STATUS_OK, final_state);
             }
 
             if !PENDING_TASK_STATES.contains(&final_state.as_str()) {
@@ -1061,13 +1972,13 @@ impl GB200SwitchRFTarget {
                 }
                 if !is_json {
                     Util::bail_nvfwupd(
-                        1,
+                        NVFWUPD_STATUS_ERR,
                         &format!("Task {} ended in unexpected state {}", job_id, final_state),
                         BailAction::DoNothing,
                         None,
                     );
                 }
-                return (1, final_state);
+                return (NVFWUPD_STATUS_ERR, final_state);
             }
 
             tokio::time::sleep(std::time::Duration::from_secs(20)).await;
@@ -1491,7 +2402,7 @@ impl GB200SwitchRFTarget {
             if !is_json {
                 println!("Parallel update method initiated successfully for all components");
             }
-            return (true, task_id_list, 0);
+            return (true, task_id_list, NVFWUPD_STATUS_OK);
         }
 
         // Monitor task completion
@@ -1509,7 +2420,7 @@ impl GB200SwitchRFTarget {
             .await;
 
         if !is_json {
-            if err_code == 0 {
+            if err_code == NVFWUPD_STATUS_OK {
                 println!("Parallel update method completed successfully for all components.");
             } else {
                 println!("Parallel update method completed, but reported errors.");
@@ -1643,17 +2554,50 @@ impl GB200SwitchRFTarget {
         _update_precondition_mode: Option<UpdatePreconditionMode>,
     ) -> (i32, Vec<String>) {
         let mut task_id_list: Vec<String> = Vec::new();
-        let mut err_code: i32 = 0;
+        let mut err_code: i32 = NVFWUPD_STATUS_OK;
+
+        match Self::nvos_image_recipe(recipe_list) {
+            Ok(Some(recipe)) => {
+                return self
+                    .start_nvos_image_update_with_access(
+                        access,
+                        recipe,
+                        cmd_args,
+                        parallel_update,
+                        json_dict,
+                        update_delay,
+                        _skip_pre_flight_checks,
+                    )
+                    .await;
+            }
+            Ok(None) => {}
+            Err(message) => {
+                if let Some(ref mut jd) = json_dict {
+                    push_switch_update_failure(
+                        jd,
+                        &message,
+                        json!({"stage": "validate", "target": nvos_image::NVOS_AP_NAME}),
+                    );
+                }
+                Util::bail_nvfwupd(
+                    NVFWUPD_STATUS_ERR,
+                    &message,
+                    BailAction::DoNothing,
+                    json_dict.as_ref().map(|v| v as &Value),
+                );
+                return (NVFWUPD_STATUS_ERR, Vec::new());
+            }
+        }
 
         let (status, msg) = pkg_parser.parse_pkg(&recipe_list[0]).await;
         if !status {
             Util::bail_nvfwupd(
-                1,
+                NVFWUPD_STATUS_ERR,
                 &format!("Invalid input file {}", recipe_list[0]),
                 BailAction::DoNothing,
                 json_dict.as_ref().map(|v| v as &Value),
             );
-            return (1, Vec::new());
+            return (NVFWUPD_STATUS_ERR, Vec::new());
         }
 
         pkg_parser.get_unpack_file_dict(&recipe_list[0]).await;
@@ -1681,12 +2625,12 @@ impl GB200SwitchRFTarget {
                                 .collect(),
                             None => {
                                 Util::bail_nvfwupd(
-                                    1,
+                                    NVFWUPD_STATUS_ERR,
                                     "Invalid target input",
                                     BailAction::DoNothing,
                                     json_dict.as_ref().map(|v| v as &Value),
                                 );
-                                return (1, Vec::new());
+                                return (NVFWUPD_STATUS_ERR, Vec::new());
                             }
                         },
                         None => Vec::new(),
@@ -1695,12 +2639,12 @@ impl GB200SwitchRFTarget {
                 Ok(None) => Vec::new(),
                 Err(msg) => {
                     Util::bail_nvfwupd(
-                        1,
+                        NVFWUPD_STATUS_ERR,
                         &msg,
                         BailAction::DoNothing,
                         json_dict.as_ref().map(|v| v as &Value),
                     );
-                    return (1, Vec::new());
+                    return (NVFWUPD_STATUS_ERR, Vec::new());
                 }
             }
         }
@@ -1714,12 +2658,12 @@ impl GB200SwitchRFTarget {
                         .collect(),
                     None => {
                         Util::bail_nvfwupd(
-                            1,
+                            NVFWUPD_STATUS_ERR,
                             "No targets specified for UpdateParametersTargets in config file",
                             BailAction::DoNothing,
                             json_dict.as_ref().map(|v| v as &Value),
                         );
-                        return (1, Vec::new());
+                        return (NVFWUPD_STATUS_ERR, Vec::new());
                     }
                 }
             } else {
@@ -1775,12 +2719,12 @@ impl GB200SwitchRFTarget {
 
         if all_targets.is_empty() {
             Util::bail_nvfwupd(
-                1,
+                NVFWUPD_STATUS_ERR,
                 "Unable to determine update targets",
                 BailAction::DoNothing,
                 json_dict.as_ref().map(|v| v as &Value),
             );
-            return (1, Vec::new());
+            return (NVFWUPD_STATUS_ERR, Vec::new());
         }
 
         if json_dict.is_none() {
@@ -1822,12 +2766,12 @@ impl GB200SwitchRFTarget {
 
         for (idx, target) in all_targets.iter().enumerate() {
             let plan = match Self::serial_update_plan(target, &recipe_list[0], &unpack_dict) {
-                Some(plan) => plan,
-                None => {
+                Ok(plan) => plan,
+                Err(message) => {
                     if json_dict.is_none() {
-                        println!("Could not find a matching firmware file for {}", target);
+                        println!("{message}");
                     }
-                    err_code = 1;
+                    err_code = NVFWUPD_STATUS_ERR;
                     continue;
                 }
             };
@@ -1899,7 +2843,7 @@ impl GB200SwitchRFTarget {
                             }),
                         );
                     }
-                    return (1, Vec::new());
+                    return (NVFWUPD_STATUS_ERR, Vec::new());
                 }
             };
 
@@ -1945,12 +2889,12 @@ impl GB200SwitchRFTarget {
 
             if !post_status {
                 Util::bail_nvfwupd(
-                    1,
+                    NVFWUPD_STATUS_ERR,
                     &format!("Update failed with status: {}", resp_text),
                     BailAction::DoNothing,
                     json_dict.as_ref().map(|v| v as &Value),
                 );
-                err_code = 1;
+                err_code = NVFWUPD_STATUS_ERR;
                 continue;
             }
 
@@ -1958,12 +2902,12 @@ impl GB200SwitchRFTarget {
                 .unwrap_or_else(|| resp_text.trim().to_string());
             if job_id.is_empty() {
                 Util::bail_nvfwupd(
-                    1,
+                    NVFWUPD_STATUS_ERR,
                     "No job ID in response",
                     BailAction::DoNothing,
                     json_dict.as_ref().map(|v| v as &Value),
                 );
-                err_code = 1;
+                err_code = NVFWUPD_STATUS_ERR;
                 continue;
             }
 
@@ -2010,7 +2954,7 @@ impl GB200SwitchRFTarget {
                     json_dict.as_deref_mut(),
                 )
                 .await;
-            if task_err_code != 0 {
+            if task_err_code != NVFWUPD_STATUS_OK {
                 err_code = task_err_code;
             } else {
                 completed_actions.push(SwitchSerialAction {
@@ -2027,7 +2971,7 @@ impl GB200SwitchRFTarget {
             }
         }
 
-        if err_code == 0
+        if err_code == NVFWUPD_STATUS_OK
             && !cmd_args.background
             && !parallel_update
             && !started_actions.is_empty()
@@ -2054,7 +2998,7 @@ impl GB200SwitchRFTarget {
                     Some(json!({ "actions": actions })),
                 );
             }
-            return (0, task_id_list);
+            return (NVFWUPD_STATUS_OK, task_id_list);
         }
 
         (err_code, task_id_list)
@@ -2193,12 +3137,12 @@ impl GB200SwitchRFTarget {
                 }
             }
             Util::bail_nvfwupd(
-                1,
+                NVFWUPD_STATUS_ERR,
                 &format!("Failure status for job {}: Error {:?}", task_id, redacted),
                 BailAction::DoNothing,
                 print_json.as_deref(),
             );
-            return (1, Some(job_state.to_lowercase()));
+            return (NVFWUPD_STATUS_ERR, Some(job_state.to_lowercase()));
         }
 
         if let Some(json_dict) = print_json {
@@ -2497,6 +3441,22 @@ mod tests {
             special: None,
             oem_parameters: None,
         }
+    }
+
+    #[test]
+    fn nvos_reboot_handoff_uses_longer_wait_window() {
+        assert_eq!(
+            GB200SwitchRFTarget::reboot_wait_minutes_for_target(Some(nvos_image::NVOS_AP_NAME)),
+            NVOS_REBOOT_WAIT_MINUTES
+        );
+        assert_eq!(
+            GB200SwitchRFTarget::reboot_wait_minutes_for_target(Some("BMC")),
+            DEFAULT_REBOOT_WAIT_MINUTES
+        );
+        assert_eq!(
+            GB200SwitchRFTarget::reboot_wait_minutes_for_target(None),
+            DEFAULT_REBOOT_WAIT_MINUTES
+        );
     }
 
     #[tokio::test]
@@ -2885,6 +3845,53 @@ mod tests {
         );
     }
 
+    #[test]
+    fn switch_target_name_validation_accepts_simple_ap_labels() {
+        assert_eq!(
+            GB200SwitchRFTarget::validate_switch_target_name(" CPLD1 ").unwrap(),
+            "cpld1"
+        );
+        assert_eq!(
+            GB200SwitchRFTarget::validate_switch_target_name("EROT-BMC").unwrap(),
+            "erot-bmc"
+        );
+        assert_eq!(
+            GB200SwitchRFTarget::validate_switch_target_name("IO_Board_SMA_0").unwrap(),
+            "io_board_sma_0"
+        );
+    }
+
+    #[test]
+    fn switch_serial_update_plan_rejects_path_like_targets() {
+        let mut unpack_dict = HashMap::new();
+        unpack_dict.insert(
+            "BMC".to_string(),
+            vec!["88.0002.1979".to_string(), "/tmp/bmc.bin".to_string()],
+        );
+
+        for target in [
+            "bmc/../../../tmp",
+            "../bmc",
+            "bmc\\..\\tmp",
+            "bmc.tmp",
+            "bmc?target",
+            "bmc#fragment",
+            "bmc'target",
+            "bmc:target",
+            "bmc target",
+            "bmc\n",
+            "",
+        ] {
+            let err = GB200SwitchRFTarget::serial_update_plan(
+                target,
+                "/tmp/nvfw_GB200-P4978_0007_260413.1.0_prod-signed.fwpkg",
+                &unpack_dict,
+            )
+            .expect_err("path-like switch target should be rejected");
+            assert!(err.contains("Unsafe switch firmware target"));
+        }
+    }
+
     #[tokio::test]
     async fn switch_cpld_workflow_uploads_vme_and_installs_cpld1() {
         let server = MockServer::start().await;
@@ -3006,6 +4013,537 @@ mod tests {
             .map(|request| request.url.path().to_string())
             .collect();
         assert_eq!(post_paths, vec![expected_install_path]);
+    }
+
+    #[test]
+    fn revision_poll_timing_stays_within_apply_deadline() {
+        let long_deadline = std::time::Instant::now() + ASIC_CONFIG_APPLY_TIMEOUT;
+        assert_eq!(
+            GB200SwitchRFTarget::revision_poll_timeout_secs(long_deadline),
+            Some(ASIC_CONFIG_APPLY_POLL_INTERVAL.as_secs())
+        );
+        assert!(
+            GB200SwitchRFTarget::revision_poll_sleep(long_deadline).unwrap()
+                <= ASIC_CONFIG_APPLY_POLL_INTERVAL
+        );
+
+        let short_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let short_timeout =
+            GB200SwitchRFTarget::revision_poll_timeout_secs(short_deadline).unwrap();
+        assert!((1..=3).contains(&short_timeout));
+        assert!(
+            GB200SwitchRFTarget::revision_poll_sleep(short_deadline).unwrap()
+                <= std::time::Duration::from_secs(3)
+        );
+
+        let expired_deadline = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        assert_eq!(
+            GB200SwitchRFTarget::revision_poll_timeout_secs(expired_deadline),
+            None
+        );
+        assert_eq!(
+            GB200SwitchRFTarget::revision_poll_sleep(expired_deadline),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn nvos_asic_preflight_saves_concrete_revision_when_applied_save_fails() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/nvue_v1/platform/firmware/ASIC"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "auto-update": "disabled",
+                "fw-source": "custom"
+            })))
+            .expect(1)
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/nvue_v1/revision"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "revision-id": "rev-42"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path("/nvue_v1/platform/firmware/ASIC"))
+            .and(body_string_contains("\"auto-update\":\"enabled\""))
+            .and(body_string_contains("\"fw-source\":\"default\""))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path("/nvue_v1/revision/rev-42"))
+            .and(body_string_contains("\"state\":\"apply\""))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .expect(1)
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/nvue_v1/revision/rev-42"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "state": "applied"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/nvue_v1/platform/firmware/ASIC"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "auto-update": "enabled",
+                "fw-source": "default"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path("/nvue_v1/revision/applied"))
+            .and(body_string_contains("\"state\":\"save\""))
+            .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+                "error": "not found"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path("/nvue_v1/revision/rev-42"))
+            .and(body_string_contains("\"state\":\"save\""))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "state": "save"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let target = GB200SwitchRFTarget::new(
+            BmcAccess::mock_with_base_url_and_type(
+                server.uri(),
+                "mock-switch-save-fallback",
+                crate::bmc_access::AccessType::NVSwitch,
+            ),
+            None,
+        );
+
+        target
+            .ensure_nvos_asic_firmware_config(SwitchNvueAccess::Legacy, None)
+            .await
+            .expect("concrete revision save fallback should allow NVOS preflight");
+    }
+
+    fn count_ssh_command(ssh: &ssh_transport::MockSshSnapshot, command: &str) -> usize {
+        ssh.exec_calls
+            .iter()
+            .filter(|call| call.command == command)
+            .count()
+    }
+
+    async fn mock_nvos_asic_preflight_ready_and_saved(server: &MockServer) {
+        Mock::given(method("GET"))
+            .and(path("/nvue_v1/platform/firmware/ASIC"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "auto-update": "enabled",
+                "fw-source": "default"
+            })))
+            .expect(1)
+            .mount(server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path("/nvue_v1/revision/applied"))
+            .and(body_string_contains("\"state\":\"save\""))
+            .and(body_string_contains("\"auto-prompt\""))
+            .and(body_string_contains("\"ays\":\"ays_yes\""))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "state": "save"
+            })))
+            .expect(1)
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn switch_nvos_bin_workflow_uploads_to_system_image_without_pldm_parse() {
+        let server = MockServer::start().await;
+        mock_nvos_asic_preflight_ready_and_saved(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/nvue_v1/system/image/files"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "images": ["nvos-amd64-25.02.4440.bin"]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(
+                "/nvue_v1/system/image/files/nvos-amd64-25.02.4440.bin",
+            ))
+            .and(body_string_contains("@install"))
+            .and(body_string_contains("\"force\":false"))
+            .and(body_string_contains("\"reboot\":\"no\""))
+            .and(body_string_contains(
+                "\"image-file\":\"nvos-amd64-25.02.4440.bin\"",
+            ))
+            .respond_with(ResponseTemplate::new(202).set_body_string("job-nvos-install"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/nvue_v1/action/job-nvos-install"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "state": "action_success",
+                "status": "NVOS image installed"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let update_file = tmp.path().join("nvos-amd64-25.02.4440.bin");
+        let mut package_file = std::fs::File::create(&update_file).unwrap();
+        package_file.write_all(b"NVOS-IMAGE").unwrap();
+        drop(package_file);
+
+        let mock_host = "mock-switch-nvos-bin";
+        ssh_transport::install_mock_for_host(mock_host);
+        let mut target = GB200SwitchRFTarget::new(
+            BmcAccess::mock_with_base_url_and_type(
+                server.uri(),
+                mock_host,
+                crate::bmc_access::AccessType::NVSwitch,
+            ),
+            None,
+        );
+        let mut parser = RealSwitchPkgParser {
+            inner: PLDM::new(),
+            parse_calls: 0,
+            unpack_calls: 0,
+        };
+        let args = cmd_args();
+
+        let (err_code, task_ids) = target
+            .start_update_monitor(
+                &[update_file.to_string_lossy().to_string()],
+                &mut parser,
+                &args,
+                1200,
+                false,
+                None,
+                0,
+                false,
+                Some(UpdatePreconditionMode::SingleShot),
+            )
+            .await;
+
+        let ssh = ssh_transport::take_mock_snapshot(mock_host).unwrap();
+        assert_eq!(err_code, 0);
+        assert_eq!(task_ids, vec!["job-nvos-install".to_string()]);
+        assert_eq!(parser.parse_calls, 0);
+        assert_eq!(parser.unpack_calls, 0);
+        assert_eq!(ssh.upload_calls.len(), 1);
+        assert_eq!(ssh.upload_calls[0].local_path, update_file);
+        assert_eq!(
+            ssh.upload_calls[0].remote_path,
+            "/host/nos-images/nvos-amd64-25.02.4440.bin"
+        );
+        assert_eq!(
+            ssh.upload_calls[0].timeout_secs,
+            NVOS_SFTP_UPLOAD_TIMEOUT_SECS,
+            "NVOS image uploads should allow a full {}-minute transfer window",
+            NVOS_SFTP_UPLOAD_TIMEOUT_SECS / 60
+        );
+        assert_eq!(
+            count_ssh_command(&ssh, "rm -f '/host/nos-images/nvos-amd64-25.02.4440.bin'"),
+            1,
+            "successful NVOS install should keep staged image after NVUE accepts install"
+        );
+
+        let requests = server
+            .received_requests()
+            .await
+            .expect("request recording enabled");
+        let install_request = requests
+            .iter()
+            .find(|request| {
+                request.method.to_string() == "POST"
+                    && request.url.path() == "/nvue_v1/system/image/files/nvos-amd64-25.02.4440.bin"
+            })
+            .expect("NVOS install request");
+        let body = String::from_utf8_lossy(&install_request.body);
+        assert!(!body.contains("skip-reboot"));
+        assert!(body.contains("\"reboot\":\"no\""));
+    }
+
+    #[tokio::test]
+    async fn switch_nvos_bin_preflight_save_failure_blocks_upload() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/nvue_v1/platform/firmware/ASIC"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "auto-update": "enabled",
+                "fw-source": "default"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path("/nvue_v1/revision/applied"))
+            .and(body_string_contains("\"state\":\"save\""))
+            .respond_with(ResponseTemplate::new(500).set_body_json(json!({
+                "error": "save failed"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let update_file = tmp.path().join("nvos-amd64-25.02.4440.bin");
+        let mut package_file = std::fs::File::create(&update_file).unwrap();
+        package_file.write_all(b"NVOS-IMAGE").unwrap();
+        drop(package_file);
+
+        let mock_host = "mock-switch-nvos-save-fails";
+        ssh_transport::install_mock_for_host(mock_host);
+        let mut target = GB200SwitchRFTarget::new(
+            BmcAccess::mock_with_base_url_and_type(
+                server.uri(),
+                mock_host,
+                crate::bmc_access::AccessType::NVSwitch,
+            ),
+            None,
+        );
+        let mut parser = RealSwitchPkgParser {
+            inner: PLDM::new(),
+            parse_calls: 0,
+            unpack_calls: 0,
+        };
+        let args = cmd_args();
+        let mut json_output = json!({"Error": [], "Error Code": 0, "Output": []});
+
+        let (err_code, task_ids) = target
+            .start_update_monitor(
+                &[update_file.to_string_lossy().to_string()],
+                &mut parser,
+                &args,
+                1200,
+                false,
+                Some(&mut json_output),
+                0,
+                false,
+                Some(UpdatePreconditionMode::SingleShot),
+            )
+            .await;
+
+        let ssh = ssh_transport::take_mock_snapshot(mock_host).unwrap();
+        assert_eq!(err_code, 1);
+        assert!(task_ids.is_empty());
+        assert!(ssh.upload_calls.is_empty());
+        assert!(json_output
+            .get("Error")
+            .and_then(Value::as_array)
+            .is_some_and(|errors| errors
+                .iter()
+                .any(|error| error.as_str().is_some_and(|message| message
+                    .contains("Failed to save applied NVUE configuration before NVOS update")))));
+    }
+
+    #[tokio::test]
+    async fn switch_nvos_bin_cleanup_runs_when_uploaded_file_is_not_visible() {
+        let server = MockServer::start().await;
+        mock_nvos_asic_preflight_ready_and_saved(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/nvue_v1/system/image/files"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "images": []
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let update_file = tmp.path().join("nvos-amd64-25.02.4440.bin");
+        let mut package_file = std::fs::File::create(&update_file).unwrap();
+        package_file.write_all(b"NVOS-IMAGE").unwrap();
+        drop(package_file);
+
+        let mock_host = "mock-switch-nvos-cleanup-verify";
+        ssh_transport::install_mock_for_host(mock_host);
+        let mut target = GB200SwitchRFTarget::new(
+            BmcAccess::mock_with_base_url_and_type(
+                server.uri(),
+                mock_host,
+                crate::bmc_access::AccessType::NVSwitch,
+            ),
+            None,
+        );
+        let mut parser = RealSwitchPkgParser {
+            inner: PLDM::new(),
+            parse_calls: 0,
+            unpack_calls: 0,
+        };
+        let args = cmd_args();
+
+        let mut json_output = json!({"Error": [], "Error Code": 0, "Output": []});
+        let (err_code, task_ids) = target
+            .start_update_monitor(
+                &[update_file.to_string_lossy().to_string()],
+                &mut parser,
+                &args,
+                1200,
+                false,
+                Some(&mut json_output),
+                0,
+                false,
+                Some(UpdatePreconditionMode::SingleShot),
+            )
+            .await;
+
+        let ssh = ssh_transport::take_mock_snapshot(mock_host).unwrap();
+        assert_eq!(err_code, 1);
+        assert!(task_ids.is_empty());
+        assert_eq!(
+            count_ssh_command(&ssh, "rm -f '/host/nos-images/nvos-amd64-25.02.4440.bin'"),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn switch_nvos_bin_cleanup_runs_when_install_post_fails() {
+        let server = MockServer::start().await;
+        mock_nvos_asic_preflight_ready_and_saved(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/nvue_v1/system/image/files"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "images": ["nvos-amd64-25.02.4440.bin"]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(
+                "/nvue_v1/system/image/files/nvos-amd64-25.02.4440.bin",
+            ))
+            .respond_with(ResponseTemplate::new(500).set_body_string("install failed"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let update_file = tmp.path().join("nvos-amd64-25.02.4440.bin");
+        let mut package_file = std::fs::File::create(&update_file).unwrap();
+        package_file.write_all(b"NVOS-IMAGE").unwrap();
+        drop(package_file);
+
+        let mock_host = "mock-switch-nvos-cleanup-post";
+        ssh_transport::install_mock_for_host(mock_host);
+        let mut target = GB200SwitchRFTarget::new(
+            BmcAccess::mock_with_base_url_and_type(
+                server.uri(),
+                mock_host,
+                crate::bmc_access::AccessType::NVSwitch,
+            ),
+            None,
+        );
+        let mut parser = RealSwitchPkgParser {
+            inner: PLDM::new(),
+            parse_calls: 0,
+            unpack_calls: 0,
+        };
+        let args = cmd_args();
+
+        let mut json_output = json!({"Error": [], "Error Code": 0, "Output": []});
+        let (err_code, task_ids) = target
+            .start_update_monitor(
+                &[update_file.to_string_lossy().to_string()],
+                &mut parser,
+                &args,
+                1200,
+                false,
+                Some(&mut json_output),
+                0,
+                false,
+                Some(UpdatePreconditionMode::SingleShot),
+            )
+            .await;
+
+        let ssh = ssh_transport::take_mock_snapshot(mock_host).unwrap();
+        assert_eq!(err_code, 1);
+        assert!(task_ids.is_empty());
+        assert_eq!(
+            count_ssh_command(&ssh, "rm -f '/host/nos-images/nvos-amd64-25.02.4440.bin'"),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn switch_nvos_bin_cleanup_runs_when_install_response_has_no_action_id() {
+        let server = MockServer::start().await;
+        mock_nvos_asic_preflight_ready_and_saved(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/nvue_v1/system/image/files"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "images": ["nvos-amd64-25.02.4440.bin"]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(
+                "/nvue_v1/system/image/files/nvos-amd64-25.02.4440.bin",
+            ))
+            .respond_with(ResponseTemplate::new(202).set_body_string(""))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let update_file = tmp.path().join("nvos-amd64-25.02.4440.bin");
+        let mut package_file = std::fs::File::create(&update_file).unwrap();
+        package_file.write_all(b"NVOS-IMAGE").unwrap();
+        drop(package_file);
+
+        let mock_host = "mock-switch-nvos-cleanup-empty-action";
+        ssh_transport::install_mock_for_host(mock_host);
+        let mut target = GB200SwitchRFTarget::new(
+            BmcAccess::mock_with_base_url_and_type(
+                server.uri(),
+                mock_host,
+                crate::bmc_access::AccessType::NVSwitch,
+            ),
+            None,
+        );
+        let mut parser = RealSwitchPkgParser {
+            inner: PLDM::new(),
+            parse_calls: 0,
+            unpack_calls: 0,
+        };
+        let args = cmd_args();
+
+        let mut json_output = json!({"Error": [], "Error Code": 0, "Output": []});
+        let (err_code, task_ids) = target
+            .start_update_monitor(
+                &[update_file.to_string_lossy().to_string()],
+                &mut parser,
+                &args,
+                1200,
+                false,
+                Some(&mut json_output),
+                0,
+                false,
+                Some(UpdatePreconditionMode::SingleShot),
+            )
+            .await;
+
+        let ssh = ssh_transport::take_mock_snapshot(mock_host).unwrap();
+        assert_eq!(err_code, 1);
+        assert!(task_ids.is_empty());
+        assert_eq!(
+            count_ssh_command(&ssh, "rm -f '/host/nos-images/nvos-amd64-25.02.4440.bin'"),
+            2
+        );
     }
 
     #[tokio::test]

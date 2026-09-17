@@ -124,39 +124,14 @@ impl NodeConfig {
     }
 }
 
-// ── Power-On Order ──
-
-/// A single step in a rack's power-on sequence.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PowerOnStep {
-    pub order_index: i32,
-    pub node_id: String,
-    pub completion_check: bool,
-    pub timeout_seconds: u32,
-}
-
-impl PowerOnStep {
-    pub fn new(order_index: i32, node_id: impl Into<String>) -> Self {
-        Self {
-            order_index,
-            node_id: node_id.into(),
-            completion_check: false,
-            timeout_seconds: 300,
-        }
-    }
-}
-
 // ── Rack Trait ──
 
 /// Trait for all rack types (e.g., NvlGb200Rack, NvlGb300Rack).
 ///
 /// Each concrete rack type owns a map of node values and provides a node
 /// factory that creates the appropriate concrete node from config. Racks handle
-/// node CRUD and power-on sequencing. All methods are synchronous — node map
-/// operations are quick in-memory work protected by internal locks.
-///
-/// Adding/removing nodes invalidates the power-on order (cleared by concrete
-/// implementations in `add_node`/`remove_node`).
+/// node CRUD. All methods are synchronous — node map operations are quick
+/// in-memory work protected by internal locks.
 pub trait Rack: Send + Sync {
     /// Node handle stored by this rack implementation.
     type Node: Node + 'static;
@@ -178,16 +153,11 @@ pub trait Rack: Send + Sync {
     fn find_node(&self, node_id: &str) -> Option<Arc<Self::Node>>;
     fn list_nodes(&self) -> Vec<Arc<Self::Node>>;
 
-    /// Tries to acquire the guard that serializes inventory-backed rack power mutations.
+    /// Tries to acquire the guard that serializes registered power operations
+    /// with inventory mutations on this rack.
     fn try_power_operation_guard(
         &self,
     ) -> std::result::Result<tokio::sync::OwnedMutexGuard<()>, tokio::sync::TryLockError>;
-
-    // ── Power-On Order ──
-
-    /// Validates and stores the power-on order against current rack inventory.
-    fn set_power_on_order(&self, order: Vec<PowerOnStep>) -> Result<()>;
-    fn get_power_on_order(&self) -> Vec<PowerOnStep>;
 }
 
 #[cfg(test)]
@@ -218,14 +188,5 @@ mod tests {
         assert!(debug.contains("admin"));
         assert!(debug.contains("[REDACTED]"));
         assert!(!debug.contains("secret"));
-    }
-
-    #[test]
-    fn power_on_step_new_sets_defaults() {
-        let step = PowerOnStep::new(0, "pshelf-01");
-        assert_eq!(step.order_index, 0);
-        assert_eq!(step.node_id, "pshelf-01");
-        assert!(!step.completion_check);
-        assert_eq!(step.timeout_seconds, 300);
     }
 }

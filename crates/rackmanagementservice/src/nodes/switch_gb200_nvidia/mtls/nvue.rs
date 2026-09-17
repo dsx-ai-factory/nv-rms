@@ -22,6 +22,7 @@ use super::super::validation::is_valid_identifier;
 use crate::transport::http_client::HttpClient;
 use crate::utilities::error::{Result, RmsError};
 
+use nvue_client::system::MtlsConfiguration;
 use serde_json::Value;
 
 impl SwitchGb200Nvidia {
@@ -69,16 +70,17 @@ impl SwitchGb200Nvidia {
         .await
     }
 
-    pub(crate) async fn get_gnmi_server_mtls_configuration(&self) -> Result<Value> {
-        self.nvue_http_get(
-            "/nvue_v1/system/gnmi-server/mtls",
-            HttpClient::DEFAULT_TIMEOUT,
-        )
-        .await
+    pub(crate) async fn get_gnmi_server_mtls_configuration(&self) -> Result<MtlsConfiguration> {
+        self.nvue_client()?
+            .get_gnmi_server_mtls(HttpClient::DEFAULT_TIMEOUT)
+            .await
+            .map_err(Into::into)
     }
 
-    pub(crate) async fn get_nvue_api_mtls_configuration(&self) -> Result<Value> {
-        self.nvue_http_get("/nvue_v1/system/api/mtls", HttpClient::DEFAULT_TIMEOUT)
+    pub(crate) async fn get_nvue_api_mtls_configuration(&self) -> Result<MtlsConfiguration> {
+        self.nvue_client()?
+            .get_system_api_mtls(HttpClient::DEFAULT_TIMEOUT)
             .await
+            .map_err(Into::into)
     }
 }

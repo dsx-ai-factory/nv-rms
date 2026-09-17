@@ -15,6 +15,9 @@
  * limitations under the License.
  */
 
+use std::sync::Arc;
+
+use futures::StreamExt;
 use librms::protos::rack_manager as rm;
 use serde_json::Value;
 
@@ -24,9 +27,15 @@ use crate::api::grpc::node_type_resolver::{
     INVENTORY_PROFILE_ATTRIBUTE, domain_node_type_to_descriptor, resolve_node_info,
     resolve_node_type,
 };
-use crate::domain::node::{Node, NodeKind, NodeType};
-use crate::domain::rack::{NodeConfig, PowerOnStep, RACK_POWER_BUSY_MESSAGE};
+use crate::domain::node::{Node, NodeKind, device_info_fetch_timeout};
+use crate::domain::rack::{NodeConfig, RACK_POWER_BUSY_MESSAGE};
 use crate::nodes::NodeInstance;
+
+/// Maximum number of node device-info reads performed concurrently during a
+/// fan-out. Bounds how many switch/BMC sessions RMS opens at once for a large
+/// rack while still turning a sequential sum-of-latencies into a bounded
+/// max-of-latencies.
+const DEVICE_INFO_FETCH_CONCURRENCY: usize = 16;
 
 impl RackManagerServiceImpl {
     pub(crate) async fn handle_list_node_inventory(
@@ -171,9 +180,11 @@ impl RackManagerServiceImpl {
             // Host endpoints are optional at registration time. Switches can
             // be created BMC-only to match legacy inventory behavior; host
             // workflows validate host_endpoint when a later RPC needs
-            // NVUE/NVOS access.
+            // NVUE/NVOS or in-band firmware access.
             let host_endpoint_result = if node_type.kind() == NodeKind::Switch {
                 flat.optional_switch_host_management_endpoint()
+            } else if node_type.supports_flint_inband_firmware() {
+                flat.optional_compute_host_ssh_endpoint()
             } else {
                 flat.optional_host_endpoint()
             };
@@ -273,8 +284,9 @@ impl RackManagerServiceImpl {
             }
         };
 
-        // A rack power sequence depends on the current inventory. Block deletes
-        // while the sequence is active so a later step cannot lose its node.
+        // Registered power operations resolve their node from the current
+        // inventory. Block deletes while one is active so it cannot lose its
+        // node mid-operation.
         let Ok(_power_guard) = rack.try_power_operation_guard() else {
             tracing::warn!(
                 node = r.node_id,
@@ -300,115 +312,6 @@ impl RackManagerServiceImpl {
             }
         }
         Ok(tonic::Response::new(rm::DeleteNodeResponse {
-            response: Some(response),
-        }))
-    }
-
-    pub(crate) async fn handle_get_rack_power_on_sequence(
-        &self,
-        req: tonic::Request<rm::GetRackPowerOnSequenceRequest>,
-    ) -> std::result::Result<tonic::Response<rm::GetRackPowerOnSequenceResponse>, tonic::Status>
-    {
-        let r = req.into_inner();
-        let mut resp = rm::GetRackPowerOnSequenceResponse {
-            status: rm::ReturnCode::Failure.into(),
-            power_on_order: Vec::new(),
-            is_valid: false,
-        };
-
-        let rack = match find_rack(&self.rack_manager, &r.rack_id) {
-            Ok(r) => r,
-            Err(_) => {
-                tracing::error!(rack = %r.rack_id, "rack not found");
-                return Ok(tonic::Response::new(resp));
-            }
-        };
-        let order = rack.get_power_on_order();
-
-        for step in &order {
-            resp.power_on_order.push(rm::PowerOnOrderItem {
-                node_id: step.node_id.clone(),
-                completion_check: Some(rm::CompletionCheck {
-                    enabled: step.completion_check,
-                    timeout_seconds: step.timeout_seconds,
-                }),
-            });
-        }
-        resp.status = rm::ReturnCode::Success.into();
-        resp.is_valid = !order.is_empty();
-        Ok(tonic::Response::new(resp))
-    }
-
-    pub(crate) async fn handle_set_rack_power_on_sequence(
-        &self,
-        req: tonic::Request<rm::SetRackPowerOnSequenceRequest>,
-    ) -> std::result::Result<tonic::Response<rm::SetRackPowerOnSequenceResponse>, tonic::Status>
-    {
-        let r = req.into_inner();
-
-        let rack_id = r.rack_id;
-        let power_on_order = r.power_on_order;
-
-        let mut response = rm::OperationResponse {
-            status: rm::ReturnCode::Failure.into(),
-            message: String::new(),
-        };
-
-        let rack = match find_rack(&self.rack_manager, &rack_id) {
-            Ok(r) => r,
-            Err(_) => {
-                tracing::error!(rack = %rack_id, "rack not found");
-                response.message = "rack not found".into();
-                return Ok(tonic::Response::new(rm::SetRackPowerOnSequenceResponse {
-                    response: Some(response),
-                }));
-            }
-        };
-
-        // The stored order is the contract used by inventory-backed rack power.
-        // Reject changes while a sequence is running so the accepted order does
-        // not diverge from the active hardware operation.
-        let Ok(_power_guard) = rack.try_power_operation_guard() else {
-            tracing::warn!(rack = rack_id, "{}", RACK_POWER_BUSY_MESSAGE);
-            response.message = RACK_POWER_BUSY_MESSAGE.to_owned();
-            return Ok(tonic::Response::new(rm::SetRackPowerOnSequenceResponse {
-                response: Some(response),
-            }));
-        };
-
-        let steps: Vec<PowerOnStep> = power_on_order
-            .into_iter()
-            .enumerate()
-            .map(|(i, item)| {
-                let completion_check = item.completion_check;
-                PowerOnStep {
-                    order_index: i as i32,
-                    node_id: item.node_id,
-                    completion_check: completion_check.as_ref().is_some_and(|check| check.enabled),
-                    timeout_seconds: completion_check
-                        .as_ref()
-                        .map_or(0, |check| check.timeout_seconds),
-                }
-            })
-            .collect();
-
-        let count = steps.len();
-
-        if let Err(e) = rack.set_power_on_order(steps) {
-            tracing::warn!(rack = %rack_id, error = %e.message, "power-on order rejected");
-            response.message = e.message;
-
-            return Ok(tonic::Response::new(rm::SetRackPowerOnSequenceResponse {
-                response: Some(response),
-            }));
-        }
-
-        tracing::info!(rack = %rack_id, count, "power-on order set");
-
-        response.status = rm::ReturnCode::Success.into();
-        response.message = format!("power-on order set with {count} steps");
-
-        Ok(tonic::Response::new(rm::SetRackPowerOnSequenceResponse {
             response: Some(response),
         }))
     }
@@ -458,38 +361,29 @@ impl RackManagerServiceImpl {
             }
         };
 
-        if let Err(error) = self.initialize_nvue_client(node.nvue_client(), None).await {
-            tracing::error!(rack = %r.rack_id, node = %r.node_id, error = %error.message, "failed to configure NVUE client");
-            resp.message = error.message;
-            return Ok(tonic::Response::new(resp));
-        }
-
-        let device_info = match node.get_device_info().await {
-            Ok(Some(v)) => v,
+        // Reuse the shared deadline-bounded read (client init + fetch + shaping)
+        // so the single-node and batch paths stay in lockstep: one per-kind
+        // timeout, one copy of the init/fetch/populate logic, and identical
+        // error / no-device-info semantics.
+        match self
+            .read_node_device_info_with_deadline(node.id(), node.as_ref())
+            .await
+        {
+            Ok(Some(info)) => {
+                resp.device_info = Some(info);
+                resp.status = rm::ReturnCode::Success.into();
+                resp.message = "Device info retrieved successfully".into();
+            }
             Ok(None) => {
                 resp.status = rm::ReturnCode::Success.into();
                 resp.message = "Device info is not available for this node type".into();
-                return Ok(tonic::Response::new(resp));
             }
-            Err(e) => {
-                tracing::error!(rack = %r.rack_id, node = %r.node_id, error = %e.message, "get_device_info failed");
-                resp.message = e.message;
-                return Ok(tonic::Response::new(resp));
+            Err(message) => {
+                tracing::error!(rack = %r.rack_id, node = %r.node_id, error = %message, "device-info read failed");
+                resp.message = message;
             }
-        };
-
-        let mut info = rm::NodeDeviceInfo {
-            node_id: node.id().to_owned(),
-            ..Default::default()
-        };
-        if let Err(msg) = populate_node_device_info(&device_info, &mut info) {
-            resp.message = msg;
-            return Ok(tonic::Response::new(resp));
         }
 
-        resp.device_info = Some(info);
-        resp.status = rm::ReturnCode::Success.into();
-        resp.message = "Device info retrieved successfully".into();
         Ok(tonic::Response::new(resp))
     }
 
@@ -531,39 +425,33 @@ impl RackManagerServiceImpl {
                 return Ok(tonic::Response::new(result));
             }
         };
-        let mut errors: Vec<String> = Vec::new();
-        let mut total_nodes = 0u32;
+        let targets: Vec<_> = rack
+            .list_nodes()
+            .into_iter()
+            .filter(|node| node.node_type() == target_type)
+            .collect();
+        let total_nodes = targets.len() as u32;
 
-        for node in rack.list_nodes() {
-            if node.node_type() != target_type {
-                continue;
-            }
-            total_nodes += 1;
+        // Fan out the per-node device-info reads concurrently with a bounded
+        // degree and a per-node deadline. One unreachable node then costs its
+        // own timeout ceiling rather than stalling every node behind it, and a
+        // large rack's latency becomes the slowest node instead of the sum.
+        let outcomes: Vec<NodeDeviceInfoOutcome> =
+            futures::stream::iter(targets.into_iter().enumerate().map(
+                |(index, node)| async move {
+                    let node_id = node.id().to_owned();
+                    let result = self
+                        .read_node_device_info_with_deadline(&node_id, node.as_ref())
+                        .await;
+                    (index, node_id, result)
+                },
+            ))
+            .buffer_unordered(DEVICE_INFO_FETCH_CONCURRENCY)
+            .collect()
+            .await;
 
-            if let Err(error) = self.initialize_nvue_client(node.nvue_client(), None).await {
-                errors.push(format!("node_id={}: {}", node.id(), error.message));
-                continue;
-            }
-
-            let device_info = match node.get_device_info().await {
-                Ok(Some(v)) => v,
-                Ok(None) => continue,
-                Err(e) => {
-                    errors.push(format!("node_id={}: {}", node.id(), e.message));
-                    continue;
-                }
-            };
-
-            let mut info = rm::NodeDeviceInfo {
-                node_id: node.id().to_owned(),
-                ..Default::default()
-            };
-            if let Err(msg) = populate_node_device_info(&device_info, &mut info) {
-                errors.push(format!("node_id={}: {}", node.id(), msg));
-                continue;
-            }
-            result.node_device_details.push(info);
-        }
+        let (details, errors) = partition_device_info_outcomes(outcomes);
+        result.node_device_details = details;
 
         if errors.is_empty() {
             result.status = rm::ReturnCode::Success.into();
@@ -606,131 +494,38 @@ impl RackManagerServiceImpl {
             return Ok(tonic::Response::new(result));
         }
 
-        let mut errors: Vec<String> = Vec::new();
-        for node_info in nodes {
-            let node_type = match resolve_node_info(&node_info) {
-                Ok(node_type) => node_type,
-                Err(error) => {
-                    errors.push(format!("node_id={}: {error}", node_info.node_id));
-                    continue;
-                }
-            };
-
-            let flat = match flatten_node_info(&node_info) {
-                Ok(flat) => flat,
-                Err(e) => {
-                    push_node_error(&mut errors, &node_info.node_id, e.message);
-                    continue;
-                }
-            };
-
-            if flat.creds_for_node_type(node_type).is_none() {
-                let source = if node_type.kind() == NodeKind::Switch {
-                    "host"
-                } else {
-                    "BMC"
-                };
-                errors.push(format!(
-                    "node_id={}: missing {source} credentials",
-                    node_info.node_id
-                ));
-                continue;
+        // Phase 1: cheap synchronous validation + ephemeral node construction
+        // (no network I/O). Failures become error entries keyed by request
+        // index so the final output preserves request order.
+        let mut outcomes: Vec<NodeDeviceInfoOutcome> = Vec::new();
+        let mut ready: Vec<(usize, String, Arc<NodeInstance>)> = Vec::new();
+        for (index, node_info) in nodes.iter().enumerate() {
+            match self.build_batch_ephemeral_node(node_info) {
+                Ok(Some(node)) => ready.push((index, node_info.node_id.clone(), node)),
+                // Node type exposes no device info: record the "no device info"
+                // outcome directly (counted as a success, no details emitted).
+                Ok(None) => outcomes.push((index, node_info.node_id.clone(), Ok(None))),
+                Err(message) => outcomes.push((index, node_info.node_id.clone(), Err(message))),
             }
-
-            // Switch device-info reads use host/NVUE. Keep BMC optional here so
-            // host-only stateless switch reads work; compute and powershelf still
-            // require BMC for Redfish.
-            let is_switch = node_type.kind() == NodeKind::Switch;
-            let bmc_endpoint = if is_switch {
-                match flat.optional_bmc_endpoint() {
-                    Ok(endpoint) => self.optional_bmc_endpoint_with_rms_tls_policy(endpoint),
-                    Err(e) => {
-                        push_node_error(&mut errors, &node_info.node_id, e.message);
-                        continue;
-                    }
-                }
-            } else {
-                match flat.bmc_endpoint().map(Some) {
-                    Ok(endpoint) => self.optional_bmc_endpoint_with_rms_tls_policy(endpoint),
-                    Err(e) => {
-                        push_node_error(&mut errors, &node_info.node_id, e.message);
-                        continue;
-                    }
-                }
-            };
-
-            let host_endpoint = if is_switch {
-                match flat.switch_host_management_endpoint().map(Some) {
-                    Ok(endpoint) => endpoint,
-                    Err(e) => {
-                        push_node_error(&mut errors, &node_info.node_id, e.message);
-                        continue;
-                    }
-                }
-            } else {
-                match flat.optional_host_endpoint() {
-                    Ok(endpoint) => endpoint,
-                    Err(e) => {
-                        push_node_error(&mut errors, &node_info.node_id, e.message);
-                        continue;
-                    }
-                }
-            };
-
-            let config = NodeConfig {
-                id: node_info.node_id.clone(),
-                node_type,
-                bmc_endpoint,
-                host_endpoint,
-                expected_inventory: None,
-            };
-            if matches!(
-                node_type,
-                NodeType::PowershelfGb200Delta | NodeType::PowershelfGb300Delta
-            ) {
-                errors.push(format!(
-                    "node_id={}: build_ephemeral_node not supported for {} nodes",
-                    node_info.node_id, node_type
-                ));
-                continue;
-            }
-
-            let node = match NodeInstance::create(&config, node_info.rack_id.as_str()) {
-                Ok(node) => node,
-                Err(e) => {
-                    push_node_error(&mut errors, &node_info.node_id, e.message);
-                    continue;
-                }
-            };
-
-            if let Err(e) = self.initialize_nvue_client(node.nvue_client(), None).await {
-                push_node_error(&mut errors, &node_info.node_id, e.message);
-                continue;
-            }
-
-            let device_info = match node.get_device_info().await {
-                Ok(device_info) => device_info,
-                Err(e) => {
-                    push_node_error(&mut errors, &node_info.node_id, e.message);
-                    continue;
-                }
-            };
-            let Some(device_info) = device_info else {
-                // Node type doesn't expose device info; skip silently (matches
-                // ListNodeDeviceInfoByNodeType behavior).
-                continue;
-            };
-
-            let mut info = rm::NodeDeviceInfo {
-                node_id: node_info.node_id.clone(),
-                ..Default::default()
-            };
-            if let Err(msg) = populate_node_device_info(&device_info, &mut info) {
-                errors.push(format!("node_id={}: {msg}", node_info.node_id));
-                continue;
-            }
-            result.node_device_details.push(info);
         }
+
+        // Phase 2: fan out the device-info reads (NVUE init + fetch)
+        // concurrently with a bounded degree and a per-node deadline, so one
+        // unreachable node cannot serialize the whole batch behind its timeout.
+        let fetched: Vec<NodeDeviceInfoOutcome> =
+            futures::stream::iter(ready.into_iter().map(|(index, node_id, node)| async move {
+                let result = self
+                    .read_node_device_info_with_deadline(&node_id, node.as_ref())
+                    .await;
+                (index, node_id, result)
+            }))
+            .buffer_unordered(DEVICE_INFO_FETCH_CONCURRENCY)
+            .collect()
+            .await;
+        outcomes.extend(fetched);
+
+        let (details, errors) = partition_device_info_outcomes(outcomes);
+        result.node_device_details = details;
 
         if errors.is_empty() {
             result.status = rm::ReturnCode::Success.into();
@@ -750,6 +545,176 @@ impl RackManagerServiceImpl {
         });
         Ok(tonic::Response::new(result))
     }
+
+    /// Read a single node's device info under a bounded deadline: configure the
+    /// NVUE client, fetch device info, and shape it into a `NodeDeviceInfo`.
+    ///
+    /// Returns `Ok(Some(info))` on success, `Ok(None)` when the node type does
+    /// not expose device info (skipped silently by callers), and `Err(message)`
+    /// (without the `node_id=` prefix, which the caller adds) for an init/fetch
+    /// failure, a populate failure, or a deadline overrun.
+    ///
+    /// The per-node-kind [`device_info_fetch_timeout`] backstop bounds only the
+    /// client I/O, split across the two phases that actually perform it:
+    ///
+    /// - NVUE client setup, bounded here. It is not serialized by the node
+    ///   `op_lock`, so bounding it cannot turn lock contention into a spurious
+    ///   timeout, and it catches a stuck TLS/setup before it can stall a fan-out.
+    /// - The device read itself, which takes the `op_lock` and then bounds its
+    ///   own I/O internally (see `NvidiaGb200Compute::get_mnnvlink_topology` and
+    ///   the `SwitchDeviceInfo::get_chassis_location_info` impl). Deliberately
+    ///   *not* wrapped here: doing so would charge the `op_lock` wait against the
+    ///   deadline, so an unrelated long-running operation on the same node (e.g.
+    ///   a firmware upload) would spuriously fail an otherwise healthy read
+    ///   instead of queuing behind it.
+    ///
+    /// A kind with no device-info I/O (powershelf) returns `None` from
+    /// [`device_info_fetch_timeout`]; setup is then awaited unwrapped, since its
+    /// `NodeInstance::get_device_info` is a synchronous `Ok(None)` and its NVUE
+    /// client is absent, so there is nothing that could hang to bound.
+    async fn read_node_device_info_with_deadline(
+        &self,
+        node_id: &str,
+        node: &NodeInstance,
+    ) -> std::result::Result<Option<rm::NodeDeviceInfo>, String> {
+        let setup = self.initialize_nvue_client(node.nvue_client(), None);
+        match device_info_fetch_timeout(node.node_type()) {
+            Some(setup_timeout) => match tokio::time::timeout(setup_timeout, setup).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => return Err(error.message),
+                Err(_elapsed) => {
+                    return Err(format!(
+                        "device-info client setup exceeded {}s deadline",
+                        setup_timeout.as_secs()
+                    ));
+                }
+            },
+            None => setup.await.map_err(|error| error.message)?,
+        }
+
+        let device_info = node
+            .get_device_info()
+            .await
+            .map_err(|error| error.message)?;
+
+        let Some(device_info) = device_info else {
+            return Ok(None);
+        };
+
+        let mut info = rm::NodeDeviceInfo {
+            node_id: node_id.to_owned(),
+            ..Default::default()
+        };
+        populate_node_device_info(&device_info, &mut info)?;
+        Ok(Some(info))
+    }
+
+    /// Validate a batch `NodeInfo` and build the ephemeral node used for a
+    /// device-info read. This is the synchronous, network-free half of the
+    /// batch handler.
+    ///
+    /// Returns `Ok(Some(node))` for a node type that exposes device info,
+    /// `Ok(None)` for a node type that has none (mirrors
+    /// [`NodeInstance::get_device_info`], so those are reported as "no device
+    /// info" rather than a failure), and `Err(message)` (bare; the caller
+    /// prefixes `node_id=`) on a validation failure. Kept separate so the async
+    /// device-info reads can be fanned out concurrently.
+    fn build_batch_ephemeral_node(
+        &self,
+        node_info: &rm::NodeInfo,
+    ) -> std::result::Result<Option<Arc<NodeInstance>>, String> {
+        let node_type = resolve_node_info(node_info).map_err(|error| error.to_string())?;
+
+        // Power shelves expose no device info (every powershelf variant returns
+        // `Ok(None)` from `NodeInstance::get_device_info`), so short-circuit to
+        // the "no device info" outcome without demanding credentials/endpoints
+        // or constructing an ephemeral node. This matches the single-node and
+        // list-by-type handlers (which read the same `Ok(None)` from an already
+        // registered node) and keeps every powershelf kind consistent: none is
+        // failed for missing/malformed creds when there is nothing to read.
+        if node_type.kind() == NodeKind::Powershelf {
+            return Ok(None);
+        }
+
+        let flat = flatten_node_info(node_info).map_err(|e| e.message)?;
+
+        if flat.creds_for_node_type(node_type).is_none() {
+            let source = if node_type.kind() == NodeKind::Switch {
+                "host"
+            } else {
+                "BMC"
+            };
+            return Err(format!("missing {source} credentials"));
+        }
+
+        // Switch device-info reads use host/NVUE. Keep BMC optional here so
+        // host-only stateless switch reads work; compute and powershelf still
+        // require BMC for Redfish.
+        let is_switch = node_type.kind() == NodeKind::Switch;
+        let bmc_endpoint = if is_switch {
+            self.optional_bmc_endpoint_with_rms_tls_policy(
+                flat.optional_bmc_endpoint().map_err(|e| e.message)?,
+            )
+        } else {
+            self.optional_bmc_endpoint_with_rms_tls_policy(
+                flat.bmc_endpoint().map(Some).map_err(|e| e.message)?,
+            )
+        };
+
+        let host_endpoint = if is_switch {
+            flat.switch_host_management_endpoint()
+                .map(Some)
+                .map_err(|e| e.message)?
+        } else if node_type.supports_flint_inband_firmware() {
+            flat.optional_compute_host_ssh_endpoint()
+                .map_err(|e| e.message)?
+        } else {
+            flat.optional_host_endpoint().map_err(|e| e.message)?
+        };
+
+        let config = NodeConfig {
+            id: node_info.node_id.clone(),
+            node_type,
+            bmc_endpoint,
+            host_endpoint,
+            expected_inventory: None,
+        };
+
+        NodeInstance::create(&config, node_info.rack_id.as_str())
+            .map(Some)
+            .map_err(|e| e.message)
+    }
+}
+
+/// Per-node outcome of a device-info fan-out, keyed by the caller's original
+/// index so results can be reassembled deterministically after a concurrent
+/// (out-of-order) fan-out. `Ok(None)` marks a node type without device info.
+type NodeDeviceInfoOutcome = (
+    usize,
+    String,
+    std::result::Result<Option<rm::NodeDeviceInfo>, String>,
+);
+
+/// Split indexed per-node outcomes into ordered device-info details and error
+/// strings. Both are returned in ascending-index order, so a concurrent fan-out
+/// still yields deterministic, request-order output. `Ok(None)` outcomes are
+/// node types without device info and are dropped (the caller counts them as
+/// successes). Error entries are prefixed with `node_id=<id>:`.
+fn partition_device_info_outcomes(
+    mut outcomes: Vec<NodeDeviceInfoOutcome>,
+) -> (Vec<rm::NodeDeviceInfo>, Vec<String>) {
+    outcomes.sort_by_key(|(index, _, _)| *index);
+
+    let mut details = Vec::new();
+    let mut errors = Vec::new();
+    for (_, node_id, outcome) in outcomes {
+        match outcome {
+            Ok(Some(info)) => details.push(info),
+            Ok(None) => {}
+            Err(message) => errors.push(format!("node_id={node_id}: {message}")),
+        }
+    }
+    (details, errors)
 }
 
 // Populate `NodeDeviceInfo` optional numeric fields from a JSON payload shaped like
@@ -769,10 +734,6 @@ fn populate_node_device_info(
     target.slot_number = extract_optional_u32(payload, "slot_number");
     target.tray_index = extract_optional_u32(payload, "tray_index");
     Ok(())
-}
-
-fn push_node_error(errors: &mut Vec<String>, node_id: &str, message: impl std::fmt::Display) {
-    errors.push(format!("node_id={node_id}: {message}"));
 }
 
 fn extract_optional_i64(payload: &Value, field: &str) -> Option<i64> {
@@ -797,6 +758,9 @@ mod tests {
 
     use super::*;
     use crate::api::grpc::server::SwitchTlsRoots;
+    use crate::domain::node::{
+        COMPUTE_DEVICE_INFO_FETCH_TIMEOUT, NodeType, SWITCH_DEVICE_INFO_FETCH_TIMEOUT,
+    };
     use crate::libnmxc::TlsMaterialStore;
     use crate::orchestrator::job_tracker::JobTracker;
     use crate::orchestrator::rack_manager::RackManager;
@@ -1066,5 +1030,344 @@ mod tests {
         assert_eq!(target.chassis_sn, Some(999999999999999999_i64));
         assert_eq!(target.slot_number, None);
         assert_eq!(target.tray_index, None);
+    }
+
+    /// Device-info behavior a [`DeviceInfoMockNode`] should exhibit when the
+    /// fan-out reads it.
+    enum DeviceInfoBehavior {
+        /// Return this payload as the node's device info.
+        Value(Value),
+        /// Node type without device info (`Ok(None)`).
+        None,
+        /// Fail the fetch with this message.
+        Error(String),
+        /// Sleep far past the deadline so the read must be timed out. Under a
+        /// paused clock this resolves via virtual time rather than wall time.
+        Hang,
+    }
+
+    /// A [`Node`] whose only interesting behavior is [`Node::get_device_info`],
+    /// letting the inventory fan-out be exercised without any real device
+    /// client. Wrapped via [`NodeInstance::from_test_node`], which delegates
+    /// `get_device_info` to this impl.
+    struct DeviceInfoMockNode {
+        id: String,
+        node_type: NodeType,
+        behavior: DeviceInfoBehavior,
+    }
+
+    #[async_trait::async_trait]
+    impl Node for DeviceInfoMockNode {
+        fn id(&self) -> &str {
+            &self.id
+        }
+
+        fn rack_id(&self) -> &str {
+            "rack-1"
+        }
+
+        fn node_type(&self) -> NodeType {
+            self.node_type
+        }
+
+        fn get_info(&self) -> HashMap<String, String> {
+            HashMap::new()
+        }
+
+        async fn get_device_info(&self) -> crate::utilities::error::Result<Option<Value>> {
+            match &self.behavior {
+                DeviceInfoBehavior::Value(value) => Ok(Some(value.clone())),
+                DeviceInfoBehavior::None => Ok(None),
+                DeviceInfoBehavior::Error(message) => {
+                    Err(crate::utilities::error::RmsError::internal(message.clone()))
+                }
+                DeviceInfoBehavior::Hang => {
+                    tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                    Ok(None)
+                }
+            }
+        }
+    }
+
+    /// Register a rack of mock device-info nodes so the inventory handlers can
+    /// be driven end-to-end without real device clients.
+    fn add_mock_nodes(
+        service: &RackManagerServiceImpl,
+        rack_id: &str,
+        nodes: Vec<(&str, NodeType, DeviceInfoBehavior)>,
+    ) {
+        let rack_type = NodeType::SwitchGb200Nvidia.product_family().rack_type();
+        service
+            .rack_manager
+            .with_rack_for_node(rack_id, rack_type, |rack| {
+                for (id, node_type, behavior) in nodes {
+                    let mock = DeviceInfoMockNode {
+                        id: id.to_owned(),
+                        node_type,
+                        behavior,
+                    };
+                    rack.add_node(id, Arc::new(NodeInstance::from_test_node(mock)))?;
+                }
+                Ok(())
+            })
+            .expect("mock rack + nodes should be created");
+    }
+
+    fn by_type_request(
+        rack_id: &str,
+        node_type: rm::NodeType,
+    ) -> rm::ListNodeDeviceInfoByNodeTypeRequest {
+        rm::ListNodeDeviceInfoByNodeTypeRequest {
+            rack_id: rack_id.to_owned(),
+            node_type: node_type as i32,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn partition_device_info_outcomes_orders_by_index_and_buckets_outcomes() {
+        // Deliberately out of index order to prove the sort restores order.
+        let outcomes: Vec<NodeDeviceInfoOutcome> = vec![
+            (
+                2,
+                "c".to_owned(),
+                Ok(Some(rm::NodeDeviceInfo {
+                    node_id: "c".to_owned(),
+                    chassis_sn: Some(3),
+                    ..Default::default()
+                })),
+            ),
+            (0, "a".to_owned(), Err("boom".to_owned())),
+            (1, "b".to_owned(), Ok(None)),
+            (
+                3,
+                "d".to_owned(),
+                Ok(Some(rm::NodeDeviceInfo {
+                    node_id: "d".to_owned(),
+                    chassis_sn: Some(4),
+                    ..Default::default()
+                })),
+            ),
+        ];
+
+        let (details, errors) = partition_device_info_outcomes(outcomes);
+
+        // `Ok(None)` is dropped; errors carry the `node_id=` prefix.
+        assert_eq!(errors, vec!["node_id=a: boom".to_owned()]);
+        // Details preserve ascending-index order regardless of input order.
+        assert_eq!(
+            details
+                .iter()
+                .map(|d| d.node_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["c", "d"]
+        );
+        assert_eq!(details[0].chassis_sn, Some(3));
+        assert_eq!(details[1].chassis_sn, Some(4));
+    }
+
+    #[tokio::test]
+    async fn list_by_type_fans_out_and_aggregates_success_none_and_error() {
+        let service = test_service();
+        add_mock_nodes(
+            &service,
+            "rack-1",
+            vec![
+                (
+                    "sw-ok",
+                    NodeType::SwitchGb200Nvidia,
+                    DeviceInfoBehavior::Value(json!({
+                        "switch_info": { "chassis_sn": 11, "slot_number": 1, "tray_index": 2 }
+                    })),
+                ),
+                (
+                    "sw-none",
+                    NodeType::SwitchGb200Nvidia,
+                    DeviceInfoBehavior::None,
+                ),
+                (
+                    "sw-err",
+                    NodeType::SwitchGb200Nvidia,
+                    DeviceInfoBehavior::Error("nvue unreachable".to_owned()),
+                ),
+                // Different node type: must be filtered out and never fetched.
+                (
+                    "compute-x",
+                    NodeType::ComputeGb200Nvidia,
+                    DeviceInfoBehavior::Value(json!({ "chassis_sn": 99 })),
+                ),
+            ],
+        );
+
+        let resp = service
+            .handle_list_node_device_info_by_node_type(tonic::Request::new(by_type_request(
+                "rack-1",
+                rm::NodeType::SwitchGb200Nvidia,
+            )))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let stats = resp.stats.expect("stats present");
+        assert_eq!(stats.total_nodes, 3);
+        assert_eq!(stats.failed_nodes, 1);
+        assert_eq!(stats.successful_nodes, 2);
+
+        assert_eq!(resp.node_device_details.len(), 1);
+        assert_eq!(resp.node_device_details[0].node_id, "sw-ok");
+        assert_eq!(resp.node_device_details[0].chassis_sn, Some(11));
+        assert_eq!(resp.status, rm::ReturnCode::Failure as i32);
+        assert!(
+            resp.message.contains("node_id=sw-err: nvue unreachable"),
+            "unexpected message: {}",
+            resp.message
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn list_by_type_times_out_slow_node_without_stalling_others() {
+        let service = test_service();
+        add_mock_nodes(
+            &service,
+            "rack-1",
+            vec![
+                (
+                    "sw-fast",
+                    NodeType::SwitchGb200Nvidia,
+                    DeviceInfoBehavior::Value(json!({ "chassis_sn": 7 })),
+                ),
+                (
+                    "sw-hang",
+                    NodeType::SwitchGb200Nvidia,
+                    DeviceInfoBehavior::Hang,
+                ),
+            ],
+        );
+
+        // With a paused clock the deadline fires in virtual time, so the hung
+        // node cannot serialize the fast node behind it or stall the test.
+        let resp = service
+            .handle_list_node_device_info_by_node_type(tonic::Request::new(by_type_request(
+                "rack-1",
+                rm::NodeType::SwitchGb200Nvidia,
+            )))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let stats = resp.stats.expect("stats present");
+        assert_eq!(stats.total_nodes, 2);
+        assert_eq!(stats.failed_nodes, 1);
+        assert_eq!(stats.successful_nodes, 1);
+
+        assert_eq!(resp.node_device_details.len(), 1);
+        assert_eq!(resp.node_device_details[0].node_id, "sw-fast");
+        assert!(
+            resp.message.contains("node_id=sw-hang")
+                && resp.message.contains("exceeded 90s deadline"),
+            "unexpected message: {}",
+            resp.message
+        );
+    }
+
+    fn powershelf_node_info(node_id: &str, node_type: rm::NodeType) -> rm::NodeInfo {
+        rm::NodeInfo {
+            node_id: node_id.to_owned(),
+            rack_id: "rack-1".to_owned(),
+            r#type: Some(node_type as i32),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn build_batch_ephemeral_node_short_circuits_powershelves_to_no_device_info() {
+        let service = test_service();
+
+        // Every powershelf kind exposes no device info, so all resolve to
+        // `Ok(None)` up front — no credentials/endpoints required and no node
+        // built. This notably includes the Liteon variants, which previously
+        // still had to pass credential validation to build an ephemeral node.
+        for node_type in [
+            rm::NodeType::PowershelfGb200Liteon,
+            rm::NodeType::PowershelfGb200Delta,
+            rm::NodeType::PowershelfGb300Liteon,
+            rm::NodeType::PowershelfGb300Delta,
+        ] {
+            let outcome = service
+                .build_batch_ephemeral_node(&powershelf_node_info("psu", node_type))
+                .expect("powershelf should not error");
+            assert!(
+                outcome.is_none(),
+                "{node_type:?} should short-circuit to no-device-info without creds"
+            );
+        }
+
+        // Other node kinds still run validation: a compute node missing BMC
+        // credentials is still rejected rather than silently short-circuited.
+        let compute = rm::NodeInfo {
+            node_id: "compute-1".to_owned(),
+            rack_id: "rack-1".to_owned(),
+            r#type: Some(rm::NodeType::ComputeGb200Nvidia as i32),
+            ..Default::default()
+        };
+        assert!(
+            service.build_batch_ephemeral_node(&compute).is_err(),
+            "non-powershelf node kinds must still be validated"
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_device_info_reports_powershelves_as_no_device_info() {
+        let service = test_service();
+
+        // Mix Liteon and Delta variants, all without credentials, to prove every
+        // powershelf kind is reported uniformly as success/no-details.
+        let resp = service
+            .handle_batch_get_node_device_info(tonic::Request::new(
+                rm::BatchGetNodeDeviceInfoRequest {
+                    nodes: Some(rm::NodeSet {
+                        nodes: vec![
+                            powershelf_node_info("psu-200l", rm::NodeType::PowershelfGb200Liteon),
+                            powershelf_node_info("psu-200d", rm::NodeType::PowershelfGb200Delta),
+                            powershelf_node_info("psu-300l", rm::NodeType::PowershelfGb300Liteon),
+                            powershelf_node_info("psu-300d", rm::NodeType::PowershelfGb300Delta),
+                        ],
+                    }),
+                },
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+
+        // Mirrors NodeInstance::get_device_info and the single-node handler:
+        // no device info means success with no details, not a failed node.
+        let stats = resp.stats.expect("stats present");
+        assert_eq!(stats.total_nodes, 4);
+        assert_eq!(stats.failed_nodes, 0);
+        assert_eq!(stats.successful_nodes, 4);
+        assert!(resp.node_device_details.is_empty());
+        assert_eq!(resp.status, rm::ReturnCode::Success as i32);
+    }
+
+    #[test]
+    fn device_info_fetch_timeout_is_keyed_by_node_kind() {
+        // Compute device info walks a multi-GET Redfish sequence, so its
+        // backstop must sit above the switch (NVUE) ceiling to avoid preempting
+        // a slow-but-responsive BMC mid-discovery.
+        assert_eq!(
+            device_info_fetch_timeout(NodeType::ComputeGb200Nvidia),
+            Some(COMPUTE_DEVICE_INFO_FETCH_TIMEOUT)
+        );
+        assert_eq!(
+            device_info_fetch_timeout(NodeType::SwitchGb200Nvidia),
+            Some(SWITCH_DEVICE_INFO_FETCH_TIMEOUT)
+        );
+        // Powershelves expose no device info (get_device_info is a synchronous
+        // Ok(None)), so there is nothing to bound and no timeout is armed.
+        assert_eq!(
+            device_info_fetch_timeout(NodeType::PowershelfGb200Delta),
+            None
+        );
+        assert!(COMPUTE_DEVICE_INFO_FETCH_TIMEOUT > SWITCH_DEVICE_INFO_FETCH_TIMEOUT);
     }
 }

@@ -45,7 +45,7 @@ The full documentation lives in [`docs/`](docs/) and is rendered with
 ## Quick start
 
 ```bash
-git clone https://github.com/NVIDIA/nv-rms.git
+git clone https://github.com/dsx-ai-factory/nv-rms.git
 cd nv-rms
 just build   # or: cargo build --release --workspace
 

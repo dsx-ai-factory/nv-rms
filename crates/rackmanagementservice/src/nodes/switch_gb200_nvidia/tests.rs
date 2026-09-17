@@ -20,9 +20,9 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use nvue_client::cluster::{ClusterNodeServerAddresses, InterfaceType};
+use nvue_client::cluster::{ClusterNodeServerAddresses, ClusterUpdate, InterfaceType};
 use nvue_client::revision::{RevisionCreate, RevisionUpdate};
-use nvue_client::system::UserPasswordPatch;
+use nvue_client::system::{GnmiServerUpdate, UserPasswordPatch};
 use serde::Serialize;
 
 use super::*;
@@ -388,6 +388,189 @@ async fn uninstall_system_image_propagates_http_error() {
     assert_eq!(err.code, ErrorCode::Unavailable);
 }
 
+#[tokio::test]
+async fn spdm_attestation_discovers_and_collects_components_serially() {
+    let server = MockServer::start().await;
+    let nonce = vec![0xab; 32];
+
+    Mock::given(method("GET"))
+        .and(path("/nvue_v1/system/security/spdm"))
+        .and(query_param("rev", "operational"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "ERoT_CPU_0": {},
+            "ERoT_BMC_0": {}
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    for (component_id, action_id) in [("ERoT_BMC_0", "spdm-bmc"), ("ERoT_CPU_0", "spdm-cpu")] {
+        Mock::given(method("POST"))
+            .and(path(format!(
+                "/nvue_v1/system/security/spdm/{component_id}"
+            )))
+            .and(body_json(serde_json::json!({
+                "@generate": {
+                    "state": "start",
+                    "parameters": {"nonce": "ab".repeat(32)}
+                }
+            })))
+            .respond_with(ResponseTemplate::new(201).set_body_json(action_id))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path(format!("/nvue_v1/action/{action_id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "state": "action_success"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/nvue_v1/system/security/spdm/{component_id}/measurements"
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "signed_measurements": component_id
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/nvue_v1/system/security/spdm/{component_id}/certificates"
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "certificate_chain": component_id
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+
+    let switch = SwitchGb200Nvidia::for_test(&server.uri());
+    let challenge = SpdmAttestationChallenge::new(nonce).unwrap();
+
+    let results = switch
+        .request_spdm_attestation_evidence(
+            &challenge,
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0].component_id, "ERoT_BMC_0");
+    assert_eq!(results[1].component_id, "ERoT_CPU_0");
+    assert!(results.iter().all(|result| result.outcome.is_ok()));
+
+    let request_paths: Vec<_> = server
+        .received_requests()
+        .await
+        .expect("wiremock requests")
+        .into_iter()
+        .map(|request| request.url.path().to_owned())
+        .collect();
+
+    assert_eq!(
+        request_paths,
+        [
+            "/nvue_v1/system/security/spdm",
+            "/nvue_v1/system/security/spdm/ERoT_BMC_0",
+            "/nvue_v1/action/spdm-bmc",
+            "/nvue_v1/system/security/spdm/ERoT_BMC_0/measurements",
+            "/nvue_v1/system/security/spdm/ERoT_BMC_0/certificates",
+            "/nvue_v1/system/security/spdm/ERoT_CPU_0",
+            "/nvue_v1/action/spdm-cpu",
+            "/nvue_v1/system/security/spdm/ERoT_CPU_0/measurements",
+            "/nvue_v1/system/security/spdm/ERoT_CPU_0/certificates",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn spdm_attestation_reports_component_failure_without_fetching_stale_evidence() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/nvue_v1/system/security/spdm"))
+        .and(query_param("rev", "operational"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "ERoT_BMC_0": {}
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/nvue_v1/system/security/spdm/ERoT_BMC_0"))
+        .respond_with(ResponseTemplate::new(201).set_body_json("spdm-bmc"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/nvue_v1/action/spdm-bmc"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "state": "action_error",
+            "detail": "measurement generation failed"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path(
+            "/nvue_v1/system/security/spdm/ERoT_BMC_0/measurements",
+        ))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path(
+            "/nvue_v1/system/security/spdm/ERoT_BMC_0/certificates",
+        ))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let switch = SwitchGb200Nvidia::for_test(&server.uri());
+    let challenge = SpdmAttestationChallenge::new(vec![0xcd; 32]).unwrap();
+
+    let results = switch
+        .request_spdm_attestation_evidence(
+            &challenge,
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+
+    assert!(
+        results[0]
+            .outcome
+            .as_ref()
+            .unwrap_err()
+            .message
+            .contains("measurement generation failed")
+    );
+}
+
+#[test]
+fn spdm_attestation_nonce_must_be_32_bytes() {
+    let error = SpdmAttestationChallenge::new(vec![0; 31]).unwrap_err();
+
+    assert_eq!(error.code, ErrorCode::InvalidArgument);
+}
+
 fn record_ssh_commands() -> (SshCommandLog, SshCommandRecorder) {
     let commands = Arc::new(Mutex::new(Vec::new()));
     let recorded = Arc::clone(&commands);
@@ -403,23 +586,64 @@ fn recorded_ssh_commands(commands: &SshCommandLog) -> Vec<String> {
     commands.lock().unwrap().clone()
 }
 
+async fn mount_current_cluster_state(server: &MockServer, state: &str, up_to_once: bool) {
+    let mock = Mock::given(method("GET"))
+        .and(path("/nvue_v1/cluster"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "state": state
+        })));
+
+    let mock = if up_to_once {
+        mock.up_to_n_times(1)
+    } else {
+        mock
+    };
+
+    mock.expect(1)
+        .named("GET /nvue_v1/cluster")
+        .mount(server)
+        .await;
+}
+
+async fn mount_stage_cluster_state(server: &MockServer, revision_id: &str, desired_state: &str) {
+    Mock::given(method("PATCH"))
+        .and(path("/nvue_v1/cluster"))
+        .and(query_param("rev", revision_id))
+        .and(body_json(ClusterUpdate::new(desired_state)))
+        .respond_with(ResponseTemplate::new(200).set_body_json(EmptyBody::default()))
+        .expect(1)
+        .named("PATCH /nvue_v1/cluster?rev")
+        .mount(server)
+        .await;
+}
+
+/// Mounts the create -> stage -> apply -> wait(applied) -> save revision
+/// sequence RMS drives to transition the cluster to `desired_state`.
+async fn mount_cluster_state_revision(server: &MockServer, revision_id: &str, desired_state: &str) {
+    mount_create_revision(server, revision_id, None).await;
+    mount_stage_cluster_state(server, revision_id, desired_state).await;
+    mount_apply_revision(server, revision_id, None).await;
+    mount_revision_get(
+        server,
+        revision_id,
+        None,
+        ResponseTemplate::new(200).set_body_json(RevisionState { state: "applied" }),
+    )
+    .await;
+    mount_save_applied_revision(server, None).await;
+}
+
 async fn assert_set_cluster_state_noops(enabled: bool, current_state: &str) {
     let server = MockServer::start().await;
 
-    Mock::given(method("GET"))
-        .and(path("/nvue_v1/cluster"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "state": current_state
-        })))
-        .expect(1)
-        .named("current GET /nvue_v1/cluster")
-        .mount(&server)
-        .await;
+    // Mount only the state read: no revision mocks are registered, so any
+    // attempt to mutate would hit a 404 and fail the call. Reaching Ok proves
+    // the transition was a no-op.
+    mount_current_cluster_state(&server, current_state, false).await;
 
-    let (commands, exec) = record_ssh_commands();
-    let switch = SwitchGb200Nvidia::for_test(&server.uri()).with_ssh_exec_for_test(exec);
+    let switch = SwitchGb200Nvidia::for_test(&server.uri());
+
     switch.set_cluster_state(enabled).await.unwrap();
-    assert!(recorded_ssh_commands(&commands).is_empty());
 }
 
 async fn assert_set_cluster_state_updates(
@@ -429,39 +653,15 @@ async fn assert_set_cluster_state_updates(
 ) {
     let server = MockServer::start().await;
 
-    Mock::given(method("GET"))
-        .and(path("/nvue_v1/cluster"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "state": current_state
-        })))
-        .up_to_n_times(1)
-        .expect(1)
-        .named("initial GET /nvue_v1/cluster")
-        .mount(&server)
-        .await;
+    mount_current_cluster_state(&server, current_state, true).await;
+    mount_cluster_state_revision(&server, "42", expected_state).await;
+    mount_current_cluster_state(&server, expected_state, false).await;
 
-    Mock::given(method("GET"))
-        .and(path("/nvue_v1/cluster"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "state": expected_state
-        })))
-        .expect(1)
-        .named("final GET /nvue_v1/cluster")
-        .mount(&server)
-        .await;
+    let switch = SwitchGb200Nvidia::for_test(&server.uri());
 
-    let (commands, exec) = record_ssh_commands();
-    let switch = SwitchGb200Nvidia::for_test(&server.uri()).with_ssh_exec_for_test(exec);
+    // Each mounted revision mock carries an `expect(1)`, verified on drop, so
+    // the transition must flow through the NVUE revision workflow.
     switch.set_cluster_state(enabled).await.unwrap();
-
-    assert_eq!(
-        recorded_ssh_commands(&commands),
-        vec![
-            format!("nv set cluster state {expected_state}"),
-            "nv config apply --assume-yes".to_owned(),
-            "nv config save".to_owned(),
-        ]
-    );
 }
 
 #[tokio::test]
@@ -475,8 +675,13 @@ async fn set_cluster_state_skips_enabled_state_when_already_enabled() {
 }
 
 #[tokio::test]
-async fn set_cluster_state_skips_start_state_when_enabling() {
-    assert_set_cluster_state_noops(true, "start").await;
+async fn set_cluster_state_enables_when_preflight_state_is_not_enabled() {
+    // The preflight no-op fires only on an exact match with the desired state.
+    // Earlier code additionally short-circuited enabling when the cluster read
+    // back the literal `"start"`; NVOS never reports that as a cluster state, so
+    // this guards that the removed special-case stays removed: a `"start"`
+    // reading drives a genuine enable revision and must converge to `enabled`.
+    assert_set_cluster_state_updates(true, "start", "enabled").await;
 }
 
 #[tokio::test]
@@ -490,41 +695,163 @@ async fn set_cluster_state_enables_disabled_cluster() {
 }
 
 #[tokio::test]
-async fn set_cluster_state_propagates_command_failure() {
+async fn set_cluster_state_waits_through_start_until_enabled() {
     let server = MockServer::start().await;
 
+    // Preflight read: cluster is disabled, so a genuine enable revision runs.
+    mount_current_cluster_state(&server, "disabled", true).await;
+    mount_cluster_state_revision(&server, "42", "enabled").await;
+
+    // Post-apply convergence: the switch first reports the transient `start`
+    // state, then settles on `enabled`. The `start` mock is consumed once and
+    // the loop must keep polling until `enabled` is observed. If `start` were
+    // (incorrectly) treated as terminal, the final `enabled` GET would never
+    // fire and its expect(1) would fail on drop.
+    mount_current_cluster_state(&server, "start", true).await;
+    mount_current_cluster_state(&server, "enabled", false).await;
+
+    let switch = SwitchGb200Nvidia::for_test(&server.uri());
+
+    switch.set_cluster_state(true).await.unwrap();
+}
+
+#[tokio::test]
+async fn set_cluster_state_treats_no_config_diff_as_success() {
+    let server = MockServer::start().await;
+
+    mount_current_cluster_state(&server, "enabled", true).await;
+    mount_create_revision(&server, "42", None).await;
+    mount_stage_cluster_state(&server, "42", "disabled").await;
+    mount_apply_revision(&server, "42", None).await;
+
+    // NVUE reports the apply as idempotent; the revision helper treats this as
+    // success and issues no save.
+    mount_revision_get(
+        &server,
+        "42",
+        None,
+        ResponseTemplate::new(200).set_body_json(RevisionStateWithIssue {
+            state: "invalid",
+            transition: RevisionTransitionWithIssue {
+                issue: RevisionIssueMap {
+                    issue_00000: RevisionIssueEntry {
+                        message: "config apply executed with no config diff",
+                        severity: "info",
+                    },
+                },
+            },
+        }),
+    )
+    .await;
+
+    mount_current_cluster_state(&server, "disabled", false).await;
+
+    let switch = SwitchGb200Nvidia::for_test(&server.uri());
+
+    switch.set_cluster_state(false).await.unwrap();
+}
+
+#[tokio::test]
+async fn set_cluster_state_propagates_stage_patch_failure() {
+    let server = MockServer::start().await;
+
+    mount_current_cluster_state(&server, "enabled", false).await;
+    mount_create_revision(&server, "42", None).await;
+
+    Mock::given(method("PATCH"))
+        .and(path("/nvue_v1/cluster"))
+        .and(query_param("rev", "42"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+            "detail": "state transition rejected"
+        })))
+        .expect(1)
+        .named("PATCH /nvue_v1/cluster?rev failure")
+        .mount(&server)
+        .await;
+
+    // A failed stage must discard the candidate revision instead of leaking it.
+    Mock::given(method("DELETE"))
+        .and(path("/nvue_v1/revision/42"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .named("DELETE /nvue_v1/revision/42 (discard candidate)")
+        .mount(&server)
+        .await;
+
+    let switch = SwitchGb200Nvidia::for_test(&server.uri());
+
+    let err = switch.set_cluster_state(false).await.unwrap_err();
+
+    assert!(err.message.contains("NVUE PATCH /nvue_v1/cluster?rev=42"));
+}
+
+#[tokio::test]
+async fn set_cluster_state_propagates_apply_failure() {
+    let server = MockServer::start().await;
+
+    mount_current_cluster_state(&server, "enabled", false).await;
+    mount_create_revision(&server, "42", None).await;
+    mount_stage_cluster_state(&server, "42", "disabled").await;
+    mount_apply_revision(&server, "42", None).await;
+
+    mount_revision_get(
+        &server,
+        "42",
+        None,
+        ResponseTemplate::new(200).set_body_json(RevisionStateWithIssue {
+            state: "failed",
+            transition: RevisionTransitionWithIssue {
+                issue: RevisionIssueMap {
+                    issue_00000: RevisionIssueEntry {
+                        message: "cluster apply rejected",
+                        severity: "error",
+                    },
+                },
+            },
+        }),
+    )
+    .await;
+
+    let switch = SwitchGb200Nvidia::for_test(&server.uri());
+
+    let err = switch.set_cluster_state(false).await.unwrap_err();
+
+    assert_eq!(err.code, ErrorCode::FailedPrecondition);
+    assert!(err.message.contains("cluster apply rejected"));
+}
+
+#[tokio::test]
+async fn set_cluster_state_errors_when_state_never_converges() {
+    let server = MockServer::start().await;
+
+    // Every read reports the pre-transition state, so operational convergence
+    // never succeeds even though the revision applies cleanly.
     Mock::given(method("GET"))
         .and(path("/nvue_v1/cluster"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "state": "enabled"
         })))
-        .expect(1)
-        .named("current GET /nvue_v1/cluster")
+        .named("GET /nvue_v1/cluster never converges")
         .mount(&server)
         .await;
 
-    let commands = Arc::new(Mutex::new(Vec::new()));
-    let recorded = Arc::clone(&commands);
-    let switch =
-        SwitchGb200Nvidia::for_test(&server.uri()).with_ssh_exec_for_test(move |command| {
-            recorded.lock().unwrap().push(command.to_owned());
-            if command == "nv config apply --assume-yes" {
-                Err(RmsError::internal("nv config apply failed"))
-            } else {
-                Ok(String::new())
-            }
-        });
+    mount_create_revision(&server, "42", None).await;
+    mount_stage_cluster_state(&server, "42", "disabled").await;
+    mount_apply_revision(&server, "42", None).await;
+    mount_revision_get(
+        &server,
+        "42",
+        None,
+        ResponseTemplate::new(200).set_body_json(RevisionState { state: "applied" }),
+    )
+    .await;
+    mount_save_applied_revision(&server, None).await;
 
+    let switch = SwitchGb200Nvidia::for_test(&server.uri());
     let err = switch.set_cluster_state(false).await.unwrap_err();
+
     assert_eq!(err.code, ErrorCode::Internal);
-    assert!(err.message.contains("nv config apply failed"));
-    assert_eq!(
-        recorded_ssh_commands(&commands),
-        vec![
-            "nv set cluster state disabled".to_owned(),
-            "nv config apply --assume-yes".to_owned(),
-        ]
-    );
+    assert!(err.message.contains("cluster state did not reach disabled"));
 }
 
 #[tokio::test]
@@ -547,6 +874,298 @@ async fn set_cluster_state_errors_when_state_missing() {
     assert!(
         err.message
             .contains("unable to determine current cluster state")
+    );
+}
+
+// ── gNMI server state (NVUE) ─────────────────────────────────────
+
+async fn mount_current_gnmi_state(server: &MockServer, state: &str, up_to_once: bool) {
+    let mock = Mock::given(method("GET"))
+        .and(path("/nvue_v1/system/gnmi-server"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "state": state
+        })));
+
+    let mock = if up_to_once {
+        mock.up_to_n_times(1)
+    } else {
+        mock
+    };
+
+    mock.expect(1)
+        .named("GET /nvue_v1/system/gnmi-server")
+        .mount(server)
+        .await;
+}
+
+async fn mount_stage_gnmi_state(server: &MockServer, revision_id: &str, desired_state: &str) {
+    Mock::given(method("PATCH"))
+        .and(path("/nvue_v1/system/gnmi-server"))
+        .and(query_param("rev", revision_id))
+        .and(body_json(GnmiServerUpdate::new(desired_state)))
+        .respond_with(ResponseTemplate::new(200).set_body_json(EmptyBody::default()))
+        .expect(1)
+        .named("PATCH /nvue_v1/system/gnmi-server?rev")
+        .mount(server)
+        .await;
+}
+
+/// Mounts the create -> stage -> apply -> wait(applied) -> save revision
+/// sequence RMS drives to transition the gNMI server to `desired_state`.
+async fn mount_gnmi_state_revision(server: &MockServer, revision_id: &str, desired_state: &str) {
+    mount_create_revision(server, revision_id, None).await;
+    mount_stage_gnmi_state(server, revision_id, desired_state).await;
+    mount_apply_revision(server, revision_id, None).await;
+    mount_revision_get(
+        server,
+        revision_id,
+        None,
+        ResponseTemplate::new(200).set_body_json(RevisionState { state: "applied" }),
+    )
+    .await;
+    mount_save_applied_revision(server, None).await;
+}
+
+async fn assert_gnmi_service_noops(enabled: bool, current_state: &str) {
+    let server = MockServer::start().await;
+
+    // Mount only the state read: no revision mocks are registered, so any
+    // attempt to mutate would hit a 404 and fail the call. Reaching Ok proves
+    // the transition was a no-op.
+    mount_current_gnmi_state(&server, current_state, false).await;
+
+    let switch = SwitchGb200Nvidia::for_test(&server.uri());
+
+    let result = switch.gnmi_service(enabled).await.unwrap();
+    assert_eq!(result["status"], "success");
+    assert_eq!(result["state"], current_state);
+}
+
+async fn assert_gnmi_service_updates(enabled: bool, current_state: &str, expected_state: &str) {
+    let server = MockServer::start().await;
+
+    mount_current_gnmi_state(&server, current_state, true).await;
+    mount_gnmi_state_revision(&server, "42", expected_state).await;
+    mount_current_gnmi_state(&server, expected_state, false).await;
+
+    let switch = SwitchGb200Nvidia::for_test(&server.uri());
+
+    // Each mounted revision mock carries an `expect(1)`, verified on drop, so
+    // the transition must flow through the NVUE revision workflow. Reaching this
+    // point proves RMS issued no `nv set` / `nv config` / `nv show` SSH command.
+    let result = switch.gnmi_service(enabled).await.unwrap();
+    assert_eq!(result["status"], "success");
+    assert_eq!(result["state"], expected_state);
+}
+
+#[tokio::test]
+async fn gnmi_service_skips_disable_when_already_disabled() {
+    assert_gnmi_service_noops(false, "disabled").await;
+}
+
+#[tokio::test]
+async fn gnmi_service_skips_enable_when_already_enabled() {
+    assert_gnmi_service_noops(true, "enabled").await;
+}
+
+#[tokio::test]
+async fn gnmi_service_enables_disabled_server() {
+    assert_gnmi_service_updates(true, "disabled", "enabled").await;
+}
+
+#[tokio::test]
+async fn gnmi_service_disables_enabled_server() {
+    assert_gnmi_service_updates(false, "enabled", "disabled").await;
+}
+
+#[tokio::test]
+async fn gnmi_service_waits_through_transient_state_until_converged() {
+    let server = MockServer::start().await;
+
+    // Preflight read: gNMI is disabled, so a genuine enable revision runs.
+    mount_current_gnmi_state(&server, "disabled", true).await;
+    mount_gnmi_state_revision(&server, "42", "enabled").await;
+
+    // Post-apply convergence: the switch first reports the stale `disabled`
+    // state, then settles on `enabled`. The loop must keep polling until the
+    // desired value is observed; if it resolved on the first reading, the final
+    // `enabled` GET would never fire and its expect(1) would fail on drop.
+    mount_current_gnmi_state(&server, "disabled", true).await;
+    mount_current_gnmi_state(&server, "enabled", false).await;
+
+    let switch = SwitchGb200Nvidia::for_test(&server.uri());
+
+    let result = switch.gnmi_service(true).await.unwrap();
+    assert_eq!(result["state"], "enabled");
+}
+
+#[tokio::test]
+async fn gnmi_service_treats_no_config_diff_as_success() {
+    let server = MockServer::start().await;
+
+    mount_current_gnmi_state(&server, "enabled", true).await;
+    mount_create_revision(&server, "42", None).await;
+    mount_stage_gnmi_state(&server, "42", "disabled").await;
+    mount_apply_revision(&server, "42", None).await;
+
+    // NVUE reports the apply as idempotent; the revision helper treats this as
+    // success and issues no save.
+    mount_revision_get(
+        &server,
+        "42",
+        None,
+        ResponseTemplate::new(200).set_body_json(RevisionStateWithIssue {
+            state: "invalid",
+            transition: RevisionTransitionWithIssue {
+                issue: RevisionIssueMap {
+                    issue_00000: RevisionIssueEntry {
+                        message: "config apply executed with no config diff",
+                        severity: "info",
+                    },
+                },
+            },
+        }),
+    )
+    .await;
+
+    mount_current_gnmi_state(&server, "disabled", false).await;
+
+    let switch = SwitchGb200Nvidia::for_test(&server.uri());
+
+    let result = switch.gnmi_service(false).await.unwrap();
+    assert_eq!(result["state"], "disabled");
+}
+
+#[tokio::test]
+async fn gnmi_service_propagates_apply_failure() {
+    let server = MockServer::start().await;
+
+    mount_current_gnmi_state(&server, "enabled", false).await;
+    mount_create_revision(&server, "42", None).await;
+    mount_stage_gnmi_state(&server, "42", "disabled").await;
+    mount_apply_revision(&server, "42", None).await;
+
+    mount_revision_get(
+        &server,
+        "42",
+        None,
+        ResponseTemplate::new(200).set_body_json(RevisionStateWithIssue {
+            state: "failed",
+            transition: RevisionTransitionWithIssue {
+                issue: RevisionIssueMap {
+                    issue_00000: RevisionIssueEntry {
+                        message: "gnmi apply rejected",
+                        severity: "error",
+                    },
+                },
+            },
+        }),
+    )
+    .await;
+
+    let switch = SwitchGb200Nvidia::for_test(&server.uri());
+
+    let err = switch.gnmi_service(false).await.unwrap_err();
+
+    assert_eq!(err.code, ErrorCode::FailedPrecondition);
+    assert!(err.message.contains("gnmi apply rejected"));
+}
+
+#[tokio::test]
+async fn gnmi_service_errors_when_state_never_converges() {
+    let server = MockServer::start().await;
+
+    // Every read reports the pre-transition state, so operational convergence
+    // never succeeds even though the revision applies cleanly.
+    Mock::given(method("GET"))
+        .and(path("/nvue_v1/system/gnmi-server"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "state": "enabled"
+        })))
+        .named("GET /nvue_v1/system/gnmi-server never converges")
+        .mount(&server)
+        .await;
+
+    mount_create_revision(&server, "42", None).await;
+    mount_stage_gnmi_state(&server, "42", "disabled").await;
+    mount_apply_revision(&server, "42", None).await;
+    mount_revision_get(
+        &server,
+        "42",
+        None,
+        ResponseTemplate::new(200).set_body_json(RevisionState { state: "applied" }),
+    )
+    .await;
+    mount_save_applied_revision(&server, None).await;
+
+    let switch = SwitchGb200Nvidia::for_test(&server.uri());
+    let err = switch.gnmi_service(false).await.unwrap_err();
+
+    // Reachable switch that never converges after the bounded retries is a
+    // switch-side, retryable condition, not an RMS-internal fault.
+    assert_eq!(err.code, ErrorCode::Unavailable);
+    assert!(
+        err.message
+            .contains("gNMI server state did not reach disabled")
+    );
+}
+
+#[tokio::test]
+async fn gnmi_service_surfaces_last_read_failure_when_never_converging() {
+    let server = MockServer::start().await;
+
+    // Preflight read succeeds (enabled != desired disabled), so a genuine
+    // revision runs. Every post-apply convergence read then fails with 503.
+    mount_current_gnmi_state(&server, "enabled", true).await;
+    mount_gnmi_state_revision(&server, "42", "disabled").await;
+
+    // GET-only mock: it shadows only the convergence reads (the stage PATCH
+    // carries a `rev` query and a different method, so it is unaffected).
+    Mock::given(method("GET"))
+        .and(path("/nvue_v1/system/gnmi-server"))
+        .respond_with(ResponseTemplate::new(503))
+        .named("convergence GET /nvue_v1/system/gnmi-server keeps failing")
+        .mount(&server)
+        .await;
+
+    let switch = SwitchGb200Nvidia::for_test(&server.uri());
+    let err = switch.gnmi_service(false).await.unwrap_err();
+
+    // The real last read cause (HTTP 503) is surfaced rather than the generic
+    // "did not reach ... after retries" timeout that previously discarded it.
+    assert_eq!(err.code, ErrorCode::Unavailable);
+    assert!(
+        err.message.contains("503"),
+        "expected the HTTP 503 read failure to surface, got: {}",
+        err.message
+    );
+    assert!(
+        !err.message.contains("did not reach"),
+        "generic retry-exhaustion error masked the real read failure: {}",
+        err.message
+    );
+}
+
+#[tokio::test]
+async fn gnmi_service_errors_when_state_missing() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/nvue_v1/system/gnmi-server"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "some-other-field": "value"
+        })))
+        .expect(1)
+        .named("current GET /nvue_v1/system/gnmi-server")
+        .mount(&server)
+        .await;
+
+    let switch = SwitchGb200Nvidia::for_test(&server.uri());
+    let err = switch.gnmi_service(false).await.unwrap_err();
+    assert_eq!(err.code, ErrorCode::Internal);
+    assert!(
+        err.message
+            .contains("unable to determine current gNMI server state")
     );
 }
 
@@ -869,6 +1488,52 @@ fn nmx_controller_unconfigured_response(manager_state: &str) -> serde_json::Valu
     })
 }
 
+/// Mounts the NVUE cluster-app manager `@update` POST that sets the manager
+/// state (replacing the former `nv action update ... manager <state>` SSH
+/// command). The body matcher pins the exact action envelope.
+async fn mount_manager_update(server: &MockServer, app: &str, desired: &str) {
+    Mock::given(method("POST"))
+        .and(path(format!("/nvue_v1/cluster/apps/{app}/manager")))
+        .and(body_json(serde_json::json!({
+            "@update": { "state": "start", "parameters": { "state": desired } }
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+        .expect(1)
+        .named("POST @update /nvue_v1/cluster/apps/<app>/manager")
+        .mount(server)
+        .await;
+}
+
+/// Mounts the NVUE cluster-app manager GET that `check_grpc_status` reads to
+/// decide whether gRPC is currently enabled. This drives the idempotent
+/// short-circuit in `enable_grpc_for_external_clients`: a state of
+/// `enabled`/`start`/`active` reports gRPC on, anything else reports it off.
+async fn mount_manager_state_get(server: &MockServer, app: &str, state: &str) {
+    Mock::given(method("GET"))
+        .and(path(format!("/nvue_v1/cluster/apps/{app}/manager")))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({ "state": state })),
+        )
+        .named("GET /nvue_v1/cluster/apps/<app>/manager")
+        .mount(server)
+        .await;
+}
+
+/// Mounts the NVUE cluster-app `@start` POST that starts a stopped app
+/// (replacing the former `nv action start cluster apps <app>` SSH command).
+async fn mount_app_start(server: &MockServer, app: &str) {
+    Mock::given(method("POST"))
+        .and(path(format!("/nvue_v1/cluster/apps/{app}")))
+        .and(body_json(
+            serde_json::json!({ "@start": { "state": "start" } }),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+        .expect(1)
+        .named("POST @start /nvue_v1/cluster/apps/<app>")
+        .mount(server)
+        .await;
+}
+
 #[tokio::test]
 async fn enable_grpc_for_external_clients_accepts_ready_app_without_manager_state() {
     let server = MockServer::start().await;
@@ -903,8 +1568,9 @@ async fn enable_grpc_for_external_clients_accepts_ready_app_without_manager_stat
         .mount(&server)
         .await;
 
-    let (commands, exec) = record_ssh_commands();
-    let switch = SwitchGb200Nvidia::for_test(&server.uri()).with_ssh_exec_for_test(exec);
+    mount_manager_update(&server, "nmx-controller", "enabled").await;
+
+    let switch = SwitchGb200Nvidia::for_test(&server.uri());
 
     let status = switch
         .enable_grpc_for_external_clients("nmx-controller", true)
@@ -917,10 +1583,6 @@ async fn enable_grpc_for_external_clients_accepts_ready_app_without_manager_stat
             .and_then(|manager| manager.get("state"))
             .and_then(|state| state.as_str()),
         Some("enabled")
-    );
-    assert_eq!(
-        recorded_ssh_commands(&commands),
-        vec!["nv action update cluster apps nmx-controller manager enabled".to_owned()]
     );
 }
 
@@ -959,8 +1621,9 @@ async fn enable_grpc_for_external_clients_attempts_action_when_readiness_unknown
         .mount(&server)
         .await;
 
-    let (commands, exec) = record_ssh_commands();
-    let switch = SwitchGb200Nvidia::for_test(&server.uri()).with_ssh_exec_for_test(exec);
+    mount_manager_update(&server, "nmx-controller", "enabled").await;
+
+    let switch = SwitchGb200Nvidia::for_test(&server.uri());
 
     let status = switch
         .enable_grpc_for_external_clients("nmx-controller", true)
@@ -973,10 +1636,6 @@ async fn enable_grpc_for_external_clients_attempts_action_when_readiness_unknown
             .and_then(|manager| manager.get("state"))
             .and_then(|state| state.as_str()),
         Some("enabled")
-    );
-    assert_eq!(
-        recorded_ssh_commands(&commands),
-        vec!["nv action update cluster apps nmx-controller manager enabled".to_owned()]
     );
 }
 
@@ -1022,8 +1681,9 @@ async fn enable_grpc_for_external_clients_waits_for_cluster_enabled_state() {
         .mount(&server)
         .await;
 
-    let (commands, exec) = record_ssh_commands();
-    let switch = SwitchGb200Nvidia::for_test(&server.uri()).with_ssh_exec_for_test(exec);
+    mount_manager_update(&server, "nmx-controller", "enabled").await;
+
+    let switch = SwitchGb200Nvidia::for_test(&server.uri());
 
     let status = switch
         .enable_grpc_for_external_clients("nmx-controller", true)
@@ -1037,10 +1697,6 @@ async fn enable_grpc_for_external_clients_waits_for_cluster_enabled_state() {
             .and_then(|state| state.as_str()),
         Some("enabled")
     );
-    assert_eq!(
-        recorded_ssh_commands(&commands),
-        vec!["nv action update cluster apps nmx-controller manager enabled".to_owned()]
-    );
 }
 
 #[tokio::test]
@@ -1049,9 +1705,9 @@ async fn enable_grpc_for_external_clients_attempts_action_after_readiness_timeou
 
     Mock::given(method("GET"))
         .and(path("/nvue_v1/cluster"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(cluster_ready_response("start")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(cluster_ready_response("disabled")))
         .expect(config::MAX_RETRY_ATTEMPTS as u64 + 1)
-        .named("transitional GET /nvue_v1/cluster until timeout")
+        .named("disabled GET /nvue_v1/cluster until timeout")
         .mount(&server)
         .await;
 
@@ -1065,8 +1721,9 @@ async fn enable_grpc_for_external_clients_attempts_action_after_readiness_timeou
         .mount(&server)
         .await;
 
-    let (commands, exec) = record_ssh_commands();
-    let switch = SwitchGb200Nvidia::for_test(&server.uri()).with_ssh_exec_for_test(exec);
+    mount_manager_update(&server, "nmx-controller", "enabled").await;
+
+    let switch = SwitchGb200Nvidia::for_test(&server.uri());
 
     let status = switch
         .enable_grpc_for_external_clients("nmx-controller", true)
@@ -1074,11 +1731,6 @@ async fn enable_grpc_for_external_clients_attempts_action_after_readiness_timeou
         .unwrap();
 
     assert_eq!(status["manager"]["state"], "enabled");
-
-    assert_eq!(
-        recorded_ssh_commands(&commands),
-        vec!["nv action update cluster apps nmx-controller manager enabled".to_owned()]
-    );
 }
 
 #[tokio::test]
@@ -1139,8 +1791,9 @@ async fn enable_grpc_for_external_clients_waits_for_nmx_controller_ready_state()
         .mount(&server)
         .await;
 
-    let (commands, exec) = record_ssh_commands();
-    let switch = SwitchGb200Nvidia::for_test(&server.uri()).with_ssh_exec_for_test(exec);
+    mount_manager_update(&server, "nmx-controller", "enabled").await;
+
+    let switch = SwitchGb200Nvidia::for_test(&server.uri());
 
     let status = switch
         .enable_grpc_for_external_clients("nmx-controller", true)
@@ -1154,9 +1807,59 @@ async fn enable_grpc_for_external_clients_waits_for_nmx_controller_ready_state()
             .and_then(|state| state.as_str()),
         Some("enabled")
     );
+}
+
+#[tokio::test]
+async fn enable_grpc_for_external_clients_treats_empty_nmxc_conn_object_as_unknown() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/nvue_v1/cluster"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "state": "enabled",
+            "nmxc-conn": {}
+        })))
+        .expect(1)
+        .named("cluster GET with nested nmxc-conn missing state")
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/nvue_v1/cluster/apps/nmx-controller"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(nmx_controller_unknown_readiness_response()),
+        )
+        .up_to_n_times(1)
+        .expect(1)
+        .named("pre-action GET /nvue_v1/cluster/apps/nmx-controller without readiness fields")
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/nvue_v1/cluster/apps/nmx-controller"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(nmx_controller_status_response("enabled")),
+        )
+        .expect(1)
+        .named("post-action GET /nvue_v1/cluster/apps/nmx-controller")
+        .mount(&server)
+        .await;
+
+    mount_manager_update(&server, "nmx-controller", "enabled").await;
+
+    let switch = SwitchGb200Nvidia::for_test(&server.uri());
+
+    let status = switch
+        .enable_grpc_for_external_clients("nmx-controller", true)
+        .await
+        .unwrap();
+
     assert_eq!(
-        recorded_ssh_commands(&commands),
-        vec!["nv action update cluster apps nmx-controller manager enabled".to_owned()]
+        status
+            .get("manager")
+            .and_then(|manager| manager.get("state"))
+            .and_then(|state| state.as_str()),
+        Some("enabled")
     );
 }
 
@@ -1192,8 +1895,9 @@ async fn enable_grpc_for_external_clients_starts_stopped_nmx_controller() {
         .mount(&server)
         .await;
 
-    let (commands, exec) = record_ssh_commands();
-    let switch = SwitchGb200Nvidia::for_test(&server.uri()).with_ssh_exec_for_test(exec);
+    mount_app_start(&server, "nmx-controller").await;
+
+    let switch = SwitchGb200Nvidia::for_test(&server.uri());
 
     let status = switch
         .enable_grpc_for_external_clients("nmx-controller", true)
@@ -1206,11 +1910,6 @@ async fn enable_grpc_for_external_clients_starts_stopped_nmx_controller() {
             .and_then(|manager| manager.get("state"))
             .and_then(|state| state.as_str()),
         Some("enabled")
-    );
-
-    assert_eq!(
-        recorded_ssh_commands(&commands),
-        vec!["nv action start cluster apps nmx-controller".to_owned()]
     );
 }
 
@@ -1246,17 +1945,565 @@ async fn ensure_cluster_app_manager_action_ready_starts_stopped_nmx_controller()
         .mount(&server)
         .await;
 
-    let (commands, exec) = record_ssh_commands();
-    let switch = SwitchGb200Nvidia::for_test(&server.uri()).with_ssh_exec_for_test(exec);
+    mount_app_start(&server, "nmx-controller").await;
+
+    let switch = SwitchGb200Nvidia::for_test(&server.uri());
 
     switch
         .ensure_cluster_app_manager_action_ready("nmx-controller")
         .await
         .unwrap();
+}
+
+/// NMX-T (nmx-telemetry) manager enable must also flow through the NVUE
+/// `@update` action, confirming the shared helper migrated both consumers.
+#[tokio::test]
+async fn enable_grpc_for_external_clients_enables_nmx_telemetry_via_nvue() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/nvue_v1/cluster"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(cluster_ready_response("enabled")))
+        .named("ready GET /nvue_v1/cluster")
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/nvue_v1/cluster/apps/nmx-telemetry"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(nmx_controller_status_response("disabled")),
+        )
+        .up_to_n_times(1)
+        .expect(1)
+        .named("pre-action GET /nvue_v1/cluster/apps/nmx-telemetry")
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/nvue_v1/cluster/apps/nmx-telemetry"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(nmx_controller_status_response("enabled")),
+        )
+        .expect(1)
+        .named("post-action GET /nvue_v1/cluster/apps/nmx-telemetry")
+        .mount(&server)
+        .await;
+
+    mount_manager_update(&server, "nmx-telemetry", "enabled").await;
+
+    let switch = SwitchGb200Nvidia::for_test(&server.uri());
+
+    let status = switch
+        .enable_grpc_for_external_clients("nmx-telemetry", true)
+        .await
+        .unwrap();
+
+    assert_eq!(status["manager"]["state"], "enabled");
+}
+
+/// The disable path (`enabled = false`) is an independent NVUE flow: it skips
+/// the manager-action readiness wait, POSTs the `disabled` manager `@update`,
+/// then polls `get_cluster_apps_status` for convergence. Exercise it end to end
+/// so regressions in the disable branch remain visible to the suite.
+#[tokio::test]
+async fn disables_grpc_for_external_clients_via_nvue() {
+    let server = MockServer::start().await;
+
+    // Pre-check reports gRPC still enabled so the idempotent short-circuit does
+    // not fire and the disable action actually runs.
+    mount_manager_state_get(&server, "nmx-controller", "enabled").await;
+
+    Mock::given(method("GET"))
+        .and(path("/nvue_v1/cluster/apps/nmx-controller"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(nmx_controller_status_response("disabled")),
+        )
+        .expect(1)
+        .named("post-action GET /nvue_v1/cluster/apps/nmx-controller")
+        .mount(&server)
+        .await;
+
+    mount_manager_update(&server, "nmx-controller", "disabled").await;
+
+    let switch = SwitchGb200Nvidia::for_test(&server.uri());
+
+    let status = switch
+        .enable_grpc_for_external_clients("nmx-controller", false)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        status
+            .get("manager")
+            .and_then(|manager| manager.get("state"))
+            .and_then(|state| state.as_str()),
+        Some("disabled")
+    );
+}
+
+/// A disable that begins from an unexpected/transitional manager state must
+/// still converge: the post-action poll tolerates a non-terminal reading
+/// before `disabled` settles. Without this the disable retry loop is untested.
+#[tokio::test]
+async fn disable_grpc_for_external_clients_converges_from_transitional_state() {
+    let server = MockServer::start().await;
+
+    mount_manager_state_get(&server, "nmx-controller", "enabled").await;
+
+    // First poll observes a transitional manager state (not yet `disabled`);
+    // the loop must keep polling rather than error or return early.
+    Mock::given(method("GET"))
+        .and(path("/nvue_v1/cluster/apps/nmx-controller"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(nmx_controller_status_response("start")),
+        )
+        .up_to_n_times(1)
+        .expect(1)
+        .named("transitional post-action GET /nvue_v1/cluster/apps/nmx-controller")
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/nvue_v1/cluster/apps/nmx-controller"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(nmx_controller_status_response("disabled")),
+        )
+        .expect(1)
+        .named("settled post-action GET /nvue_v1/cluster/apps/nmx-controller")
+        .mount(&server)
+        .await;
+
+    mount_manager_update(&server, "nmx-controller", "disabled").await;
+
+    let switch = SwitchGb200Nvidia::for_test(&server.uri());
+
+    let status = switch
+        .enable_grpc_for_external_clients("nmx-controller", false)
+        .await
+        .unwrap();
+
+    assert_eq!(status["manager"]["state"], "disabled");
+}
+
+/// Idempotence on the disable path: when the pre-check already reports gRPC
+/// disabled, the manager `@update` action must be skipped entirely.
+#[tokio::test]
+async fn disable_grpc_for_external_clients_short_circuits_when_already_disabled() {
+    let server = MockServer::start().await;
+
+    mount_manager_state_get(&server, "nmx-controller", "disabled").await;
+
+    // The disable action must NOT be issued when gRPC is already disabled.
+    Mock::given(method("POST"))
+        .and(path("/nvue_v1/cluster/apps/nmx-controller/manager"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+        .expect(0)
+        .named("manager @update must not run when already disabled")
+        .mount(&server)
+        .await;
+
+    let switch = SwitchGb200Nvidia::for_test(&server.uri());
+
+    let status = switch
+        .enable_grpc_for_external_clients("nmx-controller", false)
+        .await
+        .unwrap();
+
+    assert_eq!(status["summary"]["grpc_enabled"], false);
+}
+
+/// The `encryption` manager field binds its value from a `mode` parameter in
+/// NVOS `cue_cluster_v1` (the action token is `<mode>`, not `<encryption>`), so
+/// the NVUE `@update` body must carry `parameters.mode`, not the segment name.
+/// This pins the path-segment vs parameter-name split in
+/// `run_cluster_app_manager_field_action`; reverting to `parameters.encryption`
+/// fails to match the mock and the action errors out.
+#[tokio::test]
+async fn run_cluster_app_manager_field_action_encryption_uses_mode_parameter() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path(
+            "/nvue_v1/cluster/apps/nmx-controller/manager/encryption",
+        ))
+        .and(body_json(serde_json::json!({
+            "@update": { "state": "start", "parameters": { "mode": "mtls" } }
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+        .expect(1)
+        .named("POST @update /manager/encryption carries the mode parameter")
+        .mount(&server)
+        .await;
+
+    let switch = SwitchGb200Nvidia::for_test(&server.uri());
+
+    switch
+        .run_cluster_app_manager_field_action("nmx-controller", "encryption", "mode", "mtls")
+        .await
+        .expect("encryption manager field action should post {\"mode\":\"mtls\"}");
+}
+
+/// Cert-install SSH backstop: when the NVUE `@update` encryption bind fails
+/// (e.g. the NVUE channel is unavailable/mid-transition during mTLS bootstrap),
+/// the manager-encryption bind must fall back to the SSH nvCLI form
+/// `nv action update cluster apps <app> manager encryption mtls` and succeed.
+#[tokio::test]
+async fn bind_cluster_app_manager_encryption_falls_back_to_ssh_on_nvue_failure() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path(
+            "/nvue_v1/cluster/apps/nmx-controller/manager/encryption",
+        ))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(1)
+        .named("POST @update /manager/encryption fails, forcing SSH backstop")
+        .mount(&server)
+        .await;
+
+    let (commands, exec) = record_ssh_commands();
+    let switch = SwitchGb200Nvidia::for_test(&server.uri()).with_ssh_exec_for_test(exec);
+
+    switch
+        .bind_cluster_app_manager_encryption_mtls("nmx-controller")
+        .await
+        .expect("SSH backstop should complete the encryption bind when NVUE fails");
 
     assert_eq!(
         recorded_ssh_commands(&commands),
-        vec!["nv action start cluster apps nmx-controller".to_owned()]
+        vec!["nv action update cluster apps nmx-controller manager encryption mtls".to_owned()],
+    );
+}
+
+/// When the NVUE `@update` encryption bind succeeds, the SSH backstop must not
+/// run: cert installation stays NVUE-first and only touches SSH on failure.
+#[tokio::test]
+async fn bind_cluster_app_manager_encryption_uses_nvue_without_ssh_on_success() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path(
+            "/nvue_v1/cluster/apps/nmx-controller/manager/encryption",
+        ))
+        .and(body_json(serde_json::json!({
+            "@update": { "state": "start", "parameters": { "mode": "mtls" } }
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+        .expect(1)
+        .named("POST @update /manager/encryption succeeds via NVUE")
+        .mount(&server)
+        .await;
+
+    let (commands, exec) = record_ssh_commands();
+    let switch = SwitchGb200Nvidia::for_test(&server.uri()).with_ssh_exec_for_test(exec);
+
+    switch
+        .bind_cluster_app_manager_encryption_mtls("nmx-controller")
+        .await
+        .expect("NVUE encryption bind should succeed without SSH");
+
+    assert!(recorded_ssh_commands(&commands).is_empty());
+}
+
+/// A non-transient client HTTP 4xx (here a 400 for a malformed/invalid request)
+/// is a definitive NVUE rejection: it must surface directly rather than being
+/// masked by the SSH backstop, which would otherwise hide a real API problem.
+#[tokio::test]
+async fn bind_cluster_app_manager_encryption_surfaces_client_4xx_without_ssh() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path(
+            "/nvue_v1/cluster/apps/nmx-controller/manager/encryption",
+        ))
+        .respond_with(ResponseTemplate::new(400))
+        .expect(1)
+        .named("POST @update /manager/encryption returns client 4xx")
+        .mount(&server)
+        .await;
+
+    let (commands, exec) = record_ssh_commands();
+    let switch = SwitchGb200Nvidia::for_test(&server.uri()).with_ssh_exec_for_test(exec);
+
+    let error = switch
+        .bind_cluster_app_manager_encryption_mtls("nmx-controller")
+        .await
+        .expect_err("a client 4xx must surface, not trigger the SSH backstop");
+
+    assert!(
+        error.message.contains("returned 400"),
+        "message: {}",
+        error.message
+    );
+    assert!(
+        recorded_ssh_commands(&commands).is_empty(),
+        "SSH backstop must not run for a client 4xx rejection"
+    );
+}
+
+/// A 409 (e.g. encryption already set) is a definitive rejection and must
+/// surface rather than be papered over by the SSH backstop.
+#[tokio::test]
+async fn bind_cluster_app_manager_encryption_surfaces_conflict_without_ssh() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path(
+            "/nvue_v1/cluster/apps/nmx-controller/manager/encryption",
+        ))
+        .respond_with(ResponseTemplate::new(409))
+        .expect(1)
+        .named("POST @update /manager/encryption returns conflict")
+        .mount(&server)
+        .await;
+
+    let (commands, exec) = record_ssh_commands();
+    let switch = SwitchGb200Nvidia::for_test(&server.uri()).with_ssh_exec_for_test(exec);
+
+    switch
+        .bind_cluster_app_manager_encryption_mtls("nmx-controller")
+        .await
+        .expect_err("a 409 conflict must surface, not trigger the SSH backstop");
+
+    assert!(
+        recorded_ssh_commands(&commands).is_empty(),
+        "SSH backstop must not run for a 409 conflict"
+    );
+}
+
+/// A failed NVUE action job (the POST is accepted but the async action ends in
+/// a failure state) is a definitive rejection and must surface directly.
+#[tokio::test]
+async fn bind_cluster_app_manager_encryption_surfaces_failed_action_job_without_ssh() {
+    let server = MockServer::start().await;
+    let job_id = "enc-bind-1";
+
+    Mock::given(method("POST"))
+        .and(path(
+            "/nvue_v1/cluster/apps/nmx-controller/manager/encryption",
+        ))
+        .respond_with(ResponseTemplate::new(201).set_body_json(job_id))
+        .expect(1)
+        .named("POST @update /manager/encryption returns action job")
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path(format!("/nvue_v1/action/{job_id}")))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"state": "action_failed"})),
+        )
+        .expect(1)
+        .named("GET /nvue_v1/action/<job> reports failure")
+        .mount(&server)
+        .await;
+
+    let (commands, exec) = record_ssh_commands();
+    let switch = SwitchGb200Nvidia::for_test(&server.uri()).with_ssh_exec_for_test(exec);
+
+    switch
+        .bind_cluster_app_manager_encryption_mtls("nmx-controller")
+        .await
+        .expect_err("a failed action job must surface, not trigger the SSH backstop");
+
+    assert!(
+        recorded_ssh_commands(&commands).is_empty(),
+        "SSH backstop must not run for a failed action job"
+    );
+}
+
+/// A 403 models RMS's outbound identity not yet being trusted mid mTLS
+/// transition; this is exactly what the SSH backstop exists for, so it must
+/// still fall back rather than surface.
+#[tokio::test]
+async fn bind_cluster_app_manager_encryption_falls_back_to_ssh_on_forbidden() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path(
+            "/nvue_v1/cluster/apps/nmx-controller/manager/encryption",
+        ))
+        .respond_with(ResponseTemplate::new(403))
+        .expect(1)
+        .named("POST @update /manager/encryption returns 403 (mTLS transition)")
+        .mount(&server)
+        .await;
+
+    let (commands, exec) = record_ssh_commands();
+    let switch = SwitchGb200Nvidia::for_test(&server.uri()).with_ssh_exec_for_test(exec);
+
+    switch
+        .bind_cluster_app_manager_encryption_mtls("nmx-controller")
+        .await
+        .expect("a 403 during the mTLS transition should fall back to SSH");
+
+    assert_eq!(
+        recorded_ssh_commands(&commands),
+        vec!["nv action update cluster apps nmx-controller manager encryption mtls".to_owned()],
+    );
+}
+
+/// When the manager `@update` POST returns an action job, RMS must poll the
+/// job to completion (bounded by the action timeout) before checking state.
+#[tokio::test]
+async fn enable_grpc_for_external_clients_polls_manager_action_job_to_success() {
+    let server = MockServer::start().await;
+    let job_id = "mgr-update-1";
+
+    Mock::given(method("GET"))
+        .and(path("/nvue_v1/cluster"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(cluster_ready_response("enabled")))
+        .named("ready GET /nvue_v1/cluster")
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/nvue_v1/cluster/apps/nmx-controller"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(nmx_controller_status_response("disabled")),
+        )
+        .up_to_n_times(1)
+        .expect(1)
+        .named("pre-action GET /nvue_v1/cluster/apps/nmx-controller")
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/nvue_v1/cluster/apps/nmx-controller/manager"))
+        .and(body_json(serde_json::json!({
+            "@update": { "state": "start", "parameters": { "state": "enabled" } }
+        })))
+        .respond_with(ResponseTemplate::new(201).set_body_json(job_id))
+        .expect(1)
+        .named("POST @update returning action job")
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path(format!("/nvue_v1/action/{job_id}")))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"state": "action_success"})),
+        )
+        .expect(1)
+        .named("GET /nvue_v1/action/<job> success")
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/nvue_v1/cluster/apps/nmx-controller"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(nmx_controller_status_response("enabled")),
+        )
+        .expect(1)
+        .named("post-action GET /nvue_v1/cluster/apps/nmx-controller")
+        .mount(&server)
+        .await;
+
+    let switch = SwitchGb200Nvidia::for_test(&server.uri());
+
+    let status = switch
+        .enable_grpc_for_external_clients("nmx-controller", true)
+        .await
+        .unwrap();
+
+    assert_eq!(status["manager"]["state"], "enabled");
+}
+
+/// A failed manager action job must surface as an error (with NVUE context)
+/// and must not be followed by a post-action state check.
+#[tokio::test]
+async fn enable_grpc_for_external_clients_propagates_manager_action_failure() {
+    let server = MockServer::start().await;
+    let job_id = "mgr-update-fail";
+
+    Mock::given(method("GET"))
+        .and(path("/nvue_v1/cluster"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(cluster_ready_response("enabled")))
+        .named("ready GET /nvue_v1/cluster")
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/nvue_v1/cluster/apps/nmx-controller"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(nmx_controller_status_response("disabled")),
+        )
+        .up_to_n_times(1)
+        .expect(1)
+        .named("pre-action GET /nvue_v1/cluster/apps/nmx-controller")
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/nvue_v1/cluster/apps/nmx-controller/manager"))
+        .and(body_json(serde_json::json!({
+            "@update": { "state": "start", "parameters": { "state": "enabled" } }
+        })))
+        .respond_with(ResponseTemplate::new(201).set_body_json(job_id))
+        .expect(1)
+        .named("POST @update returning action job")
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path(format!("/nvue_v1/action/{job_id}")))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"state": "action_failed"})),
+        )
+        .expect(1)
+        .named("GET /nvue_v1/action/<job> failed")
+        .mount(&server)
+        .await;
+
+    let switch = SwitchGb200Nvidia::for_test(&server.uri());
+
+    let error = switch
+        .enable_grpc_for_external_clients("nmx-controller", true)
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.code, ErrorCode::Internal);
+}
+
+/// A manager `@update` that applies but never converges to the desired state
+/// must time out with an actionable error instead of returning success.
+#[tokio::test]
+async fn enable_grpc_for_external_clients_errors_when_manager_never_converges() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/nvue_v1/cluster"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(cluster_ready_response("enabled")))
+        .named("ready GET /nvue_v1/cluster")
+        .mount(&server)
+        .await;
+
+    // Both the readiness probe and every post-action poll observe the manager
+    // still disabled, so convergence is never reached.
+    Mock::given(method("GET"))
+        .and(path("/nvue_v1/cluster/apps/nmx-controller"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(nmx_controller_status_response("disabled")),
+        )
+        .named("never-converging GET /nvue_v1/cluster/apps/nmx-controller")
+        .mount(&server)
+        .await;
+
+    mount_manager_update(&server, "nmx-controller", "enabled").await;
+
+    let switch = SwitchGb200Nvidia::for_test(&server.uri());
+
+    let error = switch
+        .enable_grpc_for_external_clients("nmx-controller", true)
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.code, ErrorCode::Internal);
+    assert!(
+        error.message.contains("did not reach enabled"),
+        "message: {}",
+        error.message
     );
 }
 
@@ -2836,6 +4083,89 @@ async fn nvue_revision_can_finish_after_transport_handoff() {
 }
 
 #[tokio::test]
+async fn nvue_stage_config_patches_discards_candidate_on_patch_failure() {
+    let server = MockServer::start().await;
+
+    mount_create_revision(&server, "42", None).await;
+
+    Mock::given(method("PATCH"))
+        .and(path("/nvue_v1/system/api"))
+        .and(query_param("rev", "42"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+            "detail": "patch rejected"
+        })))
+        .expect(1)
+        .named("PATCH /nvue_v1/system/api?rev failure")
+        .mount(&server)
+        .await;
+
+    // The created candidate must be discarded when staging fails.
+    Mock::given(method("DELETE"))
+        .and(path("/nvue_v1/revision/42"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .named("DELETE /nvue_v1/revision/42 (discard candidate)")
+        .mount(&server)
+        .await;
+
+    let switch = SwitchGb200Nvidia::for_test(&server.uri());
+
+    let err = switch
+        .nvue_stage_config_patches(&[(
+            "/nvue_v1/system/api",
+            serde_json::json!({"certificate": "server-cert"}),
+        )])
+        .await
+        .unwrap_err();
+
+    assert!(
+        err.message
+            .contains("NVUE PATCH /nvue_v1/system/api?rev=42")
+    );
+}
+
+#[tokio::test]
+async fn nvue_stage_config_patches_preserves_staging_error_when_discard_fails() {
+    let server = MockServer::start().await;
+
+    mount_create_revision(&server, "42", None).await;
+
+    Mock::given(method("PATCH"))
+        .and(path("/nvue_v1/system/api"))
+        .and(query_param("rev", "42"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+            "detail": "patch rejected"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // Even when the discard attempt fails, the original staging error must be
+    // surfaced (the discard is best-effort and only logged).
+    Mock::given(method("DELETE"))
+        .and(path("/nvue_v1/revision/42"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let switch = SwitchGb200Nvidia::for_test(&server.uri());
+
+    let err = switch
+        .nvue_stage_config_patches(&[(
+            "/nvue_v1/system/api",
+            serde_json::json!({"certificate": "server-cert"}),
+        )])
+        .await
+        .unwrap_err();
+
+    assert!(
+        err.message
+            .contains("NVUE PATCH /nvue_v1/system/api?rev=42")
+    );
+}
+
+#[tokio::test]
 async fn matching_node_ips_skip_revision_mutation()
 -> std::result::Result<(), Box<dyn std::error::Error>> {
     let server = MockServer::start().await;
@@ -2949,7 +4279,7 @@ async fn drifted_node_ips_use_delete_patch_apply_save_and_readback()
 }
 
 #[tokio::test]
-async fn disabling_cluster_clears_node_ips_while_holding_operation_lock()
+async fn disabling_cluster_clears_both_node_ip_interfaces_while_holding_operation_lock()
 -> std::result::Result<(), Box<dyn std::error::Error>> {
     let server = MockServer::start().await;
     let configured_payload = serde_json::json!({"192.0.2.101": {}});
@@ -2972,7 +4302,50 @@ async fn disabling_cluster_clears_node_ips_while_holding_operation_lock()
         .mount(&server)
         .await;
 
-    mount_create_revision(&server, "42", None).await;
+    Mock::given(method("GET"))
+        .and(path("/nvue_v1/cluster/node/secondary/server"))
+        .and(query_param("rev", "applied"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&configured_payload))
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/nvue_v1/cluster/node/secondary/server"))
+        .and(query_param("rev", "applied"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&empty_payload))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // Three revisions clear both node IP interfaces and then disable the
+    // cluster through NVUE.
+    Mock::given(method("POST"))
+        .and(path("/nvue_v1/revision"))
+        .and(body_json(RevisionCreate::default()))
+        .respond_with(ResponseTemplate::new(200).set_body_json("42"))
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/nvue_v1/revision"))
+        .and(body_json(RevisionCreate::default()))
+        .respond_with(ResponseTemplate::new(200).set_body_json("43"))
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/nvue_v1/revision"))
+        .and(body_json(RevisionCreate::default()))
+        .respond_with(ResponseTemplate::new(200).set_body_json("44"))
+        .expect(1)
+        .mount(&server)
+        .await;
 
     Mock::given(method("GET"))
         .and(path("/nvue_v1/cluster/node/primary/server"))
@@ -3000,7 +4373,52 @@ async fn disabling_cluster_clears_node_ips_while_holding_operation_lock()
     )
     .await;
 
-    mount_save_applied_revision(&server, None).await;
+    Mock::given(method("GET"))
+        .and(path("/nvue_v1/cluster/node/secondary/server"))
+        .and(query_param("rev", "43"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&configured_payload))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("DELETE"))
+        .and(path("/nvue_v1/cluster/node/secondary"))
+        .and(query_param("rev", "43"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    mount_apply_revision(&server, "43", None).await;
+
+    mount_revision_get(
+        &server,
+        "43",
+        None,
+        ResponseTemplate::new(200).set_body_json(RevisionState { state: "applied" }),
+    )
+    .await;
+
+    // Cluster-disable revision (`44`): stage -> apply -> wait.
+    mount_stage_cluster_state(&server, "44", "disabled").await;
+    mount_apply_revision(&server, "44", None).await;
+
+    mount_revision_get(
+        &server,
+        "44",
+        None,
+        ResponseTemplate::new(200).set_body_json(RevisionState { state: "applied" }),
+    )
+    .await;
+
+    // All three revisions persist through `/revision/applied`.
+    Mock::given(method("PATCH"))
+        .and(path("/nvue_v1/revision/applied"))
+        .and(body_json(RevisionUpdate::save_with_yes_prompt()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(EmptyBody::default()))
+        .expect(3)
+        .mount(&server)
+        .await;
 
     Mock::given(method("GET"))
         .and(path("/nvue_v1/cluster"))
@@ -3017,7 +4435,6 @@ async fn disabling_cluster_clears_node_ips_while_holding_operation_lock()
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "state": "disabled"
         })))
-        .expect(3)
         .mount(&server)
         .await;
 
@@ -3035,53 +4452,40 @@ async fn disabling_cluster_clears_node_ips_while_holding_operation_lock()
     Mock::given(method("GET"))
         .and(path("/nvue_v1/cluster/apps/nmx-controller"))
         .respond_with(ResponseTemplate::new(404))
-        .expect(1)
         .mount(&server)
         .await;
 
-    let commands = Arc::new(Mutex::new(Vec::new()));
-    let recorded = Arc::clone(&commands);
-    let switch = Arc::new_cyclic(|switch: &std::sync::Weak<SwitchGb200Nvidia>| {
-        let switch = switch.clone();
+    let (commands, exec) = record_ssh_commands();
+    let switch = SwitchGb200Nvidia::for_test(&server.uri()).with_ssh_exec_for_test(exec);
 
-        SwitchGb200Nvidia::for_test(&server.uri()).with_ssh_exec_for_test(move |command| {
-            if command.starts_with("nv set cluster state") {
-                let switch = switch.upgrade().expect("switch should remain alive");
-
-                assert!(
-                    switch.op_lock.try_lock().is_err(),
-                    "cluster disable must share the node IP operation lock"
-                );
-            }
-
-            recorded.lock().unwrap().push(command.to_owned());
-            Ok(String::new())
-        })
-    });
-
+    // The whole sequence runs under a single op_lock acquisition: the disable
+    // step calls the `_unlocked` variant, so re-taking the lock (which would
+    // deadlock) would hang this test.
     switch.clear_node_ips_and_disable_cluster().await?;
 
-    assert_eq!(
-        recorded_ssh_commands(&commands),
-        vec![
-            "nv set cluster state disabled".to_owned(),
-            "nv config apply --assume-yes".to_owned(),
-            "nv config save".to_owned(),
-        ]
-    );
+    // Disabling the cluster no longer shells into the switch.
+    assert!(recorded_ssh_commands(&commands).is_empty());
 
     let requests = server
         .received_requests()
         .await
         .expect("wiremock should record requests");
 
-    let delete_position = requests
+    let primary_delete_position = requests
         .iter()
         .position(|request| {
             request.method == wiremock::http::Method::Delete
                 && request.url.path() == "/nvue_v1/cluster/node/primary"
         })
-        .expect("node IP deletion should be requested");
+        .expect("primary node IP deletion should be requested");
+
+    let secondary_delete_position = requests
+        .iter()
+        .position(|request| {
+            request.method == wiremock::http::Method::Delete
+                && request.url.path() == "/nvue_v1/cluster/node/secondary"
+        })
+        .expect("secondary node IP deletion should be requested");
 
     let state_read_position = requests
         .iter()
@@ -3091,7 +4495,8 @@ async fn disabling_cluster_clears_node_ips_while_holding_operation_lock()
         })
         .expect("cluster state should be read");
 
-    assert!(delete_position < state_read_position);
+    assert!(primary_delete_position < state_read_position);
+    assert!(secondary_delete_position < state_read_position);
 
     Ok(())
 }
@@ -3219,9 +4624,6 @@ fn config_constant_values() {
     assert_eq!(config::REVISION_APPLY_TIMEOUT_SECONDS, 60);
     assert_eq!(config::MAX_RETRY_ATTEMPTS, 3);
     assert_eq!(config::RETRY_WAIT_SECONDS, 30);
-    assert_eq!(config::GNMI_CONFIG_WAIT_SECONDS, 15);
-    assert_eq!(config::GNMI_RETRY_DELAY_1_SECONDS, 20);
-    assert_eq!(config::GNMI_RETRY_DELAY_2_SECONDS, 30);
     assert_eq!(config::GRPC_PORT_NMX_CONTROLLER, 9370);
     assert_eq!(config::GRPC_PORT_NMX_TELEMETRY, 9352);
     assert_eq!(config::VALID_COMPONENTS.len(), 6);
@@ -3936,136 +5338,6 @@ fn node_type_reports_switch_gb200() {
     assert_eq!(sw.node_type(), NodeType::SwitchGb200Nvidia);
 }
 
-async fn assert_set_cluster_state_via_nvue(enabled: bool, expected_state: &str) {
-    let server = MockServer::start().await;
-    let current_state = if enabled { "disabled" } else { "enabled" };
-
-    Mock::given(method("GET"))
-        .and(path("/nvue_v1/cluster"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "state": current_state
-        })))
-        .up_to_n_times(1)
-        .expect(1)
-        .named("initial GET /nvue_v1/cluster")
-        .mount(&server)
-        .await;
-
-    Mock::given(method("GET"))
-        .and(path("/nvue_v1/cluster"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "state": expected_state
-        })))
-        .expect(1)
-        .named("final GET /nvue_v1/cluster")
-        .mount(&server)
-        .await;
-
-    let (commands, exec) = record_ssh_commands();
-    let switch = SwitchGb200Nvidia::for_test(&server.uri()).with_ssh_exec_for_test(exec);
-
-    switch.set_cluster_state(enabled).await.unwrap();
-
-    assert_eq!(
-        recorded_ssh_commands(&commands),
-        vec![
-            format!("nv set cluster state {expected_state}"),
-            "nv config apply --assume-yes".to_owned(),
-            "nv config save".to_owned(),
-        ]
-    );
-}
-
-async fn assert_set_cluster_state_via_nvue_noops(enabled: bool, current_state: &str) {
-    let server = MockServer::start().await;
-
-    Mock::given(method("GET"))
-        .and(path("/nvue_v1/cluster"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "state": current_state
-        })))
-        .expect(1)
-        .named("current GET /nvue_v1/cluster")
-        .mount(&server)
-        .await;
-
-    let (commands, exec) = record_ssh_commands();
-    let switch = SwitchGb200Nvidia::for_test(&server.uri()).with_ssh_exec_for_test(exec);
-
-    switch.set_cluster_state(enabled).await.unwrap();
-
-    assert!(recorded_ssh_commands(&commands).is_empty());
-}
-
-async fn assert_set_cluster_state_via_nvue_no_config_diff() {
-    let server = MockServer::start().await;
-
-    Mock::given(method("GET"))
-        .and(path("/nvue_v1/cluster"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "state": "enabled"
-        })))
-        .up_to_n_times(1)
-        .expect(1)
-        .named("initial GET /nvue_v1/cluster")
-        .mount(&server)
-        .await;
-
-    Mock::given(method("GET"))
-        .and(path("/nvue_v1/cluster"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "state": "disabled"
-        })))
-        .expect(1)
-        .named("final GET /nvue_v1/cluster")
-        .mount(&server)
-        .await;
-
-    let (commands, exec) = record_ssh_commands();
-    let switch = SwitchGb200Nvidia::for_test(&server.uri()).with_ssh_exec_for_test(exec);
-
-    switch.set_cluster_state(false).await.unwrap();
-
-    assert_eq!(
-        recorded_ssh_commands(&commands),
-        vec![
-            "nv set cluster state disabled".to_owned(),
-            "nv config apply --assume-yes".to_owned(),
-            "nv config save".to_owned(),
-        ]
-    );
-}
-
-#[tokio::test]
-async fn set_cluster_state_via_nvue_stages_enabled_state() {
-    assert_set_cluster_state_via_nvue(true, "enabled").await;
-}
-
-#[tokio::test]
-async fn set_cluster_state_via_nvue_stages_disabled_state() {
-    assert_set_cluster_state_via_nvue(false, "disabled").await;
-}
-
-#[tokio::test]
-async fn set_cluster_state_via_nvue_skips_disabled_state_when_already_disabled() {
-    assert_set_cluster_state_via_nvue_noops(false, "disabled").await;
-}
-
-#[tokio::test]
-async fn set_cluster_state_via_nvue_skips_enabled_state_when_already_enabled() {
-    assert_set_cluster_state_via_nvue_noops(true, "enabled").await;
-}
-
-#[tokio::test]
-async fn set_cluster_state_via_nvue_skips_start_state_when_enabling() {
-    assert_set_cluster_state_via_nvue_noops(true, "start").await;
-}
-
-#[tokio::test]
-async fn set_cluster_state_via_nvue_treats_no_config_diff_as_success_when_revision_matches() {
-    assert_set_cluster_state_via_nvue_no_config_diff().await;
-}
-
 #[tokio::test]
 async fn bmc_aux_powercycle_uses_nv_redfish_reset_action() {
     let bmc = MockServer::start().await;
@@ -4124,5 +5396,481 @@ async fn is_already_staged_propagates_non_not_found_probe_errors() {
     assert_eq!(
         err.code,
         crate::utilities::error::ErrorCode::FailedPrecondition
+    );
+}
+
+fn sdn_state_report_ssh_exec(report_filename: &str, report_json: &str) -> SshCommandRecorder {
+    let report_filename = report_filename.to_owned();
+    let report_json = report_json.to_owned();
+    let listing_calls = AtomicUsize::new(0);
+
+    Box::new(move |command: &str| {
+        if command.starts_with("nv action generate sdn state apps nmx-controller") {
+            Ok(String::new())
+        } else if command.contains("ls -t") {
+            // The first listing runs before report generation; return no
+            // prior report so the post-generation filename always looks
+            // fresh, matching the common case in these fixtures.
+            if listing_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                Ok(String::new())
+            } else {
+                Ok(report_filename.clone())
+            }
+        } else if command.starts_with("cat ") {
+            Ok(report_json.clone())
+        } else {
+            panic!("unexpected SSH command in SDN state report test: {command}")
+        }
+    })
+}
+
+/// Uses RFC 5737 TEST-NET-2 addresses and placeholder identifiers rather than
+/// any real chassis serial, hostname, or lab address.
+fn sdn_state_report_json(second_connection_state: &str) -> String {
+    format!(
+        r#"{{
+            "statusUpdates": [
+                {{
+                    "nvbdUuid": "test-switch-01-eth1_1",
+                    "updateTimestamp": "1000000000000",
+                    "connectionStatuses": [
+                        {{
+                            "nvbsUuid": "test-peer-01",
+                            "nvbsAddress": "198.51.100.10:50000",
+                            "connectionState": "NMX_NVB_CONNECTION_STATE_CONNECTED",
+                            "kaState": "NMX_NVB_KA_STATE_OK",
+                            "activeState": "NMX_NVB_ACTIVE_STATE_ACTIVE",
+                            "roundtripLatency": 1000,
+                            "nvbdAddress": "198.51.100.1:40000"
+                        }},
+                        {{
+                            "nvbsUuid": "test-peer-02",
+                            "nvbsAddress": "198.51.100.11:50000",
+                            "connectionState": "{second_connection_state}",
+                            "kaState": "NMX_NVB_KA_STATE_OK",
+                            "activeState": "NMX_NVB_ACTIVE_STATE_ACTIVE",
+                            "roundtripLatency": 1000,
+                            "nvbdAddress": "198.51.100.1:40001"
+                        }}
+                    ]
+                }}
+            ]
+        }}"#
+    )
+}
+
+fn sdn_state_expected_peers(addresses: &[&str]) -> ClusterNodeServerAddresses {
+    addresses
+        .iter()
+        .map(|address| address.parse().expect("valid IP literal in test"))
+        .collect()
+}
+
+#[tokio::test]
+async fn verify_sdn_fabric_state_succeeds_when_every_connection_is_healthy() {
+    let report = sdn_state_report_json("NMX_NVB_CONNECTION_STATE_CONNECTED");
+
+    let exec = sdn_state_report_ssh_exec(
+        "nmx-controller_nv-bridge-state-report_20260223_154714",
+        &report,
+    );
+
+    let switch = SwitchGb200Nvidia::for_test("http://127.0.0.1:9").with_ssh_exec_for_test(exec);
+    let expected_peers = sdn_state_expected_peers(&["198.51.100.10", "198.51.100.11"]);
+
+    switch
+        .verify_sdn_fabric_state(&expected_peers)
+        .await
+        .expect("every reported connection is healthy and every peer is present");
+}
+
+#[tokio::test]
+async fn verify_sdn_fabric_state_fails_when_a_connection_is_unhealthy() {
+    let report = sdn_state_report_json("NMX_NVB_CONNECTION_STATE_DISCONNECTED");
+
+    let exec = sdn_state_report_ssh_exec(
+        "nmx-controller_nv-bridge-state-report_20260223_154714",
+        &report,
+    );
+
+    let switch = SwitchGb200Nvidia::for_test("http://127.0.0.1:9").with_ssh_exec_for_test(exec);
+    let expected_peers = sdn_state_expected_peers(&["198.51.100.10", "198.51.100.11"]);
+
+    let err = switch
+        .verify_sdn_fabric_state(&expected_peers)
+        .await
+        .expect_err("a disconnected fabric connection must fail verification");
+
+    assert!(err.message.contains("unhealthy"), "{}", err.message);
+}
+
+#[tokio::test]
+async fn verify_sdn_fabric_state_fails_when_a_configured_peer_is_missing_from_the_report() {
+    let report = sdn_state_report_json("NMX_NVB_CONNECTION_STATE_CONNECTED");
+
+    let exec = sdn_state_report_ssh_exec(
+        "nmx-controller_nv-bridge-state-report_20260223_154714",
+        &report,
+    );
+
+    let switch = SwitchGb200Nvidia::for_test("http://127.0.0.1:9").with_ssh_exec_for_test(exec);
+
+    let expected_peers =
+        sdn_state_expected_peers(&["198.51.100.10", "198.51.100.11", "198.51.100.200"]);
+
+    let err = switch
+        .verify_sdn_fabric_state(&expected_peers)
+        .await
+        .expect_err("a configured peer absent from the report must fail verification");
+
+    assert!(err.message.contains("198.51.100.200"), "{}", err.message);
+}
+
+#[tokio::test]
+async fn verify_sdn_fabric_state_fails_when_report_is_not_valid_json() {
+    let exec = sdn_state_report_ssh_exec(
+        "nmx-controller_nv-bridge-state-report_20260223_154714",
+        "not json",
+    );
+
+    let switch = SwitchGb200Nvidia::for_test("http://127.0.0.1:9").with_ssh_exec_for_test(exec);
+    let expected_peers = sdn_state_expected_peers(&["198.51.100.10"]);
+
+    let err = switch
+        .verify_sdn_fabric_state(&expected_peers)
+        .await
+        .expect_err("a malformed report body must fail verification");
+
+    assert!(
+        err.message.contains("failed to parse SDN state report"),
+        "{}",
+        err.message
+    );
+}
+
+#[tokio::test]
+async fn verify_sdn_fabric_state_rejects_a_listing_entry_with_shell_metacharacters() {
+    // No "cat " branch: a hostile filename reaching a downstream command
+    // panics this test instead of silently succeeding.
+    let switch = SwitchGb200Nvidia::for_test("http://127.0.0.1:9").with_ssh_exec_for_test(
+        |command: &str| {
+            if command.starts_with("nv action generate sdn state apps nmx-controller") {
+                Ok(String::new())
+            } else if command.contains("ls -t") {
+                Ok("report; rm -rf /".to_owned())
+            } else {
+                panic!("a hostile listing entry must never reach a downstream command: {command}")
+            }
+        },
+    );
+
+    let expected_peers = sdn_state_expected_peers(&["198.51.100.10"]);
+
+    let err = switch
+        .verify_sdn_fabric_state(&expected_peers)
+        .await
+        .expect_err("a listing entry with shell metacharacters must be rejected");
+
+    assert!(
+        err.message.contains("no SDN state report found"),
+        "{}",
+        err.message
+    );
+}
+
+#[tokio::test]
+async fn verify_sdn_fabric_state_rejects_a_listing_entry_with_path_traversal_tokens() {
+    let switch = SwitchGb200Nvidia::for_test("http://127.0.0.1:9").with_ssh_exec_for_test(
+        |command: &str| {
+            if command.starts_with("nv action generate sdn state apps nmx-controller") {
+                Ok(String::new())
+            } else if command.contains("ls -t") {
+                Ok("../report".to_owned())
+            } else {
+                panic!("a traversal listing entry must never reach a downstream command: {command}")
+            }
+        },
+    );
+
+    let expected_peers = sdn_state_expected_peers(&["198.51.100.10"]);
+
+    let err = switch
+        .verify_sdn_fabric_state(&expected_peers)
+        .await
+        .expect_err("a listing entry with path traversal tokens must be rejected");
+
+    assert!(
+        err.message.contains("no SDN state report found"),
+        "{}",
+        err.message
+    );
+}
+
+#[tokio::test]
+async fn verify_sdn_fabric_state_fails_when_the_report_does_not_refresh() {
+    let exec: SshCommandRecorder = Box::new(|command: &str| {
+        if command.starts_with("nv action generate sdn state apps nmx-controller") {
+            Ok(String::new())
+        } else if command.contains("ls -t") {
+            // Same filename before and after generation: NVOS accepted the
+            // request but never wrote a new report.
+            Ok("nmx-controller_nv-bridge-state-report_20260223_154714".to_owned())
+        } else {
+            panic!("a stale report must be rejected before being read: {command}")
+        }
+    });
+
+    let switch = SwitchGb200Nvidia::for_test("http://127.0.0.1:9").with_ssh_exec_for_test(exec);
+    let expected_peers = sdn_state_expected_peers(&["198.51.100.10"]);
+
+    let err = switch
+        .verify_sdn_fabric_state(&expected_peers)
+        .await
+        .expect_err("an unchanged report filename must fail verification");
+
+    assert!(err.message.contains("did not refresh"), "{}", err.message);
+}
+
+#[tokio::test]
+async fn verify_sdn_fabric_state_treats_an_unparseable_peer_address_as_missing() {
+    let report = r#"{
+        "statusUpdates": [
+            {
+                "nvbdUuid": "test-switch-01-eth1_1",
+                "connectionStatuses": [
+                    {
+                        "nvbsUuid": "test-peer-01",
+                        "nvbsAddress": "198.51.100.10",
+                        "connectionState": "NMX_NVB_CONNECTION_STATE_CONNECTED",
+                        "kaState": "NMX_NVB_KA_STATE_OK",
+                        "activeState": "NMX_NVB_ACTIVE_STATE_ACTIVE"
+                    }
+                ]
+            }
+        ]
+    }"#;
+
+    let exec = sdn_state_report_ssh_exec(
+        "nmx-controller_nv-bridge-state-report_20260223_154714",
+        report,
+    );
+
+    let switch = SwitchGb200Nvidia::for_test("http://127.0.0.1:9").with_ssh_exec_for_test(exec);
+    let expected_peers = sdn_state_expected_peers(&["198.51.100.10"]);
+
+    let err = switch
+        .verify_sdn_fabric_state(&expected_peers)
+        .await
+        .expect_err("a peer address that fails to parse must not count as observed");
+
+    assert!(err.message.contains("198.51.100.10"), "{}", err.message);
+}
+
+#[tokio::test]
+async fn verify_sdn_fabric_state_propagates_a_transport_failure_on_the_baseline_listing() {
+    // A channel-open failure on the pre-generation listing must not be
+    // treated the same as "no prior report": swallowing it here could let a
+    // stale report pass the freshness check if generation is never even
+    // attempted. No baseline-listing error is tolerated; the missing-report
+    // case is handled by the directory test in the command itself.
+    let exec: SshCommandRecorder = Box::new(|command: &str| {
+        if command.contains("ls -t") {
+            Err(RmsError::new(ErrorCode::Unavailable, "SSH channel closed"))
+        } else {
+            panic!(
+                "generation must not run after the baseline listing fails to transport: {command}"
+            )
+        }
+    });
+
+    let switch = SwitchGb200Nvidia::for_test("http://127.0.0.1:9").with_ssh_exec_for_test(exec);
+    let expected_peers = sdn_state_expected_peers(&["198.51.100.10"]);
+
+    let err = switch
+        .verify_sdn_fabric_state(&expected_peers)
+        .await
+        .expect_err("a transport failure on the baseline listing must propagate");
+
+    assert_eq!(err.code, ErrorCode::Unavailable);
+
+    assert!(
+        err.message.contains("SSH channel closed"),
+        "{}",
+        err.message
+    );
+}
+
+#[tokio::test]
+async fn verify_sdn_fabric_state_guards_the_baseline_listing_against_a_missing_directory() {
+    // Confirmed against two independent real VR NVL72 switches (NVOS
+    // 25.03.0566 and 25.03.0569): `ls` on a report directory that has never
+    // been generated exits with status 2. The baseline listing therefore
+    // tests for the directory first so that case stays a successful empty
+    // listing instead of an error the code would have to tolerate by class.
+    let report = sdn_state_report_json("NMX_NVB_CONNECTION_STATE_CONNECTED");
+    let listing_calls = AtomicUsize::new(0);
+
+    let exec: SshCommandRecorder = Box::new(move |command: &str| {
+        if command.starts_with("nv action generate sdn state apps nmx-controller") {
+            Ok(String::new())
+        } else if command.contains("ls -t") {
+            if listing_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                assert!(
+                    command.contains("if [ -d ") && command.contains("; then ls -t "),
+                    "the baseline listing must guard against a missing report directory \
+                     rather than let `ls` fail: {command}"
+                );
+
+                Ok(String::new())
+            } else {
+                Ok("nmx-controller_nv-bridge-state-report_20260223_154714".to_owned())
+            }
+        } else if command.starts_with("cat ") {
+            Ok(report.clone())
+        } else {
+            panic!("unexpected SSH command: {command}")
+        }
+    });
+
+    let switch = SwitchGb200Nvidia::for_test("http://127.0.0.1:9").with_ssh_exec_for_test(exec);
+    let expected_peers = sdn_state_expected_peers(&["198.51.100.10", "198.51.100.11"]);
+
+    switch
+        .verify_sdn_fabric_state(&expected_peers)
+        .await
+        .expect("a switch with no prior report must still verify its fabric state");
+}
+
+#[tokio::test]
+async fn verify_sdn_fabric_state_propagates_a_command_failure_on_the_baseline_listing() {
+    // ErrorCode::Internal is not specific enough to tolerate: SshClient::exec
+    // reports a command killed by a signal, a command with no exit status,
+    // and a failed exec request under the same code as a non-zero `ls`.
+    // Clearing previous_filename on one of those would let the freshness
+    // check accept the stale report this fixture returns after generation.
+    let listing_calls = AtomicUsize::new(0);
+
+    let exec: SshCommandRecorder = Box::new(move |command: &str| {
+        if command.contains("ls -t") {
+            if listing_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                Err(RmsError::new(
+                    ErrorCode::Internal,
+                    "SSH command \"...\" on host completed without exit status",
+                ))
+            } else {
+                Ok("nmx-controller_nv-bridge-state-report_20260223_154714".to_owned())
+            }
+        } else {
+            panic!("the baseline listing failure must stop verification: {command}")
+        }
+    });
+
+    let switch = SwitchGb200Nvidia::for_test("http://127.0.0.1:9").with_ssh_exec_for_test(exec);
+    let expected_peers = sdn_state_expected_peers(&["198.51.100.10"]);
+
+    let err = switch
+        .verify_sdn_fabric_state(&expected_peers)
+        .await
+        .expect_err("a command failure on the baseline listing must propagate");
+
+    assert_eq!(err.code, ErrorCode::Internal);
+
+    assert!(
+        err.message.contains("without exit status"),
+        "{}",
+        err.message
+    );
+}
+
+#[tokio::test]
+async fn verify_sdn_fabric_state_fails_when_a_connection_reports_a_chassis_sn_mismatch() {
+    // The mismatch is on the second connection, not the first: this rules
+    // out an early-return or indexing bug that only a single-element
+    // fixture would miss.
+    let report = r#"{
+        "statusUpdates": [
+            {
+                "nvbdUuid": "test-switch-01-eth1_1",
+                "connectionStatuses": [
+                    {
+                        "nvbsUuid": "test-peer-01",
+                        "nvbsAddress": "198.51.100.10:50000",
+                        "connectionState": "NMX_NVB_CONNECTION_STATE_CONNECTED",
+                        "kaState": "NMX_NVB_KA_STATE_OK",
+                        "activeState": "NMX_NVB_ACTIVE_STATE_ACTIVE"
+                    },
+                    {
+                        "nvbsUuid": "test-peer-02",
+                        "nvbsAddress": "198.51.100.11:50000",
+                        "connectionState": "NMX_NVB_CONNECTION_STATE_CONNECTED",
+                        "kaState": "NMX_NVB_KA_STATE_OK",
+                        "activeState": "NMX_NVB_ACTIVE_STATE_ACTIVE",
+                        "chassisSnMismatch": true
+                    }
+                ]
+            }
+        ]
+    }"#;
+
+    let exec = sdn_state_report_ssh_exec(
+        "nmx-controller_nv-bridge-state-report_20260223_154714",
+        report,
+    );
+
+    let switch = SwitchGb200Nvidia::for_test("http://127.0.0.1:9").with_ssh_exec_for_test(exec);
+    let expected_peers = sdn_state_expected_peers(&["198.51.100.10", "198.51.100.11"]);
+
+    let err = switch
+        .verify_sdn_fabric_state(&expected_peers)
+        .await
+        .expect_err("a live connection reporting a chassis serial number mismatch must fail");
+
+    assert!(
+        err.message.contains("test-peer-02")
+            && err.message.contains("chassis serial number mismatch"),
+        "{}",
+        err.message
+    );
+}
+
+#[tokio::test]
+async fn verify_sdn_fabric_state_fails_when_a_state_key_is_omitted_from_the_report() {
+    // Proto3 JSON marshaling omits a field entirely when it holds its
+    // zero/default value; this simulates a connection whose connectionState
+    // is genuinely NMX_NVB_CONNECTION_STATE_UNKNOWN (0) and therefore
+    // absent from the JSON rather than an explicit key.
+    let report = r#"{
+        "statusUpdates": [
+            {
+                "nvbdUuid": "test-switch-01-eth1_1",
+                "connectionStatuses": [
+                    {
+                        "nvbsUuid": "test-peer-01",
+                        "nvbsAddress": "198.51.100.10:50000",
+                        "kaState": "NMX_NVB_KA_STATE_OK",
+                        "activeState": "NMX_NVB_ACTIVE_STATE_ACTIVE"
+                    }
+                ]
+            }
+        ]
+    }"#;
+
+    let exec = sdn_state_report_ssh_exec(
+        "nmx-controller_nv-bridge-state-report_20260223_154714",
+        report,
+    );
+
+    let switch = SwitchGb200Nvidia::for_test("http://127.0.0.1:9").with_ssh_exec_for_test(exec);
+    let expected_peers = sdn_state_expected_peers(&["198.51.100.10"]);
+
+    let err = switch
+        .verify_sdn_fabric_state(&expected_peers)
+        .await
+        .expect_err("an omitted connectionState key must fail the connection, not the parse");
+
+    assert!(
+        err.message.contains("is unhealthy") && err.message.contains("connectionState="),
+        "expected a targeted unhealthy-connection error, not a parse failure: {}",
+        err.message
     );
 }

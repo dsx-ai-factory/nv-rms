@@ -29,7 +29,7 @@ use crate::domain::node::{
 };
 use crate::domain::rack::{EndpointConfig, NodeConfig};
 use crate::nodes::nvfwupd_adapter;
-use crate::transport::http_client::HttpClient;
+use crate::transport::http_client::{HttpClient, REDFISH_V1_ROOT};
 use crate::utilities::error::{Result, RmsError};
 
 const DELTA_CHASSIS_COLLECTION_ENDPOINT: &str = "/redfish/v1/Chassis";
@@ -103,7 +103,8 @@ impl PowershelfGb200Delta {
             password,
             bmc_endpoint.dangerously_accept_invalid_certs,
             true,
-        )?;
+        )?
+        .require_path_prefix(REDFISH_V1_ROOT);
 
         Ok(Self {
             id: config.id.clone(),
@@ -540,15 +541,18 @@ async fn fetch_delta_psu_power_states(http: &HttpClient, chassis: &Value) -> Vec
     let mut out = Vec::with_capacity(members.len());
     for member in members {
         let Some(uri) = member.get("@odata.id").and_then(|v| v.as_str()) else {
+            out.push(None);
             continue;
         };
         if uri.is_empty() {
+            out.push(None);
             continue;
         }
         match http.get(uri, HttpClient::DEFAULT_TIMEOUT).await {
             Ok(psu) => out.push(decode_delta_psu_power_state(&psu)),
             Err(e) => {
                 tracing::warn!(uri, error = %e.message, "failed to fetch Delta PowerSupply");
+                out.push(None);
             }
         }
     }
@@ -635,7 +639,11 @@ mod tests {
         })
     }
 
-    async fn mount_delta_power_state_tree(server: &MockServer, psu_powers: &[bool]) {
+    /// Mounts the chassis-collection -> chassis-document discovery layers that
+    /// `get_power_state` walks before reaching the PowerSubsystem. The chassis
+    /// `PowerSubsystem` link points at [`DELTA_TEST_SUBSYSTEM_PATH`], so this
+    /// composes with [`mount_delta_supplies_collection`].
+    async fn mount_delta_chassis_discovery(server: &MockServer) {
         Mock::given(method("GET"))
             .and(path(DELTA_CHASSIS_COLLECTION_ENDPOINT))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -653,7 +661,7 @@ mod tests {
                 "Manufacturer": "DELTA",
                 "Model": "810",
                 "PowerSubsystem": {
-                    "@odata.id": "/redfish/v1/Chassis/chassis/PowerSubsystem"
+                    "@odata.id": DELTA_TEST_SUBSYSTEM_PATH
                 },
                 "Oem": {
                     "deltaenergysystems": {}
@@ -661,6 +669,10 @@ mod tests {
             })))
             .mount(server)
             .await;
+    }
+
+    async fn mount_delta_power_state_tree(server: &MockServer, psu_powers: &[bool]) {
+        mount_delta_chassis_discovery(server).await;
         Mock::given(method("GET"))
             .and(path("/redfish/v1/Chassis/chassis/PowerSubsystem"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -702,6 +714,42 @@ mod tests {
                 .mount(server)
                 .await;
         }
+    }
+
+    const DELTA_TEST_SUBSYSTEM_PATH: &str = "/redfish/v1/Chassis/chassis/PowerSubsystem";
+    const DELTA_TEST_SUPPLIES_PATH: &str =
+        "/redfish/v1/Chassis/chassis/PowerSubsystem/PowerSupplies";
+
+    /// Minimal chassis document whose `PowerSubsystem` link points at the tree
+    /// mounted by [`mount_delta_supplies_collection`], for driving
+    /// `fetch_delta_psu_power_states` directly.
+    fn delta_test_chassis() -> Value {
+        serde_json::json!({
+            "@odata.id": "/redfish/v1/Chassis/chassis",
+            "PowerSubsystem": { "@odata.id": DELTA_TEST_SUBSYSTEM_PATH }
+        })
+    }
+
+    /// Mounts only the `PowerSubsystem` -> `PowerSupplies` collection layers so a
+    /// test can exercise `fetch_delta_psu_power_states` with an arbitrary
+    /// `Members` array (including malformed or absent `@odata.id`s). Modeled on
+    /// [`mount_delta_power_state_tree`], but exposes the raw members and leaves
+    /// individual PSU documents to the caller so failure paths can be driven.
+    async fn mount_delta_supplies_collection(server: &MockServer, members: Value) {
+        Mock::given(method("GET"))
+            .and(path(DELTA_TEST_SUBSYSTEM_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "PowerSupplies": { "@odata.id": DELTA_TEST_SUPPLIES_PATH }
+            })))
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(DELTA_TEST_SUPPLIES_PATH))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "Members": members })),
+            )
+            .mount(server)
+            .await;
     }
 
     async fn mount_delta_power_shelf_tree(server: &MockServer) {
@@ -933,6 +981,168 @@ mod tests {
         let powershelf = test_node(&server.uri());
 
         assert_eq!(powershelf.get_power_state().await.unwrap(), PowerState::Off);
+    }
+
+    #[tokio::test]
+    async fn fetch_delta_psu_power_states_yields_one_entry_per_member_none_on_failure() {
+        const PSU_ON: &str = "/redfish/v1/Chassis/chassis/PowerSubsystem/PowerSupplies/on";
+        const PSU_OFF: &str = "/redfish/v1/Chassis/chassis/PowerSubsystem/PowerSupplies/off";
+        const PSU_UNREACHABLE: &str =
+            "/redfish/v1/Chassis/chassis/PowerSubsystem/PowerSupplies/unreachable";
+
+        let server = MockServer::start().await;
+        mount_delta_supplies_collection(
+            &server,
+            serde_json::json!([
+                { "@odata.id": PSU_ON },          // readable, powered on   -> Some(true)
+                { "@odata.id": PSU_OFF },         // readable, powered off  -> Some(false)
+                { "@odata.id": PSU_UNREACHABLE }, // fetch fails (503)      -> None
+                { "Name": "no-odata-id" },        // member without @odata.id -> None
+                { "@odata.id": "" },              // member with empty uri  -> None
+            ]),
+        )
+        .await;
+        Mock::given(method("GET"))
+            .and(path(PSU_ON))
+            .respond_with(ResponseTemplate::new(200).set_body_json(delta_psu(Value::Bool(true))))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(PSU_OFF))
+            .respond_with(ResponseTemplate::new(200).set_body_json(delta_psu(Value::Bool(false))))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(PSU_UNREACHABLE))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+
+        let http = HttpClient::for_test(&server.uri());
+        let states = fetch_delta_psu_power_states(&http, &delta_test_chassis()).await;
+
+        // One positional entry per member: Some(_) when the PSU is readable,
+        // None when it is missing an @odata.id, has an empty URI, or fails to
+        // fetch. Regression guard: unreadable PSUs must not be dropped (which
+        // would let the readable ones aggregate to a falsely-confident state).
+        assert_eq!(states, vec![Some(true), Some(false), None, None, None]);
+        assert_eq!(
+            aggregate_delta_psu_power_states(&states),
+            PowerState::Off,
+            "a Some(false) still forces Off even alongside unreadable PSUs"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_delta_psu_power_states_unreadable_psu_downgrades_on_to_unknown() {
+        const PSU_ON: &str = "/redfish/v1/Chassis/chassis/PowerSubsystem/PowerSupplies/on";
+        const PSU_UNREACHABLE: &str =
+            "/redfish/v1/Chassis/chassis/PowerSubsystem/PowerSupplies/unreachable";
+
+        let server = MockServer::start().await;
+        mount_delta_supplies_collection(
+            &server,
+            serde_json::json!([
+                { "@odata.id": PSU_ON },
+                { "@odata.id": PSU_UNREACHABLE },
+            ]),
+        )
+        .await;
+        Mock::given(method("GET"))
+            .and(path(PSU_ON))
+            .respond_with(ResponseTemplate::new(200).set_body_json(delta_psu(Value::Bool(true))))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(PSU_UNREACHABLE))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+
+        let http = HttpClient::for_test(&server.uri());
+        let states = fetch_delta_psu_power_states(&http, &delta_test_chassis()).await;
+
+        assert_eq!(states, vec![Some(true), None]);
+        assert_eq!(
+            aggregate_delta_psu_power_states(&states),
+            PowerState::Unknown,
+            "an unreadable PSU must prevent a false On aggregate"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_delta_psu_power_states_is_empty_without_power_subsystem() {
+        let server = MockServer::start().await;
+        let http = HttpClient::for_test(&server.uri());
+
+        // Chassis with no PowerSubsystem link at all.
+        let chassis = serde_json::json!({ "@odata.id": "/redfish/v1/Chassis/chassis" });
+        let states = fetch_delta_psu_power_states(&http, &chassis).await;
+
+        assert!(states.is_empty());
+        assert_eq!(
+            aggregate_delta_psu_power_states(&states),
+            PowerState::Unknown
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_delta_psu_power_states_is_empty_without_power_supplies_link() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(DELTA_TEST_SUBSYSTEM_PATH))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "Id": "PowerSubsystem" })),
+            )
+            .mount(&server)
+            .await;
+
+        let http = HttpClient::for_test(&server.uri());
+        let states = fetch_delta_psu_power_states(&http, &delta_test_chassis()).await;
+
+        assert!(states.is_empty());
+        assert_eq!(
+            aggregate_delta_psu_power_states(&states),
+            PowerState::Unknown
+        );
+    }
+
+    #[tokio::test]
+    async fn get_power_state_reports_unknown_when_a_delta_psu_is_unreadable() {
+        const PSU_ON: &str = "/redfish/v1/Chassis/chassis/PowerSubsystem/PowerSupplies/1";
+        const PSU_UNREACHABLE: &str = "/redfish/v1/Chassis/chassis/PowerSubsystem/PowerSupplies/2";
+
+        let server = MockServer::start().await;
+        mount_delta_chassis_discovery(&server).await;
+        mount_delta_supplies_collection(
+            &server,
+            serde_json::json!([
+                { "@odata.id": PSU_ON },
+                { "@odata.id": PSU_UNREACHABLE },
+            ]),
+        )
+        .await;
+        Mock::given(method("GET"))
+            .and(path(PSU_ON))
+            .respond_with(ResponseTemplate::new(200).set_body_json(delta_psu(Value::Bool(true))))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(PSU_UNREACHABLE))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+
+        let powershelf = test_node(&server.uri());
+
+        // End-to-end through get_power_state: one readable "on" PSU alongside one
+        // unreadable PSU must report Unknown, not On. Before the fix the
+        // unreadable PSU was dropped and the shelf falsely reported On.
+        assert_eq!(
+            powershelf.get_power_state().await.unwrap(),
+            PowerState::Unknown
+        );
     }
 
     #[tokio::test]

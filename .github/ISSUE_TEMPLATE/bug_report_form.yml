@@ -92,7 +92,7 @@ body:
     id: code_of_conduct
     attributes:
       label: Code of Conduct
-      description: By submitting this issue, you agree to follow our [Code of Conduct](https://github.com/NVIDIA/nv-rms/blob/main/CODE_OF_CONDUCT.md).
+      description: By submitting this issue, you agree to follow our [Code of Conduct](https://github.com/dsx-ai-factory/nv-rms/blob/main/CODE_OF_CONDUCT.md).
       options:
         - label: I agree to follow NVIDIA Rack Management Service's Code of Conduct.
           required: true

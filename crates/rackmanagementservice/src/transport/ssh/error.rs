@@ -51,9 +51,13 @@ pub(super) enum SshError {
     #[error("SSH connect to {host}: {details}")]
     ConnectFailed { host: String, details: String },
 
-    /// Password authentication was rejected or failed.
+    /// The SSH authentication exchange failed before a result was returned.
     #[error("SSH auth to {host}: {details}")]
     AuthFailed { host: String, details: String },
+
+    /// The SSH server explicitly rejected the supplied credentials.
+    #[error("SSH credentials rejected by {host}")]
+    AuthRejected { host: String },
 
     /// SSH setup failed in a way callers should treat as temporarily unavailable.
     #[error("SSH unavailable during {operation}: {details}")]
@@ -147,6 +151,7 @@ impl SshError {
             Self::Timeout { .. } => ErrorCode::Timeout,
             Self::ConnectFailed { .. } => ErrorCode::ConnectionRefused,
             Self::AuthFailed { .. } | Self::EmptyPassword => ErrorCode::InvalidArgument,
+            Self::AuthRejected { .. } => ErrorCode::Unauthenticated,
             Self::Unavailable { .. } => ErrorCode::Unavailable,
             Self::Cancelled { .. } => ErrorCode::Cancelled,
             Self::LocalFileOpenFailed { .. } | Self::RemoteFileNotFound { .. } => {

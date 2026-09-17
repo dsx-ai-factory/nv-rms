@@ -18,12 +18,64 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use crate::utilities::error::{ErrorCode, Result, RmsError};
+
+// ── Device-info read timeouts ──
+//
+// Backstops for a single node's device-info read. Each device client
+// (NVUE/Redfish/SSH) already applies its own per-request timeout; these bound
+// the *aggregate* client I/O of one read so a client that fails to time out on
+// its own cannot stall an inventory fan-out.
+//
+// They are meant to be applied *around only the client I/O*, i.e. inside the
+// device-info read after the node's `op_lock` has been acquired (see
+// `NvidiaGb200Compute::get_mnnvlink_topology` and the `SwitchDeviceInfo`
+// `get_chassis_location_info` impl). Charging the `op_lock` wait against the
+// deadline would let ordinary contention with an unrelated node operation
+// (e.g. a firmware upload that holds the lock for minutes) turn a healthy node
+// into a spurious timeout; keeping the lock wait outside preserves the base
+// "queue behind the lock, then read" behavior.
+
+/// Switch device-info goes through NVUE and is a small, bounded number of
+/// requests, so a tight ceiling clears a healthy-but-slow switch while letting a
+/// genuinely stuck one fail fast.
+pub(crate) const SWITCH_DEVICE_INFO_FETCH_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// Compute device-info walks a Redfish GET sequence whose length is proportional
+/// to the systems × processors the BMC advertises — RMS cannot bound that count.
+/// This is therefore an **availability backstop, not a hard worst-case bound**:
+/// a BMC advertising many processors, or a degraded one that parks nearly every
+/// GET at its 30s per-request timeout, can still reach it (a single system with
+/// ~6 processors already sums to ~300s, i.e. right at the boundary). It is sized
+/// to clear a healthy single-system node with a handful of processors so the
+/// common slow-but-responsive case surfaces its own specific Redfish error; a
+/// pathologically large or badly degraded topology is the case it deliberately
+/// preempts with the generic deadline error.
+pub(crate) const COMPUTE_DEVICE_INFO_FETCH_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Per-node-kind device-info I/O backstop, or `None` for a kind that performs
+/// no device-info I/O and therefore needs no bound.
+///
+/// Powershelves read from a BMC/PMC for power and firmware, but expose **no
+/// device-info payload**: `NodeInstance::get_device_info` returns `Ok(None)`
+/// synchronously for every powershelf variant (see `nodes/instance.rs`), so
+/// there is nothing to time. Returning `None` lets callers skip the timeout
+/// wrapper entirely rather than arming a ceiling that could never fire. Compute
+/// (Redfish GET walk) and switch (NVUE) reads do real client I/O and get the
+/// per-kind ceiling.
+pub(crate) fn device_info_fetch_timeout(node_type: NodeType) -> Option<Duration> {
+    match node_type.kind() {
+        NodeKind::Compute => Some(COMPUTE_DEVICE_INFO_FETCH_TIMEOUT),
+        NodeKind::Switch => Some(SWITCH_DEVICE_INFO_FETCH_TIMEOUT),
+        NodeKind::Powershelf => None,
+    }
+}
 
 // ── Power ──
 
@@ -48,6 +100,7 @@ pub enum PowerOp {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[allow(clippy::upper_case_acronyms)] // Hardware acronyms (BMC/HMC) read better in ALLCAPS.
 pub enum PowerTargetType {
     #[default]
     System,
@@ -58,6 +111,7 @@ pub enum PowerTargetType {
 // ── Firmware ──
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[allow(clippy::upper_case_acronyms)] // Hardware acronyms (BMC/BIOS/…) read better in ALLCAPS.
 pub enum FirmwareType {
     #[default]
     Unknown,
@@ -193,6 +247,11 @@ impl NodeType {
         }
     }
 
+    /// Whether this node type supports host-side Flint adapter updates.
+    pub(crate) const fn supports_flint_inband_firmware(self) -> bool {
+        matches!(self, Self::ComputeGb200Nvidia | Self::ComputeGb200Wiwynn)
+    }
+
     /// Product family that owns this node type.
     pub const fn product_family(self) -> ProductFamily {
         match self {
@@ -276,15 +335,16 @@ impl fmt::Display for NodeKind {
     }
 }
 
-/// Expected NVFWUPD AP inventory selected by opaque deployment metadata.
+/// Expected firmware inventory selected by opaque deployment metadata.
 ///
-/// The profile name is returned through inventory APIs while the AP names are
-/// passed to NVFWUPD. Both values are immutable and shared by all node
-/// instances that select the same configured profile.
+/// The profile name is returned through inventory APIs. AP names are passed to
+/// NVFWUPD, while physical adapter counts are passed to Flint workflows. All
+/// values are immutable and shared by nodes selecting the configured profile.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExpectedInventoryPolicy {
     pub profile: Arc<str>,
     pub ap_names: Arc<[String]>,
+    pub flint_device_counts: Arc<nvfwupd::workflow::FlintExpectedDeviceCounts>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -331,13 +391,13 @@ pub enum FirmwareActivationMode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FirmwareActivationCommand {
-    RfPowerOn,
-    RfPowerOff,
-    RfPowerCycle,
-    RfAuxPowerCycle,
-    RfPowerStatus,
-    RfPowerShelfReset,
-    RfPowerShelfResetForce,
+    PowerOn,
+    PowerOff,
+    PowerCycle,
+    AuxPowerCycle,
+    PowerStatus,
+    PowerShelfReset,
+    PowerShelfResetForce,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -386,6 +446,25 @@ pub trait Node: Send + Sync {
         Err(RmsError::unimplemented("set_power_state", self.node_type()))
     }
 
+    // ── Device info (async, performs I/O) ──
+
+    /// Fetch a device-info payload (e.g. tray/chassis location) when the node
+    /// type exposes one.
+    ///
+    /// Production dispatch lives entirely on the inherent
+    /// [`crate::nodes::NodeInstance::get_device_info`], which the handlers call
+    /// directly; nothing in the crate reaches device info through this trait
+    /// method. It exists only so `dyn Node` test mocks can supply device-info
+    /// behavior, and is therefore `#[cfg(test)]`-gated: keeping the
+    /// always-`Ok(None)` default off the production trait surface prevents a
+    /// future trait-object/generic caller from silently getting an empty result
+    /// that disagrees with the inherent method (it becomes a compile error
+    /// instead).
+    #[cfg(test)]
+    async fn get_device_info(&self) -> Result<Option<Value>> {
+        Ok(None)
+    }
+
     // ── Firmware (async, performs I/O) ──
 
     async fn get_firmware_inventory(&self) -> Result<Vec<FirmwareInfo>> {
@@ -424,6 +503,25 @@ pub trait Node: Send + Sync {
             }
             Err(e) => Err(e),
         }
+    }
+
+    /// Update one logical firmware group.
+    ///
+    /// Most node types update one package at a time. Nodes with host-side
+    /// PSID-specific images can override this method to validate and apply all
+    /// candidate images as one atomic planning unit.
+    async fn update_firmware_group(
+        &self,
+        targets: &[FirmwareTarget],
+        force_update: bool,
+        options: FirmwareUpdateOptions,
+    ) -> Result<FirmwareUpdateOutcome> {
+        let [target] = targets else {
+            return Err(RmsError::invalid_argument(
+                "firmware update group must contain exactly one target for this node type",
+            ));
+        };
+        self.update_firmware(target, force_update, options).await
     }
 
     /// Legacy task-id based firmware update entrypoint.
@@ -642,6 +740,14 @@ mod tests {
                 false,
             ),
             (
+                NodeType::ComputeGb300Supermicro,
+                "compute_gb300_supermicro",
+                NodeKind::Compute,
+                ProductFamily::Gb300,
+                NvfwupdServerProfile::ComputeGb300,
+                false,
+            ),
+            (
                 NodeType::ComputeVrnvl72Nvidia,
                 "compute_vrnvl72_nvidia",
                 NodeKind::Compute,
@@ -673,6 +779,14 @@ mod tests {
             assert_eq!(node_type.nvfwupd_server_profile(), nvfwupd_profile);
             assert_eq!(node_type.uses_host_management_endpoint(), uses_host);
         }
+    }
+
+    #[test]
+    fn flint_inband_firmware_capability_is_limited_to_supported_gb200_compute_types() {
+        assert!(NodeType::ComputeGb200Nvidia.supports_flint_inband_firmware());
+        assert!(NodeType::ComputeGb200Wiwynn.supports_flint_inband_firmware());
+        assert!(!NodeType::SwitchGb200Nvidia.supports_flint_inband_firmware());
+        assert!(!NodeType::ComputeGb300Nvidia.supports_flint_inband_firmware());
     }
 
     #[tokio::test]

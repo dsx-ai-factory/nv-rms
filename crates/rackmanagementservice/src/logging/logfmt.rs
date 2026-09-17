@@ -467,10 +467,8 @@ impl<K: AsRef<str>, V: AsRef<str>> std::fmt::Display for Kvp<K, V> {
         // Defense-in-depth: redact password/secret-like content from every
         // emitted value so the no-secret-in-log invariant does not depend on
         // each handler scrubbing before constructing a Status/tracing field.
-        let value = nvfwupd::utils::Util::redact_secret_value_for_key(
-            self.key.as_ref(),
-            self.value.as_ref(),
-        );
+        let value =
+            common::redaction::redact_secret_value_for_key(self.key.as_ref(), self.value.as_ref());
 
         if value
             .as_bytes()

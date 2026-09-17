@@ -22,5 +22,5 @@ blank_issues_enabled: true
 # to have it show up in the 'Submit Issue' page.
 contact_links:
   - name: Ask a Question
-    url: https://github.com/NVIDIA/nv-rms/discussions
+    url: https://github.com/dsx-ai-factory/nv-rms/discussions
     about: Please ask general questions here.

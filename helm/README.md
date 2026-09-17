@@ -317,8 +317,11 @@ your values or via `--set-file`; see the site and insecure-mode examples below.
 - `maxTrackedJobs` — maximum async job records retained (config.toml `[workflows] max_tracked_jobs`). Default: `10000`.
 - `terminalJobTtlSeconds` — retention period for completed and failed job records (config.toml `[workflows] terminal_job_ttl_seconds`). Default: `86400`.
 - `expectedInventoryProfiles` — opaque profile identifiers mapped to NVFWUPD AP
-  names (config.toml `[workflows.expected_inventory_profiles]`). Nodes select a
-  profile with `NodeDescriptor.attributes["inventory_profile"]`. Default: `{}`.
+  names and optional physical Flint device counts (config.toml
+  `[workflows.expected_inventory_profiles]`). Legacy list values remain
+  supported; structured values use `apNames` and `flintDevices` (`cx7`, `cx8`,
+  and `bf3Nic`). Nodes select a profile with
+  `NodeDescriptor.attributes["inventory_profile"]`. Default: `{}`.
 - `logLevel` — optional log level / filter directive replacing `RUST_LOG` (config.toml `[logging] log_level`). Empty uses the default `info` level plus dependency caps.
 - `enableTimestamps` — assuming a logging collector is adding its own timestamps, so this is disabled by default to prevent duplicate timestamp fields. If no logging collector is being used, set true to output timestamps natively (config.toml `[logging] enable_timestamps`). Default: `false`.
 - `firmwarePersistentVolumeClaim` — existing PVC to mount at `firmwareMountPath` for firmware downloads. Leave empty to use the default `firmwareStoragePath` hostPath.

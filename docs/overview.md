@@ -31,7 +31,7 @@ appropriate files to the requested nodes based on internal hardware profiles.
 
 | Area | Capabilities |
 | --- | --- |
-| Power | Set node power state, query node power state, and run rack-level power-on / power-off / power-cycle sequences. |
+| Power | Set node power state and query node power state. |
 | Inventory | Register, update, delete, and list nodes and racks; query device info and firmware inventory per node, node type, or rack. |
 | Firmware | Start asynchronous firmware updates (single, batch, and by node type), poll job status, manage persistent firmware objects, and record apply history. |
 | Switch operations | List and push switch firmware, manage switch system images, rotate switch passwords, install switch certificates, and configure the scale-up fabric manager (NMX-C) and gNMI telemetry. |
@@ -44,7 +44,7 @@ For the exact RPCs behind each capability, see [Operations](operations/overview.
 RMS runs as a Linux service (native binary or container) on **x86-64** and
 **arm64**. The release container image is `debian:bookworm-slim`-based; the
 binary is built with the Rust toolchain pinned by
-[`rust-toolchain.toml`](https://github.com/NVIDIA/nv-rms/blob/main/rust-toolchain.toml).
+[`rust-toolchain.toml`](https://github.com/dsx-ai-factory/nv-rms/blob/main/rust-toolchain.toml).
 
 On the managed side, RMS supports NVIDIA GB200 and GB300 rack generations -
 compute trays, NVSwitch trays, and power shelves - over Redfish and NVUE. See

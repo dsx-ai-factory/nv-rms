@@ -135,6 +135,7 @@ fn make_node(id: usize, port: u16) -> NodeInfo {
         }),
         host_endpoint: None,
         node_descriptor: None,
+        additional_host_endpoints: Vec::new(),
     }
 }
 

@@ -81,6 +81,50 @@ fn json_value_has_content(value: &Value) -> bool {
     }
 }
 
+/// Return whether a URI can be safely appended to the selected target base URL.
+pub(crate) fn valid_same_origin_request_path(uri: &str) -> bool {
+    NvUtils::valid_same_origin_request_path(uri)
+}
+
+/// Return a safe same-origin request path, or fall back to `default_uri`.
+///
+/// Unsafe device/config supplied values are ignored rather than used as
+/// authenticated request destinations.
+pub(crate) fn same_origin_path_or_default(
+    candidate: Option<&str>,
+    default_uri: &str,
+    description: &str,
+) -> String {
+    if let Some(uri) = candidate {
+        if valid_same_origin_request_path(uri) {
+            return NvUtils::same_origin_request_path(uri)
+                .expect("valid path checked above")
+                .to_string();
+        }
+        tracing::warn!(
+            "Ignoring invalid {}: {}",
+            description,
+            NvUtils::sanitize_log(uri.trim())
+        );
+    }
+
+    default_uri.to_string()
+}
+
+/// Resolve a multipart update URI from an UpdateService response.
+pub(crate) fn multipart_update_uri_from_service(
+    update_service_response: &Value,
+    default_uri: &str,
+) -> String {
+    same_origin_path_or_default(
+        update_service_response
+            .get("MultipartHttpPushUri")
+            .and_then(Value::as_str),
+        default_uri,
+        "MultipartHttpPushUri from UpdateService",
+    )
+}
+
 const COMPLETION_MESSAGE_SUPPRESS_TARGETS: &[&str] = &[
     "/redfish/v1/UpdateService/SoftwareInventory/IST_Vectors",
     "/redfish/v1/UpdateService/SoftwareInventory/HGX_IST_Vectors",
@@ -2380,6 +2424,32 @@ pub fn format_duration_hms(dur: &chrono::Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn multipart_update_uri_from_service_rejects_off_origin_values() {
+        assert_eq!(
+            multipart_update_uri_from_service(
+                &json!({"MultipartHttpPushUri": " /redfish/v1/UpdateService/custom "}),
+                "/redfish/v1/UpdateService/update-multipart",
+            ),
+            "/redfish/v1/UpdateService/custom"
+        );
+
+        for uri in [
+            "https://attacker.example/upload",
+            "http://attacker.example/upload",
+            "//attacker.example/upload",
+            "/redfish/v1/UpdateService/update-multipart\nX: y",
+        ] {
+            assert_eq!(
+                multipart_update_uri_from_service(
+                    &json!({"MultipartHttpPushUri": uri}),
+                    "/redfish/v1/UpdateService/update-multipart",
+                ),
+                "/redfish/v1/UpdateService/update-multipart"
+            );
+        }
+    }
 
     struct FailingPreconditionTarget {
         bmc_access: BmcAccess,

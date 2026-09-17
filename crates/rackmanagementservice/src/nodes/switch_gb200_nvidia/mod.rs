@@ -20,13 +20,16 @@
 //! Provides node construction and management workflows over NVUE, SSH/SFTP,
 //! Redfish, and NVFWUPD.
 
+mod attestation;
 mod cluster;
 mod factory_reset;
 mod firmware;
 mod nvue;
 mod password;
+mod post_config_check;
 mod power;
 mod ssh;
+mod system;
 mod system_image;
 mod validation;
 
@@ -35,6 +38,10 @@ pub mod mtls;
 
 pub(crate) use self::password::SwitchSystemPasswordUpdateOutcome;
 pub(crate) use self::validation::{is_valid_identifier, shell_quote};
+
+#[cfg(test)]
+pub(crate) use self::attestation::SwitchSpdmAttestationEvidence;
+pub(crate) use self::attestation::{SpdmAttestationChallenge, SwitchSpdmComponentResult};
 
 pub use self::cluster::grpc_port_for_app;
 pub use self::system_image::{
@@ -52,6 +59,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use nvue_client::SharedClient as SharedNvueClient;
+use nvue_client::system::SystemPowerCycleRequest;
 #[cfg(test)]
 use nvue_client::{
     Client as NvueClient, ClientConfig as NvueConnectConfig, ClientCredentials as NvueCredentials,
@@ -474,12 +482,11 @@ impl Node for SwitchGb200Nvidia {
             ));
         }
 
-        let payload = serde_json::json!({
-            "@power-cycle": {
-                "state": "start",
-                "parameters": {"force": true}
-            }
-        });
+        let payload =
+            serde_json::to_value(SystemPowerCycleRequest::new(true)).map_err(|error| {
+                RmsError::internal(format!("failed to serialize power-cycle request: {error}"))
+            })?;
+
         self.nvue_http_post("/nvue_v1/system", &payload, HttpClient::DEFAULT_TIMEOUT)
             .await?;
         Ok(())

@@ -58,17 +58,18 @@ COPY . .
 
 # Container builds use the default linker; lld is installed via apt for local dev
 # (see .cargo/config.toml) but apt is avoided in this image (see stage header).
-RUN sed -i '/fuse-ld=lld/d' .cargo/config.toml
-
 # vergen-gitcl needs git CLI + a .git dir at compile time, but .git is
 # excluded from the build context via .dockerignore.  Inject the values
 # as build-time env vars instead; vergen 9.x uses them as overrides.
 ARG VERGEN_GIT_SHA
 ARG VERGEN_GIT_DESCRIBE
 
-RUN cargo build --release --workspace --locked
-# Pre-compile test binaries so the CI run-tests job doesn't need to recompile
-RUN cargo test --workspace --release --no-run --locked
+# Pre-compile test and benchmark binaries so the CI run-tests and run-benchmarks jobs don't need to recompile
+RUN sed -i '/fuse-ld=lld/d' .cargo/config.toml \
+    && cargo build --release --workspace \
+    && cargo test --workspace --release --no-run \
+    && cargo bench --workspace --no-run
+
 
 # ── Stage 2: Release ──
 # Minimal runtime image with the service binary, the NVFWUPD CLI for operator

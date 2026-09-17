@@ -76,13 +76,23 @@ impl<D: JobDomain> JobHandle<D> {
     }
 
     /// Updates the visible progress message when the job is still active.
+    ///
+    /// The registry logs the `job started`/`job progress` chokepoint event on
+    /// a successful update; this only warns when the update is ignored
+    /// because the job is no longer active.
     pub fn progress(&self, description: impl Into<String>) {
         if !self.registry.mark_running(&self.job_id, description) {
-            tracing::warn!("progress update ignored; job no longer active");
+            tracing::warn!(
+                job_id = %self.job_id,
+                "progress update ignored; job no longer active"
+            );
         }
     }
 
     /// Marks the job completed with a description and result payload.
+    ///
+    /// The registry logs the `job completed` chokepoint event on the
+    /// transition.
     pub fn complete(mut self, description: impl Into<String>, result_json: impl Into<String>) {
         self.finished = true;
         self.registry
@@ -90,6 +100,9 @@ impl<D: JobDomain> JobHandle<D> {
     }
 
     /// Marks the job failed with the supplied failure payload.
+    ///
+    /// The registry logs the `job failed` chokepoint event on the
+    /// transition.
     pub fn fail(mut self, failure: JobFailure) {
         self.finished = true;
         self.registry.mark_failed(&self.job_id, failure);

@@ -32,9 +32,6 @@ pub const MAX_RETRY_ATTEMPTS: u32 = 3;
 pub const RETRY_WAIT_SECONDS: u64 = 30;
 pub const REVISION_POLL_INTERVAL_SECONDS: u64 = 1;
 pub const REVISION_APPLY_TIMEOUT_SECONDS: u64 = 60;
-pub const GNMI_CONFIG_WAIT_SECONDS: u64 = 15;
-pub const GNMI_RETRY_DELAY_1_SECONDS: u64 = 20;
-pub const GNMI_RETRY_DELAY_2_SECONDS: u64 = 30;
 pub const GRPC_PORT_NMX_CONTROLLER: u16 = 9370;
 pub const GRPC_PORT_NMX_TELEMETRY: u16 = 9352;
 /// NVOS pauses gRPC while cluster manager actions run; wait before the next one.

@@ -42,14 +42,8 @@ pub(crate) fn ssh_host_key_mode_string_value_supported(value: &str) -> bool {
     )
 }
 
-fn parse_ssh_host_key_mode(
-    mode_arg: Option<&str>,
-    known_hosts_present: bool,
-) -> Result<String, String> {
+fn parse_ssh_host_key_mode(mode_arg: Option<&str>) -> Result<String, String> {
     match mode_arg {
-        None if known_hosts_present => Ok(SSH_HOST_KEY_MODE_TOFU.to_string()),
-        // SSH host-key verification is wired and ready in NVFWUPD; default
-        // enablement is pending final customer discussions.
         None => Ok(SSH_HOST_KEY_MODE_DISABLED.to_string()),
         Some(value) => {
             let value = value.trim();
@@ -81,7 +75,7 @@ pub(crate) fn parse_ssh_options(
     }
 
     let explicit_mode = arg_dict.get(SSH_HOST_KEY_MODE_ARG).map(String::as_str);
-    let mode = parse_ssh_host_key_mode(explicit_mode, known_hosts.is_some())?;
+    let mode = parse_ssh_host_key_mode(explicit_mode)?;
     if mode == SSH_HOST_KEY_MODE_DISABLED && known_hosts.is_some() {
         return Err(format!(
             "{SSH_KNOWN_HOSTS_ARG} cannot be used when {SSH_HOST_KEY_MODE_ARG}={SSH_HOST_KEY_MODE_DISABLED}; \
@@ -113,20 +107,6 @@ mod tests {
         let options = parse_ssh_options(&HashMap::new()).expect("omitted mode should default");
 
         assert_eq!(options.mode, SSH_HOST_KEY_MODE_DISABLED);
-    }
-
-    #[test]
-    fn known_hosts_without_mode_opts_into_tofu() {
-        let mut args = HashMap::new();
-        args.insert(
-            SSH_KNOWN_HOSTS_ARG.to_string(),
-            "/tmp/known_hosts".to_string(),
-        );
-
-        let options = parse_ssh_options(&args).expect("known_hosts should opt into verification");
-
-        assert_eq!(options.known_hosts.as_deref(), Some("/tmp/known_hosts"));
-        assert_eq!(options.mode, SSH_HOST_KEY_MODE_TOFU);
     }
 
     #[test]

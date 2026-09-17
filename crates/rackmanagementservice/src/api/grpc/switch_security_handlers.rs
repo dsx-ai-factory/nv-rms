@@ -29,7 +29,9 @@ use librms::protos::rack_manager as rm;
 use serde::Serialize;
 
 use super::server::RackManagerServiceImpl;
-use crate::api::grpc::conversions::{flatten_node_info, proto_node_type_to_domain};
+use crate::api::grpc::conversions::{
+    batch_targets, failed_node_results, flatten_node_info, proto_node_type_to_domain,
+};
 use crate::domain::node::NodeKind;
 use crate::domain::rack::NodeConfig;
 use crate::nodes::NodeInstance;
@@ -57,7 +59,7 @@ fn redact_password_rotation_error(message: &str, secrets: &[&str]) -> String {
         redacted = redacted.replace(secret, "XXXX");
     }
 
-    nvfwupd::utils::Util::redact_secret_fields(&redacted)
+    common::redaction::redact_secret_fields(&redacted)
 }
 
 fn validate_unique_switch_password_targets(devices: &[rm::NodeInfo]) -> Result<(), tonic::Status> {
@@ -143,70 +145,31 @@ impl RackManagerServiceImpl {
         };
         batch.job_id = parent_id.clone();
 
-        let mut queued_jobs = Vec::new();
-        let mut skipped = 0u32;
+        let (admitted, rejected) = self.job_tracker.create_batch_jobs(
+            &parent_id,
+            JobType::SwitchSystemPasswordUpdate,
+            batch_targets(devices),
+            |device| self.prepare_switch_password_job(device, username.as_ref()),
+        );
 
-        for device in devices {
-            let node_id = device.node_id.clone();
-            let rack_id = device.rack_id.clone();
+        let skipped = rejected.len() as u32;
+        batch.node_results.extend(failed_node_results(rejected));
 
-            let prepared = match self.prepare_switch_password_job(device, username.as_ref()) {
-                Ok(prepared) => prepared,
-                Err(result) => {
-                    tracing::warn!(
-                        node = %node_id,
-                        rack = %rack_id,
-                        error = %result.error_message,
-                        "skipping switch password update: failed to prepare job"
-                    );
-                    batch.node_results.push(result);
-                    skipped += 1;
-                    continue;
-                }
-            };
-
-            let pending = match self.job_tracker.create_child_job_if_node_idle(
-                &parent_id,
-                &rack_id,
-                &node_id,
-                JobType::SwitchSystemPasswordUpdate,
-            ) {
-                Ok(pending) => pending,
-                Err(failure) => {
-                    tracing::warn!(
-                        node = %node_id,
-                        rack = %rack_id,
-                        message = %failure.message,
-                        "switch password update job rejected"
-                    );
-
-                    batch.node_results.push(rm::NodeOperationResult {
-                        node_id: node_id.clone(),
-                        status: rm::ReturnCode::Failure.into(),
-                        error_message: failure.message,
-                    });
-
-                    skipped += 1;
-
-                    continue;
-                }
-            };
-
-            let job_input = SwitchPasswordJobInput {
-                endpoint_username: prepared.endpoint_username,
-                endpoint_password: prepared.endpoint_password,
-                username: Arc::clone(&username),
-                password: Arc::clone(&password),
-                rack_id: rack_id.clone(),
-                node_id: node_id.clone(),
-            };
-
-            queued_jobs.push(SwitchPasswordQueuedJob {
+        let queued_jobs: Vec<_> = admitted
+            .into_iter()
+            .map(|(device, pending, prepared)| SwitchPasswordQueuedJob {
                 pending,
                 switch: prepared.switch,
-                input: job_input,
-            });
-        }
+                input: SwitchPasswordJobInput {
+                    endpoint_username: prepared.endpoint_username,
+                    endpoint_password: prepared.endpoint_password,
+                    username: Arc::clone(&username),
+                    password: Arc::clone(&password),
+                    rack_id: device.rack_id,
+                    node_id: device.node_id,
+                },
+            })
+            .collect();
 
         let jobs_created = queued_jobs.len() as u32;
 
@@ -287,9 +250,9 @@ impl RackManagerServiceImpl {
 
     fn prepare_switch_password_job(
         &self,
-        device: rm::NodeInfo,
+        device: &rm::NodeInfo,
         username: &str,
-    ) -> std::result::Result<PreparedSwitchPasswordJob, rm::NodeOperationResult> {
+    ) -> std::result::Result<PreparedSwitchPasswordJob, String> {
         let node_id = device.node_id.clone();
         let rack_id = device.rack_id.clone();
 
@@ -311,13 +274,9 @@ impl RackManagerServiceImpl {
                 "skipping password rotation for unknown node type"
             );
 
-            let error_message = format!("device {node_id} is not a switch (type={node_type_raw})");
-
-            return Err(rm::NodeOperationResult {
-                node_id,
-                status: rm::ReturnCode::Failure.into(),
-                error_message,
-            });
+            return Err(format!(
+                "device {node_id} is not a switch (type={node_type_raw})"
+            ));
         };
 
         if node_type.kind() != NodeKind::Switch {
@@ -329,16 +288,12 @@ impl RackManagerServiceImpl {
                 "skipping password rotation for non-switch node"
             );
 
-            let error_message = format!("device {node_id} is not a switch (type={node_type})");
-
-            return Err(rm::NodeOperationResult {
-                node_id,
-                status: rm::ReturnCode::Failure.into(),
-                error_message,
-            });
+            return Err(format!(
+                "device {node_id} is not a switch (type={node_type})"
+            ));
         }
 
-        let flat = match flatten_node_info(&device) {
+        let flat = match flatten_node_info(device) {
             Ok(flat) => flat,
             Err(e) => {
                 let message = e.message;
@@ -351,11 +306,7 @@ impl RackManagerServiceImpl {
                     "skipping password rotation due to invalid endpoint credentials"
                 );
 
-                return Err(rm::NodeOperationResult {
-                    node_id,
-                    status: rm::ReturnCode::Failure.into(),
-                    error_message: message,
-                });
+                return Err(message);
             }
         };
 
@@ -369,13 +320,7 @@ impl RackManagerServiceImpl {
                     "skipping password rotation due to missing switch credentials"
                 );
 
-                let error_message = format!("Missing host credentials for switch {node_id}");
-
-                return Err(rm::NodeOperationResult {
-                    node_id,
-                    status: rm::ReturnCode::Failure.into(),
-                    error_message,
-                });
+                return Err(format!("Missing host credentials for switch {node_id}"));
             }
         };
 
@@ -412,14 +357,9 @@ impl RackManagerServiceImpl {
                     "skipping password rotation due to invalid switch host endpoint"
                 );
 
-                let error_message =
-                    format!("Invalid host endpoint for switch {node_id}: {message}");
-
-                return Err(rm::NodeOperationResult {
-                    node_id,
-                    status: rm::ReturnCode::Failure.into(),
-                    error_message,
-                });
+                return Err(format!(
+                    "Invalid host endpoint for switch {node_id}: {message}"
+                ));
             }
         };
 
@@ -444,13 +384,7 @@ impl RackManagerServiceImpl {
                     "failed to construct switch for password rotation"
                 );
 
-                let error_message = format!("Failed to construct switch: {}", e.message);
-
-                return Err(rm::NodeOperationResult {
-                    node_id,
-                    status: rm::ReturnCode::Failure.into(),
-                    error_message,
-                });
+                return Err(format!("Failed to construct switch: {}", e.message));
             }
         };
 
@@ -571,14 +505,6 @@ fn fail_switch_password_update_job(
         Some(&error_message),
     );
 
-    tracing::error!(
-        node = %input.node_id,
-        rack = %input.rack_id,
-        target_user = input.username.as_ref(),
-        error = %error_message,
-        "switch password update job failed"
-    );
-
     job.fail(JobFailure::new(error_code, error_message).with_result_json(result_json));
 }
 
@@ -676,13 +602,6 @@ async fn run_switch_password_update_job(
         Some(outcome.phase()),
         outcome.revision_id(),
         None,
-    );
-
-    tracing::info!(
-        node = %input.node_id,
-        rack = %input.rack_id,
-        target_user = input.username.as_ref(),
-        "switch password update job completed"
     );
 
     job.complete("Completed", result_json);

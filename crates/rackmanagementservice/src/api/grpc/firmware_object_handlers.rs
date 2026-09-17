@@ -32,15 +32,16 @@ use crate::api::grpc::artifact_download::{
     build_artifact_http_client, download_single_file, is_valid_sha256_hex,
 };
 use crate::api::grpc::conversions::{
-    domain_node_type_to_proto, flatten_node_info, proto_node_type_to_domain,
-    proto_node_type_to_string, timestamp_from_datetime,
+    batch_targets, domain_node_type_to_proto, failed_node_results, flatten_node_info,
+    proto_node_type_to_domain, proto_node_type_to_string, timestamp_from_datetime,
 };
 use crate::api::grpc::firmware_artifact_paths::{
     ArtifactPathError, artifact_cache_path, filename_from_location, redact_location_for_logging,
 };
 use crate::api::grpc::firmware_handlers::{
     FirmwareTargetExpectedVersions, build_ephemeral_node,
-    build_firmware_targets_from_list_with_expected_versions, spawn_firmware_update_job,
+    build_firmware_targets_from_list_with_expected_versions, spawn_firmware_object_update_job,
+    validate_firmware_object_request,
 };
 use crate::api::grpc::node_type_resolver::{
     domain_node_type_to_descriptor, resolve_component_filter_selectors,
@@ -245,28 +246,39 @@ impl RackManagerServiceImpl {
             };
 
         let hw_type = RackHardwareType(r.hardware_type);
-        let mut firmware = self
-            .backends
+        self.backends
             .firmware_objects
             .create(&id, hw_type.clone(), config, parsed_value)
             .await
             .map_err(status_from_rms_error)?;
 
-        let should_set_default = r.set_default
-            || !self
-                .backends
-                .firmware_objects
-                .has_default(&hw_type)
-                .await
-                .map_err(status_from_rms_error)?;
-        if should_set_default {
-            firmware = self
-                .backends
+        // Choose the default atomically. An explicit request forces this bundle
+        // to become the default; otherwise it becomes the default only if the
+        // hardware type has none yet. set_default_if_none folds the former
+        // check-then-act (has_default + set_default) into one serialized step,
+        // so two concurrent first-time adds cannot both claim the default.
+        //
+        // We must use the row these methods return, not the one `create`
+        // produced above: the default-selection UPDATE runs after `create`, so
+        // the created row still carries `is_default = false` and a pre-update
+        // `updated` timestamp. Both methods return the authoritative
+        // post-selection row for `id` -- its `is_default` reflects whether this
+        // bundle actually ended up the default (set_default_if_none leaves it
+        // false when another bundle already owns the slot) -- which is exactly
+        // the state the response must report.
+        let firmware = if r.set_default {
+            self.backends
                 .firmware_objects
                 .set_default(&id)
                 .await
-                .map_err(status_from_rms_error)?;
-        }
+                .map_err(status_from_rms_error)?
+        } else {
+            self.backends
+                .firmware_objects
+                .set_default_if_none(&id)
+                .await
+                .map_err(status_from_rms_error)?
+        };
 
         if !parsed.board_skus.is_empty() || !parsed.switch_system_images.is_empty() {
             let cancel = CancellationToken::new();
@@ -632,16 +644,24 @@ impl RackManagerServiceImpl {
                 jobs: Vec::new(),
             }));
         };
-        let (parent_job_id, precreated_jobs, node_jobs) =
-            self.precreate_switch_image_jobs(parent_job_id, devices);
+        let precreated = self.precreate_switch_image_jobs(parent_job_id, devices);
 
         // Every per-device job was rejected (e.g. all nodes busy or the tracker
         // is at capacity); fail the batch instead of launching stage-0 work for
         // an empty job set and reporting it as accepted.
-        if precreated_jobs.is_empty() {
-            let mut response =
-                batch_failure("No switch system image apply jobs created".to_owned());
-            response.job_id = parent_job_id.clone();
+        if precreated.jobs.is_empty() {
+            let response = rm::NodeBatchResponse {
+                status: rm::ReturnCode::Failure.into(),
+                message: "No switch system image apply jobs created".to_owned(),
+                node_results: precreated.node_results,
+                job_id: precreated.parent_job_id,
+                stats: Some(rm::NodeOperationStats {
+                    total_nodes: precreated.total_nodes,
+                    successful_nodes: 0,
+                    failed_nodes: precreated.failed_nodes,
+                }),
+            };
+
             return Ok(Response::new(rm::ApplySwitchSystemImageResponse {
                 response: Some(response),
                 object_id,
@@ -650,13 +670,17 @@ impl RackManagerServiceImpl {
             }));
         }
 
-        self.spawn_apply_switch_system_image_job(r, precreated_jobs);
-
-        let response = accepted_batch(
-            parent_job_id,
-            node_jobs.len() as u32,
+        let response = accepted_batch_with_stats(
+            precreated.parent_job_id.clone(),
+            precreated.total_nodes,
+            precreated.jobs.len() as u32,
+            precreated.failed_nodes,
+            precreated.node_results,
             "Created switch system image apply jobs. Stage 0 downloads the image artifact; use GetSwitchSystemImageJobStatus with response.job_id or node job IDs to track progress.",
         );
+
+        let node_jobs = precreated.node_jobs;
+        self.spawn_apply_switch_system_image_job(r, precreated.jobs);
 
         Ok(Response::new(rm::ApplySwitchSystemImageResponse {
             response: Some(response),
@@ -760,62 +784,39 @@ impl RackManagerServiceImpl {
         parent_job_id: String,
         devices: Vec<rm::NodeInfo>,
     ) -> PrecreatedFirmwareJobs {
-        let mut precreated_jobs = Vec::with_capacity(devices.len());
-        let mut node_jobs = Vec::with_capacity(devices.len());
-        let mut node_results = Vec::new();
         let total_nodes = devices.len() as u32;
-        let mut failed_nodes = 0u32;
 
-        for device in devices {
-            let expected_inventory = match self.expected_inventory_policy_for_node(&device) {
-                Ok(policy) => policy,
-                Err(error) => {
-                    node_results.push(rm::NodeOperationResult {
-                        node_id: device.node_id,
-                        status: rm::ReturnCode::Failure.into(),
-                        error_message: error.message,
-                    });
-                    failed_nodes += 1;
-                    continue;
-                }
-            };
-            let pending = match self.job_tracker.create_child_job_if_node_idle(
-                &parent_job_id,
-                &device.rack_id,
-                &device.node_id,
-                JobType::FirmwareUpdate,
-            ) {
-                Ok(pending) => pending,
-                Err(failure) => {
-                    tracing::warn!(
-                        node = device.node_id,
-                        rack = device.rack_id,
-                        message = %failure.message,
-                        "firmware object apply job rejected"
-                    );
+        let (admitted, rejected) = self.job_tracker.create_batch_jobs(
+            &parent_job_id,
+            JobType::FirmwareUpdate,
+            batch_targets(devices),
+            |device| {
+                self.expected_inventory_policy_for_node(device)
+                    .map_err(|error| error.message)
+            },
+        );
 
-                    node_results.push(rm::NodeOperationResult {
-                        node_id: device.node_id,
-                        status: rm::ReturnCode::Failure.into(),
-                        error_message: failure.message,
-                    });
+        let failed_nodes = rejected.len() as u32;
+        let node_results = failed_node_results(rejected).collect();
 
-                    failed_nodes += 1;
-                    continue;
-                }
-            };
-
-            let job_id = pending.id().to_string();
-            node_jobs.push(rm::NodeFirmwareJobInfo {
+        let node_jobs = admitted
+            .iter()
+            .map(|(device, pending, _)| rm::NodeFirmwareJobInfo {
                 node_id: device.node_id.clone(),
-                job_id,
-            });
-            precreated_jobs.push(PrecreatedFirmwareJob {
-                device,
-                pending,
-                expected_inventory,
-            });
-        }
+                job_id: pending.id().to_string(),
+            })
+            .collect();
+
+        let precreated_jobs: Vec<_> = admitted
+            .into_iter()
+            .map(
+                |(device, pending, expected_inventory)| PrecreatedFirmwareJob {
+                    device,
+                    pending,
+                    expected_inventory,
+                },
+            )
+            .collect();
 
         if precreated_jobs.is_empty() {
             self.job_tracker
@@ -836,46 +837,45 @@ impl RackManagerServiceImpl {
         &self,
         parent_job_id: String,
         devices: Vec<rm::NodeInfo>,
-    ) -> (
-        String,
-        Vec<PrecreatedSwitchImageJob>,
-        Vec<rm::SwitchSystemImageUpdateJobInfo>,
-    ) {
-        let mut precreated_jobs = Vec::with_capacity(devices.len());
-        let mut node_jobs = Vec::with_capacity(devices.len());
+    ) -> PrecreatedSwitchImageJobs {
+        let total_nodes = devices.len() as u32;
 
-        for device in devices {
-            let pending = match self.job_tracker.create_child_job(
-                &parent_job_id,
-                &device.rack_id,
-                &device.node_id,
-                JobType::SwitchSystemImageUpdate,
-            ) {
-                Ok(pending) => pending,
-                Err(failure) => {
-                    tracing::warn!(
-                        node = device.node_id,
-                        rack = device.rack_id,
-                        message = %failure.message,
-                        "switch image apply job rejected"
-                    );
-                    continue;
-                }
-            };
-            let job_id = pending.id().to_string();
-            node_jobs.push(rm::SwitchSystemImageUpdateJobInfo {
+        let (admitted, rejected) = self.job_tracker.create_batch_jobs(
+            &parent_job_id,
+            JobType::SwitchSystemImageUpdate,
+            batch_targets(devices),
+            |_| Ok(()),
+        );
+
+        let failed_nodes = rejected.len() as u32;
+        let node_results = failed_node_results(rejected).collect();
+
+        let node_jobs = admitted
+            .iter()
+            .map(|(device, pending, ())| rm::SwitchSystemImageUpdateJobInfo {
                 node_id: device.node_id.clone(),
-                job_id,
-            });
-            precreated_jobs.push(PrecreatedSwitchImageJob { device, pending });
-        }
+                job_id: pending.id().to_string(),
+            })
+            .collect();
+
+        let precreated_jobs: Vec<_> = admitted
+            .into_iter()
+            .map(|(device, pending, ())| PrecreatedSwitchImageJob { device, pending })
+            .collect();
 
         if precreated_jobs.is_empty() {
             self.job_tracker
                 .mark_failed_message(&parent_job_id, "No switch system image apply jobs created");
         }
 
-        (parent_job_id, precreated_jobs, node_jobs)
+        PrecreatedSwitchImageJobs {
+            parent_job_id,
+            jobs: precreated_jobs,
+            node_jobs,
+            node_results,
+            total_nodes,
+            failed_nodes,
+        }
     }
 
     fn spawn_apply_firmware_object_job(
@@ -1152,6 +1152,21 @@ impl RackManagerServiceImpl {
                     return;
                 }
                 Ok(targets) => {
+                    if let Err(error) =
+                        validate_firmware_object_request(node_type, &targets, r.activate)
+                    {
+                        mark_firmware_jobs_failed(
+                            &self.job_tracker,
+                            jobs,
+                            JobError::InvalidArgument,
+                            &format!(
+                                "Invalid firmware targets for node type {}: {}",
+                                node_type.as_str(),
+                                error.message
+                            ),
+                        );
+                        return;
+                    }
                     resolved.insert(node_type, targets);
                 }
                 Err(e) => {
@@ -1271,7 +1286,7 @@ impl RackManagerServiceImpl {
                 continue;
             }
 
-            spawn_firmware_update_job(
+            spawn_firmware_object_update_job(
                 self.job_tracker.clone(),
                 job.pending,
                 node,
@@ -1683,6 +1698,15 @@ struct PrecreatedFirmwareJob {
     expected_inventory: Option<ExpectedInventoryPolicy>,
 }
 
+struct PrecreatedSwitchImageJobs {
+    parent_job_id: String,
+    jobs: Vec<PrecreatedSwitchImageJob>,
+    node_jobs: Vec<rm::SwitchSystemImageUpdateJobInfo>,
+    node_results: Vec<rm::NodeOperationResult>,
+    total_nodes: u32,
+    failed_nodes: u32,
+}
+
 struct PrecreatedSwitchImageJob {
     device: rm::NodeInfo,
     pending: RmsJobHandle,
@@ -1795,6 +1819,7 @@ fn selection_for_node_type(
     node_type: NodeType,
 ) -> std::result::Result<Option<FirmwareObjectComponentSelection>, String> {
     if component_filters.is_empty() {
+        validate_firmware_object_component_selection(node_type, global_components)?;
         return Ok(Some(if global_components.is_empty() {
             FirmwareObjectComponentSelection::default_only()
         } else {
@@ -1809,17 +1834,32 @@ fn selection_for_node_type(
 }
 
 fn component_filter_selection(
-    _node_type: NodeType,
+    node_type: NodeType,
     filter: &rm::FirmwareObjectComponentFilter,
 ) -> std::result::Result<FirmwareObjectComponentSelection, String> {
-    // Keep node_type in this boundary for future validation of per-node target keys.
-    // Component filters currently accept source component names and target keys, so the
-    // actual narrowing remains lookup-table driven until those inputs are made stricter.
+    validate_firmware_object_component_selection(node_type, &filter.components)?;
     Ok(if filter.components.is_empty() {
         FirmwareObjectComponentSelection::all()
     } else {
         FirmwareObjectComponentSelection::components(filter.components.clone())
     })
+}
+
+fn validate_firmware_object_component_selection(
+    node_type: NodeType,
+    components: &[String],
+) -> std::result::Result<(), String> {
+    if node_type.supports_flint_inband_firmware()
+        && components
+            .iter()
+            .any(|component| component.trim().eq_ignore_ascii_case("BF3_BFB"))
+    {
+        return Err(
+            "BF3_BFB and Arm OS installation are not supported; select BF3_NIC with a Flint-compatible firmware image"
+                .to_owned(),
+        );
+    }
+    Ok(())
 }
 
 // Narrows raw firmware manifest data for one-shot apply before artifact download. Board Type
@@ -2249,11 +2289,7 @@ fn fail_precreated_child(
     refresh_child_id: &mut Option<JobId>,
 ) {
     let child_id = job.id().clone();
-    let span = job.span();
-    let error_message = failure.message.clone();
     job.fail(failure);
-    let _entered = span.enter();
-    tracing::error!(error_message, "job failed");
     refresh_child_id.get_or_insert(child_id);
 }
 
@@ -2287,10 +2323,11 @@ fn spawn_ephemeral_object_cache_cleanup<D: JobDomain>(
     cache_dir: PathBuf,
 ) {
     let cleanup_plan = ephemeral_object_cache_cleanup_plan(child_job_ids, cache_dir);
+    // Deliberately node-less, as this job touches no hardware
     let pending = match registry.create_job(
         JobSpec::new(
             "",
-            "ephemeral-object-cache-cleanup",
+            "",
             "Cleaning up ephemeral object cache",
             tracing::Span::current(),
         ),
@@ -2393,6 +2430,7 @@ fn metadata_from_lookup_table(lookup_table: &FirmwareLookupTable) -> rm::Firmwar
             for (component_key, entry) in sorted_entries {
                 if firmware_lookup_entry_mapping_for_node_type(*node_type, component_key, entry)
                     .is_none()
+                    || !firmware_entry_allowed_for_node_type(*node_type, component_key, entry)
                 {
                     continue;
                 }
@@ -2497,6 +2535,9 @@ fn target_key_from_component_key(component_key: &str) -> String {
 
 fn known_firmware_target_keys() -> &'static [&'static str] {
     &[
+        "BF3_NIC",
+        "CX7",
+        "CX8",
         "PCIE_SWITCH_CONFIG_0",
         "INFOROM_GPU_0",
         "INFOROM_GPU_1",
@@ -2538,6 +2579,7 @@ fn node_types_for_device_type(device_type: &str) -> &'static [NodeType] {
             NodeType::ComputeGb200Wiwynn,
             NodeType::ComputeGb300Nvidia,
             NodeType::ComputeGb300Lenovo,
+            NodeType::ComputeGb300Supermicro,
             NodeType::ComputeVrnvl72Nvidia,
         ],
         VRNVL72_COMPUTE_LOOKUP_KEY => &[NodeType::ComputeVrnvl72Nvidia],
@@ -2599,10 +2641,6 @@ fn batch_failure(message: String) -> rm::NodeBatchResponse {
             failed_nodes: 0,
         }),
     }
-}
-
-fn accepted_batch(job_id: String, total_nodes: u32, message: &str) -> rm::NodeBatchResponse {
-    accepted_batch_with_stats(job_id, total_nodes, 0, 0, Vec::new(), message)
 }
 
 fn accepted_batch_with_stats(
@@ -2731,38 +2769,53 @@ fn parse_firmware_component(
                 .enumerate()
                 .filter_map(|location| {
                     let (location_idx, location) = location;
+                    let advertised_filename = json_string(location, "FileName");
                     let firmware_type = optional_json_string(location, "Type")
                         .filter(|value| !value.trim().is_empty())
                         .or_else(|| {
-                            let filename = json_string(location, "FileName");
                             // This manifest shape has one update package plus a
                             // non-payload CoRIM; only infer the .fwpkg as firmware.
                             (infer_vrnvl72_defaults
                                 && component.eq_ignore_ascii_case("BMC")
-                                && filename.to_ascii_lowercase().ends_with(".fwpkg"))
+                                && advertised_filename.to_ascii_lowercase().ends_with(".fwpkg"))
                             .then(|| "Firmware".to_owned())
                         });
-                    location_is_firmware_payload(firmware_type.as_deref()).then(|| {
-                        let location_value = json_string(location, "Location");
-                        if location_value.trim().is_empty()
-                            && firmware_type
-                                .as_deref()
-                                .is_some_and(|ty| ty.eq_ignore_ascii_case("Firmware"))
-                        {
-                            tracing::debug!(
-                                component = %json_string(firmware, "Component"),
-                                context = %format!("{context}.Locations[{location_idx}]"),
-                                "firmware payload location is empty"
-                            );
-                        }
-                        FirmwareLocation {
-                            location: location_value,
-                            location_type: json_string(location, "LocationType"),
-                            firmware_type,
-                            sha256: optional_sha256(location),
-                            context: format!("{context}.Locations[{location_idx}]"),
-                        }
-                    })
+                    let location_value = json_string(location, "Location");
+                    let payload_filename = if advertised_filename.trim().is_empty() {
+                        filename_from_location(&location_value).unwrap_or_default()
+                    } else {
+                        advertised_filename.clone()
+                    };
+                    let cache_filename =
+                        filename_from_location(&location_value).unwrap_or_default();
+                    let payload_allowed = if location_value.trim().is_empty() {
+                        payload_filename.is_empty()
+                            || firmware_payload_allowed_for_component(&component, &payload_filename)
+                    } else {
+                        firmware_payload_allowed_for_component(&component, &payload_filename)
+                            && firmware_payload_allowed_for_component(&component, &cache_filename)
+                    };
+                    (location_is_firmware_payload(firmware_type.as_deref()) && payload_allowed)
+                        .then(|| {
+                            if location_value.trim().is_empty()
+                                && firmware_type
+                                    .as_deref()
+                                    .is_some_and(|ty| ty.eq_ignore_ascii_case("Firmware"))
+                            {
+                                tracing::debug!(
+                                    component = %json_string(firmware, "Component"),
+                                    context = %format!("{context}.Locations[{location_idx}]"),
+                                    "firmware payload location is empty"
+                                );
+                            }
+                            FirmwareLocation {
+                                location: location_value,
+                                location_type: json_string(location, "LocationType"),
+                                firmware_type,
+                                sha256: optional_sha256(location),
+                                context: format!("{context}.Locations[{location_idx}]"),
+                            }
+                        })
                 })
                 .collect()
         })
@@ -3342,6 +3395,8 @@ fn insert_lookup_entry(
     for location in &firmware_component.locations {
         if location_is_firmware_payload(location.firmware_type.as_deref())
             && let Ok(filename) = filename_from_location(&location.location)
+            && (!matches!(lookup_key, "CX7" | "CX8" | "BF3_NIC")
+                || flint_firmware_payload_filename(&filename))
         {
             payload_index += 1;
             device_components.insert(
@@ -3757,6 +3812,24 @@ fn location_is_firmware_payload(location_type: Option<&str>) -> bool {
     )
 }
 
+fn flint_firmware_payload_filename(filename: &str) -> bool {
+    let filename = filename.to_ascii_lowercase();
+    filename.ends_with(".bin") || filename.ends_with(".pldm")
+}
+
+fn firmware_payload_allowed_for_component(component: &str, filename: &str) -> bool {
+    if component.eq_ignore_ascii_case("BF3_BFB") {
+        return false;
+    }
+    if ["CX7", "CX8", "BF3_NIC"]
+        .iter()
+        .any(|candidate| component.eq_ignore_ascii_case(candidate))
+    {
+        return flint_firmware_payload_filename(filename);
+    }
+    true
+}
+
 fn device_type_for_node_type(node_type: NodeType) -> Option<DeviceType> {
     match node_type {
         NodeType::ComputeGb200Nvidia | NodeType::ComputeGb200Wiwynn => {
@@ -3780,6 +3853,11 @@ fn firmware_target_allows_multiple_packages(node_type: NodeType, target_key: &st
     (matches!(node_type, NodeType::ComputeGb300Lenovo) && target_key.eq_ignore_ascii_case("HMC"))
         || (matches!(node_type, NodeType::ComputeGb200Wiwynn)
             && target_key.eq_ignore_ascii_case("BMC"))
+        || (node_type.supports_flint_inband_firmware()
+            && matches!(
+                target_key.to_ascii_uppercase().as_str(),
+                "CX7" | "CX8" | "BF3_NIC"
+            ))
 }
 
 fn firmware_download_mapping_requires_all_payloads(
@@ -3795,6 +3873,11 @@ fn firmware_download_mapping_requires_all_payloads(
 
 fn firmware_component_allowed_for_node_type(node_type: NodeType, target_key: &str) -> bool {
     let target_key = target_key_from_component_key(target_key);
+    if matches!(target_key.as_str(), "CX7" | "CX8" | "BF3_NIC")
+        && !node_type.supports_flint_inband_firmware()
+    {
+        return false;
+    }
     if device_type_for_node_type(node_type).is_none() {
         return false;
     }
@@ -3888,7 +3971,7 @@ fn get_firmware_component_mappings_for_device_type(
             },
         ],
         DeviceType::ComputeGb200Nvidia | DeviceType::ComputeGb300Nvidia => {
-            vec![
+            let mut mappings = vec![
                 FirmwareTargetMapping {
                     source_component: "HMC",
                     target_key: "HMC",
@@ -3981,7 +4064,15 @@ fn get_firmware_component_mappings_for_device_type(
                     "PCIE_SWITCH_CONFIG_0",
                     "/redfish/v1/UpdateService/FirmwareInventory/HGX_PCIeSwitchConfig_0",
                 ),
-            ]
+            ];
+            if *device_type == DeviceType::ComputeGb200Nvidia {
+                mappings.extend([
+                    flint_firmware_mapping("CX7"),
+                    flint_firmware_mapping("CX8"),
+                    flint_firmware_mapping("BF3_NIC"),
+                ]);
+            }
+            mappings
         }
         DeviceType::SwitchGb200Nvidia | DeviceType::SwitchGb300Nvidia => vec![
             switch_firmware_mapping("BMC+FPGA+EROT", "BMC", "bmc"),
@@ -4016,6 +4107,15 @@ fn hgx_firmware_mapping(
         source_component: "HMC",
         target_key,
         redfish_target,
+        default_apply: false,
+    }
+}
+
+fn flint_firmware_mapping(component: &'static str) -> FirmwareTargetMapping {
+    FirmwareTargetMapping {
+        source_component: component,
+        target_key: component,
+        redfish_target: component,
         default_apply: false,
     }
 }
@@ -4096,6 +4196,9 @@ fn get_firmware_flash_order(node_type: NodeType) -> &'static [&'static str] {
             "/redfish/v1/UpdateService/FirmwareInventory/HGX_InfoROM_GPU_2",
             "/redfish/v1/UpdateService/FirmwareInventory/HGX_InfoROM_GPU_3",
             "/redfish/v1/UpdateService/FirmwareInventory/HGX_PCIeSwitchConfig_0",
+            "CX7",
+            "CX8",
+            "BF3_NIC",
             "",
         ],
         NodeType::PowershelfGb200Liteon
@@ -4264,6 +4367,16 @@ mod tests {
                 "BoardSKUs": board_skus
             }]
         })
+    }
+
+    fn firmware_location(location: &str, firmware_type: &str) -> FirmwareLocation {
+        FirmwareLocation {
+            location: location.to_owned(),
+            location_type: "HTTPS".to_owned(),
+            firmware_type: Some(firmware_type.to_owned()),
+            sha256: None,
+            context: String::new(),
+        }
     }
 
     fn firmware_object_with_lookup(lookup: FirmwareLookupTable) -> FirmwareObject {
@@ -4494,15 +4607,31 @@ mod tests {
     }
 
     #[test]
-    fn accepted_batch_reports_queued_nodes_without_completed_successes() {
-        let response = accepted_batch("job-1".to_owned(), 3, "queued");
+    fn accepted_batch_counts_admitted_nodes_not_completed_successes() {
+        let response = accepted_batch_with_stats(
+            "job-1".to_owned(),
+            3,
+            2,
+            1,
+            vec![rm::NodeOperationResult {
+                node_id: "node-3".to_owned(),
+                status: rm::ReturnCode::Failure.into(),
+                error_message: "busy".to_owned(),
+            }],
+            "queued",
+        );
         let Some(stats) = response.stats.as_ref() else {
             panic!("accepted batch should include stats");
         };
 
+        // `successful_nodes` counts child jobs admitted, not firmware applied;
+        // one rejected node makes the whole batch a failure and is reported
+        // per-node rather than dropped.
+        assert_eq!(response.status, rm::ReturnCode::Failure as i32);
         assert_eq!(stats.total_nodes, 3);
-        assert_eq!(stats.successful_nodes, 0);
-        assert_eq!(stats.failed_nodes, 0);
+        assert_eq!(stats.successful_nodes, 2);
+        assert_eq!(stats.failed_nodes, 1);
+        assert_eq!(response.node_results.len(), 1);
     }
 
     #[tokio::test]
@@ -4567,6 +4696,115 @@ mod tests {
         assert_eq!(stats.failed_nodes, 3);
         assert_eq!(response.jobs.len(), 7);
         assert_eq!(batch.node_results.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn apply_switch_system_image_reports_rejected_switches() {
+        let service = test_service();
+        let mut nodes = Vec::new();
+        let mut active_jobs = Vec::new();
+
+        // Two switches are already owned by an in-flight image update, so their
+        // apply must be refused rather than admitted alongside it.
+        for idx in 0..2 {
+            let node_id = format!("sw-busy-{idx}");
+            let active = service
+                .job_tracker
+                .create_job("rack-1", &node_id, JobType::SwitchSystemImageUpdate)
+                .unwrap();
+            active.progress("running");
+            active_jobs.push(active);
+
+            nodes.push(rm::NodeInfo {
+                node_id,
+                rack_id: "rack-1".to_owned(),
+                r#type: Some(rm::NodeType::SwitchGb200Nvidia as i32),
+                ..Default::default()
+            });
+        }
+
+        for idx in 0..3 {
+            nodes.push(rm::NodeInfo {
+                node_id: format!("sw-idle-{idx}"),
+                rack_id: "rack-1".to_owned(),
+                r#type: Some(rm::NodeType::SwitchGb200Nvidia as i32),
+                ..Default::default()
+            });
+        }
+
+        let request = rm::ApplySwitchSystemImageRequest {
+            rack_id: "rack-1".to_owned(),
+            config_json: "not-json".to_owned(),
+            hardware_type: "gb200".to_owned(),
+            nodes: Some(rm::NodeSet { nodes }),
+            ..Default::default()
+        };
+
+        let response = service
+            .handle_apply_switch_system_image(Request::new(request))
+            .await
+            .expect("handler should return a response")
+            .into_inner();
+
+        let Some(batch) = response.response.as_ref() else {
+            panic!("batch response should be present");
+        };
+        let Some(stats) = batch.stats.as_ref() else {
+            panic!("stats should be present");
+        };
+
+        assert_eq!(stats.total_nodes, 5);
+        assert_eq!(stats.successful_nodes, 3);
+        assert_eq!(stats.failed_nodes, 2);
+        assert_eq!(response.jobs.len(), 3);
+        assert_eq!(batch.status, rm::ReturnCode::Failure as i32);
+
+        let rejected: Vec<&str> = batch
+            .node_results
+            .iter()
+            .map(|result| result.node_id.as_str())
+            .collect();
+        assert_eq!(rejected, ["sw-busy-0", "sw-busy-1"]);
+    }
+
+    #[tokio::test]
+    async fn apply_switch_system_image_rejects_duplicate_switch_targets() {
+        let service = test_service();
+        let device = rm::NodeInfo {
+            node_id: "sw-1".to_owned(),
+            rack_id: "rack-1".to_owned(),
+            r#type: Some(rm::NodeType::SwitchGb200Nvidia as i32),
+            ..Default::default()
+        };
+
+        let request = rm::ApplySwitchSystemImageRequest {
+            rack_id: "rack-1".to_owned(),
+            config_json: "not-json".to_owned(),
+            hardware_type: "gb200".to_owned(),
+            nodes: Some(rm::NodeSet {
+                nodes: vec![device.clone(), device],
+            }),
+            ..Default::default()
+        };
+
+        let response = service
+            .handle_apply_switch_system_image(Request::new(request))
+            .await
+            .expect("handler should return a response")
+            .into_inner();
+
+        let Some(batch) = response.response.as_ref() else {
+            panic!("batch response should be present");
+        };
+
+        // The repeated switch takes one job, not two concurrent installs.
+        assert_eq!(response.jobs.len(), 1);
+        assert_eq!(batch.node_results.len(), 1);
+        assert!(
+            batch.node_results[0].error_message.contains("duplicate"),
+            "expected a duplicate-target rejection, got: {}",
+            batch.node_results[0].error_message
+        );
     }
 
     #[tokio::test]
@@ -6340,6 +6578,35 @@ mod tests {
     }
 
     #[test]
+    fn metadata_exposes_only_eligible_supermicro_gb300_artifacts() {
+        let metadata =
+            metadata_from_lookup_table(&supermicro_gb300_lookup_table_from_firmware_manifest());
+        let supermicro_descriptor =
+            domain_node_type_to_descriptor(NodeType::ComputeGb300Supermicro);
+        let supermicro = metadata
+            .device_components
+            .iter()
+            .find(|entry| entry.node_descriptor.as_ref() == Some(&supermicro_descriptor))
+            .expect("Supermicro GB300 metadata should be present");
+
+        assert_eq!(supermicro.node_type, rm::NodeType::Unspecified as i32);
+        let artifact_filenames: HashSet<_> = supermicro
+            .components
+            .iter()
+            .flat_map(|component| component.artifacts.iter())
+            .map(|artifact| artifact.filename.as_str())
+            .collect();
+        assert_eq!(
+            artifact_filenames,
+            HashSet::from([
+                "prod/test-bios-image.bin",
+                "prod/NvOBMC_test-image.bin",
+                "prod/compute-nosbios.fwpkg",
+            ])
+        );
+    }
+
+    #[test]
     fn apply_filter_keeps_only_liteon_downloads_for_liteon_powershelf() {
         let config = release_catalog(serde_json::json!([{
             "SKUID": "test-powershelf-sku",
@@ -6607,6 +6874,136 @@ mod tests {
             device_type_for_node_type(NodeType::SwitchVrnvl72Nvidia),
             Some(DeviceType::SwitchVrnvl72Nvidia)
         );
+    }
+
+    #[test]
+    fn gb200_flint_mappings_are_opt_in_and_keep_multiple_images() {
+        let mappings =
+            get_firmware_component_mappings_for_device_type(&DeviceType::ComputeGb200Nvidia);
+        for name in ["CX7", "CX8", "BF3_NIC"] {
+            let mapping = mappings
+                .iter()
+                .find(|mapping| mapping.target_key == name)
+                .expect("Flint component mapping should exist");
+            assert_eq!(mapping.source_component, name);
+            assert_eq!(mapping.redfish_target, name);
+            assert!(!mapping.default_apply);
+            for node_type in [NodeType::ComputeGb200Nvidia, NodeType::ComputeGb200Wiwynn] {
+                assert!(firmware_target_allows_multiple_packages(node_type, name));
+                assert!(firmware_component_allowed_for_node_type(node_type, name));
+            }
+        }
+
+        let mut entries = HashMap::new();
+        insert_lookup_entry(
+            &mut entries,
+            "CX7",
+            "CX7",
+            &FirmwareComponent {
+                component: "CX7".to_owned(),
+                bundle: None,
+                version: Some("28.44.1036".to_owned()),
+                component_type: Some("prod".to_owned()),
+                context: String::new(),
+                locations: vec![
+                    firmware_location("https://example.test/cx7-a.signed.pldm", "Firmware"),
+                    firmware_location("https://example.test/cx7-b.signed.reduced.bin", "Binary"),
+                    firmware_location("https://example.test/cx7-attestation.cbor", "Firmware"),
+                    firmware_location("https://example.test/cx7-comid.json", "Binary"),
+                ],
+                subcomponents: Vec::new(),
+            },
+            "",
+            "prod",
+        );
+
+        assert_eq!(entries.len(), 2);
+        assert!(entries.values().all(|entry| {
+            entry.filename.ends_with(".pldm") || entry.filename.ends_with(".bin")
+        }));
+
+        let lookup = FirmwareLookupTable {
+            devices: HashMap::from([(COMPUTE_LOOKUP_KEY.to_owned(), entries)]),
+            switch_system_images: HashMap::new(),
+        };
+        for node_type in [NodeType::ComputeGb200Nvidia, NodeType::ComputeGb200Wiwynn] {
+            let targets = build_firmware_targets(
+                &lookup,
+                node_type,
+                COMPUTE_LOOKUP_KEY,
+                "prod",
+                "gb200-fw",
+                FIRMWARE_OBJECT_CACHE_SUBDIR,
+                &FirmwareObjectComponentSelection::components(vec!["CX7".to_owned()]),
+            )
+            .expect("Flint targets should be generated");
+            assert_eq!(targets.len(), 2);
+            assert!(targets.iter().all(|target| target.target == "CX7"));
+        }
+    }
+
+    #[test]
+    fn gb200_flint_manifest_parser_ignores_non_firmware_artifacts() {
+        let firmware = serde_json::json!({
+            "Component": "CX7",
+            "Locations": [{
+                "Location": "https://example.test/download/cx7.signed.pldm",
+                "FileName": "cx7.signed.pldm",
+                "Type": "Firmware"
+            }, {
+                "Location": "https://example.test/download/cx7.signed.reduced.bin",
+                "FileName": "cx7.signed.reduced.bin",
+                "Type": "Binary"
+            }, {
+                "Location": "https://example.test/download/cx7-attestation.cbor",
+                "FileName": "cx7-attestation.cbor",
+                "Type": "Firmware"
+            }, {
+                "Location": "https://example.test/download/cx7-comid.json",
+                "FileName": "cx7-comid.json",
+                "Type": "Binary"
+            }]
+        });
+
+        let parsed = parse_firmware_component(&firmware, "ctx", false);
+        assert_eq!(parsed.locations.len(), 2);
+        assert_eq!(
+            parsed.locations[0].location,
+            "https://example.test/download/cx7.signed.pldm"
+        );
+        assert_eq!(
+            parsed.locations[1].location,
+            "https://example.test/download/cx7.signed.reduced.bin"
+        );
+
+        let bf3_bfb = parse_firmware_component(
+            &serde_json::json!({
+                "Component": "BF3_BFB",
+                "Locations": [{
+                    "Location": "https://example.test/bf3.bfb",
+                    "FileName": "bf3.bfb",
+                    "Type": "Firmware"
+                }]
+            }),
+            "ctx",
+            false,
+        );
+        assert!(bf3_bfb.locations.is_empty());
+    }
+
+    #[test]
+    fn gb200_bf3_bfb_selection_is_rejected() {
+        for node_type in [NodeType::ComputeGb200Nvidia, NodeType::ComputeGb200Wiwynn] {
+            let error = component_filter_selection(
+                node_type,
+                &rm::FirmwareObjectComponentFilter {
+                    components: vec!["BF3_BFB".to_owned()],
+                },
+            )
+            .expect_err("BF3_BFB must remain unsupported");
+
+            assert!(error.contains("BF3_NIC"));
+        }
     }
 
     #[test]
@@ -7431,6 +7828,10 @@ mod tests {
         assert!(!firmware_target_allows_multiple_packages(
             NodeType::ComputeGb200Wiwynn,
             "HMC"
+        ));
+        assert!(firmware_target_allows_multiple_packages(
+            NodeType::ComputeGb200Wiwynn,
+            "CX7"
         ));
 
         let components = vec![

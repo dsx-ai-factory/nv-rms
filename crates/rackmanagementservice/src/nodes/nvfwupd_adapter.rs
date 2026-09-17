@@ -15,6 +15,8 @@
  * limitations under the License.
  */
 
+use std::sync::LazyLock;
+
 use secrecy::{ExposeSecret, SecretString};
 use serde_json::Value;
 
@@ -43,6 +45,7 @@ fn to_target_config(
         port: Some(port),
         server_type: to_server_type(node_type),
         verify_tls,
+        allow_http: false,
         ssh_known_hosts: None,
         // RMS does not manage an NVFWUPD known_hosts file yet, so preserve the
         // existing RMS SSH/SFTP behavior until RMS can provide explicit policy.
@@ -118,11 +121,39 @@ pub fn map_error(error: nv::NvFwUpdError) -> RmsError {
             sanitize(&target),
             sanitize(&message)
         )),
+        nv::NvFwUpdError::HostUnreachable { target, message } => RmsError::unavailable(format!(
+            "NVFWUPD host unreachable for {}: {}",
+            sanitize(&target),
+            sanitize(&message)
+        )),
         nv::NvFwUpdError::AuthFailed { target, message } => RmsError::invalid_argument(format!(
             "NVFWUPD authentication failed for {}: {}",
             sanitize(&target),
             sanitize(&message)
         )),
+        nv::NvFwUpdError::HostToolUnavailable { tool, message } => {
+            RmsError::failed_precondition(format!(
+                "NVFWUPD required host tool {} is unavailable: {}",
+                sanitize(&tool),
+                sanitize(&message)
+            ))
+        }
+        nv::NvFwUpdError::HostSudoUnavailable { message } => {
+            RmsError::failed_precondition(format!(
+                "NVFWUPD required host sudo access is unavailable: {}",
+                sanitize(&message)
+            ))
+        }
+        nv::NvFwUpdError::IncompatibleFirmware { component, message } => {
+            RmsError::failed_precondition(format!(
+                "NVFWUPD incompatible firmware selection for {}: {}",
+                sanitize(&component),
+                sanitize(&message)
+            ))
+        }
+        nv::NvFwUpdError::Cancelled { operation } => {
+            RmsError::cancelled(format!("NVFWUPD operation cancelled: {operation}"))
+        }
         nv::NvFwUpdError::PackageParse { path, message } => RmsError::invalid_argument(format!(
             "NVFWUPD package parse failed for {}: {}",
             sanitize(&path),
@@ -298,14 +329,14 @@ fn to_activation_mode(mode: FirmwareActivationMode) -> nv::ActivationMode {
 
 fn to_activation_command(command: FirmwareActivationCommand) -> nv::ActivationCommand {
     match command {
-        FirmwareActivationCommand::RfPowerOn => nv::ActivationCommand::RfPowerOn,
-        FirmwareActivationCommand::RfPowerOff => nv::ActivationCommand::RfPowerOff,
-        FirmwareActivationCommand::RfPowerCycle => nv::ActivationCommand::RfPowerCycle,
-        FirmwareActivationCommand::RfAuxPowerCycle => nv::ActivationCommand::RfAuxPowerCycle,
-        FirmwareActivationCommand::RfPowerStatus => nv::ActivationCommand::RfPowerStatus,
-        FirmwareActivationCommand::RfPowerShelfReset => nv::ActivationCommand::RfPowerShelfReset,
-        FirmwareActivationCommand::RfPowerShelfResetForce => {
-            nv::ActivationCommand::RfPowerShelfResetForce
+        FirmwareActivationCommand::PowerOn => nv::ActivationCommand::PowerOn,
+        FirmwareActivationCommand::PowerOff => nv::ActivationCommand::PowerOff,
+        FirmwareActivationCommand::PowerCycle => nv::ActivationCommand::PowerCycle,
+        FirmwareActivationCommand::AuxPowerCycle => nv::ActivationCommand::AuxPowerCycle,
+        FirmwareActivationCommand::PowerStatus => nv::ActivationCommand::PowerStatus,
+        FirmwareActivationCommand::PowerShelfReset => nv::ActivationCommand::PowerShelfReset,
+        FirmwareActivationCommand::PowerShelfResetForce => {
+            nv::ActivationCommand::PowerShelfResetForce
         }
     }
 }
@@ -370,8 +401,21 @@ fn is_terminal_task_state(state: nv::TaskState) -> bool {
     )
 }
 
+/// Shared IPv4/IPv6 log sanitizer. Its configuration is fixed
+/// (`new(None, None, None)`), so compile the address-matching regexes exactly
+/// once and reuse the instance: `sanitize` runs per output line of an
+/// nvfwupd/SSH transcript during a firmware update, and rebuilding the regex on
+/// every call would be needless work.
+static LOG_SANITIZER: LazyLock<common::log_sanitize::LogSanitizer> =
+    LazyLock::new(|| common::log_sanitize::LogSanitizer::new(None, None, None));
+
 fn sanitize(value: &str) -> String {
-    nvfwupd::utils::Util::sanitize_log(value)
+    // Always-on secret redaction followed by the default IPv4/IPv6 address
+    // sanitizer. This mirrors nvfwupd's `sanitize_log` in RMS (which never
+    // configures nvfwupd's CLI-only global sanitize state), while depending on
+    // the shared `utils` crate rather than nvfwupd for a pure logging concern.
+    let redacted = common::redaction::redact_secret_fields(value);
+    LOG_SANITIZER.sanitize(&redacted)
 }
 
 #[cfg(test)]
@@ -574,12 +618,12 @@ mod tests {
     #[test]
     fn activation_request_maps_all_modes() {
         let single = to_activation_request(FirmwareActivationRequest {
-            mode: FirmwareActivationMode::SingleCommand(FirmwareActivationCommand::RfPowerStatus),
+            mode: FirmwareActivationMode::SingleCommand(FirmwareActivationCommand::PowerStatus),
             cancellation: None,
         });
         assert!(matches!(
             single.mode,
-            nv::ActivationMode::SingleCommand(nv::ActivationCommand::RfPowerStatus)
+            nv::ActivationMode::SingleCommand(nv::ActivationCommand::PowerStatus)
         ));
 
         let compute = to_activation_request(FirmwareActivationRequest {
@@ -782,5 +826,15 @@ mod tests {
         });
         assert!(!running.completed);
         assert_eq!(running.status, "Running");
+    }
+
+    #[test]
+    fn cancelled_nvfwupd_error_maps_to_cancelled_rms_error() {
+        let error = map_error(nv::NvFwUpdError::Cancelled {
+            operation: "Flint update",
+        });
+
+        assert_eq!(error.code, ErrorCode::Cancelled);
+        assert_eq!(error.message, "NVFWUPD operation cancelled: Flint update");
     }
 }

@@ -21,8 +21,7 @@ use std::time::Duration;
 
 use super::super::system_image::contains_case_insensitive;
 use super::super::{SwitchGb200Nvidia, extract_job_id};
-use super::app::app_control_plane_state;
-use crate::utilities::error::{Result, RmsError};
+use crate::utilities::error::{ErrorCode, Result, RmsError};
 
 use nvue_client::DEFAULT_TIMEOUT as NVUE_DEFAULT_TIMEOUT;
 use nvue_client::cluster::{
@@ -31,7 +30,6 @@ use nvue_client::cluster::{
 use nvue_client::sdn::{
     FACTORY_DEFAULT_ENDPOINT as SDN_FACTORY_DEFAULT_ENDPOINT, SdnFactoryDefaultResetRequest,
 };
-use serde_json::Value;
 
 // SDN factory-default reset waits on runtime state, which can outlast the
 // NVUE action response and should not share the shorter revision-apply limit.
@@ -135,8 +133,14 @@ impl SwitchGb200Nvidia {
         let mut last_observed = "nmx-controller state was not observed".to_owned();
 
         while std::time::Instant::now() < deadline {
-            let app_status = match self.get_cluster_apps_status(NMX_CONTROLLER_APP_NAME).await {
-                Ok(app_status) => app_status,
+            let app_status = match self
+                .nvue_client()?
+                .get_cluster_app(NMX_CONTROLLER_APP_NAME, NVUE_DEFAULT_TIMEOUT)
+                .await
+                .map_err(RmsError::from)
+            {
+                Ok(app_status) => Some(app_status),
+                Err(error) if error.code == ErrorCode::NotFound => None,
                 Err(e) => {
                     last_observed = format!("failed to read nmx-controller state: {}", e.message);
 
@@ -154,29 +158,11 @@ impl SwitchGb200Nvidia {
                 }
             };
 
-            let control_plane_state = app_control_plane_state(&app_status).unwrap_or_default();
-
-            let status = app_status
-                .get("status")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-
-            let reason = app_status
-                .get("reason")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-
-            let app_missing = app_status.get("installed").and_then(Value::as_bool) == Some(false);
-
-            let runtime_state_available =
-                !status.is_empty() || !reason.is_empty() || !control_plane_state.trim().is_empty();
-
-            if app_missing && saw_reset_in_progress {
+            if app_status.is_none() && saw_reset_in_progress {
                 tracing::info!(
                     node = %self.id,
                     action_id,
                     poll,
-                    response = %app_status,
                     saw_reset_in_progress,
                     "SDN factory-default runtime app is absent after observed reset progress"
                 );
@@ -184,12 +170,11 @@ impl SwitchGb200Nvidia {
                 return Ok(());
             }
 
-            if app_missing {
+            let Some(app_status) = app_status else {
                 tracing::warn!(
                     node = %self.id,
                     action_id,
                     poll,
-                    response = %app_status,
                     saw_reset_in_progress,
                     "SDN factory-default runtime app is absent without observed reset progress"
                 );
@@ -197,14 +182,21 @@ impl SwitchGb200Nvidia {
                 return Err(RmsError::failed_precondition(format!(
                     "nmx-controller runtime app is absent after SDN factory-default reset action {action_id}, but reset progress was not observed; target switch may not be the primary switch"
                 )));
-            }
+            };
+
+            let control_plane_state = app_status.addition_info.as_deref().unwrap_or_default();
+            let status = app_status.status.as_deref().unwrap_or_default();
+            let reason = app_status.reason.as_deref().unwrap_or_default();
+
+            let runtime_state_available =
+                !status.is_empty() || !reason.is_empty() || !control_plane_state.trim().is_empty();
 
             if !runtime_state_available {
                 tracing::warn!(
                     node = %self.id,
                     action_id,
                     poll,
-                    response = %app_status,
+                    response = ?app_status,
                     "SDN factory-default runtime state is unavailable"
                 );
 

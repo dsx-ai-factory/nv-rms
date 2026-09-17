@@ -22,6 +22,7 @@
 //! implementations or call CLI-shaped command modules directly.
 
 use std::collections::{BTreeSet, HashMap};
+use std::future::Future;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -46,8 +47,9 @@ use crate::utils::Util as NvUtils;
 use crate::workflow::{
     ActivationMode, ActivationRequest, ActivationSummary, FirmwareComponent, FirmwareUpdateOutcome,
     FirmwareUpdateRequest, FirmwareVersionCheckRequest, FirmwareVersionCheckSummary,
-    FirmwareVersionCheckTarget, NvFwUpdError, Result, ServerType, StagedMode, TargetConfig,
-    TaskHandle, TaskState, TaskStatus, UpdateSummary,
+    FirmwareVersionCheckTarget, FlintFirmwareUpdateRequest, FlintFirmwareVersionCheckRequest,
+    HostTargetConfig, NvFwUpdError, Result, ServerType, StagedMode, TargetConfig, TaskHandle,
+    TaskState, TaskStatus, UpdateSummary,
 };
 
 const DEFAULT_REDFISH_TIMEOUT_SECS: u64 = 900;
@@ -59,15 +61,26 @@ const EXPECTED_INVENTORY_POST_ACTIVATION_RETRIES: u32 = 3;
 const EXPECTED_INVENTORY_POST_ACTIVATION_RETRY_INTERVAL_SECS: u64 = 120;
 #[cfg(test)]
 const EXPECTED_INVENTORY_POST_ACTIVATION_RETRY_INTERVAL_SECS: u64 = 0;
-const COMPUTE_ACTIVATION_POWER_OFF_DELAY_SECS: u64 = 20;
 const COMPUTE_ACTIVATION_COMMAND_RETRIES: u32 = 10;
 #[cfg(not(test))]
 const COMPUTE_ACTIVATION_COMMAND_RETRY_DELAY_SECS: u64 = 60;
 #[cfg(test)]
 const COMPUTE_ACTIVATION_COMMAND_RETRY_DELAY_SECS: u64 = 0;
-const COMPUTE_ACTIVATION_BMC_WAIT_ATTEMPTS: u64 = 60;
-const COMPUTE_ACTIVATION_BMC_WAIT_INTERVAL_SECS: u64 = 5;
-const COMPUTE_ACTIVATION_POWER_ON_RESEND_INTERVAL_SECS: u64 = 60;
+const COMPUTE_ACTIVATION_POWER_STATE_ATTEMPTS: u64 = 12;
+const COMPUTE_ACTIVATION_POWER_STATE_POLL_INTERVAL_SECS: u64 = 5;
+const COMPUTE_ACTIVATION_AC_CYCLE_ATTEMPTS: u32 = 2;
+#[cfg(not(test))]
+const COMPUTE_ACTIVATION_AC_CYCLE_STABILIZATION: Duration = Duration::from_secs(3 * 60);
+#[cfg(test)]
+const COMPUTE_ACTIVATION_AC_CYCLE_STABILIZATION: Duration = Duration::ZERO;
+const LEGACY_COMPUTE_ACTIVATION_POWER_OFF_DELAY_SECS: u64 = 20;
+const LEGACY_COMPUTE_ACTIVATION_BMC_WAIT_ATTEMPTS: u64 = 60;
+const LEGACY_COMPUTE_ACTIVATION_BMC_WAIT_INTERVAL_SECS: u64 = 5;
+const LEGACY_COMPUTE_ACTIVATION_POWER_ON_RESEND_INTERVAL_SECS: u64 = 60;
+#[cfg(not(test))]
+const COMPUTE_HOST_BOOT_AC_CYCLE_STABILIZATION: Duration = Duration::from_secs(3 * 60);
+#[cfg(test)]
+const COMPUTE_HOST_BOOT_AC_CYCLE_STABILIZATION: Duration = Duration::ZERO;
 const SWITCH_ACTIVATION_RECOVERY_PATH: &str = "/nvue_v1/platform/firmware";
 const POWERSHELF_ACTIVATION_RECOVERY_PATH: &str = "/redfish/v1";
 
@@ -602,6 +615,7 @@ impl<'a> WorkflowTargetBuilder<'a> {
             servertype: server_type_arg(self.target.server_type).to_string(),
             base_url,
             transport_type: "https".to_string(),
+            allow_http: self.target.allow_http,
             access_type: self.access_type(),
             ssh_known_hosts: self.target.ssh_known_hosts.clone(),
             ssh_host_key_mode: self.target.ssh_host_key_mode.as_target_arg().to_string(),
@@ -650,6 +664,7 @@ impl<'a> WorkflowTargetBuilder<'a> {
             servertype: server_type_arg(self.target.server_type).to_string(),
             base_url,
             transport_type: "https".to_string(),
+            allow_http: self.target.allow_http,
             access_type: AccessType::NVSwitch,
             ssh_known_hosts: self.target.ssh_known_hosts.clone(),
             ssh_host_key_mode: self.target.ssh_host_key_mode.as_target_arg().to_string(),
@@ -1385,6 +1400,72 @@ pub async fn update_firmware_with_expected_inventory(
         .await
 }
 
+/// Update host-visible ConnectX or BlueField NIC firmware with Flint.
+pub async fn update_flint_firmware(
+    host: HostTargetConfig,
+    request: FlintFirmwareUpdateRequest,
+) -> Result<FirmwareUpdateOutcome> {
+    crate::flint::update_firmware(host, request).await
+}
+
+/// Update GB200 host-visible firmware, with one pre-flash device-discovery recovery cycle.
+pub async fn update_gb200_flint_firmware(
+    host: HostTargetConfig,
+    target: TargetConfig,
+    request: FlintFirmwareUpdateRequest,
+) -> Result<FirmwareUpdateOutcome> {
+    if target.server_type != ServerType::GB200 {
+        return Err(NvFwUpdError::Unsupported(
+            "GB200 Flint device-discovery recovery workflow",
+        ));
+    }
+
+    let mut rf_target = build_target(&target)?;
+    let mut recovery = Gb200FlintDeviceDiscoveryRecovery {
+        rf_target: rf_target.as_rf_target_mut(),
+        host: host.clone(),
+        cancellation: request.cancellation.clone(),
+    };
+    crate::flint::update_firmware_with_discovery_recovery(host, request, &mut recovery).await
+}
+
+/// Compare host-visible ConnectX or BlueField NIC versions with Flint images.
+pub async fn verify_flint_firmware_versions(
+    host: HostTargetConfig,
+    request: FlintFirmwareVersionCheckRequest,
+) -> Result<FirmwareVersionCheckSummary> {
+    crate::flint::verify_firmware_versions(host, request).await
+}
+
+/// Ensure a GB200 compute host is booted before a host-side Flint workflow.
+pub async fn ensure_gb200_host_os_ready(
+    host: HostTargetConfig,
+    target: TargetConfig,
+    cancellation: Option<tokio_util::sync::CancellationToken>,
+) -> Result<ActivationSummary> {
+    if target.server_type != ServerType::GB200 {
+        return Err(NvFwUpdError::Unsupported(
+            "GB200 host OS boot readiness workflow",
+        ));
+    }
+    if cancellation
+        .as_ref()
+        .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
+    {
+        return Err(NvFwUpdError::Cancelled {
+            operation: "GB200 host OS boot readiness",
+        });
+    }
+
+    let mut rf_target = build_target(&target)?;
+    ensure_gb200_host_os_ready_with(
+        rf_target.as_rf_target_mut(),
+        || crate::flint::wait_for_host_os_ready(host.clone(), cancellation.clone()),
+        COMPUTE_HOST_BOOT_AC_CYCLE_STABILIZATION,
+    )
+    .await
+}
+
 async fn update_firmware_with_context(
     context: &WorkflowContext,
     target: TargetConfig,
@@ -1708,25 +1789,100 @@ async fn activate_full_gb200_compute(target: TargetConfig) -> Result<ActivationS
             "full GB200 compute activation workflow",
         ));
     }
+    if target.server_type != ServerType::GB200 {
+        return activate_full_compute_legacy(target).await;
+    }
 
     let mut rf_target = build_target(&target)?;
-    run_compute_activation_command(rf_target.as_rf_target_mut(), "RF_PWR_OFF").await?;
-    tokio::time::sleep(Duration::from_secs(COMPUTE_ACTIVATION_POWER_OFF_DELAY_SECS)).await;
-    run_compute_activation_command(rf_target.as_rf_target_mut(), "RF_AUX_PWR_CYCLE").await?;
-    wait_for_compute_bmc(&target).await?;
-    run_compute_activation_command(rf_target.as_rf_target_mut(), "RF_PWR_ON").await?;
-    wait_for_compute_power_on(rf_target.as_rf_target_mut()).await?;
+    let ac_cycle_attempts = activate_full_gb200_compute_with_policy(
+        rf_target.as_rf_target_mut(),
+        COMPUTE_ACTIVATION_POWER_STATE_ATTEMPTS,
+        COMPUTE_ACTIVATION_POWER_STATE_POLL_INTERVAL_SECS,
+        COMPUTE_ACTIVATION_AC_CYCLE_STABILIZATION,
+        COMPUTE_ACTIVATION_AC_CYCLE_ATTEMPTS,
+    )
+    .await?;
 
     Ok(ActivationSummary {
         message: "full GB200 compute activation completed".to_string(),
         details: json!({
             "commands": ["RF_PWR_OFF", "RF_AUX_PWR_CYCLE", "RF_PWR_ON"],
-            "bmc_wait_seconds": 2 * COMPUTE_ACTIVATION_BMC_WAIT_ATTEMPTS
-                * COMPUTE_ACTIVATION_BMC_WAIT_INTERVAL_SECS,
-            "power_on_resend_interval_seconds": COMPUTE_ACTIVATION_POWER_ON_RESEND_INTERVAL_SECS,
+            "verified_power_states": ["Off", "On"],
+            "power_state_timeout_seconds": COMPUTE_ACTIVATION_POWER_STATE_ATTEMPTS
+                * COMPUTE_ACTIVATION_POWER_STATE_POLL_INTERVAL_SECS,
+            "ac_cycle_stabilization_seconds": COMPUTE_ACTIVATION_AC_CYCLE_STABILIZATION.as_secs(),
+            "ac_cycle_attempts": ac_cycle_attempts,
+        }),
+    })
+}
+
+async fn activate_full_compute_legacy(target: TargetConfig) -> Result<ActivationSummary> {
+    let mut rf_target = build_target(&target)?;
+    run_compute_activation_command(rf_target.as_rf_target_mut(), "RF_PWR_OFF").await?;
+    tokio::time::sleep(Duration::from_secs(
+        LEGACY_COMPUTE_ACTIVATION_POWER_OFF_DELAY_SECS,
+    ))
+    .await;
+    run_compute_activation_command(rf_target.as_rf_target_mut(), "RF_AUX_PWR_CYCLE").await?;
+    wait_for_legacy_compute_bmc(&target).await?;
+    run_compute_activation_command(rf_target.as_rf_target_mut(), "RF_PWR_ON").await?;
+    wait_for_legacy_compute_power_on(rf_target.as_rf_target_mut()).await?;
+
+    Ok(ActivationSummary {
+        message: "full compute activation completed".to_string(),
+        details: json!({
+            "commands": ["RF_PWR_OFF", "RF_AUX_PWR_CYCLE", "RF_PWR_ON"],
+            "bmc_wait_seconds": 2 * LEGACY_COMPUTE_ACTIVATION_BMC_WAIT_ATTEMPTS
+                * LEGACY_COMPUTE_ACTIVATION_BMC_WAIT_INTERVAL_SECS,
+            "power_on_resend_interval_seconds": LEGACY_COMPUTE_ACTIVATION_POWER_ON_RESEND_INTERVAL_SECS,
             "verified_power_state": "On",
         }),
     })
+}
+
+async fn activate_full_gb200_compute_with_policy(
+    rf_target: &mut (dyn RFTarget + Send + Sync),
+    power_state_attempts: u64,
+    power_state_poll_interval_secs: u64,
+    ac_cycle_stabilization: Duration,
+    ac_cycle_attempts: u32,
+) -> Result<u32> {
+    run_compute_activation_command(rf_target, "RF_PWR_OFF").await?;
+    wait_for_compute_power_state_with_timeout(
+        rf_target,
+        "Off",
+        power_state_attempts,
+        power_state_poll_interval_secs,
+    )
+    .await?;
+
+    let ac_cycle_attempts = ac_cycle_attempts.max(1);
+    for ac_cycle_attempt in 1..=ac_cycle_attempts {
+        run_compute_activation_command(rf_target, "RF_AUX_PWR_CYCLE").await?;
+        tokio::time::sleep(ac_cycle_stabilization).await;
+        run_compute_activation_command(rf_target, "RF_PWR_ON").await?;
+
+        match wait_for_compute_power_state_with_timeout(
+            rf_target,
+            "On",
+            power_state_attempts,
+            power_state_poll_interval_secs,
+        )
+        .await
+        {
+            Ok(()) => return Ok(ac_cycle_attempt),
+            Err(error) if ac_cycle_attempt < ac_cycle_attempts => {
+                tracing::warn!(
+                    attempt = ac_cycle_attempt,
+                    error = %error,
+                    "compute did not reach power state On; retrying the auxiliary AC cycle once"
+                );
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    unreachable!("the activation loop always executes at least once")
 }
 
 async fn wait_for_activation_recovery(
@@ -1860,11 +2016,11 @@ async fn run_activation_command_with_retry(
     }
 }
 
-async fn wait_for_compute_bmc(target: &TargetConfig) -> Result<()> {
+async fn wait_for_legacy_compute_bmc(target: &TargetConfig) -> Result<()> {
     let access = build_bmc_access(target)?;
-    for _ in 0..COMPUTE_ACTIVATION_BMC_WAIT_ATTEMPTS {
+    for _ in 0..LEGACY_COMPUTE_ACTIVATION_BMC_WAIT_ATTEMPTS {
         tokio::time::sleep(Duration::from_secs(
-            COMPUTE_ACTIVATION_BMC_WAIT_INTERVAL_SECS,
+            LEGACY_COMPUTE_ACTIVATION_BMC_WAIT_INTERVAL_SECS,
         ))
         .await;
         let (ok, _) = access
@@ -1876,8 +2032,9 @@ async fn wait_for_compute_bmc(target: &TargetConfig) -> Result<()> {
     }
 
     Err(NvFwUpdError::Timeout {
-        operation: "wait for GB200 compute BMC after activation",
-        seconds: COMPUTE_ACTIVATION_BMC_WAIT_ATTEMPTS * COMPUTE_ACTIVATION_BMC_WAIT_INTERVAL_SECS,
+        operation: "wait for compute BMC after activation",
+        seconds: LEGACY_COMPUTE_ACTIVATION_BMC_WAIT_ATTEMPTS
+            * LEGACY_COMPUTE_ACTIVATION_BMC_WAIT_INTERVAL_SECS,
     })
 }
 
@@ -1910,32 +2067,127 @@ async fn query_compute_power_state(access: &BmcAccess) -> Option<String> {
         .map(|system| system.power_state)
 }
 
-async fn wait_for_compute_power_on(rf_target: &mut (dyn RFTarget + Send + Sync)) -> Result<()> {
-    let resend_poll_count = (COMPUTE_ACTIVATION_POWER_ON_RESEND_INTERVAL_SECS
-        / COMPUTE_ACTIVATION_BMC_WAIT_INTERVAL_SECS)
-        .max(1);
+async fn ensure_gb200_host_os_ready_with<F, Fut>(
+    rf_target: &mut (dyn RFTarget + Send + Sync),
+    mut wait_for_host_os: F,
+    ac_cycle_stabilization: Duration,
+) -> Result<ActivationSummary>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<u32>>,
+{
+    let power_state = query_compute_power_state(rf_target.target_access()).await;
+    let initial_power_on_requested = !power_state
+        .as_deref()
+        .is_some_and(|state| state.eq_ignore_ascii_case("On"));
+    if initial_power_on_requested {
+        run_activation_command(rf_target, "RF_PWR_ON").await?;
+    }
 
-    wait_for_compute_power_on_with_policy(
-        rf_target,
-        COMPUTE_ACTIVATION_BMC_WAIT_ATTEMPTS,
-        COMPUTE_ACTIVATION_BMC_WAIT_INTERVAL_SECS,
-        resend_poll_count,
-    )
-    .await
+    match wait_for_host_os().await {
+        Ok(attempts) => {
+            return Ok(ActivationSummary {
+                message: "GB200 host OS is ready".to_owned(),
+                details: json!({
+                    "initial_power_state": power_state.as_deref(),
+                    "initial_power_on_requested": initial_power_on_requested,
+                    "host_probe_attempts": attempts,
+                    "recovery_ac_cycle": false,
+                }),
+            });
+        }
+        Err(error)
+            if !matches!(
+                &error,
+                NvFwUpdError::HostUnreachable { .. } | NvFwUpdError::Timeout { .. }
+            ) =>
+        {
+            return Err(error);
+        }
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "GB200 host did not boot; retrying once after an auxiliary AC cycle"
+            );
+        }
+    }
+
+    run_activation_command(rf_target, "RF_AUX_PWR_CYCLE").await?;
+    tokio::time::sleep(ac_cycle_stabilization).await;
+    run_activation_command(rf_target, "RF_PWR_ON").await?;
+    let attempts = wait_for_host_os().await?;
+
+    Ok(ActivationSummary {
+        message: "GB200 host OS is ready after auxiliary AC-cycle recovery".to_owned(),
+        details: json!({
+            "initial_power_state": power_state.as_deref(),
+            "initial_power_on_requested": initial_power_on_requested,
+            "host_probe_attempts_after_recovery": attempts,
+            "recovery_ac_cycle": true,
+            "recovery_commands": ["RF_AUX_PWR_CYCLE", "RF_PWR_ON"],
+            "ac_cycle_stabilization_seconds": ac_cycle_stabilization.as_secs(),
+        }),
+    })
 }
 
-async fn wait_for_compute_power_on_with_policy(
+struct Gb200FlintDeviceDiscoveryRecovery<'a> {
+    rf_target: &'a mut (dyn RFTarget + Send + Sync),
+    host: HostTargetConfig,
+    cancellation: Option<tokio_util::sync::CancellationToken>,
+}
+
+#[async_trait::async_trait]
+impl crate::flint::FlintDeviceDiscoveryRecovery for Gb200FlintDeviceDiscoveryRecovery<'_> {
+    async fn recover(&mut self) -> Result<()> {
+        if self
+            .cancellation
+            .as_ref()
+            .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
+        {
+            return Err(NvFwUpdError::Cancelled {
+                operation: "GB200 Flint device discovery recovery",
+            });
+        }
+
+        recover_gb200_host_after_flint_discovery_failure_with(
+            self.rf_target,
+            || crate::flint::wait_for_host_os_ready(self.host.clone(), self.cancellation.clone()),
+            COMPUTE_HOST_BOOT_AC_CYCLE_STABILIZATION,
+        )
+        .await
+    }
+}
+
+async fn recover_gb200_host_after_flint_discovery_failure_with<F, Fut>(
     rf_target: &mut (dyn RFTarget + Send + Sync),
-    attempts: u64,
-    poll_interval_secs: u64,
-    resend_poll_count: u64,
+    wait_for_host_os: F,
+    ac_cycle_stabilization: Duration,
+) -> Result<()>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<u32>>,
+{
+    run_activation_command(rf_target, "RF_AUX_PWR_CYCLE").await?;
+    tokio::time::sleep(ac_cycle_stabilization).await;
+    run_activation_command(rf_target, "RF_PWR_ON").await?;
+    wait_for_host_os().await?;
+    Ok(())
+}
+
+async fn wait_for_legacy_compute_power_on(
+    rf_target: &mut (dyn RFTarget + Send + Sync),
 ) -> Result<()> {
+    let resend_poll_count = (LEGACY_COMPUTE_ACTIVATION_POWER_ON_RESEND_INTERVAL_SECS
+        / LEGACY_COMPUTE_ACTIVATION_BMC_WAIT_INTERVAL_SECS)
+        .max(1);
     let mut last_power_state = None;
     let mut polls_since_power_on = 0_u64;
-    let resend_poll_count = resend_poll_count.max(1);
 
-    for attempt in 1..=attempts {
-        tokio::time::sleep(Duration::from_secs(poll_interval_secs)).await;
+    for attempt in 1..=LEGACY_COMPUTE_ACTIVATION_BMC_WAIT_ATTEMPTS {
+        tokio::time::sleep(Duration::from_secs(
+            LEGACY_COMPUTE_ACTIVATION_BMC_WAIT_INTERVAL_SECS,
+        ))
+        .await;
 
         polls_since_power_on = polls_since_power_on.saturating_add(1);
         let observed_power_state = query_compute_power_state(rf_target.target_access()).await;
@@ -1949,15 +2201,17 @@ async fn wait_for_compute_power_on_with_policy(
         let is_off = observed_power_state
             .as_deref()
             .is_some_and(|state| state.eq_ignore_ascii_case("Off"));
-
         if observed_power_state.is_some() {
             last_power_state = observed_power_state;
         }
 
-        if is_off && attempt < attempts && polls_since_power_on >= resend_poll_count {
+        if is_off
+            && attempt < LEGACY_COMPUTE_ACTIVATION_BMC_WAIT_ATTEMPTS
+            && polls_since_power_on >= resend_poll_count
+        {
             tracing::warn!(
                 attempt,
-                resend_interval_secs = COMPUTE_ACTIVATION_POWER_ON_RESEND_INTERVAL_SECS,
+                resend_interval_secs = LEGACY_COMPUTE_ACTIVATION_POWER_ON_RESEND_INTERVAL_SECS,
                 "compute system remains Off after accepted power-on; resending RF_PWR_ON"
             );
             if let Err(error) = run_activation_command(rf_target, "RF_PWR_ON").await {
@@ -1977,8 +2231,90 @@ async fn wait_for_compute_power_on_with_policy(
     );
     Err(NvFwUpdError::Timeout {
         operation: "wait for compute system power state On",
-        seconds: attempts * poll_interval_secs,
+        seconds: LEGACY_COMPUTE_ACTIVATION_BMC_WAIT_ATTEMPTS
+            * LEGACY_COMPUTE_ACTIVATION_BMC_WAIT_INTERVAL_SECS,
     })
+}
+
+async fn wait_for_compute_power_state_with_timeout(
+    rf_target: &mut (dyn RFTarget + Send + Sync),
+    expected_power_state: &'static str,
+    attempts: u64,
+    poll_interval_secs: u64,
+) -> Result<()> {
+    let timeout_secs = attempts.saturating_mul(poll_interval_secs);
+    if timeout_secs == 0 {
+        return wait_for_compute_power_state_with_policy(
+            rf_target,
+            expected_power_state,
+            attempts,
+            poll_interval_secs,
+        )
+        .await;
+    }
+
+    match tokio::time::timeout(
+        Duration::from_secs(timeout_secs),
+        wait_for_compute_power_state_with_policy(
+            rf_target,
+            expected_power_state,
+            attempts,
+            poll_interval_secs,
+        ),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(compute_power_state_timeout(
+            expected_power_state,
+            timeout_secs,
+        )),
+    }
+}
+
+async fn wait_for_compute_power_state_with_policy(
+    rf_target: &mut (dyn RFTarget + Send + Sync),
+    expected_power_state: &'static str,
+    attempts: u64,
+    poll_interval_secs: u64,
+) -> Result<()> {
+    let mut last_power_state = None;
+
+    for _ in 0..attempts {
+        tokio::time::sleep(Duration::from_secs(poll_interval_secs)).await;
+
+        let observed_power_state = query_compute_power_state(rf_target.target_access()).await;
+        if observed_power_state
+            .as_deref()
+            .is_some_and(|state| state.eq_ignore_ascii_case(expected_power_state))
+        {
+            return Ok(());
+        }
+
+        if observed_power_state.is_some() {
+            last_power_state = observed_power_state;
+        }
+    }
+
+    tracing::warn!(
+        expected_power_state,
+        power_state = last_power_state.as_deref().unwrap_or("unavailable"),
+        "compute system did not reach the expected power state during activation"
+    );
+    Err(compute_power_state_timeout(
+        expected_power_state,
+        attempts.saturating_mul(poll_interval_secs),
+    ))
+}
+
+fn compute_power_state_timeout(expected_power_state: &'static str, seconds: u64) -> NvFwUpdError {
+    let operation = match expected_power_state {
+        "Off" => "wait for compute system power state Off",
+        "On" => "wait for compute system power state On",
+        _ => "wait for compute system power state",
+    };
+
+    NvFwUpdError::Timeout { operation, seconds }
 }
 
 fn build_target(target: &TargetConfig) -> Result<WorkflowTarget> {
@@ -2979,6 +3315,7 @@ mod tests {
             port: Some(443),
             server_type,
             verify_tls: false,
+            allow_http: false,
             ssh_known_hosts: None,
             ssh_host_key_mode: crate::workflow::SshHostKeyMode::TrustOnFirstUse,
         }
@@ -3489,7 +3826,9 @@ mod tests {
         let mut pkg = FailingFirmwarePkg::default();
         let mut parser = WorkflowPkgParser::new(&mut pkg, true);
 
-        let (ok, msg) = parser.parse_pkg("/tmp/generic_bmc_signed.ima").await;
+        let (ok, msg) = parser
+            .parse_pkg("/tmp/generic_raw_bmc_update_signed.ima")
+            .await;
 
         assert!(ok);
         assert!(msg.is_empty());
@@ -3744,6 +4083,7 @@ mod tests {
             port: None,
             server_type: ServerType::GB200,
             verify_tls: true,
+            allow_http: true,
             ssh_known_hosts: None,
             ssh_host_key_mode: crate::workflow::SshHostKeyMode::TrustOnFirstUse,
         };
@@ -3757,6 +4097,7 @@ mod tests {
         assert_eq!(access.port, "");
         assert_eq!(access.base_url, "https://[2001:db8::44]");
         assert_eq!(access.transport_type, "https");
+        assert!(access.allow_http);
         assert_eq!(access.access_type, AccessType::Login);
         assert_eq!(access.servertype, "gb200");
     }
@@ -4292,7 +4633,7 @@ mod tests {
         let cases = [
             (
                 ServerType::GB200,
-                ActivationMode::SingleCommand(crate::workflow::ActivationCommand::RfPowerOff),
+                ActivationMode::SingleCommand(crate::workflow::ActivationCommand::PowerOff),
                 "RF_PWR_OFF",
             ),
             (
@@ -4420,7 +4761,7 @@ mod tests {
         assert!(matches!(
             activation_command_for_mode(
                 ServerType::HGX,
-                &ActivationMode::SingleCommand(crate::workflow::ActivationCommand::RfPowerCycle),
+                &ActivationMode::SingleCommand(crate::workflow::ActivationCommand::PowerCycle),
             ),
             Err(NvFwUpdError::Unsupported(_))
         ));
@@ -4436,6 +4777,7 @@ mod tests {
                 port: Some(443),
                 server_type: ServerType::PowerShelf,
                 verify_tls: false,
+                allow_http: false,
                 ssh_known_hosts: None,
                 ssh_host_key_mode: crate::workflow::SshHostKeyMode::TrustOnFirstUse,
             },
@@ -4557,7 +4899,141 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn compute_power_on_wait_completes_when_system_zero_is_on() {
+    async fn gb200_host_boot_requests_power_on_before_waiting_for_os() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/redfish/v1/Systems"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "Members": [{"@odata.id": "/redfish/v1/Systems/System_0"}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/redfish/v1/Systems/System_0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "PowerState": "Off"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let access = BmcAccess::mock_with_base_url(server.uri(), "mock-compute");
+        let mut target = RetryingActivationTarget::with_access([0], access);
+        let summary = ensure_gb200_host_os_ready_with(
+            &mut target,
+            || std::future::ready(Ok(2)),
+            Duration::ZERO,
+        )
+        .await
+        .expect("powered-off host should boot without recovery");
+
+        assert_eq!(target.commands, vec!["RF_PWR_ON"]);
+        assert_eq!(summary.details["recovery_ac_cycle"], false);
+        assert_eq!(summary.details["host_probe_attempts"], 2);
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn gb200_host_boot_retries_once_after_auxiliary_ac_cycle() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/redfish/v1/Systems"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "Members": [{"@odata.id": "/redfish/v1/Systems/System_0"}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/redfish/v1/Systems/System_0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "PowerState": "On"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let access = BmcAccess::mock_with_base_url(server.uri(), "mock-compute");
+        let mut target = RetryingActivationTarget::with_access([0, 0], access);
+        let mut host_results = VecDeque::from([
+            Err(NvFwUpdError::Timeout {
+                operation: "wait for GB200 host OS boot",
+                seconds: 360,
+            }),
+            Ok(3),
+        ]);
+        let summary = ensure_gb200_host_os_ready_with(
+            &mut target,
+            || std::future::ready(host_results.pop_front().expect("host result")),
+            Duration::ZERO,
+        )
+        .await
+        .expect("second boot attempt should succeed");
+
+        assert_eq!(target.commands, vec!["RF_AUX_PWR_CYCLE", "RF_PWR_ON"]);
+        assert_eq!(summary.details["recovery_ac_cycle"], true);
+        assert_eq!(summary.details["host_probe_attempts_after_recovery"], 3);
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn gb200_host_boot_does_not_ac_cycle_for_authentication_failure() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/redfish/v1/Systems"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "Members": [{"@odata.id": "/redfish/v1/Systems/System_0"}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/redfish/v1/Systems/System_0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "PowerState": "On"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let access = BmcAccess::mock_with_base_url(server.uri(), "mock-compute");
+        let mut target = RetryingActivationTarget::with_access([], access);
+        let error = ensure_gb200_host_os_ready_with(
+            &mut target,
+            || {
+                std::future::ready(Err(NvFwUpdError::AuthFailed {
+                    target: "host".to_owned(),
+                    message: "invalid credentials".to_owned(),
+                }))
+            },
+            Duration::ZERO,
+        )
+        .await
+        .expect_err("authentication failures are not boot failures");
+
+        assert!(matches!(error, NvFwUpdError::AuthFailed { .. }));
+        assert!(target.commands.is_empty());
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn gb200_flint_discovery_recovery_ac_cycles_and_waits_for_host() {
+        let mut target = RetryingActivationTarget::new([0, 0]);
+
+        recover_gb200_host_after_flint_discovery_failure_with(
+            &mut target,
+            || std::future::ready(Ok(2)),
+            Duration::ZERO,
+        )
+        .await
+        .expect("device-discovery recovery should reboot the host");
+
+        assert_eq!(target.commands, vec!["RF_AUX_PWR_CYCLE", "RF_PWR_ON"]);
+    }
+
+    #[tokio::test]
+    async fn compute_power_state_wait_completes_when_system_zero_matches() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/redfish/v1/Systems"))
@@ -4580,16 +5056,18 @@ mod tests {
 
         let access = BmcAccess::mock_with_base_url(server.uri(), "mock-compute");
         let mut target = RetryingActivationTarget::with_access([], access);
-        wait_for_compute_power_on_with_policy(&mut target, 3, 0, 1)
+        wait_for_compute_power_state_with_policy(&mut target, "On", 3, 0)
             .await
-            .expect("System_0 reporting On should complete activation");
+            .expect("System_0 reporting the expected state should complete activation");
 
         assert!(target.commands.is_empty());
         server.verify().await;
     }
 
     #[tokio::test]
-    async fn compute_power_on_wait_resends_accepted_command_until_system_turns_on() {
+    async fn full_compute_activation_retries_the_ac_cycle_when_power_on_times_out() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/redfish/v1/Systems"))
@@ -4598,38 +5076,48 @@ mod tests {
                     {"@odata.id": "/redfish/v1/Systems/System_0"}
                 ]
             })))
-            .expect(2)
+            .expect(3)
             .mount(&server)
             .await;
+        let power_state_queries = Arc::new(AtomicUsize::new(0));
+        let response_counter = Arc::clone(&power_state_queries);
         Mock::given(method("GET"))
             .and(path("/redfish/v1/Systems/System_0"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "PowerState": "Off"
-            })))
-            .up_to_n_times(1)
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path("/redfish/v1/Systems/System_0"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "PowerState": "On"
-            })))
-            .expect(1)
+            .respond_with(move |_: &wiremock::Request| {
+                let state = match response_counter.fetch_add(1, Ordering::SeqCst) {
+                    0 | 1 => "Off",
+                    _ => "On",
+                };
+                ResponseTemplate::new(200).set_body_json(json!({"PowerState": state}))
+            })
+            .expect(3)
             .mount(&server)
             .await;
 
         let access = BmcAccess::mock_with_base_url(server.uri(), "mock-compute");
-        let mut target = RetryingActivationTarget::with_access([0], access);
-        wait_for_compute_power_on_with_policy(&mut target, 3, 0, 1)
-            .await
-            .expect("periodic resend should allow an initially ignored power-on to recover");
+        let mut target = RetryingActivationTarget::with_access([0, 0, 0, 0, 0], access);
+        let attempts =
+            activate_full_gb200_compute_with_policy(&mut target, 1, 0, Duration::ZERO, 2)
+                .await
+                .expect("the second complete AC cycle should recover the host");
 
-        assert_eq!(target.commands, vec!["RF_PWR_ON"]);
+        assert_eq!(attempts, 2);
+        assert_eq!(
+            target.commands,
+            vec![
+                "RF_PWR_OFF",
+                "RF_AUX_PWR_CYCLE",
+                "RF_PWR_ON",
+                "RF_AUX_PWR_CYCLE",
+                "RF_PWR_ON"
+            ]
+        );
+        assert_eq!(power_state_queries.load(Ordering::SeqCst), 3);
         server.verify().await;
     }
 
     #[tokio::test]
-    async fn compute_power_on_wait_times_out_when_system_remains_off() {
+    async fn full_compute_activation_fails_after_one_ac_cycle_retry() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/redfish/v1/Systems"))
@@ -4651,10 +5139,10 @@ mod tests {
             .await;
 
         let access = BmcAccess::mock_with_base_url(server.uri(), "mock-compute");
-        let mut target = RetryingActivationTarget::with_access([0, 0], access);
-        let err = wait_for_compute_power_on_with_policy(&mut target, 3, 0, 1)
+        let mut target = RetryingActivationTarget::with_access([0, 0, 0, 0, 0], access);
+        let err = activate_full_gb200_compute_with_policy(&mut target, 1, 0, Duration::ZERO, 2)
             .await
-            .expect_err("an Off system should time out after periodic resends");
+            .expect_err("an Off system should fail after one complete AC-cycle retry");
 
         assert!(matches!(
             err,
@@ -4663,7 +5151,16 @@ mod tests {
                 seconds: 0,
             }
         ));
-        assert_eq!(target.commands, vec!["RF_PWR_ON", "RF_PWR_ON"]);
+        assert_eq!(
+            target.commands,
+            vec![
+                "RF_PWR_OFF",
+                "RF_AUX_PWR_CYCLE",
+                "RF_PWR_ON",
+                "RF_AUX_PWR_CYCLE",
+                "RF_PWR_ON"
+            ]
+        );
         server.verify().await;
     }
 
@@ -4822,8 +5319,116 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn powershelf_activation_skips_second_wait_when_reset_post_already_observed_recovery() {
-        use wiremock::matchers::{method, path};
+    async fn powershelf_activation_reuses_activation_command_recovery() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        async fn write_json_response(socket: &mut tokio::net::TcpStream, status: &str, body: &str) {
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test server should bind");
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let recovery_gets = Arc::new(AtomicUsize::new(0));
+        let recovery_gets_for_server = Arc::clone(&recovery_gets);
+        let server_task = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let recovery_gets = Arc::clone(&recovery_gets_for_server);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let Ok(n) = socket.read(&mut buf).await else {
+                        return;
+                    };
+                    let request = String::from_utf8_lossy(&buf[..n]);
+                    let request_line = request.lines().next().unwrap_or_default();
+                    let mut parts = request_line.split_whitespace();
+                    let method = parts.next().unwrap_or_default();
+                    let path = parts.next().unwrap_or_default();
+
+                    match (method, path) {
+                        ("GET", "/redfish/v1/Managers") => {
+                            write_json_response(
+                                &mut socket,
+                                "200 OK",
+                                r#"{"Members":[{"@odata.id":"/redfish/v1/Managers/powershelf"}]}"#,
+                            )
+                            .await;
+                        }
+                        ("GET", "/redfish/v1/Managers/powershelf") => {
+                            write_json_response(
+                                &mut socket,
+                                "200 OK",
+                                r##"{"Actions":{"#Manager.Reset":{"target":"/redfish/v1/Managers/powershelf/Actions/Manager.Reset"}}}"##,
+                            )
+                            .await;
+                        }
+                        ("POST", "/redfish/v1/Managers/powershelf/Actions/Manager.Reset") => {
+                            // Simulate the real reset handoff case: the request reaches
+                            // the device, but the HTTPS response is lost as it reboots.
+                        }
+                        ("GET", "/redfish/v1") => {
+                            let attempt = recovery_gets.fetch_add(1, Ordering::SeqCst);
+                            if attempt == 0 {
+                                write_json_response(
+                                    &mut socket,
+                                    "503 Service Unavailable",
+                                    r#"{"error":{"message":"powershelf rebooting"}}"#,
+                                )
+                                .await;
+                            } else {
+                                write_json_response(
+                                    &mut socket,
+                                    "200 OK",
+                                    r#"{"RedfishVersion":"1.0.0"}"#,
+                                )
+                                .await;
+                            }
+                        }
+                        _ => {
+                            write_json_response(
+                                &mut socket,
+                                "404 Not Found",
+                                r#"{"error":{"message":"not found"}}"#,
+                            )
+                            .await;
+                        }
+                    }
+                });
+            }
+        });
+
+        let summary = activate_powershelf_reset_with_access(
+            BmcAccess::mock_with_base_url(base_url, "mock-powershelf"),
+            "RF_PWRSHELF_RESET",
+        )
+        .await
+        .expect("PowerShelf reset activation should reuse internally observed recovery");
+
+        server_task.abort();
+        assert_eq!(summary.details["command"], "RF_PWRSHELF_RESET");
+        assert_eq!(summary.details["recovery"]["attempts"], 2);
+        assert_eq!(
+            summary.details["recovery"]["observed_by"],
+            "activation_command"
+        );
+        assert_eq!(recovery_gets.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn powershelf_activation_accepts_same_origin_absolute_reset_uri() {
+        use wiremock::matchers::{body_string_contains, method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let server = MockServer::start().await;
@@ -4842,9 +5447,23 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "Actions": {
                     "#Manager.Reset": {
-                        "target": "http://127.0.0.1:9/redfish/v1/Managers/powershelf/Actions/Manager.Reset"
+                        "target": format!(
+                            "{}/redfish/v1/Managers/powershelf/Actions/Manager.Reset",
+                            server.uri()
+                        )
                     }
                 }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(
+                "/redfish/v1/Managers/powershelf/Actions/Manager.Reset",
+            ))
+            .and(body_string_contains("GracefulRestart"))
+            .respond_with(ResponseTemplate::new(202).set_body_json(json!({
+                "Reset": "accepted"
             })))
             .expect(1)
             .mount(&server)
@@ -4873,14 +5492,11 @@ mod tests {
             "RF_PWRSHELF_RESET",
         )
         .await
-        .expect("PowerShelf reset activation should reuse internally observed recovery");
+        .expect("PowerShelf reset activation should accept same-origin absolute reset URI");
 
         assert_eq!(summary.details["command"], "RF_PWRSHELF_RESET");
         assert_eq!(summary.details["recovery"]["attempts"], 2);
-        assert_eq!(
-            summary.details["recovery"]["observed_by"],
-            "activation_command"
-        );
+        assert_eq!(summary.details["recovery"]["observed_by"], "workflow");
     }
 
     #[tokio::test]

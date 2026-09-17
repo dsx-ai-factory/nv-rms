@@ -1883,11 +1883,11 @@ impl RackManagerTrait for RackManagerServiceImpl {
         self.handle_get_power_state(req).await
     }
 
-    async fn sequence_rack_power(
+    async fn execute_cold_reboot(
         &self,
-        req: tonic::Request<rm::SequenceRackPowerRequest>,
-    ) -> std::result::Result<tonic::Response<rm::SequenceRackPowerResponse>, tonic::Status> {
-        self.handle_sequence_rack_power(req).await
+        req: tonic::Request<rm::ExecuteColdRebootRequest>,
+    ) -> std::result::Result<tonic::Response<rm::ExecuteColdRebootResponse>, tonic::Status> {
+        self.handle_execute_cold_reboot(req).await
     }
 
     // ── Inventory ──
@@ -1919,22 +1919,6 @@ impl RackManagerTrait for RackManagerServiceImpl {
         req: tonic::Request<rm::DeleteNodeRequest>,
     ) -> std::result::Result<tonic::Response<rm::DeleteNodeResponse>, tonic::Status> {
         self.handle_delete_node(req).await
-    }
-
-    async fn get_rack_power_on_sequence(
-        &self,
-        req: tonic::Request<rm::GetRackPowerOnSequenceRequest>,
-    ) -> std::result::Result<tonic::Response<rm::GetRackPowerOnSequenceResponse>, tonic::Status>
-    {
-        self.handle_get_rack_power_on_sequence(req).await
-    }
-
-    async fn set_rack_power_on_sequence(
-        &self,
-        req: tonic::Request<rm::SetRackPowerOnSequenceRequest>,
-    ) -> std::result::Result<tonic::Response<rm::SetRackPowerOnSequenceResponse>, tonic::Status>
-    {
-        self.handle_set_rack_power_on_sequence(req).await
     }
 
     async fn list_racks(
@@ -1982,6 +1966,15 @@ impl RackManagerTrait for RackManagerServiceImpl {
     ) -> std::result::Result<tonic::Response<rm::GetNodeFirmwareInventoryResponse>, tonic::Status>
     {
         self.handle_get_node_firmware_inventory(req).await
+    }
+
+    async fn batch_get_firmware_inventory(
+        &self,
+        req: tonic::Request<rm::BatchGetFirmwareInventoryRequest>,
+    ) -> std::result::Result<tonic::Response<rm::BatchGetFirmwareInventoryResponse>, tonic::Status>
+    {
+        let req = normalize_request(req, |r| normalize_node_set(&mut r.nodes))?;
+        self.handle_batch_get_firmware_inventory(req).await
     }
 
     async fn update_firmware(
@@ -2046,6 +2039,25 @@ impl RackManagerTrait for RackManagerServiceImpl {
     {
         let req = normalize_request(req, |r| normalize_node_set(&mut r.nodes))?;
         self.handle_update_switch_system_password(req).await
+    }
+
+    async fn batch_collect_switch_spdm_attestation_evidence(
+        &self,
+        req: tonic::Request<rm::BatchCollectSwitchSpdmAttestationEvidenceRequest>,
+    ) -> std::result::Result<
+        tonic::Response<rm::BatchCollectSwitchSpdmAttestationEvidenceResponse>,
+        tonic::Status,
+    > {
+        let req = normalize_request(req, |r| {
+            for node in &mut r.targets {
+                normalize_node_info(node)?;
+            }
+
+            Ok(())
+        })?;
+
+        self.handle_batch_collect_switch_spdm_attestation_evidence(req)
+            .await
     }
 
     async fn get_rack_firmware_inventory(

@@ -42,6 +42,54 @@ impl PostgresFirmwareObjectStore {
     }
 }
 
+/// First key of the two-int `pg_advisory_xact_lock` used to serialize default
+/// firmware selection. Acts as a private namespace so the per-hardware-type
+/// lock cannot collide with advisory locks taken elsewhere. Value spells
+/// "RMFD" (RMS FirmwareDefault) in ASCII.
+const FIRMWARE_DEFAULT_LOCK_NAMESPACE: i32 = 0x524d_4644;
+
+/// Serialize every default-bundle change for one hardware type by taking a
+/// transaction-scoped advisory lock keyed on it. Concurrent `set_default` /
+/// `set_default_if_none` calls for the same hardware type then queue behind
+/// one another instead of racing on the partial unique index, so the loser
+/// serializes cleanly rather than failing with a duplicate-key error. The lock
+/// is released automatically at COMMIT/ROLLBACK.
+async fn lock_default_slot(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    hw: &RackHardwareType,
+) -> Result<()> {
+    sqlx::query("SELECT pg_advisory_xact_lock($1, hashtext($2))")
+        .bind(FIRMWARE_DEFAULT_LOCK_NAMESPACE)
+        .bind(hw)
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| DatabaseError::query("acquire default-slot advisory lock", e))?;
+    Ok(())
+}
+
+/// Same as [`lock_default_slot`], but resolves the hardware type from a
+/// firmware `id` inside the lock statement. This lets callers that do not
+/// already hold the hardware type take the advisory lock without a separate
+/// unlocked read first, while still acquiring it before touching any row (the
+/// lock order set by `set_default`). A non-existent `id` makes the subquery
+/// NULL; `pg_advisory_xact_lock` is STRICT and acquires no lock in that case,
+/// so the caller's following row read is responsible for reporting not-found.
+async fn lock_default_slot_for_id(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    id: &str,
+) -> Result<()> {
+    sqlx::query(
+        "SELECT pg_advisory_xact_lock($1, hashtext( \
+             (SELECT rack_hardware_type FROM rack_firmware WHERE id = $2)))",
+    )
+    .bind(FIRMWARE_DEFAULT_LOCK_NAMESPACE)
+    .bind(id)
+    .execute(&mut **tx)
+    .await
+    .map_err(|e| DatabaseError::query("acquire default-slot advisory lock", e))?;
+    Ok(())
+}
+
 // ── Apply-history row used only for the LEFT JOIN with availability ──
 
 #[derive(Debug, Clone, FromRow)]
@@ -192,8 +240,22 @@ impl FirmwareObjectStore for PostgresFirmwareObjectStore {
         // them appear as one logical step to other readers/writers.
         let mut tx = self.pool.begin().await.map_err(DatabaseError::from)?;
 
-        // Look up the target's hardware type. Locking the row keeps a
-        // concurrent set_default for the same row from racing us.
+        // Take the per-hardware-type advisory lock BEFORE any FOR UPDATE row
+        // lock. Read the hardware type first without locking so it can key the
+        // lock. Locking the slot ahead of the row gives a single lock order
+        // (advisory -> rows) and avoids a deadlock: otherwise one call could
+        // hold the target row lock while waiting on the advisory lock, while
+        // the advisory holder's "clear previous default" waits on that row.
+        let (hw,): (RackHardwareType,) =
+            sqlx::query_as("SELECT rack_hardware_type FROM rack_firmware WHERE id = $1")
+                .bind(id)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(|e| DatabaseError::not_found_or_query("firmware object", id, e))?;
+        lock_default_slot(&mut tx, &hw).await?;
+
+        // Now that the slot is ours, lock the target row (also serializes a
+        // concurrent set_default for the same id) and confirm it still exists.
         let fw: FirmwareObject =
             sqlx::query_as("SELECT * FROM rack_firmware WHERE id = $1 FOR UPDATE")
                 .bind(id)
@@ -224,6 +286,58 @@ impl FirmwareObjectStore for PostgresFirmwareObjectStore {
 
         tx.commit().await.map_err(DatabaseError::from)?;
         Ok(updated)
+    }
+
+    async fn set_default_if_none(&self, id: &str) -> Result<FirmwareObject> {
+        let mut tx = self.pool.begin().await.map_err(DatabaseError::from)?;
+
+        // Serialize default selection for this hardware type on the advisory
+        // lock alone. That lock -- not a row lock -- is what protects the
+        // partial unique index (rack_firmware_default_idx) against concurrent
+        // default-setters: a `FOR UPDATE` on existing rows would not stop a
+        // *new* row being inserted and made default, so the row lock adds no
+        // safety here. The hardware-type read is folded into the lock
+        // statement, so there is no separate unlocked query and the advisory
+        // lock is still taken before any row is touched (see set_default).
+        lock_default_slot_for_id(&mut tx, id).await?;
+
+        // Plain read -- no row lock needed now that the advisory lock
+        // serializes default changes for this hardware type. Supplies the
+        // current row for the no-op return path and the hardware type for the
+        // guard below, and reports not-found when the id does not exist.
+        let fw: FirmwareObject = sqlx::query_as("SELECT * FROM rack_firmware WHERE id = $1")
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| DatabaseError::not_found_or_query("firmware object", id, e))?;
+
+        // The NOT EXISTS guard makes this a no-op whenever any row of this
+        // hardware type is already default (including this one), so an existing
+        // operator-chosen default is never clobbered by an add.
+        let updated: Option<FirmwareObject> = sqlx::query_as(
+            "UPDATE rack_firmware \
+             SET is_default = true, updated = NOW() \
+             WHERE id = $1 \
+               AND NOT EXISTS ( \
+                   SELECT 1 FROM rack_firmware \
+                   WHERE rack_hardware_type = $2 AND is_default = true \
+               ) \
+             RETURNING *",
+        )
+        .bind(id)
+        .bind(&fw.rack_hardware_type)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| DatabaseError::query("set default if none", e))?;
+
+        tx.commit().await.map_err(DatabaseError::from)?;
+
+        // `None` means the guard tripped: another row of this hardware type is
+        // already the default, so this call intentionally changed nothing.
+        // Return the requested object's current (unchanged) state -- callers
+        // want the state of `id`, and the result is idempotent when this row
+        // already holds the default.
+        Ok(updated.unwrap_or(fw))
     }
 
     async fn has_default(&self, hw: &RackHardwareType) -> Result<bool> {

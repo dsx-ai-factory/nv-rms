@@ -25,6 +25,7 @@ use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
+use reqwest::Url;
 use serde_json::{json, Value};
 use tokio::time::{sleep, Duration};
 
@@ -274,15 +275,75 @@ impl PowerShelfRFTarget {
         *observed_unreachable
     }
 
-    /// Build the Manager.Reset POST URL from either relative or absolute targets.
-    fn manager_reset_request_url(base_url: &str, target_uri: &str) -> String {
-        if target_uri.starts_with("http://") || target_uri.starts_with("https://") {
-            target_uri.to_string()
-        } else if target_uri.starts_with('/') {
-            format!("{}{}", base_url.trim_end_matches('/'), target_uri)
-        } else {
-            format!("{}/{}", base_url.trim_end_matches('/'), target_uri)
+    /// Return true when two URLs have the same scheme, host, and effective port.
+    fn same_url_origin(left: &Url, right: &Url) -> bool {
+        left.scheme() == right.scheme()
+            && left.host_str() == right.host_str()
+            && left.port_or_known_default() == right.port_or_known_default()
+    }
+
+    /// Resolve a Redfish member/action URI against the selected PowerShelf BMC.
+    ///
+    /// Device-provided Redfish links are allowed only when they resolve to the
+    /// same scheme, host, and port as the configured BMC endpoint. The returned
+    /// URL is safe to use directly for callers that do not prepend `base_url`.
+    fn same_origin_redfish_url(base_url: &str, uri: &str, label: &str) -> Result<Url, String> {
+        let uri = uri.trim();
+        if uri.is_empty() || uri.starts_with("//") || uri.chars().any(char::is_control) {
+            return Err(format!(
+                "{label} is not a safe same-origin path: {}",
+                NvUtils::sanitize_log(uri)
+            ));
         }
+
+        let base = Url::parse(base_url).map_err(|e| format!("Invalid PowerShelf base URL: {e}"))?;
+        let resolved = if uri.starts_with("http://") || uri.starts_with("https://") {
+            Url::parse(uri)
+                .map_err(|e| format!("Invalid {label} {}: {e}", NvUtils::sanitize_log(uri)))?
+        } else if uri.starts_with('/') {
+            base.join(uri)
+                .map_err(|e| format!("Invalid {label} {}: {e}", NvUtils::sanitize_log(uri)))?
+        } else {
+            base.join(&format!("/{uri}"))
+                .map_err(|e| format!("Invalid {label} {}: {e}", NvUtils::sanitize_log(uri)))?
+        };
+
+        if !Self::same_url_origin(&base, &resolved) {
+            return Err(format!(
+                "{label} must stay on the target BMC origin: {}",
+                NvUtils::sanitize_log(uri)
+            ));
+        }
+        if !resolved.username().is_empty() || resolved.password().is_some() {
+            return Err(format!(
+                "{label} must not contain user info: {}",
+                NvUtils::sanitize_log(uri)
+            ));
+        }
+
+        Ok(resolved)
+    }
+
+    /// Resolve a Redfish member URI to the path/query form expected by
+    /// `BmcAccess::dispatch_request*`.
+    fn same_origin_redfish_path(base_url: &str, uri: &str, label: &str) -> Result<String, String> {
+        let resolved = Self::same_origin_redfish_url(base_url, uri, label)?;
+        let mut path = resolved.path().to_string();
+        if let Some(query) = resolved.query() {
+            path.push('?');
+            path.push_str(query);
+        }
+        Ok(path)
+    }
+
+    /// Build the Manager.Reset POST URL from a relative or same-origin target.
+    ///
+    /// Redfish action targets are device-provided. Absolute off-origin URLs and
+    /// authority-like paths are rejected so Basic Auth never follows a target BMC
+    /// response to another origin.
+    fn manager_reset_request_url(base_url: &str, target_uri: &str) -> Result<String, String> {
+        Self::same_origin_redfish_url(base_url, target_uri, "Manager.Reset target URI")
+            .map(|url| url.to_string())
     }
 
     /// Probe for the expected outage and recovery after a PowerShelf reset.
@@ -396,15 +457,26 @@ impl PowerShelfRFTarget {
 
         let mut handoff_tasks = Vec::new();
         for member in members {
-            let Some(uri) = member.get("@odata.id").and_then(Value::as_str) else {
+            let Some(raw_uri) = member.get("@odata.id").and_then(Value::as_str) else {
                 continue;
             };
-            let Some(task_id) = task_id_from_task_member_uri(uri) else {
+            let Ok(uri) = Self::same_origin_redfish_path(
+                &self.bmc_access.base_url,
+                raw_uri,
+                "Task member URI",
+            ) else {
+                tracing::warn!(
+                    "Ignoring unsafe PowerShelf TaskService member URI: {}",
+                    NvUtils::sanitize_log(raw_uri.trim())
+                );
+                continue;
+            };
+            let Some(task_id) = task_id_from_task_member_uri(&uri) else {
                 continue;
             };
             let (task_ok, task) = self
                 .target_access()
-                .dispatch_request("GET", uri, None, None)
+                .dispatch_request("GET", &uri, None, None)
                 .await;
             if task_ok && Self::is_on_reset_handoff_task(&task) {
                 handoff_tasks.push((task_id, task));
@@ -1930,10 +2002,25 @@ impl RFTarget for PowerShelfRFTarget {
         if status {
             if let Some(members) = managers_response.get("Members").and_then(|v| v.as_array()) {
                 for member in members {
-                    if let Some(manager_uri) = member.get("@odata.id").and_then(|v| v.as_str()) {
+                    if let Some(raw_manager_uri) = member.get("@odata.id").and_then(|v| v.as_str())
+                    {
+                        let manager_uri = match Self::same_origin_redfish_path(
+                            &self.bmc_access.base_url,
+                            raw_manager_uri,
+                            "Manager member URI",
+                        ) {
+                            Ok(uri) => uri,
+                            Err(_) => {
+                                tracing::warn!(
+                                    "Ignoring unsafe PowerShelf Manager member URI: {}",
+                                    NvUtils::sanitize_log(raw_manager_uri.trim())
+                                );
+                                continue;
+                            }
+                        };
                         let (ok, manager_dict) = self
                             .bmc_access
-                            .dispatch_request_full("GET", manager_uri, None, None, 30, true, None)
+                            .dispatch_request_full("GET", &manager_uri, None, None, 30, true, None)
                             .await;
                         if !ok {
                             continue;
@@ -1964,7 +2051,18 @@ impl RFTarget for PowerShelfRFTarget {
 
         let uri = target_uri.unwrap();
         let body = json!({"ResetType": reset_type});
-        let full_url = Self::manager_reset_request_url(&self.bmc_access.base_url, &uri);
+        let full_url = match Self::manager_reset_request_url(&self.bmc_access.base_url, &uri) {
+            Ok(url) => url,
+            Err(message) => {
+                Util::bail_nvfwupd(
+                    1,
+                    &format!("Error: {message}"),
+                    BailAction::DoNothing,
+                    cmd_args.quiet.then_some(&quiet_json),
+                );
+                return 1;
+            }
+        };
         let post_result = self
             .bmc_access
             .client
@@ -2777,7 +2875,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn flex_pmc_inventory_matches_sample_pmc_package_key() {
+    async fn flex_pmc_inventory_matches_real_pmc_package_key() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/redfish/v1/UpdateService/FirmwareInventory"))
@@ -3129,28 +3227,104 @@ mod tests {
     }
 
     #[test]
-    fn manager_reset_request_url_accepts_absolute_and_relative_targets() {
+    fn manager_reset_request_url_accepts_relative_and_same_origin_targets() {
         assert_eq!(
             PowerShelfRFTarget::manager_reset_request_url(
                 "https://10.0.0.5",
                 "/redfish/v1/Managers/bmc/Actions/Manager.Reset"
-            ),
+            )
+            .unwrap(),
             "https://10.0.0.5/redfish/v1/Managers/bmc/Actions/Manager.Reset"
         );
         assert_eq!(
             PowerShelfRFTarget::manager_reset_request_url(
                 "https://10.0.0.5/",
                 "redfish/v1/Managers/bmc/Actions/Manager.Reset"
-            ),
+            )
+            .unwrap(),
             "https://10.0.0.5/redfish/v1/Managers/bmc/Actions/Manager.Reset"
         );
         assert_eq!(
             PowerShelfRFTarget::manager_reset_request_url(
                 "https://10.0.0.5",
-                "https://bmc.example/redfish/v1/Managers/bmc/Actions/Manager.Reset"
-            ),
-            "https://bmc.example/redfish/v1/Managers/bmc/Actions/Manager.Reset"
+                "https://10.0.0.5/redfish/v1/Managers/bmc/Actions/Manager.Reset"
+            )
+            .unwrap(),
+            "https://10.0.0.5/redfish/v1/Managers/bmc/Actions/Manager.Reset"
         );
+    }
+
+    #[test]
+    fn same_origin_redfish_path_accepts_relative_and_same_origin_absolute_members() {
+        assert_eq!(
+            PowerShelfRFTarget::same_origin_redfish_path(
+                "https://10.0.0.5",
+                "/redfish/v1/Managers/bmc?expand=1",
+                "Manager member URI"
+            )
+            .unwrap(),
+            "/redfish/v1/Managers/bmc?expand=1"
+        );
+        assert_eq!(
+            PowerShelfRFTarget::same_origin_redfish_path(
+                "https://10.0.0.5/",
+                "redfish/v1/TaskService/Tasks/Task-1",
+                "Task member URI"
+            )
+            .unwrap(),
+            "/redfish/v1/TaskService/Tasks/Task-1"
+        );
+        assert_eq!(
+            PowerShelfRFTarget::same_origin_redfish_path(
+                "https://10.0.0.5",
+                "https://10.0.0.5/redfish/v1/Managers/bmc",
+                "Manager member URI"
+            )
+            .unwrap(),
+            "/redfish/v1/Managers/bmc"
+        );
+    }
+
+    #[test]
+    fn same_origin_redfish_path_rejects_off_origin_members() {
+        for member_uri in [
+            "https://bmc.example/redfish/v1/Managers/bmc",
+            "http://10.0.0.5/redfish/v1/Managers/bmc",
+            "https://user:pass@10.0.0.5/redfish/v1/Managers/bmc",
+            "//bmc.example/redfish/v1/Managers/bmc",
+            "/redfish/v1/Managers/bmc\nX-Test: yes",
+            "/redfish/v1/Managers/bmc\u{7}",
+        ] {
+            let err = PowerShelfRFTarget::same_origin_redfish_path(
+                "https://10.0.0.5",
+                member_uri,
+                "Manager member URI",
+            )
+            .expect_err("off-origin or unsafe member URI should be rejected");
+            assert!(
+                err.contains("Manager member URI"),
+                "unexpected error: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn manager_reset_request_url_rejects_off_origin_targets() {
+        for target_uri in [
+            "https://bmc.example/redfish/v1/Managers/bmc/Actions/Manager.Reset",
+            "http://10.0.0.5/redfish/v1/Managers/bmc/Actions/Manager.Reset",
+            "https://user:pass@10.0.0.5/redfish/v1/Managers/bmc/Actions/Manager.Reset",
+            "//bmc.example/redfish/v1/Managers/bmc/Actions/Manager.Reset",
+            "/redfish/v1/Managers/bmc/Actions/Manager.Reset\nX-Test: yes",
+            "/redfish/v1/Managers/bmc/Actions/Manager.Reset\u{7}",
+        ] {
+            let err = PowerShelfRFTarget::manager_reset_request_url("https://10.0.0.5", target_uri)
+                .expect_err("off-origin or unsafe target should be rejected");
+            assert!(
+                err.contains("Manager.Reset target URI"),
+                "unexpected error: {err}"
+            );
+        }
     }
 
     #[test]
@@ -4554,7 +4728,7 @@ mod tests {
             .await;
         Mock::given(method("POST"))
             .and(path("/redfish/v1/UpdateService/update"))
-            .and(body_string_contains("generic flex pmc firmware"))
+            .and(body_string_contains("flex pmc firmware"))
             .respond_with(ResponseTemplate::new(202).set_body_json(json!({
                 "@odata.id": "/redfish/v1/TaskService/Tasks/FlexTask-1"
             })))
@@ -4564,7 +4738,7 @@ mod tests {
 
         let tmp = tempfile::tempdir().unwrap();
         let update_file = tmp.path().join("generic-flex-pmc-v1.0.0.fwpkg");
-        tokio::fs::write(&update_file, b"generic flex pmc firmware")
+        tokio::fs::write(&update_file, b"flex pmc firmware")
             .await
             .unwrap();
 
@@ -4620,7 +4794,7 @@ mod tests {
 
         let tmp = tempfile::tempdir().unwrap();
         let update_file = tmp.path().join("generic-flex-pmc-v1.0.0.fwpkg");
-        tokio::fs::write(&update_file, b"generic flex pmc firmware")
+        tokio::fs::write(&update_file, b"flex pmc firmware")
             .await
             .unwrap();
 

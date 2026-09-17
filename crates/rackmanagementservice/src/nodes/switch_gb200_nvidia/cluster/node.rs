@@ -127,20 +127,21 @@ impl SwitchGb200Nvidia {
         Ok(true)
     }
 
-    /// Clears primary node IPs, disables the cluster, and waits for shutdown.
+    /// Clears node IPs on both interfaces, disables the cluster, and waits for
+    /// shutdown.
     ///
     /// NVOS rejects cluster disable while cluster-node servers remain
     /// configured, so this method clears addresses before disabling the cluster.
     pub(crate) async fn clear_node_ips_and_disable_cluster(&self) -> Result<()> {
-        // Keep both mutations and shutdown convergence in one operation so no
-        // cluster-state or node-IP update can interleave with the transition.
+        // Keep the address clears and shutdown convergence in one operation so
+        // no cluster-state or node-IP update can interleave with the transition.
         let _op_guard = self.op_lock.lock().await;
+        let empty = ClusterNodeServerAddresses::new();
 
-        self.reconcile_node_ips_unlocked(
-            InterfaceType::Primary,
-            &ClusterNodeServerAddresses::new(),
-        )
-        .await?;
+        for interface_type in [InterfaceType::Primary, InterfaceType::Secondary] {
+            self.reconcile_node_ips_unlocked(interface_type, &empty)
+                .await?;
+        }
 
         self.set_cluster_state_unlocked(false).await?;
 

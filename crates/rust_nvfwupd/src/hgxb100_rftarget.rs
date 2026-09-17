@@ -25,7 +25,7 @@ use serde_json::{json, Value};
 
 use crate::bmc_access::BmcAccess;
 use crate::gh_rftarget::{self, GHRFTarget};
-use crate::rf_target::{CmdArgs, PkgParser, RFTarget};
+use crate::rf_target::{multipart_update_uri_from_service, CmdArgs, PkgParser, RFTarget};
 use crate::util::{BailAction, Util};
 use crate::utils::Util as NvUtils;
 
@@ -283,11 +283,8 @@ impl RFTarget for HGXB100RFTarget {
                 );
                 return None;
             }
-            let mp_uri = us_response
-                .get("MultipartHttpPushUri")
-                .and_then(|v| v.as_str())
-                .unwrap_or("/redfish/v1/UpdateService")
-                .to_string();
+            let mp_uri =
+                multipart_update_uri_from_service(&us_response, "/redfish/v1/UpdateService");
 
             let param_val = json_data.unwrap_or(json!({}));
             let oem_val = oem_params_json.map(Value::String);
@@ -604,13 +601,10 @@ impl RFTarget for HGXRUBINRFTarget {
     }
 
     fn get_update_uri(&self, update_service_response: &Value) -> String {
-        if let Some(uri) = update_service_response
-            .get("MultipartHttpPushUri")
-            .and_then(|v| v.as_str())
-        {
-            return uri.to_string();
-        }
-        "/redfish/v1/UpdateService/update-multipart".to_string()
+        multipart_update_uri_from_service(
+            update_service_response,
+            "/redfish/v1/UpdateService/update-multipart",
+        )
     }
 
     /// HGX RUBIN supports only RF_PWR_CYCLE via Manager.Reset.
@@ -879,5 +873,73 @@ mod tests {
         let body = String::from_utf8_lossy(&requests[0].body);
         assert!(body.contains("name=\"UpdateParameters\""));
         assert!(body.contains("{\"Targets\":[]}"));
+    }
+
+    #[tokio::test]
+    async fn hgxb100_multipart_ignores_unsafe_update_service_uri() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/redfish/v1/UpdateService"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ServiceEnabled": true,
+                "MultipartHttpPushUri": "https://attacker.example/upload"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/redfish/v1/UpdateService"))
+            .respond_with(ResponseTemplate::new(202).set_body_json(json!({"Id": "Task-Default"})))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let update_file = tmp.path().join("HGXB100_fw.fwpkg");
+        tokio::fs::write(&update_file, b"firmware").await.unwrap();
+
+        let mut target = HGXB100RFTarget::new(
+            BmcAccess::mock_with_base_url(server.uri(), "mock-hgxb100"),
+            None,
+        );
+        let mut args = cmd_args();
+        args.staged_update = true;
+
+        let task_id = target
+            .update_component(
+                &args,
+                "/unused-push-uri",
+                update_file.to_str().unwrap(),
+                30,
+                None,
+                false,
+            )
+            .await;
+
+        assert_eq!(task_id.as_deref(), Some("Task-Default"));
+    }
+
+    #[test]
+    fn hgxrubin_get_update_uri_ignores_unsafe_device_supplied_values() {
+        let target = HGXRUBINRFTarget::new(BmcAccess::default_stub(), None);
+
+        assert_eq!(
+            target.get_update_uri(&json!({
+                "MultipartHttpPushUri": "/redfish/v1/UpdateService/custom-multipart"
+            })),
+            "/redfish/v1/UpdateService/custom-multipart"
+        );
+
+        for invalid_uri in [
+            "https://attacker.example/upload",
+            "http://attacker.example/upload",
+            "//attacker.example/upload",
+            "/redfish/v1/UpdateService/update-multipart\nX-Injected: yes",
+        ] {
+            assert_eq!(
+                target.get_update_uri(&json!({ "MultipartHttpPushUri": invalid_uri })),
+                "/redfish/v1/UpdateService/update-multipart"
+            );
+        }
     }
 }

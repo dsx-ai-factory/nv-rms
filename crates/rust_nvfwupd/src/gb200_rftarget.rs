@@ -29,7 +29,9 @@ use tokio::time::sleep;
 
 use crate::bmc_access::BmcAccess;
 use crate::gh200_rftarget;
-use crate::rf_target::{CmdArgs, PkgParser, RFTarget, UpdatePreconditionMode};
+use crate::rf_target::{
+    multipart_update_uri_from_service, CmdArgs, PkgParser, RFTarget, UpdatePreconditionMode,
+};
 use crate::util::{BailAction, TraceFlags, Util};
 use crate::utils::Util as NvUtils;
 
@@ -70,6 +72,8 @@ const BACKGROUND_COPY_SINGLE_SHOT_QUERY_RETRIES: usize = 3;
 const BACKGROUND_COPY_SINGLE_SHOT_QUERY_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 const BACKGROUND_COPY_WAIT_LOG_INTERVAL: Duration = Duration::from_secs(60);
 const WRITE_PROTECT_QUERY_TIMEOUT_SECS: u64 = 30;
+const WRITE_PROTECT_INVENTORY_QUERY_ATTEMPTS: usize = 3;
+const WRITE_PROTECT_INVENTORY_QUERY_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 const GLOBAL_WRITE_PROTECT_URI: &str = "/redfish/v1/Chassis/Chassis_0";
 const GLOBAL_WRITE_PROTECT_POINTER: &str = "/Oem/Nvidia/HardwareWriteProtectEnable";
 const FIRMWARE_INVENTORY_URI: &str = "/redfish/v1/UpdateService/FirmwareInventory";
@@ -351,22 +355,51 @@ impl GB200RFTarget {
         &self,
         json_dict: Option<&mut Value>,
     ) -> Result<Vec<String>, String> {
-        let (ok, inventory) = self
-            .dispatch_write_protect_get(FIRMWARE_INVENTORY_URI, json_dict)
-            .await;
-        if !ok {
+        self.discover_firmware_inventory_uris_with_retry_interval(
+            json_dict,
+            WRITE_PROTECT_INVENTORY_QUERY_RETRY_INTERVAL,
+        )
+        .await
+    }
+
+    /// Discover FirmwareInventory URIs with bounded retries for transient failures.
+    ///
+    /// The root FirmwareInventory collection is required before component-level
+    /// `WriteProtected` values can be inspected, so transient failures are
+    /// retried before the precondition returns a hard error.
+    async fn discover_firmware_inventory_uris_with_retry_interval(
+        &self,
+        mut json_dict: Option<&mut Value>,
+        retry_interval: Duration,
+    ) -> Result<Vec<String>, String> {
+        let mut last_inventory = json!({});
+        for attempt in 1..=WRITE_PROTECT_INVENTORY_QUERY_ATTEMPTS {
+            let (ok, inventory) = self
+                .dispatch_write_protect_get(FIRMWARE_INVENTORY_URI, json_dict.as_deref_mut())
+                .await;
+            if ok {
+                return Self::firmware_inventory_member_uris(&inventory);
+            }
+
             tracing::warn!(
                 uri = FIRMWARE_INVENTORY_URI,
+                attempt,
+                max_attempts = WRITE_PROTECT_INVENTORY_QUERY_ATTEMPTS,
                 response = %NvUtils::redact_secret_json_value(&inventory),
                 "Failed to query FirmwareInventory while checking WriteProtected values"
             );
-            return Err(format!(
-                "Failed to query {FIRMWARE_INVENTORY_URI} while checking FirmwareInventory \
-                 WriteProtected values"
-            ));
+            last_inventory = inventory;
+
+            if attempt < WRITE_PROTECT_INVENTORY_QUERY_ATTEMPTS {
+                sleep(retry_interval).await;
+            }
         }
 
-        Self::firmware_inventory_member_uris(&inventory)
+        Err(format!(
+            "Failed to query {FIRMWARE_INVENTORY_URI} while checking FirmwareInventory \
+             WriteProtected values after {WRITE_PROTECT_INVENTORY_QUERY_ATTEMPTS} attempt(s): {}",
+            NvUtils::redact_secret_json_value(&last_inventory)
+        ))
     }
 
     /// Read the optional `WriteProtected` value for one FirmwareInventory item.
@@ -790,14 +823,15 @@ impl RFTarget for GB200RFTarget {
     // ------------------------------------------------------------------
 
     /// Returns the multipart HTTP push URI from the UpdateService response.
+    ///
+    /// Device-provided values must be same-origin paths. Absolute URLs or
+    /// authority-like paths are ignored so Basic Auth and firmware payloads stay
+    /// pinned to the selected BMC endpoint.
     fn get_update_uri(&self, update_service_response: &Value) -> String {
-        if let Some(uri) = update_service_response
-            .get("MultipartHttpPushUri")
-            .and_then(|v| v.as_str())
-        {
-            return uri.to_string();
-        }
-        "/redfish/v1/UpdateService/update-multipart".to_string()
+        multipart_update_uri_from_service(
+            update_service_response,
+            "/redfish/v1/UpdateService/update-multipart",
+        )
     }
 
     // ------------------------------------------------------------------
@@ -1170,7 +1204,7 @@ impl RFTarget for GB200RFTarget {
         update_uri: &str,
         update_file: &str,
         time_out: u64,
-        json_dict: Option<&mut Value>,
+        mut json_dict: Option<&mut Value>,
         parallel_update: bool,
     ) -> Option<String> {
         // --- Resolve OEM parameters (-o/--oem_parameters) ---
@@ -1185,7 +1219,7 @@ impl RFTarget for GB200RFTarget {
                     1,
                     &msg,
                     BailAction::DoNothing,
-                    None,
+                    json_dict.as_deref(),
                     parallel_update,
                 );
                 return None;
@@ -1193,33 +1227,21 @@ impl RFTarget for GB200RFTarget {
         };
 
         // --- Resolve special update parameters (-s/--special) ---
-        let mut param_list: Option<String> = match &cmd_args.special {
-            Some(vals) if !vals.is_empty() => {
-                let first = &vals[0];
-                if self.validate_json(first) {
-                    Some(first.clone())
-                } else if std::path::Path::new(first).is_file() {
-                    match tokio::fs::read_to_string(first).await {
-                        Ok(contents) => Some(contents),
-                        Err(e) => {
-                            Util::bail_nvfwupd_threadsafe(
-                                1,
-                                &format!(
-                                    "Failed to open or read given file {} error: ({})",
-                                    first, e
-                                ),
-                                BailAction::DoNothing,
-                                None,
-                                parallel_update,
-                            );
-                            return None;
-                        }
-                    }
-                } else {
-                    Some(first.clone())
-                }
+        let mut param_list: Option<String> = match self
+            .resolve_json_or_file(cmd_args.special.as_deref(), "special")
+            .await
+        {
+            Ok(value) => value,
+            Err(msg) => {
+                Util::bail_nvfwupd_threadsafe(
+                    1,
+                    &msg,
+                    BailAction::DoNothing,
+                    json_dict.as_deref(),
+                    parallel_update,
+                );
+                return None;
             }
-            _ => None,
         };
 
         // --- Generate default Targets when special is not provided ---
@@ -1250,7 +1272,7 @@ impl RFTarget for GB200RFTarget {
                     1,
                     "Target Platform does not support staged update",
                     BailAction::DoNothing,
-                    None,
+                    json_dict.as_deref(),
                     parallel_update,
                 );
                 return None;
@@ -2094,6 +2116,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn write_protect_inventory_collection_retries_transient_query_failure() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/redfish/v1/UpdateService/FirmwareInventory"))
+            .respond_with(ResponseTemplate::new(503).set_body_json(json!({
+                "error": "temporarily unavailable"
+            })))
+            .expect(2)
+            .up_to_n_times(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/redfish/v1/UpdateService/FirmwareInventory"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "Members": [
+                    {"@odata.id": "/redfish/v1/UpdateService/FirmwareInventory/HGX_FW_GPU_0"}
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let target = GB200RFTarget::new(
+            BmcAccess::mock_with_base_url(server.uri(), "mock-gb200"),
+            None,
+        );
+
+        let uris = target
+            .discover_firmware_inventory_uris_with_retry_interval(None, Duration::ZERO)
+            .await
+            .expect("transient FirmwareInventory collection failures should be retried");
+
+        assert_eq!(
+            uris,
+            vec!["/redfish/v1/UpdateService/FirmwareInventory/HGX_FW_GPU_0".to_string()]
+        );
+    }
+
+    #[tokio::test]
     async fn background_copy_precondition_passes_when_completed() {
         let server = MockServer::start().await;
         mock_write_protect_disabled(&server).await;
@@ -2439,6 +2500,91 @@ mod tests {
 
         assert_eq!(task_id.as_deref(), Some("Task-GB200"));
         assert_eq!(output["Output"][0]["Id"], "Task-GB200");
+    }
+
+    #[test]
+    fn get_update_uri_ignores_unsafe_device_supplied_values() {
+        let target = GB200RFTarget::new(BmcAccess::default_stub(), None);
+        let default_uri = "/redfish/v1/UpdateService/update-multipart";
+
+        assert_eq!(
+            target.get_update_uri(&json!({
+                "MultipartHttpPushUri": "/redfish/v1/UpdateService/custom-multipart"
+            })),
+            "/redfish/v1/UpdateService/custom-multipart"
+        );
+
+        for invalid_uri in [
+            "https://attacker.example/upload",
+            "http://attacker.example/upload",
+            "//attacker.example/upload",
+            "@attacker.example/upload",
+            "/redfish/v1/UpdateService/update-multipart\nX-Injected: yes",
+            "/redfish/v1/UpdateService/update-multipart\u{7}",
+        ] {
+            assert_eq!(
+                target.get_update_uri(&json!({ "MultipartHttpPushUri": invalid_uri })),
+                default_uri
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn update_component_rejects_special_file_with_invalid_json() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/redfish/v1/UpdateService/update-multipart"))
+            .respond_with(ResponseTemplate::new(202).set_body_json(json!({
+                "Id": "unexpected"
+            })))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let update_file = tmp.path().join("P4059_update.fwpkg");
+        let special_file = tmp.path().join("special.txt");
+        tokio::fs::write(&update_file, b"firmware").await.unwrap();
+        tokio::fs::write(&special_file, b"/etc/shadow")
+            .await
+            .unwrap();
+
+        let mut target = GB200RFTarget::new(
+            BmcAccess::mock_with_base_url(server.uri(), "mock-gb200"),
+            None,
+        );
+        let cmd_args = CmdArgs {
+            cmd: "update_fw".to_string(),
+            background: false,
+            details: false,
+            staged_update: false,
+            staged_activate_update: false,
+            quiet: true,
+            special: Some(vec![special_file.to_string_lossy().to_string()]),
+            oem_parameters: None,
+        };
+        let mut output = json!({
+            "Output": [],
+            "Error": [],
+            "Error Code": 0
+        });
+
+        let task_id = target
+            .update_component(
+                &cmd_args,
+                "/redfish/v1/UpdateService/update-multipart",
+                update_file.to_str().unwrap(),
+                30,
+                Some(&mut output),
+                false,
+            )
+            .await;
+
+        assert!(task_id.is_none());
+        assert!(output["Output"].as_array().unwrap().is_empty());
     }
 
     #[tokio::test]

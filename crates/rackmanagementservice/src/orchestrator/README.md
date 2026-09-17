@@ -271,11 +271,20 @@ sequenceDiagram
 - **Batch (parent) jobs.** A parent aggregates several child leaf jobs so a batch
   request (e.g. update firmware on many nodes) has one status handle. A child may
   belong to at most one parent; the parent's status is derived from its children.
-- **Node-idle admission.** `create_job_if_node_idle` (backed by
-  `JobRegistry::create_job`) admits a job only when no other active job targets
-  the same `rack_id` / `node_id`, using an active-node index over queued and
-  running leaf jobs. This serializes mutating operations per node. Cancellation
-  keeps the node busy until the job actually transitions to a terminal state.
+- **Node-idle admission.** `JobRegistry::create_job` admits a node-idle job only
+  when no other active job targets the same `rack_id` / `node_id`. The
+  active-node index holds *every* non-terminal job that carries a node, whatever
+  its position in the tree: queued and running jobs, children, and top-level
+  jobs — including a top-level job that has since become a parent, which stays
+  indexed against its own node until it goes terminal. So a node-idle request is
+  refused whenever any non-terminal job with that `rack_id` / `node_id` is
+  indexed, not only when a queued or running leaf owns the node. This serializes
+  mutating operations per node.
+- **Batch admission.** `create_batch_jobs` reserves one node-idle child per
+  target in request order, rejecting a repeated `rack_id` / `node_id` before it
+  runs the caller's per-node check. It returns both the admitted jobs and the
+  rejected targets with their reasons, so handlers can report every rejected
+  node through `NodeBatchResponse.node_results` instead of dropping it.
 - **Capacity and retention.** New jobs are refused with an at-capacity failure
   once the registry is full. Terminal records are retained for the configured TTL
   (so late pollers still see the result) and then removed — by admission-time

@@ -18,149 +18,24 @@
 //! Utils module for nvfwupd
 //!
 //! Provides log sanitization and utility functions for the nvfwupd tool.
+//!
+//! The generic secret-redaction and log-sanitization primitives now live in
+//! the shared [`common`] crate. This module keeps nvfwupd's public API stable
+//! (re-exporting the sanitizer types and delegating the redaction helpers on
+//! [`Util`]) while retaining the nvfwupd-specific policy: the CLI sanitize
+//! config, global toggle, credential field list, and platform helpers.
 
-use regex::Regex;
-use serde::Serialize;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::process::Command;
-use std::sync::{LazyLock, RwLock};
+use std::sync::RwLock;
 
 use tracing::error;
 
-// ---------------------------------------------------------------------------
-// Built-in log sanitizer patterns
-// ---------------------------------------------------------------------------
-
-/// Supported built-in log sanitizer regex identifiers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum BuiltInLogSanitizers {
-    Ipv4,
-    Ipv6,
-}
-
-impl BuiltInLogSanitizers {
-    /// Returns the regex pattern string for this built-in sanitizer.
-    pub fn pattern(&self) -> &'static str {
-        match self {
-            BuiltInLogSanitizers::Ipv4 => {
-                r"((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])"
-            }
-            BuiltInLogSanitizers::Ipv6 => {
-                concat!(
-                    r"(([0-9a-fA-F]{1,4}:){7,7}[0-9a-fA-F]{1,4}|",
-                    r"([0-9a-fA-F]{1,4}:){1,7}:|",
-                    r"([0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|",
-                    r"([0-9a-fA-F]{1,4}:){1,5}(:[0-9a-fA-F]{1,4}){1,2}|",
-                    r"([0-9a-fA-F]{1,4}:){1,4}(:[0-9a-fA-F]{1,4}){1,3}|",
-                    r"([0-9a-fA-F]{1,4}:){1,3}(:[0-9a-fA-F]{1,4}){1,4}|",
-                    r"([0-9a-fA-F]{1,4}:){1,2}(:[0-9a-fA-F]{1,4}){1,5}|",
-                    r"[0-9a-fA-F]{1,4}:((:[0-9a-fA-F]{1,4}){1,6})|",
-                    r":((:[0-9a-fA-F]{1,4}){1,7}|:)|",
-                    r"fe80:(:[0-9a-fA-F]{0,4}){0,4}%[0-9a-zA-Z]{1,}|",
-                    r"::(ffff(:0{1,4}){0,1}:){0,1}((25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])\.){3,3}",
-                    r"(25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])|",
-                    r"([0-9a-fA-F]{1,4}:){1,4}:((25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])\.){3,3}",
-                    r"(25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9]))"
-                )
-            }
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// LogSanitizer
-// ---------------------------------------------------------------------------
-
-/// Sanitizes log output by replacing sensitive strings (IPs, credentials)
-/// with a configurable replacement string (default `"XXXX"`).
-///
-/// Accepts an explicit list of literal strings to filter as well as built-in
-/// regex patterns for IPv4 / IPv6 addresses. All patterns are compiled into
-/// a single [`Regex`] for efficient matching.
-pub struct LogSanitizer {
-    compiled: Option<Regex>,
-    replacement: String,
-}
-
-impl LogSanitizer {
-    /// Default replacement token used when sensitive data is found.
-    pub const DEFAULT_REPLACEMENT: &'static str = "XXXX";
-
-    /// Creates a new `LogSanitizer`.
-    ///
-    /// # Arguments
-    /// * `string_list`        - Literal strings to filter (will be regex-escaped
-    ///                          and wrapped in word-boundary assertions).
-    /// * `replacement_string` - Token that replaces every match (default `"XXXX"`).
-    /// * `additional_regex`   - Slice of [`BuiltInLogSanitizers`] whose patterns
-    ///                          will be appended to the compiled regex.
-    pub fn new(
-        string_list: Option<&[String]>,
-        replacement_string: Option<&str>,
-        additional_regex: Option<&[BuiltInLogSanitizers]>,
-    ) -> Self {
-        let replacement = replacement_string
-            .unwrap_or(Self::DEFAULT_REPLACEMENT)
-            .to_string();
-
-        let mut patterns: Vec<String> = Vec::new();
-
-        // Escape literal strings and wrap with word-boundary-like lookarounds.
-        // Python used (?<!\w) and (?!\w) which are equivalent to \b on word chars.
-        if let Some(list) = string_list {
-            for s in list {
-                if !s.is_empty() {
-                    let escaped = regex::escape(s);
-                    patterns.push(format!(r"(?-u:\b){}(?-u:\b)", escaped));
-                }
-            }
-        }
-
-        // Append built-in regex patterns.
-        let defaults = [BuiltInLogSanitizers::Ipv4, BuiltInLogSanitizers::Ipv6];
-        let builtins = additional_regex.unwrap_or(&defaults);
-        for sanitizer in builtins {
-            patterns.push(sanitizer.pattern().to_string());
-        }
-
-        let compiled = if patterns.is_empty() {
-            None
-        } else {
-            let joined = patterns.join("|");
-            match Regex::new(&joined) {
-                Ok(re) => Some(re),
-                Err(e) => {
-                    error!("Failed to compile log sanitizer regex: {}", e);
-                    None
-                }
-            }
-        };
-
-        Self {
-            compiled,
-            replacement,
-        }
-    }
-
-    /// Returns a no-op sanitizer that passes strings through unchanged.
-    pub fn noop() -> Self {
-        Self {
-            compiled: None,
-            replacement: Self::DEFAULT_REPLACEMENT.to_string(),
-        }
-    }
-
-    /// Sanitizes `input` by replacing all matches with the replacement string.
-    pub fn sanitize(&self, input: &str) -> String {
-        match &self.compiled {
-            Some(re) => re
-                .replace_all(input, self.replacement.as_str())
-                .into_owned(),
-            None => input.to_string(),
-        }
-    }
-}
+// Re-exported from the shared `common` crate so existing
+// `nvfwupd::utils::{LogSanitizer, BuiltInLogSanitizers}` import paths keep
+// working.
+pub use common::log_sanitize::{BuiltInLogSanitizers, LogSanitizer};
 
 // ---------------------------------------------------------------------------
 // Global sanitization state
@@ -172,47 +47,6 @@ static IS_SANITIZE: RwLock<bool> = RwLock::new(true);
 /// Global sanitization config (key-value pairs parsed from CLI arguments).
 static SANITIZE_CONFIG: std::sync::LazyLock<RwLock<Option<HashMap<String, String>>>> =
     std::sync::LazyLock::new(|| RwLock::new(None));
-
-static SECRET_DOUBLE_QUOTED_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r#"(?ix)
-        (?P<prefix>["']?(?P<key>[A-Za-z0-9_.-]*(?:password|passwd|pwd|pass)[A-Za-z0-9_.-]*)["']?\s*(?:=|:)\s*)
-        "(?P<value>[^"]*)"
-        "#,
-    )
-    .expect("valid double-quoted secret field regex")
-});
-
-static SECRET_SINGLE_QUOTED_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r#"(?ix)
-        (?P<prefix>["']?(?P<key>[A-Za-z0-9_.-]*(?:password|passwd|pwd|pass)[A-Za-z0-9_.-]*)["']?\s*(?:=|:)\s*)
-        '(?P<value>[^']*)'
-        "#,
-    )
-    .expect("valid single-quoted secret field regex")
-});
-
-static SECRET_BARE_EQUALS_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r#"(?ix)
-        (?P<prefix>["']?(?P<key>[A-Za-z0-9_.-]*(?:password|passwd|pwd|pass)[A-Za-z0-9_.-]*)["']?\s*=\s*)
-        (?P<value>[^"',}\]\r\n]*?)
-        (?P<suffix>["']|\s+[A-Za-z0-9_.-]+\s*=|\s*[,}\]]|$)
-        "#,
-    )
-    .expect("valid bare equals secret field regex")
-});
-
-static SECRET_BARE_COLON_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r#"(?ix)
-        (?P<prefix>["']?(?P<key>[A-Za-z0-9_.-]*(?:password|passwd|pwd|pass)[A-Za-z0-9_.-]*)["']?\s*:\s*)
-        (?P<value>[^,\r\n}\])]+)
-        "#,
-    )
-    .expect("valid bare colon secret field regex")
-});
 
 // ---------------------------------------------------------------------------
 // Util
@@ -321,6 +155,32 @@ impl Util {
             .unwrap_or(false)
     }
 
+    /// Return a trimmed same-origin request path when a Redfish/NVUE URI is safe
+    /// to append to the already-selected target base URL.
+    ///
+    /// This intentionally accepts only path-style values such as
+    /// `/redfish/v1/UpdateService/update-multipart`. Absolute URLs,
+    /// authority-style paths (`//host/path`), empty values, and control
+    /// characters are rejected so device/config supplied URIs cannot redirect
+    /// authenticated requests away from the selected target.
+    pub fn same_origin_request_path(uri: &str) -> Option<&str> {
+        if uri.chars().any(char::is_control) {
+            return None;
+        }
+
+        let uri = uri.trim();
+        if uri.is_empty() || !uri.starts_with('/') || uri.starts_with("//") {
+            return None;
+        }
+
+        Some(uri)
+    }
+
+    /// Return whether `uri` is a safe same-origin request path.
+    pub fn valid_same_origin_request_path(uri: &str) -> bool {
+        Self::same_origin_request_path(uri).is_some()
+    }
+
     /// Parses a `"key=value"` config list into a [`HashMap`].
     ///
     /// Returns `None` if `config` is empty or `None`.
@@ -384,125 +244,46 @@ impl Util {
         LogSanitizer::new(Some(&filter_list), None, None)
     }
 
-    /// Returns true when `field` is a password-like key that should never be logged.
+    /// Returns true when `field` is a secret-like key that should never be logged.
+    ///
+    /// Delegates to the shared [`common::redaction`] primitive.
     pub fn is_secret_field_name(field: &str) -> bool {
-        let normalized = field
-            .trim_matches(|c: char| c == '"' || c == '\'' || c.is_ascii_whitespace())
-            .replace(['-', '.'], "_")
-            .to_ascii_lowercase();
-
-        normalized == "password"
-            || normalized == "passwd"
-            || normalized == "pwd"
-            || normalized == "pass"
-            || normalized.ends_with("_password")
-            || normalized.ends_with("_passwd")
-            || normalized.ends_with("_pwd")
-            || normalized.ends_with("_pass")
-            || normalized.contains("password")
-    }
-
-    fn redact_secret_replacement(caps: &regex::Captures<'_>, quoted: bool) -> String {
-        let Some(key) = caps.name("key").map(|m| m.as_str()) else {
-            return caps
-                .get(0)
-                .map(|m| m.as_str().to_string())
-                .unwrap_or_default();
-        };
-
-        if !Self::is_secret_field_name(key) {
-            return caps
-                .get(0)
-                .map(|m| m.as_str().to_string())
-                .unwrap_or_default();
-        }
-
-        let prefix = caps.name("prefix").map(|m| m.as_str()).unwrap_or_default();
-        let suffix = caps.name("suffix").map(|m| m.as_str()).unwrap_or_default();
-        if quoted {
-            format!(r#"{prefix}"{}"{suffix}"#, LogSanitizer::DEFAULT_REPLACEMENT)
-        } else {
-            format!("{prefix}{}{suffix}", LogSanitizer::DEFAULT_REPLACEMENT)
-        }
+        common::redaction::is_secret_field_name(field)
     }
 
     /// Redacts password-like key/value fields independent of SANITIZE_LOG.
+    ///
+    /// Delegates to the shared [`common::redaction`] primitive.
     pub fn redact_secret_fields(data: &str) -> String {
-        let data = SECRET_DOUBLE_QUOTED_RE
-            .replace_all(data, |caps: &regex::Captures<'_>| {
-                Self::redact_secret_replacement(caps, true)
-            })
-            .into_owned();
-        let data = SECRET_SINGLE_QUOTED_RE
-            .replace_all(&data, |caps: &regex::Captures<'_>| {
-                Self::redact_secret_replacement(caps, true)
-            })
-            .into_owned();
-        let data = SECRET_BARE_EQUALS_RE
-            .replace_all(&data, |caps: &regex::Captures<'_>| {
-                Self::redact_secret_replacement(caps, false)
-            })
-            .into_owned();
-        SECRET_BARE_COLON_RE
-            .replace_all(&data, |caps: &regex::Captures<'_>| {
-                Self::redact_secret_replacement(caps, false)
-            })
-            .into_owned()
+        common::redaction::redact_secret_fields(data)
     }
 
     /// Redacts one CLI-style `key=value` argument without relying on whitespace delimiters.
+    ///
+    /// Delegates to the shared [`common::redaction`] primitive.
     pub fn redact_secret_key_value_arg(arg: &str) -> String {
-        let Some((key, _value)) = arg.split_once('=') else {
-            return Self::redact_secret_fields(arg);
-        };
-
-        if Self::is_secret_field_name(key) {
-            format!("{key}={}", LogSanitizer::DEFAULT_REPLACEMENT)
-        } else {
-            Self::redact_secret_fields(arg)
-        }
+        common::redaction::redact_secret_key_value_arg(arg)
     }
 
     /// Redacts a value when its owning key is password-like, otherwise scans the value.
+    ///
+    /// Delegates to the shared [`common::redaction`] primitive.
     pub fn redact_secret_value_for_key(key: &str, value: &str) -> String {
-        if Self::is_secret_field_name(key) {
-            LogSanitizer::DEFAULT_REPLACEMENT.to_string()
-        } else {
-            Self::redact_secret_fields(value)
-        }
+        common::redaction::redact_secret_value_for_key(key, value)
     }
 
     /// Recursively redacts password-like keys from a JSON value.
+    ///
+    /// Delegates to the shared [`common::redaction`] primitive.
     pub fn redact_secret_json_value(value: &Value) -> Value {
-        match value {
-            Value::Object(map) => Value::Object(
-                map.iter()
-                    .map(|(key, value)| {
-                        let redacted = if Self::is_secret_field_name(key) {
-                            Value::String(LogSanitizer::DEFAULT_REPLACEMENT.to_string())
-                        } else {
-                            Self::redact_secret_json_value(value)
-                        };
-                        (key.clone(), redacted)
-                    })
-                    .collect(),
-            ),
-            Value::Array(values) => {
-                Value::Array(values.iter().map(Self::redact_secret_json_value).collect())
-            }
-            Value::String(value) => Value::String(Self::redact_secret_fields(value)),
-            _ => value.clone(),
-        }
+        common::redaction::redact_secret_json_value(value)
     }
 
     /// Pretty-prints JSON after recursively redacting password-like fields.
+    ///
+    /// Delegates to the shared [`common::redaction`] primitive.
     pub fn redacted_json_pretty_4space(value: &Value) -> String {
-        let redacted = Self::redact_secret_json_value(value);
-        let buf = Vec::new();
-        let formatter = serde_json::ser::PrettyFormatter::with_indent(b"    ");
-        let mut ser = serde_json::Serializer::with_formatter(buf, formatter);
-        redacted.serialize(&mut ser).unwrap_or(());
-        String::from_utf8(ser.into_inner()).unwrap_or_default()
+        common::redaction::redacted_json_pretty_4space(value)
     }
 
     /// Sanitizes `data` using the current global sanitization config.
@@ -589,38 +370,11 @@ impl Drop for SanitizeTestGuard {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_sanitize_ipv4() {
-        let sanitizer = LogSanitizer::new(None, None, Some(&[BuiltInLogSanitizers::Ipv4]));
-        let result = sanitizer.sanitize("Connecting to 192.168.1.100 on port 443");
-        assert_eq!(result, "Connecting to XXXX on port 443");
-    }
-
-    #[test]
-    fn test_sanitize_literal_strings() {
-        let secrets = vec!["admin".to_string(), "s3cret".to_string()];
-        let sanitizer = LogSanitizer::new(Some(&secrets), None, Some(&[]));
-        let result = sanitizer.sanitize("user=admin pass=s3cret");
-        assert_eq!(result, "user=XXXX pass=XXXX");
-    }
-
-    #[test]
-    fn test_noop_sanitizer() {
-        let sanitizer = LogSanitizer::noop();
-        let input = "unchanged 192.168.1.1 data";
-        assert_eq!(sanitizer.sanitize(input), input);
-    }
-
-    #[test]
-    fn test_custom_replacement() {
-        let sanitizer = LogSanitizer::new(
-            None,
-            Some("[REDACTED]"),
-            Some(&[BuiltInLogSanitizers::Ipv4]),
-        );
-        let result = sanitizer.sanitize("host 10.0.0.1 is up");
-        assert_eq!(result, "host [REDACTED] is up");
-    }
+    // NOTE: the generic `LogSanitizer` and `redact_secret_*` primitives are
+    // owned and unit-tested by the shared `utils` crate. The tests below cover
+    // the nvfwupd-specific policy layered on top (CLI sanitize config, the
+    // global toggle, `sanitize_log`, and platform helpers); they still exercise
+    // the delegation end-to-end via `Util`/the re-exported `LogSanitizer`.
 
     #[test]
     fn test_default_log_config() {
@@ -633,6 +387,26 @@ mod tests {
     fn ping_to_check_system_rejects_option_shaped_hosts() {
         assert!(!Util::ping_to_check_system("-n"));
         assert!(!Util::ping_to_check_system("--help"));
+    }
+
+    #[test]
+    fn same_origin_request_path_rejects_off_origin_values() {
+        assert_eq!(
+            Util::same_origin_request_path(" /redfish/v1/UpdateService "),
+            Some("/redfish/v1/UpdateService")
+        );
+
+        for value in [
+            "",
+            "https://attacker.example/upload",
+            "http://attacker.example/upload",
+            "//attacker.example/upload",
+            "redfish/v1/UpdateService",
+            "/redfish/v1/UpdateService\nInjected: yes",
+            "/redfish/v1/UpdateService\u{7}",
+        ] {
+            assert!(Util::same_origin_request_path(value).is_none());
+        }
     }
 
     #[test]
@@ -692,82 +466,6 @@ mod tests {
         assert!(!result.contains("admin"));
         assert!(!result.contains("s3cret"));
         assert!(!result.contains("10.0.0.1"));
-    }
-
-    #[test]
-    fn test_redact_secret_fields_masks_password_like_keys() {
-        let secret = "plain_secret";
-        let cases = [
-            format!("password={secret}"),
-            format!("password={secret} with spaces"),
-            format!("RF_PASSWORD: {secret}"),
-            format!(r#"{{"RF_PASSWORD": "{secret}"}}"#),
-            format!("{{'RF_Pass': '{secret}'}}"),
-            format!(r#"{{"target": ["ip=192.0.2.1", "password={secret}"]}}"#),
-            format!(r#"{{"target": ["ip=192.0.2.1", "password={secret} with spaces"]}}"#),
-        ];
-
-        for case in cases {
-            let redacted = Util::redact_secret_fields(&case);
-            assert!(!redacted.contains(secret), "{redacted}");
-            assert!(!redacted.contains("with spaces"), "{redacted}");
-            assert!(redacted.contains(LogSanitizer::DEFAULT_REPLACEMENT));
-        }
-
-        assert_eq!(Util::redact_secret_fields("compass=north"), "compass=north");
-    }
-
-    #[test]
-    fn test_redact_secret_key_value_arg_masks_whitespace_password_value() {
-        let redacted = Util::redact_secret_key_value_arg("password=alpha beta gamma");
-        assert_eq!(redacted, "password=XXXX");
-
-        let redacted = Util::redact_secret_key_value_arg("user=admin");
-        assert_eq!(redacted, "user=admin");
-    }
-
-    #[test]
-    fn test_redact_secret_json_value_masks_nested_passwords() {
-        let value = serde_json::json!({
-            "Targets": [
-                {
-                    "BMC_IP": "192.0.2.1",
-                    "RF_USERNAME": "admin",
-                    "RF_PASSWORD": "plain_secret",
-                    "Nested": {
-                        "bmc_ssh_password": "other_secret"
-                    }
-                }
-            ]
-        });
-
-        let redacted = Util::redact_secret_json_value(&value);
-        let rendered = redacted.to_string();
-        assert!(!rendered.contains("plain_secret"));
-        assert!(!rendered.contains("other_secret"));
-        assert!(rendered.contains(LogSanitizer::DEFAULT_REPLACEMENT));
-    }
-
-    #[test]
-    fn test_redacted_json_pretty_4space_masks_response_fields() {
-        let value = serde_json::json!({
-            "Messages": [
-                {
-                    "Message": "BMC echoed password=raw response secret",
-                    "MessageArgs": ["password=arg secret"]
-                }
-            ],
-            "Oem": {
-                "Password": "nested secret"
-            }
-        });
-
-        let rendered = Util::redacted_json_pretty_4space(&value);
-
-        assert!(!rendered.contains("raw response secret"));
-        assert!(!rendered.contains("arg secret"));
-        assert!(!rendered.contains("nested secret"));
-        assert!(rendered.contains(LogSanitizer::DEFAULT_REPLACEMENT));
     }
 
     #[test]

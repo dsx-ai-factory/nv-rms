@@ -22,6 +22,7 @@ use std::collections::BTreeMap;
 use crate::NVUE_V1_SERVER;
 use crate::action::SimpleAction;
 use crate::uri::path_segment;
+use crate::util::deserialize_optional_lenient_string;
 
 use serde::{Deserialize, Serialize};
 
@@ -119,19 +120,35 @@ fn meaningful_platform_string(value: &str) -> Option<&str> {
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ChassisLocation {
     /// Chassis serial number.
-    #[serde(default, rename = "chassis-sn")]
+    #[serde(
+        default,
+        rename = "chassis-sn",
+        deserialize_with = "deserialize_optional_lenient_string"
+    )]
     pub chassis_sn: Option<String>,
 
     /// Slot number.
-    #[serde(default, rename = "slot-number")]
+    #[serde(
+        default,
+        rename = "slot-number",
+        deserialize_with = "deserialize_optional_lenient_string"
+    )]
     pub slot_number: Option<String>,
 
     /// Topology ID.
-    #[serde(default, rename = "topology-id")]
+    #[serde(
+        default,
+        rename = "topology-id",
+        deserialize_with = "deserialize_optional_lenient_string"
+    )]
     pub topology_id: Option<String>,
 
     /// Tray index.
-    #[serde(default, rename = "tray-index")]
+    #[serde(
+        default,
+        rename = "tray-index",
+        deserialize_with = "deserialize_optional_lenient_string"
+    )]
     pub tray_index: Option<String>,
 }
 
@@ -340,6 +357,38 @@ mod tests {
             let platform: Platform = serde_json::from_str(case.input).unwrap();
             assert_eq!(platform.model(), case.expected, "{}", case.name);
         }
+    }
+
+    #[test]
+    fn chassis_location_accepts_string_and_numeric_tray_indexes() {
+        let string_location: ChassisLocation =
+            serde_json::from_str(r#"{"tray-index":"7"}"#).unwrap();
+
+        let numeric_location: ChassisLocation =
+            serde_json::from_str(r#"{"tray-index":7}"#).unwrap();
+
+        assert_eq!(string_location.tray_index.as_deref(), Some("7"));
+        assert_eq!(numeric_location.tray_index.as_deref(), Some("7"));
+    }
+
+    #[test]
+    fn chassis_location_fields_are_lenient_about_numeric_and_wrong_shaped_values() {
+        let numeric_location: ChassisLocation =
+            serde_json::from_str(r#"{"chassis-sn":123,"slot-number":4,"topology-id":56}"#).unwrap();
+
+        assert_eq!(numeric_location.chassis_sn.as_deref(), Some("123"));
+        assert_eq!(numeric_location.slot_number.as_deref(), Some("4"));
+        assert_eq!(numeric_location.topology_id.as_deref(), Some("56"));
+
+        let wrong_shaped_location: ChassisLocation = serde_json::from_str(
+            r#"{"chassis-sn":true,"slot-number":[1],"topology-id":{},"tray-index":null}"#,
+        )
+        .unwrap();
+
+        assert_eq!(wrong_shaped_location.chassis_sn, None);
+        assert_eq!(wrong_shaped_location.slot_number, None);
+        assert_eq!(wrong_shaped_location.topology_id, None);
+        assert_eq!(wrong_shaped_location.tray_index, None);
     }
 
     #[test]

@@ -897,6 +897,10 @@ mod tests {
         assert_eq!(registry.parent_for_job(&c2_id).as_ref(), Some(&parent_id));
     }
 
+    /// Becoming a parent does not evict a job from the active-node index: the
+    /// index tracks non-terminal jobs carrying a node, not leaves, so a
+    /// top-level job that gains children still blocks node-idle admission for
+    /// its own node.
     #[test]
     fn top_level_job_can_become_parent_without_leaving_active_index() {
         let registry = Arc::new(JobRegistry::<TestDomain>::new(TTL));
@@ -1115,5 +1119,289 @@ mod tests {
             .create_leaf(test_spec("rack", "other"))
             .expect("registry write lock must remain usable after observer panic");
         assert!(registry.get(pending.id()).is_some());
+    }
+
+    mod lifecycle_log_chokepoints {
+        //! Chokepoint log coverage: [`JobRegistry::create_job`] and
+        //! [`JobRegistry::update`] are the only places that emit `job
+        //! created`/`job started`/`job progress`/`job completed`/`job
+        //! failed`, so these tests exercise the registry directly (through
+        //! `create_leaf`/`create_parent`/`create_child` and the returned
+        //! [`JobHandle`]) rather than any specific domain's call sites.
+        use std::sync::Mutex;
+
+        use tracing_subscriber::prelude::*;
+
+        use super::*;
+
+        #[derive(Clone)]
+        struct TestWriter {
+            buf: Arc<Mutex<Vec<u8>>>,
+        }
+
+        impl TestWriter {
+            fn new() -> Self {
+                Self {
+                    buf: Arc::new(Mutex::new(Vec::new())),
+                }
+            }
+
+            fn text(&self) -> String {
+                let guard = self.buf.lock().unwrap();
+                String::from_utf8_lossy(&guard).into_owned()
+            }
+        }
+
+        impl std::io::Write for TestWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                let mut guard = self.buf.lock().unwrap();
+                guard.write(buf)
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        /// Runs `emit` under a logfmt subscriber (no span logs) and returns
+        /// every event line it produced, so assertions can select the line
+        /// for a specific chokepoint message.
+        fn capture_event_lines(emit: impl FnOnce()) -> Vec<String> {
+            let writer = TestWriter::new();
+            let cloned_writer = writer.clone();
+            let layer = crate::logging::logfmt::layer()
+                .with_writer(Arc::new(move || Box::new(cloned_writer.clone())))
+                .with_span_logs(false);
+            let subscriber = tracing_subscriber::registry().with(layer);
+
+            tracing::subscriber::with_default(subscriber, || {
+                tracing::callsite::rebuild_interest_cache();
+                emit();
+            });
+
+            writer.text().lines().map(ToString::to_string).collect()
+        }
+
+        fn find_line<'a>(lines: &'a [String], msg: &str) -> &'a str {
+            let matches: Vec<&String> = lines
+                .iter()
+                .filter(|line| line.contains(&format!(r#"msg="{msg}""#)))
+                .collect();
+            assert_eq!(
+                matches.len(),
+                1,
+                "expected exactly one {msg:?} line, got {matches:?} (all lines: {lines:?})"
+            );
+            matches[0]
+        }
+
+        fn assert_no_line(lines: &[String], msg: &str) {
+            assert!(
+                !lines
+                    .iter()
+                    .any(|line| line.contains(&format!(r#"msg="{msg}""#))),
+                "expected no {msg:?} line, got: {lines:?}"
+            );
+        }
+
+        #[test]
+        fn create_leaf_logs_job_created_once_with_job_id_and_description() {
+            let registry = Arc::new(JobRegistry::<TestDomain>::new(TTL));
+            // Kept alive past `capture_event_lines` so the RAII "job
+            // abandoned" cleanup on drop doesn't pollute the captured lines.
+            let mut pending = None;
+
+            let lines = capture_event_lines(|| {
+                pending = Some(registry.create_leaf(test_spec("rack-1", "node-1")).unwrap());
+            });
+
+            let job_id = pending.unwrap().id().to_string();
+            let line = find_line(&lines, "job created");
+            assert!(line.contains(&format!("job_id={job_id}")), "{line}");
+            assert!(line.contains("parent_job_id=None"), "{line}");
+            assert!(line.contains("rack_id=rack-1"), "{line}");
+            assert!(line.contains("node_id=node-1"), "{line}");
+            assert!(line.contains(r#"description=Queued"#), "{line}");
+            assert_no_line(&lines, "job failed");
+        }
+
+        #[test]
+        fn create_leaf_with_empty_node_id_still_logs_job_created() {
+            // A leaf created via `create_leaf_if_node_idle` with no target
+            // node (e.g. a batch-style job) must not be mistaken for a
+            // parent just because its `node_id` happens to be empty too.
+            let registry = Arc::new(JobRegistry::<TestDomain>::new(TTL));
+            let mut pending = None;
+
+            let lines = capture_event_lines(|| {
+                pending = Some(
+                    registry
+                        .create_leaf_if_node_idle(test_spec("rack-1", ""))
+                        .unwrap(),
+                );
+            });
+
+            let job_id = pending.unwrap().id().to_string();
+            let line = find_line(&lines, "job created");
+            assert!(line.contains(&format!("job_id={job_id}")), "{line}");
+            assert!(line.contains("parent_job_id=None"), "{line}");
+            assert!(line.contains("rack_id=rack-1"), "{line}");
+            assert!(line.contains("node_id="), "{line}");
+        }
+
+        #[test]
+        fn create_parent_logs_job_created_with_none_parent_job_id() {
+            let registry = Arc::new(JobRegistry::<TestDomain>::new(TTL));
+            // Kept alive past `capture_event_lines` so the RAII "job
+            // abandoned" cleanup on drop doesn't pollute the captured lines.
+            let mut parent = None;
+
+            let lines = capture_event_lines(|| {
+                parent = Some(
+                    registry
+                        .create_parent(ParentJobSpec::new(
+                            "rack-1",
+                            "Batch accepting child jobs",
+                            tracing::Span::none(),
+                        ))
+                        .unwrap(),
+                );
+            });
+            let _parent = parent;
+
+            let line = find_line(&lines, "job created");
+            assert!(line.contains("parent_job_id=None"), "{line}");
+            assert!(line.contains("rack_id=rack-1"), "{line}");
+            assert_no_line(&lines, "job failed");
+        }
+
+        #[test]
+        fn create_child_logs_job_created_with_parent_job_id() {
+            let registry = Arc::new(JobRegistry::<TestDomain>::new(TTL));
+            let parent = registry
+                .create_parent(ParentJobSpec::new(
+                    "rack-1",
+                    "Batch accepting child jobs",
+                    tracing::Span::none(),
+                ))
+                .unwrap();
+            let parent_id = parent.id().to_string();
+            // Kept alive past `capture_event_lines` so the RAII "job
+            // abandoned" cleanup on drop doesn't pollute the captured lines.
+            let mut child = None;
+
+            let lines = capture_event_lines(|| {
+                child = Some(
+                    registry
+                        .create_child(
+                            &JobId::from(parent_id.as_str()),
+                            test_spec("rack-1", "node-1"),
+                        )
+                        .unwrap(),
+                );
+            });
+
+            let child_id = child.unwrap().id().to_string();
+            let line = find_line(&lines, "job created");
+            assert!(line.contains(&format!("job_id={child_id}")), "{line}");
+            assert!(
+                line.contains(&format!("parent_job_id={parent_id}")),
+                "{line}"
+            );
+            assert!(line.contains("rack_id=rack-1"), "{line}");
+            assert!(line.contains("node_id=node-1"), "{line}");
+            assert_no_line(&lines, "job failed");
+        }
+
+        #[test]
+        fn first_progress_call_logs_job_started_not_progress() {
+            let registry = Arc::new(JobRegistry::<TestDomain>::new(TTL));
+            let pending = registry.create_leaf(test_spec("rack-1", "node-1")).unwrap();
+            let job_id = pending.id().to_string();
+
+            let lines = capture_event_lines(|| {
+                pending.progress("Uploading firmware image");
+            });
+
+            let line = find_line(&lines, "job started");
+            assert!(line.contains(&format!("job_id={job_id}")), "{line}");
+            assert!(
+                line.contains(r#"description="Uploading firmware image""#),
+                "{line}"
+            );
+            assert_no_line(&lines, "job progress");
+        }
+
+        #[test]
+        fn later_progress_call_logs_job_progress_not_started_again() {
+            let registry = Arc::new(JobRegistry::<TestDomain>::new(TTL));
+            let pending = registry.create_leaf(test_spec("rack-1", "node-1")).unwrap();
+            let job_id = pending.id().to_string();
+            pending.progress("Uploading firmware image");
+
+            let lines = capture_event_lines(|| {
+                pending.progress("Verifying firmware image");
+            });
+
+            let line = find_line(&lines, "job progress");
+            assert!(line.contains(&format!("job_id={job_id}")), "{line}");
+            assert!(line.contains("rack_id=rack-1"), "{line}");
+            assert!(line.contains("node_id=node-1"), "{line}");
+            assert!(
+                line.contains(r#"description="Verifying firmware image""#),
+                "{line}"
+            );
+            assert_no_line(&lines, "job started");
+        }
+
+        #[test]
+        fn complete_logs_job_completed_once_with_description() {
+            let registry = Arc::new(JobRegistry::<TestDomain>::new(TTL));
+            let pending = registry.create_leaf(test_spec("rack-1", "node-1")).unwrap();
+            let job_id = pending.id().to_string();
+
+            let lines = capture_event_lines(|| {
+                pending.complete("Firmware update completed", r#"{"status":"ok"}"#);
+            });
+
+            let line = find_line(&lines, "job completed");
+            assert!(line.contains(&format!("job_id={job_id}")), "{line}");
+            assert!(
+                line.contains(r#"description="Firmware update completed""#),
+                "{line}"
+            );
+            assert_no_line(&lines, "job failed");
+        }
+
+        #[test]
+        fn fail_logs_job_failed_once_with_message_not_placeholder_description() {
+            let registry = Arc::new(JobRegistry::<TestDomain>::new(TTL));
+            let pending = registry.create_leaf(test_spec("rack-1", "node-1")).unwrap();
+            let job_id = pending.id().to_string();
+
+            let lines = capture_event_lines(|| {
+                pending.fail(JobFailure::new(TestFailure::Explicit, "disk full"));
+            });
+
+            let line = find_line(&lines, "job failed");
+            assert!(line.contains(&format!("job_id={job_id}")), "{line}");
+            assert!(line.contains(r#"description="disk full""#), "{line}");
+            assert_no_line(&lines, "job completed");
+        }
+
+        #[test]
+        fn dropping_unfinished_handle_logs_job_failed_via_raii_cleanup() {
+            let registry = Arc::new(JobRegistry::<TestDomain>::new(TTL));
+            let pending = registry.create_leaf(test_spec("rack-1", "node-1")).unwrap();
+            let job_id = pending.id().to_string();
+
+            let lines = capture_event_lines(|| {
+                drop(pending);
+            });
+
+            let line = find_line(&lines, "job failed");
+            assert!(line.contains(&format!("job_id={job_id}")), "{line}");
+            assert!(line.contains(r#"description="job abandoned""#), "{line}");
+        }
     }
 }

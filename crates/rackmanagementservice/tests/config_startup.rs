@@ -74,8 +74,7 @@ fn missing_config_exits_with_clear_error() {
 #[test]
 fn invalid_config_exits_with_clear_error() {
     let tmp = tempfile::tempdir().unwrap();
-    // Unknown key is rejected by deny_unknown_fields.
-    let path = write_config(tmp.path(), "definitely_not_a_real_key = 123\n");
+    let path = write_config(tmp.path(), "port = \"not-a-number\"\n");
 
     let output = Command::new(BIN)
         .arg("--config")

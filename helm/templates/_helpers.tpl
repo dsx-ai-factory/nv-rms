@@ -147,6 +147,17 @@ is violated, or when either value is zero (the binary rejects both at startup).
 {{- end -}}
 
 {{/*
+Validate Grafana dashboard values when grafana.dashboard.enabled is true.
+Fails helm rendering when datasourceUid is unset or empty, surfacing the
+misconfiguration at template time rather than silently at runtime.
+*/}}
+{{- define "rack-manager.validateGrafanaDashboard" -}}
+{{- if not .Values.grafana.dashboard.datasourceUid -}}
+{{- fail "grafana.dashboard.datasourceUid must not be empty when grafana.dashboard.enabled is true" -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
 Guard against values that still use the old rmsPostgres.patchForgeCluster key
 (renamed to rmsPostgres.patchExternalCluster). values.schema.json does not
 constrain rmsPostgres, so Helm silently merges the stale key and would
@@ -213,9 +224,29 @@ sftp_upload_timeout_seconds = {{ .Values.apiServer.sftpUploadTimeoutSeconds }}
 sftp_step_timeout_seconds = {{ .Values.apiServer.sftpStepTimeoutSeconds }}
 {{- if .Values.apiServer.expectedInventoryProfiles }}
 
-[workflows.expected_inventory_profiles]
 {{- range $profile := keys .Values.apiServer.expectedInventoryProfiles | sortAlpha }}
-{{ $profile | quote }} = {{ index $.Values.apiServer.expectedInventoryProfiles $profile | toJson }}
+{{- $expected := index $.Values.apiServer.expectedInventoryProfiles $profile }}
+
+[workflows.expected_inventory_profiles.{{ $profile | quote }}]
+{{- if kindIs "slice" $expected }}
+ap_names = {{ $expected | toJson }}
+{{- else }}
+ap_names = {{ default (list) (index $expected "apNames") | toJson }}
+{{- $flintDevices := index $expected "flintDevices" }}
+{{- if $flintDevices }}
+
+[workflows.expected_inventory_profiles.{{ $profile | quote }}.flint_devices]
+{{- if hasKey $flintDevices "cx7" }}
+cx7 = {{ index $flintDevices "cx7" }}
+{{- end }}
+{{- if hasKey $flintDevices "cx8" }}
+cx8 = {{ index $flintDevices "cx8" }}
+{{- end }}
+{{- if hasKey $flintDevices "bf3Nic" }}
+bf3_nic = {{ index $flintDevices "bf3Nic" }}
+{{- end }}
+{{- end }}
+{{- end }}
 {{- end }}
 {{- end }}
 
