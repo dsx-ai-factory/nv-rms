@@ -545,12 +545,9 @@ impl SwitchMtlsMaterialPaths {
 }
 
 impl SwitchGb200Nvidia {
-    /// Reuses the active NVUE API certificate objects for NMX Controller mTLS.
-    ///
-    /// The certificate RPC provisions and verifies NVUE before scale-up
-    /// reconciliation selects a primary. Reusing that binding avoids importing
-    /// duplicate certificate objects during each primary rotation.
-    pub(crate) async fn bind_nmx_controller_to_nvue_api_material(&self) -> Result<()> {
+    /// Returns the `(ca_id, cert_id)` bound to the NVUE API, which
+    /// `ConfigureSwitchCertificate` must have configured first.
+    async fn nvue_api_material_ids(&self) -> Result<(String, String)> {
         let api = self
             .nvue_client()?
             .get_system_api(HttpClient::DEFAULT_TIMEOUT)
@@ -563,7 +560,8 @@ impl SwitchGb200Nvidia {
                 RmsError::failed_precondition(
                     "NVUE API certificate is not configured; run ConfigureSwitchCertificate first",
                 )
-            })?;
+            })?
+            .to_string();
 
         let mtls = self.get_nvue_api_mtls_configuration().await?;
 
@@ -575,15 +573,67 @@ impl SwitchGb200Nvidia {
                     "NVUE API mTLS CA certificate is not configured; run \
                      ConfigureSwitchCertificate first",
                 )
-            })?;
+            })?
+            .to_string();
 
-        self.bind_cluster_app_mtls("nmx-controller", ca_id, cert_id)
+        Ok((ca_id, cert_id))
+    }
+
+    /// Reuses the active NVUE API certificate objects for NMX Controller mTLS.
+    ///
+    /// The certificate RPC provisions and verifies NVUE before scale-up
+    /// reconciliation selects a primary. Reusing that binding avoids importing
+    /// duplicate certificate objects during each primary rotation.
+    pub(crate) async fn bind_nmx_controller_to_nvue_api_material(&self) -> Result<()> {
+        let (ca_id, cert_id) = self.nvue_api_material_ids().await?;
+
+        self.bind_cluster_app_mtls("nmx-controller", &ca_id, &cert_id)
             .await?;
 
-        self.verify_cluster_app_mtls("nmx-controller", ca_id, cert_id)
+        self.verify_cluster_app_mtls("nmx-controller", &ca_id, &cert_id)
             .await?;
 
         Ok(())
+    }
+
+    /// Reports whether NMX Controller mTLS is bound to the certificate objects
+    /// the NVUE API currently uses.
+    ///
+    /// Certificate rotation refreshes the NVUE binding first, so a mismatch
+    /// means NMX Controller still serves the superseded certificate even while
+    /// that certificate keeps validating.
+    pub(crate) async fn nmx_controller_binding_is_current(&self) -> Result<bool> {
+        let (ca_id, cert_id) = self.nvue_api_material_ids().await?;
+
+        let certificate = self
+            .get_cluster_app_manager_leaf("nmx-controller", "certificate")
+            .await?;
+        let ca_certificate = self
+            .get_cluster_app_manager_leaf("nmx-controller", "ca-certificate")
+            .await?;
+        let encryption = self
+            .get_cluster_app_manager_leaf("nmx-controller", "encryption")
+            .await?;
+
+        let bound_cert = extract_string_field(&certificate, "certificate");
+        let bound_ca = extract_string_field(&ca_certificate, "ca-certificate");
+        let bound_encryption = extract_string_field(&encryption, "encryption");
+        let is_current = bound_cert == Some(cert_id.as_str())
+            && bound_ca == Some(ca_id.as_str())
+            && bound_encryption == Some("mtls");
+
+        tracing::debug!(
+            node = %self.id(),
+            nvue_certificate = %cert_id,
+            nvue_ca_certificate = %ca_id,
+            nmx_certificate = bound_cert.unwrap_or("(unset)"),
+            nmx_ca_certificate = bound_ca.unwrap_or("(unset)"),
+            nmx_encryption = bound_encryption.unwrap_or("(unset)"),
+            is_current,
+            "compared NMX Controller mTLS binding with NVUE API material"
+        );
+
+        Ok(is_current)
     }
 
     pub(crate) async fn unset_mtls_services(
@@ -1409,6 +1459,76 @@ mod tests {
                 .message
                 .contains("run ConfigureSwitchCertificate first")
         );
+    }
+
+    async fn mount_nmx_controller_binding(
+        server: &MockServer,
+        nvue_cert: &str,
+        nvue_ca: &str,
+        nmx_cert: &str,
+        nmx_ca: &str,
+        nmx_encryption: &str,
+    ) {
+        let responses = [
+            (
+                NVUE_SYSTEM_API_PATH.to_string(),
+                json!({"certificate": nvue_cert}),
+            ),
+            (
+                NVUE_SYSTEM_API_MTLS_PATH.to_string(),
+                json!({"ca-certificate": nvue_ca}),
+            ),
+            (
+                "/nvue_v1/cluster/apps/nmx-controller/manager/certificate".to_string(),
+                json!({"certificate": nmx_cert}),
+            ),
+            (
+                "/nvue_v1/cluster/apps/nmx-controller/manager/ca-certificate".to_string(),
+                json!({"ca-certificate": nmx_ca}),
+            ),
+            (
+                "/nvue_v1/cluster/apps/nmx-controller/manager/encryption".to_string(),
+                json!({"encryption": nmx_encryption}),
+            ),
+        ];
+
+        for (endpoint, body) in responses {
+            Mock::given(method("GET"))
+                .and(path(endpoint))
+                .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                .mount(server)
+                .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn nmx_controller_binding_is_current_when_ids_match_nvue_api() {
+        let server = MockServer::start().await;
+        mount_nmx_controller_binding(&server, "cert-2", "ca-1", "cert-2", "ca-1", "mtls").await;
+
+        let switch = SwitchGb200Nvidia::for_test(&server.uri());
+
+        assert!(switch.nmx_controller_binding_is_current().await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn nmx_controller_binding_is_stale_when_nvue_certificate_was_rotated() {
+        let server = MockServer::start().await;
+        mount_nmx_controller_binding(&server, "cert-2", "ca-1", "cert-1", "ca-1", "mtls").await;
+
+        let switch = SwitchGb200Nvidia::for_test(&server.uri());
+
+        assert!(!switch.nmx_controller_binding_is_current().await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn nmx_controller_binding_is_stale_when_encryption_is_not_mtls() {
+        let server = MockServer::start().await;
+        mount_nmx_controller_binding(&server, "cert-2", "ca-1", "cert-2", "ca-1", "none").await;
+
+        let switch = SwitchGb200Nvidia::for_test(&server.uri());
+
+        assert!(!switch.nmx_controller_binding_is_current().await.unwrap());
     }
 
     #[tokio::test]

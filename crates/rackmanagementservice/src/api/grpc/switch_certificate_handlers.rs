@@ -703,11 +703,39 @@ async fn test_nmx_hello_with_retries(
 }
 
 /// Configures manager mTLS after a Hello transport failure, then verifies it.
+/// Decides whether the primary's NMX Controller mTLS binding must be
+/// (re)configured.
+///
+/// A stale binding is reconfigured even though the superseded certificate
+/// still completes a handshake; otherwise a rotated NVUE certificate would only
+/// reach NMX Controller once the old one expired. A current binding is only
+/// checked: rebinding identical certificate objects cannot fix a failed
+/// connectivity check, so that failure is reported as-is. Only when the
+/// binding cannot be read does a connect failure trigger the rebind, because
+/// the binding may then be missing altogether.
 async fn ensure_primary_nmx_controller_mtls(
+    binding_is_current: impl Future<Output = Result<bool>>,
     check: impl Future<Output = Result<()>>,
     configure: impl Future<Output = Result<()>>,
     verify: impl Future<Output = Result<()>>,
 ) -> Result<()> {
+    match binding_is_current.await {
+        Ok(true) => return check.await,
+        Ok(false) => {
+            tracing::info!(
+                "configuring primary NMX Controller mTLS with the current NVUE API certificate material"
+            );
+            configure.await?;
+            return verify.await;
+        }
+        Err(error) => {
+            tracing::warn!(
+                error = %error.message,
+                "could not compare NMX Controller mTLS binding with NVUE API material; deciding by connectivity check"
+            );
+        }
+    }
+
     match check.await {
         Ok(()) => return Ok(()),
         Err(error) if nmx_hello_connect_error(&error) => {
@@ -1688,9 +1716,12 @@ async fn run_switch_certificate_job(
 impl RackManagerServiceImpl {
     /// Ensures the selected primary uses the configured NMX Controller security mode.
     ///
-    /// NMX Hello is the idempotent connectivity check. When the selected switch
-    /// does not yet expose NMX Controller through mTLS, this path reuses the
-    /// certificate objects already bound by `ConfigureSwitchCertificate`.
+    /// NMX Controller is rebound whenever its certificate objects differ from
+    /// the ones `ConfigureSwitchCertificate` bound to the NVUE API, so a
+    /// rotated certificate reaches NMX Controller before the old one expires.
+    /// Otherwise NMX Hello is the idempotent connectivity check and its result
+    /// is final; a connect failure only triggers the rebind when the binding
+    /// could not be read.
     pub(crate) async fn enforce_primary_nmx_controller_security(
         &self,
         switch: &dyn SwitchScaleUpManagement,
@@ -1721,6 +1752,7 @@ impl RackManagerServiceImpl {
         );
 
         ensure_primary_nmx_controller_mtls(
+            switch.nmx_controller_binding_is_current(),
             async {
                 prepare_nmx_controller_for_hello(switch, switch_host).await?;
                 test_nmx_hello(switch_host, &client_tls, &self.nmx_gateway_id).await
@@ -2812,11 +2844,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_initial_hello_configures_nmx_manager_then_succeeds() {
+    async fn unreadable_binding_with_failed_hello_configures_nmx_manager_then_succeeds() {
         let configured = std::cell::Cell::new(false);
         let verified = std::cell::Cell::new(false);
 
         ensure_primary_nmx_controller_mtls(
+            ready(Err(RmsError::internal("NVUE unavailable for test"))),
             ready(Err(RmsError::internal("NMX Hello connect failed for test"))),
             async {
                 configured.set(true);
@@ -2832,6 +2865,99 @@ mod tests {
 
         assert!(configured.get());
         assert!(verified.get());
+    }
+
+    #[tokio::test]
+    async fn current_nmx_binding_with_failed_hello_reports_error_without_rebinding() {
+        let configured = std::cell::Cell::new(false);
+
+        let error = ensure_primary_nmx_controller_mtls(
+            ready(Ok(true)),
+            ready(Err(RmsError::internal("NMX Hello connect failed for test"))),
+            async {
+                configured.set(true);
+                Ok(())
+            },
+            ready(Ok(())),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.message.contains("NMX Hello connect failed"));
+        assert!(
+            !configured.get(),
+            "rebinding identical certificate objects cannot fix a connectivity failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_nmx_binding_is_reconfigured_although_hello_still_succeeds() {
+        let checked = std::cell::Cell::new(false);
+        let configured = std::cell::Cell::new(false);
+        let verified = std::cell::Cell::new(false);
+
+        ensure_primary_nmx_controller_mtls(
+            ready(Ok(false)),
+            async {
+                checked.set(true);
+                Ok(())
+            },
+            async {
+                configured.set(true);
+                Ok(())
+            },
+            async {
+                verified.set(true);
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !checked.get(),
+            "a stale binding must not wait for Hello to fail"
+        );
+        assert!(configured.get());
+        assert!(verified.get());
+    }
+
+    #[tokio::test]
+    async fn current_nmx_binding_with_successful_hello_is_left_alone() {
+        let configured = std::cell::Cell::new(false);
+
+        ensure_primary_nmx_controller_mtls(
+            ready(Ok(true)),
+            ready(Ok(())),
+            async {
+                configured.set(true);
+                Ok(())
+            },
+            ready(Ok(())),
+        )
+        .await
+        .unwrap();
+
+        assert!(!configured.get());
+    }
+
+    #[tokio::test]
+    async fn unreadable_nmx_binding_falls_back_to_hello_check() {
+        let configured = std::cell::Cell::new(false);
+
+        ensure_primary_nmx_controller_mtls(
+            ready(Err(RmsError::internal("NVUE unavailable for test"))),
+            ready(Ok(())),
+            async {
+                configured.set(true);
+                Ok(())
+            },
+            ready(Ok(())),
+        )
+        .await
+        .unwrap();
+
+        assert!(!configured.get());
     }
 
     #[tokio::test]
