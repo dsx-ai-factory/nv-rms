@@ -83,6 +83,18 @@ tests:
             persistentVolumeClaim:
               claimName: rms-firmware
 
+  - it: renders empty storageClassName when storageClass is "-" (disable dynamic provisioning)
+    set:
+      global.image.tag: test
+      apiServer.tls.enabled: false
+      apiServer.firmwarePvc.create: true
+      apiServer.firmwarePvc.storageClass: "-"
+    asserts:
+      - template: templates/api-server-firmware-pvc.yaml
+        equal:
+          path: spec.storageClassName
+          value: ""
+
   - it: mounts a pre-existing claim without creating a PVC
     set:
       global.image.tag: test
