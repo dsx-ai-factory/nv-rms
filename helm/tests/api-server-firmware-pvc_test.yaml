@@ -1,0 +1,116 @@
+suite: API server firmware PVC creation
+release:
+  name: rms
+  namespace: rack-manager
+templates:
+  - templates/api-server-deployment.yaml
+  - templates/api-server-firmware-pvc.yaml
+tests:
+  - it: does not create a PVC by default
+    set:
+      global.image.tag: test
+      apiServer.tls.enabled: false
+    asserts:
+      - template: templates/api-server-firmware-pvc.yaml
+        hasDocuments:
+          count: 0
+
+  - it: creates a firmware PVC with the default name when create is true
+    set:
+      global.image.tag: test
+      apiServer.tls.enabled: false
+      apiServer.firmwarePvc.create: true
+    asserts:
+      - template: templates/api-server-firmware-pvc.yaml
+        isKind:
+          of: PersistentVolumeClaim
+      - template: templates/api-server-firmware-pvc.yaml
+        equal:
+          path: metadata.name
+          value: rms-rack-manager-firmware
+      - template: templates/api-server-firmware-pvc.yaml
+        equal:
+          path: spec.resources.requests.storage
+          value: 20Gi
+      - template: templates/api-server-firmware-pvc.yaml
+        equal:
+          path: spec.accessModes
+          value:
+            - ReadWriteOnce
+      - template: templates/api-server-firmware-pvc.yaml
+        notExists:
+          path: spec.storageClassName
+      - template: templates/api-server-deployment.yaml
+        documentSelector:
+          path: kind
+          value: Deployment
+        contains:
+          path: spec.template.spec.volumes
+          content:
+            name: firmware-storage
+            persistentVolumeClaim:
+              claimName: rms-rack-manager-firmware
+
+  - it: honors an explicit claim name, size and storageClass when creating
+    set:
+      global.image.tag: test
+      apiServer.tls.enabled: false
+      apiServer.firmwarePersistentVolumeClaim: rms-firmware
+      apiServer.firmwarePvc.create: true
+      apiServer.firmwarePvc.size: 50Gi
+      apiServer.firmwarePvc.storageClass: fast-ssd
+    asserts:
+      - template: templates/api-server-firmware-pvc.yaml
+        equal:
+          path: metadata.name
+          value: rms-firmware
+      - template: templates/api-server-firmware-pvc.yaml
+        equal:
+          path: spec.resources.requests.storage
+          value: 50Gi
+      - template: templates/api-server-firmware-pvc.yaml
+        equal:
+          path: spec.storageClassName
+          value: fast-ssd
+      - template: templates/api-server-deployment.yaml
+        documentSelector:
+          path: kind
+          value: Deployment
+        contains:
+          path: spec.template.spec.volumes
+          content:
+            name: firmware-storage
+            persistentVolumeClaim:
+              claimName: rms-firmware
+
+  - it: renders empty storageClassName when storageClass is "-" (disable dynamic provisioning)
+    set:
+      global.image.tag: test
+      apiServer.tls.enabled: false
+      apiServer.firmwarePvc.create: true
+      apiServer.firmwarePvc.storageClass: "-"
+    asserts:
+      - template: templates/api-server-firmware-pvc.yaml
+        equal:
+          path: spec.storageClassName
+          value: ""
+
+  - it: mounts a pre-existing claim without creating a PVC
+    set:
+      global.image.tag: test
+      apiServer.tls.enabled: false
+      apiServer.firmwarePersistentVolumeClaim: preexisting-claim
+    asserts:
+      - template: templates/api-server-firmware-pvc.yaml
+        hasDocuments:
+          count: 0
+      - template: templates/api-server-deployment.yaml
+        documentSelector:
+          path: kind
+          value: Deployment
+        contains:
+          path: spec.template.spec.volumes
+          content:
+            name: firmware-storage
+            persistentVolumeClaim:
+              claimName: preexisting-claim
