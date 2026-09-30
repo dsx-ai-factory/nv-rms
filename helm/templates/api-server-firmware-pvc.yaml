@@ -13,6 +13,6 @@ spec:
     requests:
       storage: {{ .Values.apiServer.firmwarePvc.size | quote }}
   {{- with .Values.apiServer.firmwarePvc.storageClass }}
-  storageClassName: {{ . | quote }}
+  storageClassName: {{ eq . "-" | ternary "" . | quote }}
   {{- end }}
 {{- end }}
