@@ -29,6 +29,6 @@ spec:
     requests:
       storage: {{ $firmwarePvc.size | default "20Gi" | quote }}
   {{- with ($firmwarePvc.storageClass | default "" | trim) }}
-  storageClassName: {{ . | quote }}
+  storageClassName: {{ eq . "-" | ternary "" . | quote }}
   {{- end }}
 {{- end }}
