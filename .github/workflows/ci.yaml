@@ -27,7 +27,6 @@ jobs:
       helm_version: ${{ steps.version.outputs.helm_version }}
       short_sha: ${{ steps.version.outputs.short_sha }}
       publish: ${{ steps.publish.outputs.publish }}
-      publish_chart: ${{ steps.publish.outputs.publish_chart }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -86,15 +85,12 @@ jobs:
         run: |
           set -euo pipefail
           publish=false
-          publish_chart=false
           case "${GITHUB_REF}" in
             refs/heads/release/*/*) ;; # one level only, like the trigger and nvcr-publish
-            refs/heads/main|refs/heads/release/*) publish=true; publish_chart=true ;;
-            refs/tags/*) publish=true ;;
+            refs/heads/main|refs/heads/release/*|refs/tags/*) publish=true ;;
           esac
           if printf '%s' "${COMMIT_MESSAGE}" | grep -q 'ci-publish'; then publish=true; fi
           echo "publish=${publish}" >> "$GITHUB_OUTPUT"
-          echo "publish_chart=${publish_chart}" >> "$GITHUB_OUTPUT"
           echo "Publish gate: ${publish}"
 
   build-container-x86_64:
@@ -578,13 +574,12 @@ jobs:
           template: 'true'
           valueOverrides: '["global.image.tag=validate", "apiServer.tls.enabled=false"]'
 
-  # Package + push the Helm chart to NGC
-  # publish only when Chart.yaml changes on main or release/* (tags never publish
-  # the chart). Published versions carry an -OSS suffix. 
-  # ngc-duplicate:fail so re-pushing an unbumped version fails.
+  # Package + push the Helm chart to NGC whenever images publish, after the
+  # multi-arch manifest. Published versions carry an -OSS suffix.
+  # ngc-duplicate:skip so re-pushing an existing version is a no-op.
   helm-publish:
-    needs: [prepare, helm-validate]
-    if: ${{ needs.prepare.outputs.publish_chart == 'true' }}
+    needs: [prepare, helm-validate, publish-manifest]
+    if: ${{ needs.prepare.outputs.publish == 'true' }}
     runs-on: linux-amd64-cpu4
     timeout-minutes: 30
     environment:
@@ -596,26 +591,7 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
 
-      - name: Detect Chart.yaml change
-        id: chart
-        env:
-          BEFORE_SHA: ${{ github.event.before }}
-        run: |
-          set -euo pipefail
-          changed=false
-          BASE="${BEFORE_SHA:-}"
-          if [ -n "${BASE}" ] && [ "${BASE}" != "0000000000000000000000000000000000000000" ] && git cat-file -e "${BASE}" 2>/dev/null; then
-            if git diff --name-only "${BASE}" HEAD | grep -qx 'helm/Chart.yaml'; then
-              changed=true
-            fi
-          else
-            echo "Chart.yaml change check skipped (no usable base SHA); treating as unchanged."
-          fi
-          echo "changed=${changed}" >> "$GITHUB_OUTPUT"
-          echo "Chart.yaml changed: ${changed}"
-
       - name: Package and push Helm chart to NGC
-        if: ${{ steps.chart.outputs.changed == 'true' }}
         uses: dsx-ai-factory/dsx-github-actions/.github/actions/helm-package-push@v1.17.2
         with:
           chart-path: helm
@@ -624,11 +600,7 @@ jobs:
           lint: 'false'
           ngc-key: ${{ secrets.RMS_DEV_REGISTRY_PASSWORD }}
           ngc-path: ${{ vars.RMS_DEV_NGC_PATH }}
-          ngc-duplicate: fail
-
-      - name: Skip publish (Chart.yaml unchanged)
-        if: ${{ steps.chart.outputs.changed != 'true' }}
-        run: echo "helm/Chart.yaml unchanged on this ref; nothing to publish."
+          ngc-duplicate: skip
 
   security-codeql-scan:
     name: CodeQL Security Analysis
