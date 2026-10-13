@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+      - "release/*"
       - "pull-request/[0-9]+"
     tags:
       - "v[0-9]*.[0-9]*.[0-9]*"
@@ -476,7 +477,7 @@ jobs:
         uses: ./.github/actions/docker-auth
         with:
           registry: ${{ vars.RMS_DEV_REGISTRY }}
-          username: ${{ secrets.RMS_DEV_REGISTRY_USERNAME }}
+          username: ${{ vars.RMS_DEV_REGISTRY_USERNAME }}
           token: ${{ secrets.RMS_DEV_REGISTRY_PASSWORD }}
 
       - name: Build and push release image (${{ matrix.arch }})
@@ -514,7 +515,7 @@ jobs:
         uses: ./.github/actions/docker-auth
         with:
           registry: ${{ vars.RMS_DEV_REGISTRY }}
-          username: ${{ secrets.RMS_DEV_REGISTRY_USERNAME }}
+          username: ${{ vars.RMS_DEV_REGISTRY_USERNAME }}
           token: ${{ secrets.RMS_DEV_REGISTRY_PASSWORD }}
 
       - name: Create and inspect multi-arch manifest
