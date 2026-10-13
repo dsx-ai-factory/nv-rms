@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+      - "release/*"
       - "pull-request/[0-9]+"
     tags:
       - "v[0-9]*.[0-9]*.[0-9]*"
@@ -75,7 +76,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       # Publish gate (single source of truth for the release/publish jobs):
-      # publish on main, release/**, any tag, or an explicit `ci-publish` opt-in
+      # publish on main, release/*, any tag, or an explicit `ci-publish` opt-in
       # in the commit message. Mirrors the GitLab push-to-registry rules.
       - name: Compute publish gate
         id: publish
@@ -459,6 +460,8 @@ jobs:
           - { arch: arm64, runner: linux-arm64-cpu32 }
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
+    environment:
+      name: nvcr-publish
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -474,7 +477,7 @@ jobs:
         uses: ./.github/actions/docker-auth
         with:
           registry: ${{ vars.RMS_DEV_REGISTRY }}
-          username: ${{ secrets.RMS_DEV_REGISTRY_USERNAME }}
+          username: ${{ vars.RMS_DEV_REGISTRY_USERNAME }}
           token: ${{ secrets.RMS_DEV_REGISTRY_PASSWORD }}
 
       - name: Build and push release image (${{ matrix.arch }})
@@ -495,6 +498,8 @@ jobs:
     if: ${{ needs.prepare.outputs.publish == 'true' }}
     runs-on: linux-amd64-cpu4
     timeout-minutes: 30
+    environment:
+      name: nvcr-publish
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -510,7 +515,7 @@ jobs:
         uses: ./.github/actions/docker-auth
         with:
           registry: ${{ vars.RMS_DEV_REGISTRY }}
-          username: ${{ secrets.RMS_DEV_REGISTRY_USERNAME }}
+          username: ${{ vars.RMS_DEV_REGISTRY_USERNAME }}
           token: ${{ secrets.RMS_DEV_REGISTRY_PASSWORD }}
 
       - name: Create and inspect multi-arch manifest
@@ -568,15 +573,16 @@ jobs:
           template: 'true'
           valueOverrides: '["global.image.tag=validate", "apiServer.tls.enabled=false"]'
 
-  # Package + push the Helm chart to NGC
-  # publish only when Chart.yaml changes on main or release/** (tags never publish
-  # the chart). Published versions carry an -OSS suffix. 
-  # ngc-duplicate:fail so re-pushing an unbumped version fails.
+  # Package + push the Helm chart to NGC whenever images publish, after the
+  # multi-arch manifest. Published versions carry an -OSS suffix.
+  # ngc-duplicate:skip so re-pushing an existing version is a no-op.
   helm-publish:
-    needs: [prepare, helm-validate]
-    if: ${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/') }}
+    needs: [prepare, helm-validate, publish-manifest]
+    if: ${{ needs.prepare.outputs.publish == 'true' }}
     runs-on: linux-amd64-cpu4
     timeout-minutes: 30
+    environment:
+      name: nvcr-publish
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -584,26 +590,7 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
 
-      - name: Detect Chart.yaml change
-        id: chart
-        env:
-          BEFORE_SHA: ${{ github.event.before }}
-        run: |
-          set -euo pipefail
-          changed=false
-          BASE="${BEFORE_SHA:-}"
-          if [ -n "${BASE}" ] && [ "${BASE}" != "0000000000000000000000000000000000000000" ] && git cat-file -e "${BASE}" 2>/dev/null; then
-            if git diff --name-only "${BASE}" HEAD | grep -qx 'helm/Chart.yaml'; then
-              changed=true
-            fi
-          else
-            echo "Chart.yaml change check skipped (no usable base SHA); treating as unchanged."
-          fi
-          echo "changed=${changed}" >> "$GITHUB_OUTPUT"
-          echo "Chart.yaml changed: ${changed}"
-
       - name: Package and push Helm chart to NGC
-        if: ${{ steps.chart.outputs.changed == 'true' }}
         uses: dsx-ai-factory/dsx-github-actions/.github/actions/helm-package-push@v1.17.2
         with:
           chart-path: helm
@@ -612,11 +599,7 @@ jobs:
           lint: 'false'
           ngc-key: ${{ secrets.RMS_DEV_REGISTRY_PASSWORD }}
           ngc-path: ${{ vars.RMS_DEV_NGC_PATH }}
-          ngc-duplicate: fail
-
-      - name: Skip publish (Chart.yaml unchanged)
-        if: ${{ steps.chart.outputs.changed != 'true' }}
-        run: echo "helm/Chart.yaml unchanged on this ref; nothing to publish."
+          ngc-duplicate: skip
 
   security-codeql-scan:
     name: CodeQL Security Analysis
