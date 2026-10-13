@@ -86,7 +86,6 @@ jobs:
           set -euo pipefail
           publish=false
           case "${GITHUB_REF}" in
-            refs/heads/release/*/*) ;; # one level only, like the trigger and nvcr-publish
             refs/heads/main|refs/heads/release/*|refs/tags/*) publish=true ;;
           esac
           if printf '%s' "${COMMIT_MESSAGE}" | grep -q 'ci-publish'; then publish=true; fi
