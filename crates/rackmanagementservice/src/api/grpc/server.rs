@@ -925,7 +925,9 @@ mod tests {
     async fn start_rejects_plaintext_without_insecure_mode() {
         use crate::metrics::{self, MetricsInfo};
 
-        let port = portpicker::pick_unused_port().expect("no free port");
+        // Port 0 is an OS-assigned port: this test only asserts that `start`
+        // fails closed, so it never connects and never reads the port back.
+        let port = 0;
 
         let _metrics_registry = metrics::init(&MetricsInfo {
             grpc_port: port,
@@ -953,7 +955,9 @@ mod tests {
     async fn start_rejects_invalid_sftp_upload_options() {
         use crate::metrics::{self, MetricsInfo};
 
-        let port = portpicker::pick_unused_port().expect("no free port");
+        // Port 0 is an OS-assigned port: this test only asserts that `start`
+        // fails closed, so it never connects and never reads the port back.
+        let port = 0;
 
         let _metrics_registry = metrics::init(&MetricsInfo {
             grpc_port: port,

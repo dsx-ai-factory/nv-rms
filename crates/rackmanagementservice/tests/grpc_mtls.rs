@@ -155,14 +155,6 @@ async fn start_mtls_server(fx: &MtlsFixture) -> (GrpcServer, u16) {
 
     let rm = Arc::new(RackManager::new());
     let jt = Arc::new(JobTracker::new());
-    let port = portpicker::pick_unused_port().expect("no free port");
-    let _metrics_registry = metrics::init(&metrics::MetricsInfo {
-        grpc_port: port,
-        firmware_dir: "firmware".to_string(),
-        persistence_type: "memory".to_string(),
-        tls_mode: TlsMode::Mtls,
-    })
-    .unwrap();
 
     let tls = TlsConfig::resolve(
         fx.server_cert_path.to_str(),
@@ -173,10 +165,26 @@ async fn start_mtls_server(fx: &MtlsFixture) -> (GrpcServer, u16) {
     .expect("failed to resolve server TLS material")
     .expect("mTLS fixture always provides cert + key");
 
-    let mut server = GrpcServer::new(port, rm, jt, Backends::memory()).with_tls(tls);
-    server.start().await.unwrap();
+    let mut server = GrpcServer::new(0, rm, jt, Backends::memory()).with_tls(tls);
 
-    // Give the listener a beat to actually bind.
+    // Bind an OS-assigned port and hold the listener, so the port cannot be
+    // claimed by anyone else between selection and serving. `metrics::init`
+    // needs the port up front, which is why the bind is split from the start.
+    let (incoming, port) = server
+        .bind_localhost_ephemeral_port()
+        .expect("bind mTLS server port");
+
+    let _metrics_registry = metrics::init(&metrics::MetricsInfo {
+        grpc_port: port,
+        firmware_dir: "firmware".to_string(),
+        persistence_type: "memory".to_string(),
+        tls_mode: TlsMode::Mtls,
+    })
+    .unwrap();
+
+    server.start_with_bound_incoming(incoming).await.unwrap();
+
+    // Give the serving task a beat to start accepting on the bound listener.
     tokio::time::sleep(Duration::from_millis(150)).await;
 
     (server, port)

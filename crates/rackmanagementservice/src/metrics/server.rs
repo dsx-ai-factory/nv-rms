@@ -44,6 +44,16 @@ impl MetricsServer {
         }
     }
 
+    /// Port the metrics listener uses.
+    ///
+    /// Before [`MetricsServer::start`] this is the requested port, which may be
+    /// `0` to ask the OS to assign one. After a successful start it is always
+    /// the actual bound port.
+    #[must_use]
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
     /// Bind the metrics listener and begin serving in a background task.
     ///
     /// `tls` is `Some` for standard server-authenticated TLS (no client certs).
@@ -64,6 +74,17 @@ impl MetricsServer {
         let listener = tokio::net::TcpListener::bind(addr).await.map_err(|e| {
             RmsError::unavailable(format!("metrics server failed to bind {addr}: {e}"))
         })?;
+
+        // Record the port actually bound: a requested port of 0 is assigned by
+        // the OS, and both the logs below and `port()` must report the real one.
+        self.port = listener
+            .local_addr()
+            .map_err(|e| {
+                RmsError::unavailable(format!(
+                    "metrics server failed to inspect bound address: {e}"
+                ))
+            })?
+            .port();
 
         let (shutdown_tx, shutdown_rx) = watch::channel(());
         self.shutdown_tx = Some(shutdown_tx);
@@ -205,12 +226,12 @@ mod tests {
 
     #[tokio::test]
     async fn metrics_server_serves_prometheus_on_dedicated_port() {
-        let port = portpicker::pick_unused_port().expect("no free port");
-        let mut server = MetricsServer::new(port);
+        let mut server = MetricsServer::new(0);
         server
             .start(ensure_registry(), None)
             .await
             .expect("start metrics server");
+        let port = server.port();
 
         tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -230,12 +251,12 @@ mod tests {
 
     #[tokio::test]
     async fn metrics_server_returns_not_found_for_other_paths() {
-        let port = portpicker::pick_unused_port().expect("no free port");
-        let mut server = MetricsServer::new(port);
+        let mut server = MetricsServer::new(0);
         server
             .start(ensure_registry(), None)
             .await
             .expect("start metrics server");
+        let port = server.port();
 
         tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -267,12 +288,12 @@ mod tests {
 
     #[tokio::test]
     async fn metrics_server_serves_over_tls_and_shuts_down() {
-        let port = portpicker::pick_unused_port().expect("no free port");
-        let mut server = MetricsServer::new(port);
+        let mut server = MetricsServer::new(0);
         server
             .start(ensure_registry(), Some(test_server_config()))
             .await
             .expect("start metrics server");
+        let port = server.port();
 
         tokio::time::sleep(Duration::from_millis(50)).await;
 

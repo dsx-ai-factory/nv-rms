@@ -114,11 +114,11 @@ fn switch_redfish_power_node(
 
 #[tokio::test]
 async fn mockup_server_starts_and_serves_json() {
-    let port = portpicker::pick_unused_port().expect("no free port");
     let server = RedfishSimulator::builder()
-        .add_gb200_compute(port)
+        .add_gb200_compute(0)
         .start()
         .await;
+    let port = server.ports()[0];
 
     let client = reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
@@ -140,13 +140,13 @@ async fn mockup_server_starts_and_serves_json() {
 
 #[tokio::test]
 async fn mockup_server_firmware_upload_and_task_poll() {
-    let port = portpicker::pick_unused_port().expect("no free port");
     let server = RedfishSimulator::builder()
         .with_task_delay(0.1)
         .never_fail_firmware_updates()
-        .add_gb200_compute(port)
+        .add_gb200_compute(0)
         .start()
         .await;
+    let port = server.ports()[0];
 
     let client = reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
@@ -669,11 +669,11 @@ async fn compute_firmware_uploads_work_against_mock_server() -> TestResult {
 
 #[tokio::test]
 async fn mockup_server_config_endpoint() {
-    let port = portpicker::pick_unused_port().expect("no free port");
     let server = RedfishSimulator::builder()
-        .add_gb200_compute(port)
+        .add_gb200_compute(0)
         .start()
         .await;
+    let port = server.ports()[0];
 
     let client = reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
@@ -726,11 +726,11 @@ async fn mockup_server_config_endpoint() {
 
 #[tokio::test]
 async fn mockup_server_404_for_unknown_path() {
-    let port = portpicker::pick_unused_port().expect("no free port");
     let server = RedfishSimulator::builder()
-        .add_gb200_compute(port)
+        .add_gb200_compute(0)
         .start()
         .await;
+    let port = server.ports()[0];
 
     let client = reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
@@ -750,14 +750,15 @@ async fn mockup_server_404_for_unknown_path() {
 
 #[tokio::test]
 async fn mockup_server_multi_port() {
-    let port1 = portpicker::pick_unused_port().expect("no free port");
-    let port2 = portpicker::pick_unused_port().expect("no free port");
-
+    // Using port 0 for OS-assigned port
     let server = RedfishSimulator::builder()
-        .add_gb200_compute(port1)
-        .add_gb200_compute(port2)
+        .add_gb200_compute(0)
+        .add_gb200_compute(0)
         .start()
         .await;
+    let [port1, port2] = server.ports() else {
+        panic!("expected two bound simulator ports");
+    };
 
     let client = reqwest::Client::builder()
         .danger_accept_invalid_certs(true)

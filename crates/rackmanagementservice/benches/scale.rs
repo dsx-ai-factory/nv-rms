@@ -164,13 +164,17 @@ async fn start_grpc_server(
             .build()
             .unwrap(),
     );
-    let port = portpicker::pick_unused_port().expect("no free port");
-
     let tmp_fw_dir = std::env::temp_dir();
-    let mut server = GrpcServer::new(port, rm, jt, Backends::memory())
+    let mut server = GrpcServer::new(0, rm, jt, Backends::memory())
         .with_firmware_dir(tmp_fw_dir)
         .with_insecure_listener();
-    server.start().await.unwrap();
+
+    // Bind an OS-assigned port and hold the listener through to serving, so the
+    // port cannot be claimed by anyone else in between.
+    let (incoming, port) = server
+        .bind_localhost_ephemeral_port()
+        .expect("bind benchmark server port");
+    server.start_with_bound_incoming(incoming).await.unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let addr = format!("http://127.0.0.1:{port}");
