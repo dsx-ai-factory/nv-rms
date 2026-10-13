@@ -76,19 +76,15 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       # Publish gate (single source of truth for the release/publish jobs):
-      # publish on main, release/*, any tag, or an explicit `ci-publish` opt-in
-      # in the commit message. Mirrors the GitLab push-to-registry rules.
+      # publish on main, release/*, or any tag.
       - name: Compute publish gate
         id: publish
-        env:
-          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
         run: |
           set -euo pipefail
           publish=false
           case "${GITHUB_REF}" in
             refs/heads/main|refs/heads/release/*|refs/tags/*) publish=true ;;
           esac
-          if printf '%s' "${COMMIT_MESSAGE}" | grep -q 'ci-publish'; then publish=true; fi
           echo "publish=${publish}" >> "$GITHUB_OUTPUT"
           echo "Publish gate: ${publish}"
 
