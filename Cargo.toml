@@ -37,7 +37,6 @@ noyalib = { version = "0.0.8", features = ["compat-serde-yaml"] }
 nv-redfish = { version = "0.11.0", default-features = false }
 nvfwupd = { path = "crates/rust_nvfwupd" }
 nvue_client = { path = "crates/nvue_client" }
-portpicker = "0.1"
 prometheus = "0.14"
 prost = "0.14"
 prost-types = "0.14"

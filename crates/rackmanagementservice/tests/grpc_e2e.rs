@@ -1847,13 +1847,13 @@ async fn compute_firmware_rejects_mixed_inband_and_oob_targets() {
 #[tokio::test]
 async fn compute_firmware_upload_guaranteed_failure() {
     // Dedicated simulator instance with 100% failure rate, isolated from other tests.
-    let fail_port = portpicker::pick_unused_port().expect("no free port") as u16;
     let fail_mockup = RedfishSimulator::builder()
         .with_task_delay(0.01)
         .always_fail_firmware_updates()
-        .add_gb200_compute(fail_port)
+        .add_gb200_compute(0)
         .start()
         .await;
+    let fail_port = fail_mockup.ports()[0];
 
     let (mut server, mut client) = start_server().await;
 

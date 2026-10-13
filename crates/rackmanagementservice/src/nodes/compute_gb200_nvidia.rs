@@ -180,6 +180,13 @@ impl NvidiaGb200Compute {
     }
 
     fn flint_host_target_config(&self) -> Result<nvfwupd::workflow::HostTargetConfig> {
+        self.flint_host_target_config_with_home(std::env::var_os("HOME").map(PathBuf::from))
+    }
+
+    fn flint_host_target_config_with_home(
+        &self,
+        home: Option<PathBuf>,
+    ) -> Result<nvfwupd::workflow::HostTargetConfig> {
         let bmc_credentials = self.bmc_endpoint.credentials.as_ref().ok_or_else(|| {
             RmsError::failed_precondition(
                 "BMC username/password credentials are required to activate GB200 in-band firmware updates",
@@ -208,13 +215,12 @@ impl NvidiaGb200Compute {
                 "host_endpoint username/password credentials are required for GB200 in-band firmware updates",
             ));
         }
-        let ssh_known_hosts = std::env::var_os("HOME")
+        let ssh_known_hosts = home
             .ok_or_else(|| {
                 RmsError::failed_precondition(
                     "SSH host-key verification requires HOME or an explicit known_hosts path",
                 )
-            })
-            .map(PathBuf::from)?
+            })?
             .join(".ssh/known_hosts")
             .into_os_string()
             .into_string()
@@ -795,17 +801,18 @@ mod tests {
         };
         let compute = NvidiaGb200Compute::from_config(&config, "rack-01").unwrap();
 
-        let target = compute.flint_host_target_config().unwrap();
+        // Figment configuration tests clear the process environment in parallel.
+        let target = compute
+            .flint_host_target_config_with_home(Some(PathBuf::from("/test-home")))
+            .unwrap();
 
         assert_eq!(target.ip, "192.168.1.1");
         assert_eq!(target.port, Some(22));
         assert_eq!(target.username, "host-admin");
         assert_eq!(target.password, "host-pass");
-        assert!(
-            target
-                .ssh_known_hosts
-                .as_deref()
-                .is_some_and(|path| path.ends_with("/.ssh/known_hosts"))
+        assert_eq!(
+            target.ssh_known_hosts.as_deref(),
+            Some("/test-home/.ssh/known_hosts")
         );
         assert_eq!(
             target.ssh_host_key_mode,
