@@ -27,6 +27,7 @@ jobs:
       helm_version: ${{ steps.version.outputs.helm_version }}
       short_sha: ${{ steps.version.outputs.short_sha }}
       publish: ${{ steps.publish.outputs.publish }}
+      publish_chart: ${{ steps.publish.outputs.publish_chart }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -76,7 +77,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       # Publish gate (single source of truth for the release/publish jobs):
-      # publish on main, release/**, any tag, or an explicit `ci-publish` opt-in
+      # publish on main, release/*, any tag, or an explicit `ci-publish` opt-in
       # in the commit message. Mirrors the GitLab push-to-registry rules.
       - name: Compute publish gate
         id: publish
@@ -85,11 +86,15 @@ jobs:
         run: |
           set -euo pipefail
           publish=false
+          publish_chart=false
           case "${GITHUB_REF}" in
-            refs/heads/main|refs/heads/release/*|refs/tags/*) publish=true ;;
+            refs/heads/release/*/*) ;; # one level only, like the trigger and nvcr-publish
+            refs/heads/main|refs/heads/release/*) publish=true; publish_chart=true ;;
+            refs/tags/*) publish=true ;;
           esac
           if printf '%s' "${COMMIT_MESSAGE}" | grep -q 'ci-publish'; then publish=true; fi
           echo "publish=${publish}" >> "$GITHUB_OUTPUT"
+          echo "publish_chart=${publish_chart}" >> "$GITHUB_OUTPUT"
           echo "Publish gate: ${publish}"
 
   build-container-x86_64:
@@ -574,12 +579,12 @@ jobs:
           valueOverrides: '["global.image.tag=validate", "apiServer.tls.enabled=false"]'
 
   # Package + push the Helm chart to NGC
-  # publish only when Chart.yaml changes on main or release/** (tags never publish
+  # publish only when Chart.yaml changes on main or release/* (tags never publish
   # the chart). Published versions carry an -OSS suffix. 
   # ngc-duplicate:fail so re-pushing an unbumped version fails.
   helm-publish:
     needs: [prepare, helm-validate]
-    if: ${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/') }}
+    if: ${{ needs.prepare.outputs.publish_chart == 'true' }}
     runs-on: linux-amd64-cpu4
     timeout-minutes: 30
     environment:
