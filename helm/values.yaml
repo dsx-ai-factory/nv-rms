@@ -91,8 +91,21 @@ apiServer:
       enabled: false
   # Existing PersistentVolumeClaim for firmware artifacts. Leave empty (or omit) to
   # use firmwareStoragePath hostPath; set a valid PVC name in a site override
-  # passed with -f.
+  # passed with -f. When apiServer.firmwarePvc.create is true this also names the
+  # PVC the chart creates (defaults to "<fullname>-firmware" when left empty).
   firmwarePersistentVolumeClaim: ""
+  # Let the chart own the firmware PVC instead of requiring a pre-created one or a
+  # hostPath. hostPath is unavailable to unprivileged pods on clusters that enforce
+  # the restricted Pod Security Standard, so create a PVC there. When create is true
+  # the Deployment mounts the created claim regardless of firmwarePersistentVolumeClaim.
+  firmwarePvc:
+    create: false
+    size: 20Gi
+    # StorageClass for the created PVC. "" uses the cluster default; "-" disables
+    # dynamic provisioning (bind an existing PV). Ignored when create is false.
+    storageClass: ""
+    accessModes:
+      - ReadWriteOnce
   # Host directory on the node (hostPath volume source).
   firmwareStoragePath: /mnt/data
   # In-container mount for firmware artifacts; rendered into config.toml as
