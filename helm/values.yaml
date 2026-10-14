@@ -271,6 +271,16 @@ database:
   name: my_rms_db
   credentialsSecret: rms-api-server.rack-manager.my-pg-cluster.credentials
   sslMode: require
+  # Keys within credentialsSecret holding the username and password. Defaults
+  # match the common Zalando naming (username/password). Some operators use
+  # different key names — e.g. Crunchy Data (CrunchyData/postgres-operator)
+  # publishes the role name under "user" — so these are configurable to let the
+  # chart consume an operator-managed secret directly, without a re-mapping step.
+  # Only consulted in external database mode; standalone chart-managed Postgres
+  # always uses username/password.
+  credentialsSecretKeys:
+    username: username
+    password: password
 
 # In-cluster Postgres (used only when databaseMode: standalone and postgres.enabled: true).
 # Leave enabled: false when using database.host / rmsPostgres above.
