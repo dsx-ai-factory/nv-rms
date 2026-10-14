@@ -4,7 +4,7 @@
 # Rules are evaluated from top to bottom, with later rules taking precedence.
 
 # Default owners for everything in the repo
-* @dsx-ai-factory/rms-sw-admins
+* @dsx-ai-factory/rms-sw-contributors
 
 # GitHub process and automation files
 /.github/ @dsx-ai-factory/rms-sw-admins
