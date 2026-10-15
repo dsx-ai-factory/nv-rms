@@ -756,3 +756,5 @@ bash helm/scripts/test-chart.sh
 The script uses a local `helm unittest` plugin when installed. If the plugin is
 missing and Docker is available, it runs the same tests with the
 `helmunittest/helm-unittest` container image.
+
+Temporary line for a CI test; this change will not be merged.
