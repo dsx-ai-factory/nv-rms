@@ -88,34 +88,54 @@ detailed guide: [Adding Support for New Hardware](new-hardware-support.md).
 
 ## Building standalone nvfwupd
 
-The `nvfwupd` CLI can be built as a standalone, portable binary. A plain build
-inherits the host sysroot glibc baseline; the `docker/nvfwupd-standalone/`
-Dockerfiles produce binaries with a glibc 2.17 baseline for broad portability.
+Build only the `nvfwupd` CLI for the host platform with:
 
 ```bash
-# Host-arch build (inherits host glibc baseline)
-cargo build --release -p nvfwupd
-
-# Portable x86_64 binary (glibc 2.17 baseline)
-docker buildx build --platform linux/amd64 --target artifact \
-    --output type=local,dest=target/x86_64-unknown-linux-gnu/release \
-    -f docker/nvfwupd-standalone/Dockerfile.x86_64-glibc217 .
-
-# Portable arm64 binary (glibc 2.17 baseline, Zig cross-linking from x86)
-docker buildx build --platform linux/amd64 --target artifact \
-    --output type=local,dest=target/aarch64-unknown-linux-gnu/release \
-    -f docker/nvfwupd-standalone/Dockerfile.arm64-glibc217 .
-
-# Cross-compile arm64 directly from an x86 host (inherits host aarch64 glibc)
-rustup target add aarch64-unknown-linux-gnu
-CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
-    RUSTFLAGS="-C link-arg=-fuse-ld=bfd" \
-    cargo build --release -p nvfwupd --target aarch64-unknown-linux-gnu
-
-# Verify a produced artifact does not require newer glibc symbols
-readelf --version-info target/x86_64-unknown-linux-gnu/release/nvfwupd \
-    | grep -o 'GLIBC_[0-9]\+\.[0-9]\+' | sort -Vu | tail
+cargo build --locked --release -p nvfwupd
 ```
+
+The host build writes `target/release/nvfwupd` and uses the host toolchain and
+system libraries. On Linux with glibc, its required glibc version depends on
+that build environment.
+
+### Linux musl builds
+
+The workspace [Makefile](https://github.com/dsx-ai-factory/nv-rms/blob/main/crates/rust_nvfwupd/Makefile)
+provides x86_64 and arm64 musl targets. Install the Rust target for each
+architecture that you need:
+
+```bash
+rustup target add x86_64-unknown-linux-musl
+rustup target add aarch64-unknown-linux-musl
+```
+
+Use an x86_64 Linux build environment with a C toolchain for x86_64 musl for
+the x86_64 target. The arm64 target uses Zig and `cargo-zigbuild`; install both
+and make them available on `PATH` before building.
+
+Run these commands from the workspace root:
+
+```bash
+# x86_64 Linux musl
+make -C crates/rust_nvfwupd nvfwupd-x86
+
+# arm64 Linux musl, using cargo-zigbuild
+make -C crates/rust_nvfwupd nvfwupd-arm64
+```
+
+The equivalent Cargo commands are:
+
+```bash
+cargo build --locked --release -p nvfwupd \
+    --target x86_64-unknown-linux-musl
+
+cargo zigbuild --locked --release -p nvfwupd \
+    --target aarch64-unknown-linux-musl
+```
+
+The binaries are written to `target/x86_64-unknown-linux-musl/release/nvfwupd`
+and `target/aarch64-unknown-linux-musl/release/nvfwupd`, respectively. Check the
+produced binary in the intended deployment environment before distribution.
 
 The release container image also bundles `nvfwupd`; extract it with
 `docker cp` from a created container if you need the binary that shipped in a
