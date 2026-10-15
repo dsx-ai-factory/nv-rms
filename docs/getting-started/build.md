@@ -102,12 +102,19 @@ docker build --target builder -t rms-builder .
 
 ### Standalone nvfwupd binaries
 
-The `nvfwupd` CLI can be built on its own - convenient for distributing a
-diagnostics tool. A plain `cargo build --release -p nvfwupd` inherits the host
-sysroot glibc baseline; the `docker/nvfwupd-standalone/` Dockerfiles produce
-portable x86-64 and arm64 binaries with a glibc 2.17 baseline. See the
+The `nvfwupd` CLI can be built on its own. The workspace provides Makefile
+targets for x86_64 and arm64 Linux musl builds, as described in the
+[README](https://github.com/dsx-ai-factory/nv-rms#building-the-nvfwupd-cli):
+
+```bash
+make -C crates/rust_nvfwupd nvfwupd-x86
+make -C crates/rust_nvfwupd nvfwupd-arm64
+```
+
+The binaries are written to `target/x86_64-unknown-linux-musl/release/nvfwupd`
+and `target/aarch64-unknown-linux-musl/release/nvfwupd`, respectively. See the
 [Development](../reference/development.md#building-standalone-nvfwupd) reference
-for the full set of cross-build and verification commands.
+for the required toolchains and equivalent Cargo commands.
 
 ## Next steps
 
