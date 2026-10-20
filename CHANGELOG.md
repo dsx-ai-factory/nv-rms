@@ -1,7 +1,7 @@
 # Changelog
 
 This file records selected changes in the public RMS repository. Changes after
-the latest public tag are listed under Unreleased, with links to their source.
+the latest public tag are listed under Unreleased, with links to their sources.
 
 ## Unreleased
 

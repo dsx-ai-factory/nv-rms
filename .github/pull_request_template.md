@@ -8,7 +8,7 @@
 
 ## Type Of Change
 
-<!-- Check one that best describes this PR. -->
+<!-- Check the one that best describes this PR. -->
 
 - [ ] **Add** - New feature or capability
 - [ ] **Change** - Changes in existing functionality
