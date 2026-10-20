@@ -30,7 +30,8 @@ jobs:
     # rather than fail them red. Fern's answer to this is `pull_request_target`,
     # which is deliberately not used here (it would run fork code with secrets).
     if: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
-    runs-on: linux-amd64-cpu4
+    # Self-hosted runners reject pull_request events.
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
       pull-requests: write
