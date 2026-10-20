@@ -47,7 +47,7 @@ redfish_test_support = { path = "crates/redfish_test_support" }
 regex = "1"
 common = { path = "crates/common" }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots", "rustls-tls-native-roots", "multipart", "stream"] }
-russh = "0.63.1"
+russh = "0.64.1"
 russh-sftp = "2"
 rustls = "0.23"
 rustls-pemfile = "2"
