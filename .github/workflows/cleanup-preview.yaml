@@ -15,6 +15,12 @@ on:
 permissions:
   contents: read
 
+# Same group as preview-docs.yaml: cancel a publication still running for this
+# branch before deleting its preview, or it could publish after the deletion.
+concurrency:
+  group: preview-docs-${{ github.event.ref }}
+  cancel-in-progress: true
+
 jobs:
   cleanup:
     name: Delete Preview

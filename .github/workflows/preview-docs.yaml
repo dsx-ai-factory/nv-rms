@@ -16,8 +16,9 @@ on:
 permissions:
   contents: read
 
+# Shared with cleanup-preview.yaml, keyed on the branch name both can see.
 concurrency:
-  group: preview-docs-${{ github.ref }}
+  group: preview-docs-${{ github.ref_name }}
   cancel-in-progress: true
 
 jobs:
