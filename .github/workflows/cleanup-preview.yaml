@@ -2,18 +2,15 @@ name: Clean Up Preview Links
 
 # Companion to preview-docs.yaml, following Fern's reference workflow at
 # https://buildwithfern.com/learn/docs/preview-publish/preview-changes#preview-links
-# Deletes the preview under the same `--id` (the head branch name) that
-# preview-docs.yaml generated it with. Fern previews never expire on their own.
+# Deletes the preview under the same `--id` (the `pull-request/<number>` branch
+# name) that preview-docs.yaml generated it with. Fern previews never expire on
+# their own.
+#
+# Self-hosted runners do not run `pull_request` events, so instead of the PR
+# closing, the trigger is copy-pr-bot deleting that branch, which it does when
+# the PR closes or merges.
 on:
-  pull_request:
-    types: [closed]
-    branches:
-      - main
-    # Mirror preview-docs.yaml: only PRs that touched docs/ or fern/ ever got a
-    # preview to delete. Safe to filter here; nothing gates on this workflow.
-    paths:
-      - "docs/**"
-      - "fern/**"
+  delete:
 
 permissions:
   contents: read
@@ -21,12 +18,10 @@ permissions:
 jobs:
   cleanup:
     name: Delete Preview
-    # Only same-repo PRs ever produced a preview to clean up (fork PRs are skipped
-    # in preview-docs.yaml). Run on any close, not just merge: previews persist
-    # until explicitly deleted.
-    if: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
-    # Self-hosted runners reject pull_request events.
-    runs-on: ubuntu-latest
+    # `delete` has no branch filter. This runs for every closed PR, docs or not;
+    # deleting a preview that was never generated is harmless.
+    if: ${{ github.event.ref_type == 'branch' && startsWith(github.event.ref, 'pull-request/') }}
+    runs-on: linux-amd64-cpu4
     timeout-minutes: 15
     steps:
       - name: Checkout repository
@@ -40,8 +35,8 @@ jobs:
       - name: Delete preview deployment
         env:
           FERN_TOKEN: ${{ secrets.FERN_TOKEN }}
-          HEAD_REF: ${{ github.head_ref }}
+          PREVIEW_ID: ${{ github.event.ref }}
         run: |
-          echo "Deleting preview for branch: $HEAD_REF"
-          fern docs preview delete --id "$HEAD_REF" \
+          echo "Deleting preview for branch: $PREVIEW_ID"
+          fern docs preview delete --id "$PREVIEW_ID" \
             || echo "Preview deletion returned non-zero - it may already be gone"
