@@ -31,13 +31,13 @@ spec:
               valueFrom:
                 secretKeyRef:
                   name: {{ include "rack-manager.databaseCredentialsSecret" . }}
-                  key: username
+                  key: {{ include "rack-manager.dbUsernameKey" . }}
                   optional: true
             - name: PGPASSWORD
               valueFrom:
                 secretKeyRef:
                   name: {{ include "rack-manager.databaseCredentialsSecret" . }}
-                  key: password
+                  key: {{ include "rack-manager.dbPasswordKey" . }}
                   optional: true
             - name: DB_NAME
               value: {{ .Values.database.name | quote }}
