@@ -324,7 +324,8 @@ your values or via `--set-file`; see the site and insecure-mode examples below.
   `NodeDescriptor.attributes["inventory_profile"]`. Default: `{}`.
 - `logLevel` — optional log level / filter directive replacing `RUST_LOG` (config.toml `[logging] log_level`). Empty uses the default `info` level plus dependency caps.
 - `enableTimestamps` — assuming a logging collector is adding its own timestamps, so this is disabled by default to prevent duplicate timestamp fields. If no logging collector is being used, set true to output timestamps natively (config.toml `[logging] enable_timestamps`). Default: `false`.
-- `firmwarePersistentVolumeClaim` — existing PVC to mount at `firmwareMountPath` for firmware downloads. Leave empty to use the default `firmwareStoragePath` hostPath.
+- `firmwarePersistentVolumeClaim` — PVC name to mount at `firmwareMountPath` for firmware downloads. When `firmwarePvc.create` is `false` this must reference an existing PVC; leave empty to use the default `firmwareStoragePath` hostPath. When `firmwarePvc.create` is `true` it names the PVC the chart creates (defaults to `<fullname>-firmware` when empty).
+- `firmwarePvc` — let the chart own the firmware PVC instead of a pre-created claim or a hostPath. `hostPath` is unavailable to unprivileged pods on clusters that enforce the restricted Pod Security Standard, so set `firmwarePvc.create: true` there. Sub-keys: `create` (default `false`), `size` (default `20Gi`), `storageClass` (`""` = cluster default, `"-"` = disable dynamic provisioning), `accessModes` (default `[ReadWriteOnce]`). Ignored when `create` is `false`.
 - `sftpUploadTimeoutSeconds` — overall SFTP upload wall-clock timeout (seconds); config.toml `[workflows] sftp_upload_timeout_seconds`. Default: `3600`.
 - `sftpStepTimeoutSeconds` — per-step SFTP stall timeout (seconds); config.toml `[workflows] sftp_step_timeout_seconds`. Must be <= `sftpUploadTimeoutSeconds`. Default: `30`.
 
@@ -488,13 +489,31 @@ the restart or re-push happens.
 ### Firmware PVC
 
 The firmware download filesystem defaults to a node `hostPath` from
-`apiServer.firmwareStoragePath`. To use persistent cluster storage, create a
-site override with an existing claim name. Keep `apiServer.firmwarePersistentVolumeClaim`
-empty in `helm/values.yaml`; set it only in a site values file layered with `-f`.
+`apiServer.firmwareStoragePath`. That default does not work on clusters that
+deny unprivileged pods `hostPath` access (e.g. those enforcing the restricted
+Pod Security Standard), so back it with a PVC there. There are two ways to do so.
+
+Mount an existing claim you (or an operator) provisioned separately. Keep
+`apiServer.firmwarePersistentVolumeClaim` empty in `helm/values.yaml`; set it
+only in a site values file layered with `-f`:
 
 ```yaml
 apiServer:
   firmwarePersistentVolumeClaim: rms-firmware-downloads
+```
+
+Or let the chart create and own the PVC:
+
+```yaml
+apiServer:
+  firmwarePvc:
+    create: true
+    size: 20Gi
+    storageClass: ""      # "" = cluster default, "-" = disable dynamic provisioning
+    accessModes:
+      - ReadWriteOnce
+  # Optional: name the created claim; defaults to "<fullname>-firmware".
+  firmwarePersistentVolumeClaim: rms-firmware
 ```
 
 When `apiServer.replicaCount` is greater than 1, use a PVC backed by storage

@@ -162,6 +162,34 @@
           "pattern": "^$|^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)*$",
           "description": "Existing PVC claimName for the firmware download filesystem. Empty string uses apiServer.firmwareStoragePath hostPath. Non-empty values must be valid Kubernetes DNS subdomain names."
         },
+        "firmwarePvc": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "create": {
+              "type": "boolean",
+              "description": "When true, the chart creates the firmware PersistentVolumeClaim (named apiServer.firmwarePersistentVolumeClaim, or \"<fullname>-firmware\" when unset) instead of requiring a pre-created PVC or hostPath. The Deployment then mounts the created claim."
+            },
+            "size": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Requested storage size for the created firmware PVC (e.g. 20Gi). Ignored when create is false."
+            },
+            "storageClass": {
+              "type": "string",
+              "description": "StorageClass for the created firmware PVC. Empty string uses the cluster default; \"-\" disables dynamic provisioning. Ignored when create is false."
+            },
+            "accessModes": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "string",
+                "enum": ["ReadWriteOnce", "ReadOnlyMany", "ReadWriteMany", "ReadWriteOncePod"]
+              },
+              "description": "Access modes for the created firmware PVC. Ignored when create is false."
+            }
+          }
+        },
         "nmxGatewayId": {
           "type": "string",
           "minLength": 1,
