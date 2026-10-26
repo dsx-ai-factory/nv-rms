@@ -20759,7 +20759,7 @@ DEALINGS IN THE SOFTWARE.
 
 [[third_party_libraries]]
 package_name = "rustls-webpki"
-package_version = "0.103.10"
+package_version = "0.103.13"
 repository = "https://github.com/rustls/webpki"
 license = "ISC"
 
@@ -23693,8 +23693,8 @@ DEALINGS IN THE SOFTWARE.
 
 [[third_party_libraries]]
 package_name = "tar"
-package_version = "0.4.45"
-repository = "https://github.com/alexcrichton/tar-rs"
+package_version = "0.4.46"
+repository = "https://github.com/composefs/tar-rs"
 license = "MIT"
 
 [[third_party_libraries.licenses]]
