@@ -10,7 +10,7 @@ long-lived concerns:
   background jobs that clients start and then poll for status.
 
 This document collects the diagrams and design notes that are too large to keep
-inline in the source doc comments.
+inline in the source code's doc comments.
 
 ## RackManager registry locking
 

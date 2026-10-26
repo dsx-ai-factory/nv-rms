@@ -23,4 +23,4 @@ SVG instead of exporting it separately:
 rsvg-convert -z 2 northbound-southbound.svg -o northbound-southbound.png
 ```
 
-Keep the source and rendered files in sync in the same commit.
+Commit the source and rendered files together so they stay in sync.

@@ -1842,6 +1842,7 @@ mod tests {
 
     #[test]
     fn command_errors_classify_sudo_and_timeouts() {
+        let _guard = crate::utils::SanitizeTestGuard::new();
         let sudo = command_error(
             "host",
             "mst",

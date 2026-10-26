@@ -890,24 +890,25 @@ mod tests {
 
     #[tokio::test]
     async fn start_service_invalid_port_zero_succeeds() {
-        let metrics_port = portpicker::pick_unused_port().expect("no free metrics port");
+        // Both ports are 0, so the OS assigns each listener a free port. The
+        // metrics/grpc "must differ" check is skipped at 0, and nothing here
+        // connects to either listener.
         let c = RmsConfig {
             port: 0,
             metrics: RmsMetricsConfig {
-                port: metrics_port,
+                port: 0,
                 ..RmsMetricsConfig::default()
             },
             ..config(true)
         };
-        if let Ok(mut service) = start_service(
+        let mut service = start_service(
             &c,
             None,
             ApiListenerMode::Insecure,
             SwitchTlsRoots::default(),
         )
         .await
-        {
-            service.stop().await;
-        }
+        .expect("start_service should succeed with OS-assigned ports");
+        service.stop().await;
     }
 }

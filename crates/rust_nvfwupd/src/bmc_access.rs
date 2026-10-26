@@ -3954,6 +3954,7 @@ mod tests {
 
     #[tokio::test]
     async fn scp_remove_remote_file_sanitizes_transport_errors() {
+        let _guard = crate::utils::SanitizeTestGuard::new();
         let mock_host = "mock-switch-cleanup-transport-error";
         ssh_transport::install_mock_exec_error_for_host(
             mock_host,

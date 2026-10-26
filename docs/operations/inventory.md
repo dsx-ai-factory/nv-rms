@@ -23,7 +23,7 @@ NVFWUPD AP names and physical Flint device counts. `CreateNodes` rejects empty
 or unknown supplied profiles, while omission preserves legacy behavior.
 `ListNodeInventory` returns the selected profile.
 
-`CreateNodes` succeeds only when zero nodes fail. `DeleteNode` is refused while
+`CreateNodes` succeeds only when no nodes fail. `DeleteNode` is refused while
 a registered power operation is running on the rack (the operation resolves its
 node from current inventory).
 

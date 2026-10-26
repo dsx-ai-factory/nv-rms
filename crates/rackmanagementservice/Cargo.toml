@@ -67,7 +67,6 @@ figment = { workspace = true, features = ["test"] }
 hyper = { workspace = true }
 hyper-util = { workspace = true, features = ["tokio", "server-auto"] }
 librms = { workspace = true, features = ["client", "serde"] }
-portpicker = { workspace = true }
 rcgen = { workspace = true }
 redfish_test_support = { workspace = true }
 tar = { workspace = true }
