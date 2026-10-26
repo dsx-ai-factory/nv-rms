@@ -2,6 +2,7 @@
 name = "nvfwupd"
 version = "2.1.2"
 edition = "2021"
+license.workspace = true
 description = "CLI tool for updating firmware components through BMC using Redfish protocol"
 
 [[bin]]
@@ -36,6 +37,7 @@ tokio-util = { workspace = true, features = ["io", "rt"] }
 tracing = { workspace = true }
 tracing-appender = { workspace = true }
 tracing-subscriber = { workspace = true }
+common = { workspace = true }
 tar = { workspace = true }
 tempfile = { workspace = true }
 russh = { workspace = true }

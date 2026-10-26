@@ -1,13 +1,18 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+ * SPDX-License-Identifier: Apache-2.0
  *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 /// Classification of async RMS workflows tracked by the job lifecycle.
@@ -21,6 +26,8 @@ pub enum JobType {
     SwitchSystemPasswordUpdate,
     SwitchSystemImageUpdate,
     ConfigureScaleUpFabricManagerV2,
+    /// Coordinator and per-node reservation holds for a rack cold reboot.
+    ColdRebootSequence,
 }
 
 impl JobType {
@@ -34,6 +41,7 @@ impl JobType {
             Self::SwitchSystemPasswordUpdate => "switch_system_password_update",
             Self::SwitchSystemImageUpdate => "switch_system_image_update",
             Self::ConfigureScaleUpFabricManagerV2 => "configure_scale_up_fabric_manager_v2",
+            Self::ColdRebootSequence => "cold_reboot_sequence",
         }
     }
 
@@ -49,6 +57,7 @@ impl JobType {
             Self::SwitchSystemPasswordUpdate => "switch system password update",
             Self::SwitchSystemImageUpdate => "switch system image update",
             Self::ConfigureScaleUpFabricManagerV2 => "scale-up fabric configuration",
+            Self::ColdRebootSequence => "cold reboot",
         }
     }
 
@@ -64,6 +73,7 @@ impl JobType {
             Self::SwitchSystemPasswordUpdate => "switch system password updates",
             Self::SwitchSystemImageUpdate => "switch system image updates",
             Self::ConfigureScaleUpFabricManagerV2 => "scale-up fabric configurations",
+            Self::ColdRebootSequence => "cold reboots",
         }
     }
 }

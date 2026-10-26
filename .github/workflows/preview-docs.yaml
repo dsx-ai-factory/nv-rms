@@ -1,0 +1,146 @@
+name: Preview Docs
+
+# Follows the reference workflow Fern publishes at
+# https://buildwithfern.com/learn/docs/preview-publish/preview-changes#preview-links
+#
+# Trigger mirrors ci.yaml: self-hosted runners do not run `pull_request` events,
+# so this runs on the `pull-request/<number>` branches that copy-pr-bot mirrors
+# trusted and vetted PRs onto. The preview is keyed on that branch name, so
+# every push to a PR updates the same URL, and cleanup-preview.yaml deletes it
+# under that same id when copy-pr-bot deletes the branch.
+on:
+  push:
+    branches:
+      - "pull-request/[0-9]+"
+
+permissions:
+  contents: read
+
+# Shared with cleanup-preview.yaml, keyed on the branch name both can see.
+concurrency:
+  group: preview-docs-${{ github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  changes:
+    name: Check for docs changes
+    runs-on: linux-amd64-cpu4
+    timeout-minutes: 10
+    outputs:
+      docs: ${{ steps.diff.outputs.docs }}
+      number: ${{ steps.diff.outputs.number }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      # A push `paths` filter sees only the files in that push, not the whole
+      # PR, so compare with main the way a `pull_request` filter would.
+      - name: Compare with main
+        id: diff
+        run: |
+          echo "number=${GITHUB_REF_NAME#pull-request/}" >> "$GITHUB_OUTPUT"
+          if git diff --quiet origin/main...HEAD -- docs fern; then
+            echo "docs=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "docs=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  preview:
+    name: Preview Docs
+    needs: changes
+    if: ${{ needs.changes.outputs.docs == 'true' }}
+    runs-on: linux-amd64-cpu4
+    timeout-minutes: 30
+    permissions:
+      pull-requests: write
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0  # origin/main...HEAD diff for the changed-page links
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Setup Fern CLI
+        uses: fern-api/setup-fern-cli@d07601425e9c9ede8745d71ca75c4c462d98755d
+
+      - name: Generate preview URL
+        id: generate-docs
+        env:
+          FERN_TOKEN: ${{ secrets.FERN_TOKEN }}
+          FERN_NO_VERSION_REDIRECTION: "true"
+          PREVIEW_ID: ${{ github.ref_name }}
+        run: |
+          OUTPUT=$(fern generate --docs --preview --id "$PREVIEW_ID" 2>&1) || true
+          echo "$OUTPUT"
+          URL=$(echo "$OUTPUT" | grep -oP 'Published docs to \K.*(?= \()' || true)
+          # `fern generate` failures are swallowed above, so a missing URL is
+          # the real signal that the preview did not publish.
+          if [ -z "$URL" ]; then
+            echo "::error::Fern did not report a published preview URL"
+            exit 1
+          fi
+          echo "preview_url=$URL" >> "$GITHUB_OUTPUT"
+          echo "Preview URL: $URL"
+
+      - name: Get page links for changed pages
+        id: page-links
+        env:
+          FERN_TOKEN: ${{ secrets.FERN_TOKEN }}
+          PREVIEW_URL: ${{ steps.generate-docs.outputs.preview_url }}
+        run: |
+          # RMS docs pages are .md, not the .mdx Fern's reference workflow
+          # assumes, and only docs/ and fern/ hold site content.
+          CHANGED_FILES=$(git diff --name-only origin/main...HEAD -- docs fern \
+            | grep -E '\.mdx?$' || echo "")
+
+          if [ -z "$CHANGED_FILES" ] || [ -z "$PREVIEW_URL" ]; then
+            echo "page_links=" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+
+          BASE_URL=$(echo "$PREVIEW_URL" | grep -oP 'https?://[^/]+')
+
+          FILES_PARAM=$(echo "$CHANGED_FILES" | tr '\n' ',' | sed 's/,$//')
+          RESPONSE=$(curl -sf -H "FERN_TOKEN: $FERN_TOKEN" "${PREVIEW_URL}/api/fern-docs/get-slug-for-file?files=${FILES_PARAM}" 2>/dev/null) || {
+            echo "page_links=" >> "$GITHUB_OUTPUT"; exit 0
+          }
+
+          PAGE_LINKS=$(echo "$RESPONSE" | jq -r --arg url "$BASE_URL" \
+            '.mappings[] | select(.slug != null) | "- [\(.slug)](\($url)/\(.slug))"')
+
+          if [ -n "$PAGE_LINKS" ]; then
+            { echo "page_links<<EOF"; echo "$PAGE_LINKS"; echo "EOF"; } >> "$GITHUB_OUTPUT"
+          else
+            echo "page_links=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create comment content
+        env:
+          PREVIEW_URL: ${{ steps.generate-docs.outputs.preview_url }}
+          PAGE_LINKS: ${{ steps.page-links.outputs.page_links }}
+        run: |
+          echo ":herb: **Preview your docs:** <${PREVIEW_URL}>" > comment.md
+
+          if [ -n "$PAGE_LINKS" ]; then
+            {
+              echo ""
+              echo "Here are the markdown pages you've updated:"
+              echo "$PAGE_LINKS"
+            } >> comment.md
+          fi
+
+      - name: Post PR comment
+        uses: thollander/actions-comment-pull-request@v2.4.3
+        with:
+          filePath: comment.md
+          comment_tag: preview-docs
+          mode: upsert
+          pr_number: ${{ needs.changes.outputs.number }}

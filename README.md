@@ -45,7 +45,7 @@ The full documentation lives in [`docs/`](docs/) and is rendered with
 ## Quick start
 
 ```bash
-git clone https://github.com/NVIDIA/nv-rms.git
+git clone https://github.com/dsx-ai-factory/nv-rms.git
 cd nv-rms
 just build   # or: cargo build --release --workspace
 
@@ -83,6 +83,17 @@ cargo zigbuild --locked --release -p nvfwupd \
 The resulting binaries are written under `target/<target-triple>/release/`.
 The arm64 build requires Zig and `cargo-zigbuild` in addition to the Rust target.
 
+## Contributing and questions
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow, validation
+commands, and Developer Certificate of Origin requirements. All participants
+must follow the [Code of Conduct](CODE_OF_CONDUCT.md).
+
+For contribution questions that are not security-sensitive, open an
+[issue](https://github.com/dsx-ai-factory/nv-rms/issues) with the relevant context.
+Report security vulnerabilities privately as described in
+[SECURITY.md](SECURITY.md).
+
 ## Third-party software
 
 This project will download and install additional third-party open source
@@ -94,5 +105,5 @@ information.
 
 ## License
 
-Licensed under the NVIDIA Software and Model Evaluation License. See
+Licensed under the Apache License, Version 2.0. See
 [`LICENSE`](LICENSE) for the full text.

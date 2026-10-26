@@ -1,13 +1,18 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+ * SPDX-License-Identifier: Apache-2.0
  *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 //! In-memory implementation of [`FirmwareObjectStore`]. Mirrors the Postgres
@@ -189,6 +194,33 @@ impl FirmwareObjectStore for MemoryFirmwareObjectStore {
         Ok(fw.clone())
     }
 
+    async fn set_default_if_none(&self, id: &str) -> Result<FirmwareObject> {
+        // Hold the write lock across the check+set so the "is there a default?"
+        // decision and the write are one atomic step -- the in-process
+        // equivalent of the Postgres advisory-lock serialization.
+        let mut catalog = recover(self.catalog.write());
+        let target_hw = catalog
+            .get(id)
+            .ok_or_else(|| RmsError::not_found(format!("firmware object {id} not found")))?
+            .rack_hardware_type
+            .clone();
+
+        // Any row of this hardware type (including id itself) already default
+        // means the slot is full; leave it untouched.
+        let default_exists = catalog
+            .values()
+            .any(|fw| fw.rack_hardware_type == target_hw && fw.is_default);
+
+        let fw = catalog
+            .get_mut(id)
+            .ok_or_else(|| RmsError::not_found(format!("firmware object {id} not found")))?;
+        if !default_exists {
+            fw.is_default = true;
+            fw.updated = Utc::now();
+        }
+        Ok(fw.clone())
+    }
+
     async fn has_default(&self, hw: &RackHardwareType) -> Result<bool> {
         let catalog = recover(self.catalog.read());
         Ok(catalog
@@ -321,6 +353,17 @@ mod tests {
             .await
             .expect("find_by_id should succeed on a poisoned-but-recovered lock");
         assert_eq!(found.id, "fw-1");
+
+        // set_default_if_none must recover through the same path rather than
+        // panic on the poisoned catalog lock.
+        let defaulted = store
+            .set_default_if_none("fw-1")
+            .await
+            .expect("set_default_if_none should succeed on a poisoned-but-recovered lock");
+        assert!(
+            defaulted.is_default,
+            "set_default_if_none should fill the empty default slot"
+        );
     }
 
     /// Companion to `recovers_from_poisoned_lock` covering the history lock:

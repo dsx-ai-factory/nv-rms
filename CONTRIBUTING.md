@@ -20,7 +20,7 @@ a public issue or pull request.
 
 ## Before You Start
 
-Search the [existing issues](https://github.com/NVIDIA/nv-rms/issues) before
+Search the [existing issues](https://github.com/dsx-ai-factory/nv-rms/issues) before
 opening a new one. Use the repository's issue forms for bugs, feature requests,
 and documentation work. For a substantial behavior or API change, open an issue
 first so maintainers can confirm scope and direction before implementation.
@@ -62,11 +62,50 @@ amend it locally before requesting review:
 git commit --amend --signoff --no-edit
 ```
 
+### Full text of the DCO
+
+```text
+Developer Certificate of Origin
+Version 1.1
+
+Copyright (C) 2004, 2006 The Linux Foundation and its contributors.
+
+Everyone is permitted to copy and distribute verbatim copies of this
+license document, but changing it is not allowed.
+
+
+Developer's Certificate of Origin 1.1
+
+By making a contribution to this project, I certify that:
+
+(a) The contribution was created in whole or in part by me and I
+    have the right to submit it under the open source license
+    indicated in the file; or
+
+(b) The contribution is based upon previous work that, to the best
+    of my knowledge, is covered under an appropriate open source
+    license and I have the right under that license to submit that
+    work with modifications, whether created in whole or in part
+    by me, under the same open source license (unless I am
+    permitted to submit under a different license), as indicated
+    in the file; or
+
+(c) The contribution was provided directly to me by some other
+    person who certified (a), (b) or (c) and I have not modified
+    it.
+
+(d) I understand and agree that this project and the contribution
+    are public and that a record of the contribution (including all
+    personal information I submit with it, including my sign-off) is
+    maintained indefinitely and may be redistributed consistent with
+    this project or the open source license(s) involved.
+```
+
 ## Fork and Setup
 
 ### 1. Fork and clone the repository
 
-Fork [NVIDIA/nv-rms](https://github.com/NVIDIA/nv-rms), then clone your fork:
+Fork [dsx-ai-factory/nv-rms](https://github.com/dsx-ai-factory/nv-rms), then clone your fork:
 
 ```bash
 git clone https://github.com/<your-username>/nv-rms.git
@@ -76,7 +115,7 @@ cd nv-rms
 ### 2. Add the upstream remote
 
 ```bash
-git remote add upstream https://github.com/NVIDIA/nv-rms.git
+git remote add upstream https://github.com/dsx-ai-factory/nv-rms.git
 git fetch upstream
 ```
 
@@ -117,7 +156,7 @@ Examples include `fix/sftp-timeout`, `feature/new-rack-type`, and
 3. Add or update tests that exercise the changed behavior.
 4. Run formatting, linting, and relevant tests locally.
 5. Sign off every commit with the DCO trailer.
-6. Open a pull request against `NVIDIA/nv-rms:main` using the repository
+6. Open a pull request against `dsx-ai-factory/nv-rms:main` using the repository
    template.
 
 ## Engineering Guidelines
@@ -179,6 +218,7 @@ Without PostgreSQL, run the suites that do not require it:
 
 ```bash
 cargo test --release --lib
+cargo test --release --test config_startup
 cargo test --release --test grpc_e2e
 cargo test --release --test grpc_mtls
 cargo test --release --test mockup_server_test
@@ -217,8 +257,12 @@ for integration-test and benchmark details.
 Maintainers may ask for changes, split an overly broad pull request, or decline
 work that does not align with the project roadmap or security posture.
 
+Pull requests are not merged directly on GitHub: after review, maintainers
+integrate accepted changes into NVIDIA's internal repository, and the changes
+appear in a subsequent public release of this repository.
+
 ## Questions
 
 For contribution questions that are not security-sensitive, open an
-[issue](https://github.com/NVIDIA/nv-rms/issues) with the relevant context.
+[issue](https://github.com/dsx-ai-factory/nv-rms/issues) with the relevant context.
 Report vulnerabilities privately as described in [SECURITY.md](SECURITY.md).

@@ -1,13 +1,18 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+ * SPDX-License-Identifier: Apache-2.0
  *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 use std::collections::HashMap;
@@ -920,7 +925,9 @@ mod tests {
     async fn start_rejects_plaintext_without_insecure_mode() {
         use crate::metrics::{self, MetricsInfo};
 
-        let port = portpicker::pick_unused_port().expect("no free port");
+        // Port 0 is an OS-assigned port: this test only asserts that `start`
+        // fails closed, so it never connects and never reads the port back.
+        let port = 0;
 
         let _metrics_registry = metrics::init(&MetricsInfo {
             grpc_port: port,
@@ -948,7 +955,9 @@ mod tests {
     async fn start_rejects_invalid_sftp_upload_options() {
         use crate::metrics::{self, MetricsInfo};
 
-        let port = portpicker::pick_unused_port().expect("no free port");
+        // Port 0 is an OS-assigned port: this test only asserts that `start`
+        // fails closed, so it never connects and never reads the port back.
+        let port = 0;
 
         let _metrics_registry = metrics::init(&MetricsInfo {
             grpc_port: port,
@@ -1878,11 +1887,11 @@ impl RackManagerTrait for RackManagerServiceImpl {
         self.handle_get_power_state(req).await
     }
 
-    async fn sequence_rack_power(
+    async fn execute_cold_reboot(
         &self,
-        req: tonic::Request<rm::SequenceRackPowerRequest>,
-    ) -> std::result::Result<tonic::Response<rm::SequenceRackPowerResponse>, tonic::Status> {
-        self.handle_sequence_rack_power(req).await
+        req: tonic::Request<rm::ExecuteColdRebootRequest>,
+    ) -> std::result::Result<tonic::Response<rm::ExecuteColdRebootResponse>, tonic::Status> {
+        self.handle_execute_cold_reboot(req).await
     }
 
     // ── Inventory ──
@@ -1914,22 +1923,6 @@ impl RackManagerTrait for RackManagerServiceImpl {
         req: tonic::Request<rm::DeleteNodeRequest>,
     ) -> std::result::Result<tonic::Response<rm::DeleteNodeResponse>, tonic::Status> {
         self.handle_delete_node(req).await
-    }
-
-    async fn get_rack_power_on_sequence(
-        &self,
-        req: tonic::Request<rm::GetRackPowerOnSequenceRequest>,
-    ) -> std::result::Result<tonic::Response<rm::GetRackPowerOnSequenceResponse>, tonic::Status>
-    {
-        self.handle_get_rack_power_on_sequence(req).await
-    }
-
-    async fn set_rack_power_on_sequence(
-        &self,
-        req: tonic::Request<rm::SetRackPowerOnSequenceRequest>,
-    ) -> std::result::Result<tonic::Response<rm::SetRackPowerOnSequenceResponse>, tonic::Status>
-    {
-        self.handle_set_rack_power_on_sequence(req).await
     }
 
     async fn list_racks(
@@ -1977,6 +1970,15 @@ impl RackManagerTrait for RackManagerServiceImpl {
     ) -> std::result::Result<tonic::Response<rm::GetNodeFirmwareInventoryResponse>, tonic::Status>
     {
         self.handle_get_node_firmware_inventory(req).await
+    }
+
+    async fn batch_get_firmware_inventory(
+        &self,
+        req: tonic::Request<rm::BatchGetFirmwareInventoryRequest>,
+    ) -> std::result::Result<tonic::Response<rm::BatchGetFirmwareInventoryResponse>, tonic::Status>
+    {
+        let req = normalize_request(req, |r| normalize_node_set(&mut r.nodes))?;
+        self.handle_batch_get_firmware_inventory(req).await
     }
 
     async fn update_firmware(
@@ -2041,6 +2043,25 @@ impl RackManagerTrait for RackManagerServiceImpl {
     {
         let req = normalize_request(req, |r| normalize_node_set(&mut r.nodes))?;
         self.handle_update_switch_system_password(req).await
+    }
+
+    async fn batch_collect_switch_spdm_attestation_evidence(
+        &self,
+        req: tonic::Request<rm::BatchCollectSwitchSpdmAttestationEvidenceRequest>,
+    ) -> std::result::Result<
+        tonic::Response<rm::BatchCollectSwitchSpdmAttestationEvidenceResponse>,
+        tonic::Status,
+    > {
+        let req = normalize_request(req, |r| {
+            for node in &mut r.targets {
+                normalize_node_info(node)?;
+            }
+
+            Ok(())
+        })?;
+
+        self.handle_batch_collect_switch_spdm_attestation_evidence(req)
+            .await
     }
 
     async fn get_rack_firmware_inventory(

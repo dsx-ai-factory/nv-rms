@@ -1,13 +1,18 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+ * SPDX-License-Identifier: Apache-2.0
  *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 //! Scale benchmarks — measures Rust service performance at 100–10k node scale
@@ -130,6 +135,7 @@ fn make_node(id: usize, port: u16) -> NodeInfo {
         }),
         host_endpoint: None,
         node_descriptor: None,
+        additional_host_endpoints: Vec::new(),
     }
 }
 
@@ -158,13 +164,17 @@ async fn start_grpc_server(
             .build()
             .unwrap(),
     );
-    let port = portpicker::pick_unused_port().expect("no free port");
-
     let tmp_fw_dir = std::env::temp_dir();
-    let mut server = GrpcServer::new(port, rm, jt, Backends::memory())
+    let mut server = GrpcServer::new(0, rm, jt, Backends::memory())
         .with_firmware_dir(tmp_fw_dir)
         .with_insecure_listener();
-    server.start().await.unwrap();
+
+    // Bind an OS-assigned port and hold the listener through to serving, so the
+    // port cannot be claimed by anyone else in between.
+    let (incoming, port) = server
+        .bind_localhost_ephemeral_port()
+        .expect("bind benchmark server port");
+    server.start_with_bound_incoming(incoming).await.unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let addr = format!("http://127.0.0.1:{port}");

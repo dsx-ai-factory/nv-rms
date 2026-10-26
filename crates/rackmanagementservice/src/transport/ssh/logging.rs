@@ -1,13 +1,18 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+ * SPDX-License-Identifier: Apache-2.0
  *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 //! Redaction and bounded string helpers for SSH structured logs.
@@ -21,7 +26,9 @@ use std::sync::LazyLock;
 
 use regex::Regex;
 
-const REDACTED_SECRET: &str = "XXXX";
+/// Redaction token, sourced from the shared `common` crate so SSH logs use
+/// the same placeholder as every other RMS redaction path.
+const REDACTED_SECRET: &str = common::DEFAULT_REPLACEMENT;
 
 /// Maximum command text emitted as a structured log field.
 pub(super) const SSH_LOG_COMMAND_MAX_CHARS: usize = 160;
@@ -64,6 +71,14 @@ pub(super) fn ssh_command_log_value(command: &str) -> String {
 /// This intentionally does not redact space-delimited `password <word>` forms
 /// because recovery transcripts also contain status phrases such as "password
 /// unchanged".
+///
+/// The SSH-specific matcher below is line-bounded on purpose (it uses only
+/// tab/space, never a newline, around the `:`/`=` separator). The shared
+/// `common::redaction` pass is deliberately *not* layered on here: its
+/// separators allow newlines, which would let a `Retype new password:` prompt
+/// swallow the following `password unchanged` status line. SSH transcripts thus
+/// keep their own matcher; only the redaction token is shared (see
+/// [`REDACTED_SECRET`]).
 pub(super) fn scrub_password_recovery_transcript(transcript: &str, new_password: &str) -> String {
     scrub_password_key_values(transcript, new_password).into_owned()
 }

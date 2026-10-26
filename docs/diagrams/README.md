@@ -7,6 +7,7 @@ Markdown under `docs/` references the rendered `.svg` files.
 | --- | --- | --- |
 | Northbound / southbound connections | `northbound-southbound.drawio` | `northbound-southbound.svg` / `.png` |
 | Internal component layers | `internal-components.drawio` | `internal-components.svg` / `.png` |
+| Kubernetes deployment model | `kubernetes-deployment.drawio` | `kubernetes-deployment.svg` / `.png` |
 
 ## Editing
 
@@ -22,4 +23,4 @@ SVG instead of exporting it separately:
 rsvg-convert -z 2 northbound-southbound.svg -o northbound-southbound.png
 ```
 
-Keep the source and rendered files in sync in the same commit.
+Commit the source and rendered files together so they stay in sync.

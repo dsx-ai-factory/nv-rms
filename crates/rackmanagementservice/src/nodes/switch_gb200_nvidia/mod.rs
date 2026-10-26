@@ -1,13 +1,18 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+ * SPDX-License-Identifier: Apache-2.0
  *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 //! NVIDIA GB200 switch node implementation.
@@ -15,13 +20,16 @@
 //! Provides node construction and management workflows over NVUE, SSH/SFTP,
 //! Redfish, and NVFWUPD.
 
+mod attestation;
 mod cluster;
 mod factory_reset;
 mod firmware;
 mod nvue;
 mod password;
+mod post_config_check;
 mod power;
 mod ssh;
+mod system;
 mod system_image;
 mod validation;
 
@@ -30,6 +38,10 @@ pub mod mtls;
 
 pub(crate) use self::password::SwitchSystemPasswordUpdateOutcome;
 pub(crate) use self::validation::{is_valid_identifier, shell_quote};
+
+#[cfg(test)]
+pub(crate) use self::attestation::SwitchSpdmAttestationEvidence;
+pub(crate) use self::attestation::{SpdmAttestationChallenge, SwitchSpdmComponentResult};
 
 pub use self::cluster::grpc_port_for_app;
 pub use self::system_image::{
@@ -47,6 +59,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use nvue_client::SharedClient as SharedNvueClient;
+use nvue_client::system::SystemPowerCycleRequest;
 #[cfg(test)]
 use nvue_client::{
     Client as NvueClient, ClientConfig as NvueConnectConfig, ClientCredentials as NvueCredentials,
@@ -469,12 +482,11 @@ impl Node for SwitchGb200Nvidia {
             ));
         }
 
-        let payload = serde_json::json!({
-            "@power-cycle": {
-                "state": "start",
-                "parameters": {"force": true}
-            }
-        });
+        let payload =
+            serde_json::to_value(SystemPowerCycleRequest::new(true)).map_err(|error| {
+                RmsError::internal(format!("failed to serialize power-cycle request: {error}"))
+            })?;
+
         self.nvue_http_post("/nvue_v1/system", &payload, HttpClient::DEFAULT_TIMEOUT)
             .await?;
         Ok(())

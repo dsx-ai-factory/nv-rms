@@ -1,13 +1,18 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+ * SPDX-License-Identifier: Apache-2.0
  *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 //! Shared SSH/SFTP host-key option parsing.
@@ -37,14 +42,8 @@ pub(crate) fn ssh_host_key_mode_string_value_supported(value: &str) -> bool {
     )
 }
 
-fn parse_ssh_host_key_mode(
-    mode_arg: Option<&str>,
-    known_hosts_present: bool,
-) -> Result<String, String> {
+fn parse_ssh_host_key_mode(mode_arg: Option<&str>) -> Result<String, String> {
     match mode_arg {
-        None if known_hosts_present => Ok(SSH_HOST_KEY_MODE_TOFU.to_string()),
-        // SSH host-key verification is wired and ready in NVFWUPD; default
-        // enablement is pending final customer discussions.
         None => Ok(SSH_HOST_KEY_MODE_DISABLED.to_string()),
         Some(value) => {
             let value = value.trim();
@@ -76,7 +75,7 @@ pub(crate) fn parse_ssh_options(
     }
 
     let explicit_mode = arg_dict.get(SSH_HOST_KEY_MODE_ARG).map(String::as_str);
-    let mode = parse_ssh_host_key_mode(explicit_mode, known_hosts.is_some())?;
+    let mode = parse_ssh_host_key_mode(explicit_mode)?;
     if mode == SSH_HOST_KEY_MODE_DISABLED && known_hosts.is_some() {
         return Err(format!(
             "{SSH_KNOWN_HOSTS_ARG} cannot be used when {SSH_HOST_KEY_MODE_ARG}={SSH_HOST_KEY_MODE_DISABLED}; \
@@ -108,20 +107,6 @@ mod tests {
         let options = parse_ssh_options(&HashMap::new()).expect("omitted mode should default");
 
         assert_eq!(options.mode, SSH_HOST_KEY_MODE_DISABLED);
-    }
-
-    #[test]
-    fn known_hosts_without_mode_opts_into_tofu() {
-        let mut args = HashMap::new();
-        args.insert(
-            SSH_KNOWN_HOSTS_ARG.to_string(),
-            "/tmp/known_hosts".to_string(),
-        );
-
-        let options = parse_ssh_options(&args).expect("known_hosts should opt into verification");
-
-        assert_eq!(options.known_hosts.as_deref(), Some("/tmp/known_hosts"));
-        assert_eq!(options.mode, SSH_HOST_KEY_MODE_TOFU);
     }
 
     #[test]

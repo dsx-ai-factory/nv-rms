@@ -1,13 +1,18 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+ * SPDX-License-Identifier: Apache-2.0
  *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 //! NVOS mTLS certificate installation for switch services.
@@ -17,6 +22,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use serde::Serialize;
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
@@ -147,27 +153,41 @@ fn nvue_cluster_app_manager_sub_endpoint(app_name: &str, field: &str) -> String 
     format!("{}/{}", nvue_cluster_app_manager_endpoint(app_name), field)
 }
 
-fn nvue_import_ca_certificate_parameters(uri: &str) -> Value {
-    json!({ "uri": uri })
+#[derive(Serialize)]
+struct ImportCaCertificateParameters<'a> {
+    uri: &'a str,
 }
 
-fn nvue_import_entity_certificate_parameters(cert_uri: &str, key_uri: &str) -> Value {
-    json!({
-        "uri-public-key": cert_uri,
-        "uri-private-key": key_uri,
-    })
+#[derive(Serialize)]
+struct ImportEntityCertificateParameters<'a> {
+    #[serde(rename = "uri-public-key")]
+    public_key_uri: &'a str,
+
+    #[serde(rename = "uri-private-key")]
+    private_key_uri: &'a str,
 }
 
-fn nvue_cluster_app_manager_certificate_parameters(cert_id: &str) -> Value {
-    json!({ "cert-id": cert_id })
+#[derive(Serialize)]
+struct ClusterAppManagerCertificateParameters<'a> {
+    #[serde(rename = "cert-id")]
+    certificate_id: &'a str,
 }
 
-fn nvue_cluster_app_manager_ca_certificate_parameters(ca_id: &str) -> Value {
-    json!({ "cacert-id": ca_id })
+#[derive(Serialize)]
+struct ClusterAppManagerCaCertificateParameters<'a> {
+    #[serde(rename = "cacert-id")]
+    ca_certificate_id: &'a str,
 }
 
-fn nvue_cluster_app_manager_encryption_parameters() -> Value {
-    json!({ "encryption": "mtls" })
+#[derive(Serialize)]
+struct CertificateBinding<'a> {
+    certificate: &'a str,
+}
+
+#[derive(Serialize)]
+struct CaCertificateBinding<'a> {
+    #[serde(rename = "ca-certificate")]
+    ca_certificate: &'a str,
 }
 
 fn mtls_unset_command(service: SwitchMtlsService) -> &'static str {
@@ -272,12 +292,12 @@ fn verify_certificate_not_expired(response: &Value, certificate_id: &str) -> Res
 }
 
 fn verify_expected_field(
-    response: &Value,
+    actual: Option<&str>,
     field: &str,
     expected: &str,
     context: &str,
 ) -> Result<()> {
-    let actual = extract_string_field(response, field).ok_or_else(|| {
+    let actual = actual.ok_or_else(|| {
         RmsError::failed_precondition(format!("{context} response missing {field}"))
     })?;
     if actual != expected {
@@ -525,42 +545,95 @@ impl SwitchMtlsMaterialPaths {
 }
 
 impl SwitchGb200Nvidia {
-    /// Reuses the active NVUE API certificate objects for NMX Controller mTLS.
-    ///
-    /// The certificate RPC provisions and verifies NVUE before scale-up
-    /// reconciliation selects a primary. Reusing that binding avoids importing
-    /// duplicate certificate objects during each primary rotation.
-    pub(crate) async fn bind_nmx_controller_to_nvue_api_material(&self) -> Result<()> {
+    /// Returns the `(ca_id, cert_id)` bound to the NVUE API, which
+    /// `ConfigureSwitchCertificate` must have configured first.
+    async fn nvue_api_material_ids(&self) -> Result<(String, String)> {
         let api = self
-            .nvue_http_get(NVUE_SYSTEM_API_PATH, HttpClient::DEFAULT_TIMEOUT)
+            .nvue_client()?
+            .get_system_api(HttpClient::DEFAULT_TIMEOUT)
             .await?;
 
-        let cert_id = extract_string_field(&api, "certificate")
+        let cert_id = api
+            .certificate()
             .filter(|value| !value.is_empty() && *value != "self-signed")
             .ok_or_else(|| {
                 RmsError::failed_precondition(
                     "NVUE API certificate is not configured; run ConfigureSwitchCertificate first",
                 )
-            })?;
+            })?
+            .to_string();
 
         let mtls = self.get_nvue_api_mtls_configuration().await?;
 
-        let ca_id = extract_string_field(&mtls, "ca-certificate")
+        let ca_id = mtls
+            .ca_certificate()
             .filter(|value| !value.is_empty())
             .ok_or_else(|| {
                 RmsError::failed_precondition(
                     "NVUE API mTLS CA certificate is not configured; run \
                      ConfigureSwitchCertificate first",
                 )
-            })?;
+            })?
+            .to_string();
 
-        self.bind_cluster_app_mtls("nmx-controller", ca_id, cert_id)
+        Ok((ca_id, cert_id))
+    }
+
+    /// Reuses the active NVUE API certificate objects for NMX Controller mTLS.
+    ///
+    /// The certificate RPC provisions and verifies NVUE before scale-up
+    /// reconciliation selects a primary. Reusing that binding avoids importing
+    /// duplicate certificate objects during each primary rotation.
+    pub(crate) async fn bind_nmx_controller_to_nvue_api_material(&self) -> Result<()> {
+        let (ca_id, cert_id) = self.nvue_api_material_ids().await?;
+
+        self.bind_cluster_app_mtls("nmx-controller", &ca_id, &cert_id)
             .await?;
 
-        self.verify_cluster_app_mtls("nmx-controller", ca_id, cert_id)
+        self.verify_cluster_app_mtls("nmx-controller", &ca_id, &cert_id)
             .await?;
 
         Ok(())
+    }
+
+    /// Reports whether NMX Controller mTLS is bound to the certificate objects
+    /// the NVUE API currently uses.
+    ///
+    /// Certificate rotation refreshes the NVUE binding first, so a mismatch
+    /// means NMX Controller still serves the superseded certificate even while
+    /// that certificate keeps validating.
+    pub(crate) async fn nmx_controller_binding_is_current(&self) -> Result<bool> {
+        let (ca_id, cert_id) = self.nvue_api_material_ids().await?;
+
+        let certificate = self
+            .get_cluster_app_manager_leaf("nmx-controller", "certificate")
+            .await?;
+        let ca_certificate = self
+            .get_cluster_app_manager_leaf("nmx-controller", "ca-certificate")
+            .await?;
+        let encryption = self
+            .get_cluster_app_manager_leaf("nmx-controller", "encryption")
+            .await?;
+
+        let bound_cert = extract_string_field(&certificate, "certificate");
+        let bound_ca = extract_string_field(&ca_certificate, "ca-certificate");
+        let bound_encryption = extract_string_field(&encryption, "encryption");
+        let is_current = bound_cert == Some(cert_id.as_str())
+            && bound_ca == Some(ca_id.as_str())
+            && bound_encryption == Some("mtls");
+
+        tracing::debug!(
+            node = %self.id(),
+            nvue_certificate = %cert_id,
+            nvue_ca_certificate = %ca_id,
+            nmx_certificate = bound_cert.unwrap_or("(unset)"),
+            nmx_ca_certificate = bound_ca.unwrap_or("(unset)"),
+            nmx_encryption = bound_encryption.unwrap_or("(unset)"),
+            is_current,
+            "compared NMX Controller mTLS binding with NVUE API material"
+        );
+
+        Ok(is_current)
     }
 
     pub(crate) async fn unset_mtls_services(
@@ -892,7 +965,7 @@ impl SwitchGb200Nvidia {
         self.nvue_start_action(
             &ca_endpoint,
             "@import",
-            nvue_import_ca_certificate_parameters(&ca_uri),
+            ImportCaCertificateParameters { uri: &ca_uri },
         )
         .await?;
 
@@ -907,7 +980,10 @@ impl SwitchGb200Nvidia {
         self.nvue_start_action(
             &entity_endpoint,
             "@import",
-            nvue_import_entity_certificate_parameters(&cert_uri, &key_uri),
+            ImportEntityCertificateParameters {
+                public_key_uri: &cert_uri,
+                private_key_uri: &key_uri,
+            },
         )
         .await?;
 
@@ -956,12 +1032,28 @@ impl SwitchGb200Nvidia {
             }
             SwitchMtlsService::ScaleUpFabricTelemetryInterface => {
                 tracing::debug!(node = %self.id(), service = "gnmi-server", "binding gNMI server mTLS");
+
+                let certificate = serde_json::to_value(CertificateBinding {
+                    certificate: &cert_id,
+                })
+                .map_err(|error| {
+                    RmsError::internal(format!(
+                        "failed to serialize gNMI certificate binding: {error}"
+                    ))
+                })?;
+
+                let ca_certificate = serde_json::to_value(CaCertificateBinding {
+                    ca_certificate: &ca_id,
+                })
+                .map_err(|error| {
+                    RmsError::internal(format!(
+                        "failed to serialize gNMI CA certificate binding: {error}"
+                    ))
+                })?;
+
                 self.nvue_apply_config_patches(&[
-                    (NVUE_GNMI_SERVER_PATH, json!({ "certificate": cert_id })),
-                    (
-                        NVUE_GNMI_SERVER_MTLS_PATH,
-                        json!({ "ca-certificate": ca_id }),
-                    ),
+                    (NVUE_GNMI_SERVER_PATH, certificate),
+                    (NVUE_GNMI_SERVER_MTLS_PATH, ca_certificate),
                 ])
                 .await?;
             }
@@ -991,15 +1083,30 @@ impl SwitchGb200Nvidia {
         &self,
         material: &SwitchMtlsMaterialPaths,
     ) -> Result<String> {
+        let certificate_id = material.entity_cert_id();
+        let ca_certificate_id = material.ca_cert_id();
+
+        let certificate = serde_json::to_value(CertificateBinding {
+            certificate: &certificate_id,
+        })
+        .map_err(|error| {
+            RmsError::internal(format!(
+                "failed to serialize NVUE API certificate binding: {error}"
+            ))
+        })?;
+
+        let ca_certificate = serde_json::to_value(CaCertificateBinding {
+            ca_certificate: &ca_certificate_id,
+        })
+        .map_err(|error| {
+            RmsError::internal(format!(
+                "failed to serialize NVUE API CA certificate binding: {error}"
+            ))
+        })?;
+
         self.nvue_stage_config_patches(&[
-            (
-                NVUE_SYSTEM_API_PATH,
-                json!({ "certificate": material.entity_cert_id() }),
-            ),
-            (
-                NVUE_SYSTEM_API_MTLS_PATH,
-                json!({ "ca-certificate": material.ca_cert_id() }),
-            ),
+            (NVUE_SYSTEM_API_PATH, certificate),
+            (NVUE_SYSTEM_API_MTLS_PATH, ca_certificate),
         ])
         .await
     }
@@ -1035,7 +1142,12 @@ impl SwitchGb200Nvidia {
         let nvue_mtls = if services.contains(&SwitchMtlsService::NvueApi) {
             let configuration = self.get_nvue_api_mtls_configuration().await?;
 
-            verify_expected_field(&configuration, "ca-certificate", &ca_id, "NVUE API mTLS")?;
+            verify_expected_field(
+                configuration.ca_certificate(),
+                "ca-certificate",
+                &ca_id,
+                "NVUE API mTLS",
+            )?;
 
             Some(configuration)
         } else {
@@ -1045,7 +1157,12 @@ impl SwitchGb200Nvidia {
         let gnmi_mtls = if services.contains(&SwitchMtlsService::ScaleUpFabricTelemetryInterface) {
             let configuration = self.get_gnmi_server_mtls_configuration().await?;
 
-            verify_expected_field(&configuration, "ca-certificate", &ca_id, "gNMI server mTLS")?;
+            verify_expected_field(
+                configuration.ca_certificate(),
+                "ca-certificate",
+                &ca_id,
+                "gNMI server mTLS",
+            )?;
 
             Some(configuration)
         } else {
@@ -1083,8 +1200,9 @@ impl SwitchGb200Nvidia {
         let certificate = self
             .get_cluster_app_manager_leaf(app_name, "certificate")
             .await?;
+
         verify_expected_field(
-            &certificate,
+            extract_string_field(&certificate, "certificate"),
             "certificate",
             cert_id,
             &format!("cluster app {app_name} manager certificate"),
@@ -1093,8 +1211,9 @@ impl SwitchGb200Nvidia {
         let ca_certificate = self
             .get_cluster_app_manager_leaf(app_name, "ca-certificate")
             .await?;
+
         verify_expected_field(
-            &ca_certificate,
+            extract_string_field(&ca_certificate, "ca-certificate"),
             "ca-certificate",
             ca_id,
             &format!("cluster app {app_name} manager CA certificate"),
@@ -1103,8 +1222,9 @@ impl SwitchGb200Nvidia {
         let encryption = self
             .get_cluster_app_manager_leaf(app_name, "encryption")
             .await?;
+
         verify_expected_field(
-            &encryption,
+            extract_string_field(&encryption, "encryption"),
             "encryption",
             "mtls",
             &format!("cluster app {app_name} manager encryption"),
@@ -1142,11 +1262,25 @@ impl SwitchGb200Nvidia {
         let cert_bindings = [
             (
                 "certificate",
-                nvue_cluster_app_manager_certificate_parameters(cert_id),
+                serde_json::to_value(ClusterAppManagerCertificateParameters {
+                    certificate_id: cert_id,
+                })
+                .map_err(|error| {
+                    RmsError::internal(format!(
+                        "failed to serialize cluster app certificate binding: {error}"
+                    ))
+                })?,
             ),
             (
                 "ca-certificate",
-                nvue_cluster_app_manager_ca_certificate_parameters(ca_id),
+                serde_json::to_value(ClusterAppManagerCaCertificateParameters {
+                    ca_certificate_id: ca_id,
+                })
+                .map_err(|error| {
+                    RmsError::internal(format!(
+                        "failed to serialize cluster app CA certificate binding: {error}"
+                    ))
+                })?,
             ),
         ];
         let settle_delay = Duration::from_secs(config::CLUSTER_MANAGER_ACTION_SETTLE_SECONDS);
@@ -1165,35 +1299,21 @@ impl SwitchGb200Nvidia {
             tokio::time::sleep(settle_delay).await;
         }
 
-        let encryption_field = "encryption";
-        let encryption_endpoint = nvue_cluster_app_manager_sub_endpoint(app_name, encryption_field);
+        // Encryption manager binding prefers the typed NVUE `@update` action
+        // (the `encryption` segment binds its value from a `mode` parameter in
+        // NVOS `cue_cluster_v1`, so the parameter name is `mode`, not the
+        // segment name), but retains an explicit SSH nvCLI backstop for this
+        // step: cert installation is a bootstrap where the NVUE channel can be
+        // unavailable/mid-transition, and SSH is an independent credential
+        // path. See `bind_cluster_app_manager_encryption_mtls`.
         tracing::debug!(
             node = %self.id(),
             app_name,
-            field = encryption_field,
-            endpoint = %encryption_endpoint,
-            "binding cluster app manager encryption via NVUE API"
+            field = "encryption",
+            "binding cluster app manager encryption (NVUE with SSH backstop)"
         );
-        match self
-            .nvue_start_action(
-                &encryption_endpoint,
-                "@update",
-                nvue_cluster_app_manager_encryption_parameters(),
-            )
-            .await
-        {
-            Ok(()) => {}
-            Err(e) => {
-                tracing::warn!(
-                    node = %self.id(),
-                    app_name,
-                    error = %e.message,
-                    "NVUE REST encryption update failed; retrying via NVOS CLI"
-                );
-                self.run_cluster_app_manager_field_action(app_name, encryption_field, "mtls")
-                    .await?;
-            }
-        }
+        self.bind_cluster_app_manager_encryption_mtls(app_name)
+            .await?;
 
         tracing::debug!(
             node = %self.id(),
@@ -1341,6 +1461,76 @@ mod tests {
         );
     }
 
+    async fn mount_nmx_controller_binding(
+        server: &MockServer,
+        nvue_cert: &str,
+        nvue_ca: &str,
+        nmx_cert: &str,
+        nmx_ca: &str,
+        nmx_encryption: &str,
+    ) {
+        let responses = [
+            (
+                NVUE_SYSTEM_API_PATH.to_string(),
+                json!({"certificate": nvue_cert}),
+            ),
+            (
+                NVUE_SYSTEM_API_MTLS_PATH.to_string(),
+                json!({"ca-certificate": nvue_ca}),
+            ),
+            (
+                "/nvue_v1/cluster/apps/nmx-controller/manager/certificate".to_string(),
+                json!({"certificate": nmx_cert}),
+            ),
+            (
+                "/nvue_v1/cluster/apps/nmx-controller/manager/ca-certificate".to_string(),
+                json!({"ca-certificate": nmx_ca}),
+            ),
+            (
+                "/nvue_v1/cluster/apps/nmx-controller/manager/encryption".to_string(),
+                json!({"encryption": nmx_encryption}),
+            ),
+        ];
+
+        for (endpoint, body) in responses {
+            Mock::given(method("GET"))
+                .and(path(endpoint))
+                .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                .mount(server)
+                .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn nmx_controller_binding_is_current_when_ids_match_nvue_api() {
+        let server = MockServer::start().await;
+        mount_nmx_controller_binding(&server, "cert-2", "ca-1", "cert-2", "ca-1", "mtls").await;
+
+        let switch = SwitchGb200Nvidia::for_test(&server.uri());
+
+        assert!(switch.nmx_controller_binding_is_current().await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn nmx_controller_binding_is_stale_when_nvue_certificate_was_rotated() {
+        let server = MockServer::start().await;
+        mount_nmx_controller_binding(&server, "cert-2", "ca-1", "cert-1", "ca-1", "mtls").await;
+
+        let switch = SwitchGb200Nvidia::for_test(&server.uri());
+
+        assert!(!switch.nmx_controller_binding_is_current().await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn nmx_controller_binding_is_stale_when_encryption_is_not_mtls() {
+        let server = MockServer::start().await;
+        mount_nmx_controller_binding(&server, "cert-2", "ca-1", "cert-2", "ca-1", "none").await;
+
+        let switch = SwitchGb200Nvidia::for_test(&server.uri());
+
+        assert!(!switch.nmx_controller_binding_is_current().await.unwrap());
+    }
+
     #[tokio::test]
     async fn stable_material_detects_source_changes() {
         let directory = tempfile::tempdir().unwrap();
@@ -1459,6 +1649,30 @@ mod tests {
     }
 
     #[test]
+    fn expected_field_distinguishes_missing_and_mismatched_values() {
+        let missing =
+            verify_expected_field(None, "ca-certificate", "rms-ca", "NVUE API mTLS").unwrap_err();
+
+        let mismatch = verify_expected_field(
+            Some("other-ca"),
+            "ca-certificate",
+            "rms-ca",
+            "NVUE API mTLS",
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            missing.message,
+            "NVUE API mTLS response missing ca-certificate"
+        );
+
+        assert_eq!(
+            mismatch.message,
+            "NVUE API mTLS expected ca-certificate=rms-ca, got other-ca"
+        );
+    }
+
+    #[test]
     fn nvue_certificate_endpoints_use_security_paths() {
         assert_eq!(
             nvue_ca_certificate_endpoint("rms-example-ca"),
@@ -1490,13 +1704,19 @@ mod tests {
 
     #[test]
     fn nvue_import_parameters_match_certificate_management_api() {
-        let ca = nvue_import_ca_certificate_parameters("file:///home/admin/certs/ca.pem");
+        let ca = serde_json::to_value(ImportCaCertificateParameters {
+            uri: "file:///home/admin/certs/ca.pem",
+        })
+        .unwrap();
+
         assert_eq!(ca["uri"], "file:///home/admin/certs/ca.pem");
 
-        let entity = nvue_import_entity_certificate_parameters(
-            "file:///home/admin/certs/client.pem",
-            "file:///home/admin/certs/client.key",
-        );
+        let entity = serde_json::to_value(ImportEntityCertificateParameters {
+            public_key_uri: "file:///home/admin/certs/client.pem",
+            private_key_uri: "file:///home/admin/certs/client.key",
+        })
+        .unwrap();
+
         assert_eq!(
             entity["uri-public-key"],
             "file:///home/admin/certs/client.pem"
@@ -1509,14 +1729,19 @@ mod tests {
 
     #[test]
     fn nvue_cluster_app_manager_update_requests_mtls_binding() {
-        let cert = nvue_cluster_app_manager_certificate_parameters("rms-example-cert");
+        let cert = serde_json::to_value(ClusterAppManagerCertificateParameters {
+            certificate_id: "rms-example-cert",
+        })
+        .unwrap();
+
         assert_eq!(cert["cert-id"], "rms-example-cert");
 
-        let ca = nvue_cluster_app_manager_ca_certificate_parameters("rms-example-ca");
-        assert_eq!(ca["cacert-id"], "rms-example-ca");
+        let ca = serde_json::to_value(ClusterAppManagerCaCertificateParameters {
+            ca_certificate_id: "rms-example-ca",
+        })
+        .unwrap();
 
-        let encryption = nvue_cluster_app_manager_encryption_parameters();
-        assert_eq!(encryption["encryption"], "mtls");
+        assert_eq!(ca["cacert-id"], "rms-example-ca");
     }
 
     #[test]

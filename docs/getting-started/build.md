@@ -5,7 +5,7 @@ Make sure you have the [build prerequisites](prerequisites.md) installed first.
 ## Cloning the RMS repo
 
 ```bash
-git clone https://github.com/NVIDIA/nv-rms.git
+git clone https://github.com/dsx-ai-factory/nv-rms.git
 cd nv-rms
 ```
 
@@ -19,7 +19,7 @@ The workspace produces two binaries: `rackmanagementservice` (the service) and
 
 ### Release build
 
-Recommended, via the [`Justfile`](https://github.com/NVIDIA/nv-rms/blob/main/Justfile):
+Recommended, via the [`Justfile`](https://github.com/dsx-ai-factory/nv-rms/blob/main/Justfile):
 
 ```bash
 just build
@@ -58,7 +58,7 @@ just docs-api
 
 ## Container images
 
-RMS ships a multi-stage [`Dockerfile`](https://github.com/NVIDIA/nv-rms/blob/main/Dockerfile):
+RMS ships a multi-stage [`Dockerfile`](https://github.com/dsx-ai-factory/nv-rms/blob/main/Dockerfile):
 
 - **Stage 1 - `builder`** (`rust:1.96-bookworm`): the full build environment
   (Rust toolchain, `protoc`, linkers). Produces the workspace release binaries
@@ -102,12 +102,19 @@ docker build --target builder -t rms-builder .
 
 ### Standalone nvfwupd binaries
 
-The `nvfwupd` CLI can be built on its own - convenient for distributing a
-diagnostics tool. A plain `cargo build --release -p nvfwupd` inherits the host
-sysroot glibc baseline; the `docker/nvfwupd-standalone/` Dockerfiles produce
-portable x86-64 and arm64 binaries with a glibc 2.17 baseline. See the
+The `nvfwupd` CLI can be built on its own. The workspace provides Makefile
+targets for x86_64 and arm64 Linux musl builds, as described in the
+[README](https://github.com/dsx-ai-factory/nv-rms#building-the-nvfwupd-cli):
+
+```bash
+make -C crates/rust_nvfwupd nvfwupd-x86
+make -C crates/rust_nvfwupd nvfwupd-arm64
+```
+
+The binaries are written to `target/x86_64-unknown-linux-musl/release/nvfwupd`
+and `target/aarch64-unknown-linux-musl/release/nvfwupd`, respectively. See the
 [Development](../reference/development.md#building-standalone-nvfwupd) reference
-for the full set of cross-build and verification commands.
+for the required toolchains and equivalent Cargo commands.
 
 ## Next steps
 

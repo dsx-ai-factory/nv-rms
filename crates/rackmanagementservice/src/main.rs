@@ -1,13 +1,18 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+ * SPDX-License-Identifier: Apache-2.0
  *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 use std::path::PathBuf;
@@ -404,8 +409,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Parse configuration before logging is initialized so a bad config surfaces
     // immediately; report the failure to stderr since the tracing subscriber is
     // not yet installed.
-    let config = match RmsConfig::load(&cli.config) {
-        Ok(config) => config,
+    let (config, unknown_config_keys) = match RmsConfig::load(&cli.config) {
+        Ok(loaded) => loaded,
         Err(msg) => {
             eprintln!("configuration error: {msg}");
             std::process::exit(1);
@@ -419,6 +424,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.logging.log_level.as_deref(),
         config.logging.enable_timestamps,
     )?;
+
+    for key in &unknown_config_keys {
+        tracing::warn!(key, "unknown configuration key ignored; possible typo");
+    }
 
     // Plaintext gRPC requires `tls.insecure = true` in the config *and* the
     // RMS_ALLOW_INSECURE=1 env gate (sourced from a different channel than the
@@ -881,24 +890,25 @@ mod tests {
 
     #[tokio::test]
     async fn start_service_invalid_port_zero_succeeds() {
-        let metrics_port = portpicker::pick_unused_port().expect("no free metrics port");
+        // Both ports are 0, so the OS assigns each listener a free port. The
+        // metrics/grpc "must differ" check is skipped at 0, and nothing here
+        // connects to either listener.
         let c = RmsConfig {
             port: 0,
             metrics: RmsMetricsConfig {
-                port: metrics_port,
+                port: 0,
                 ..RmsMetricsConfig::default()
             },
             ..config(true)
         };
-        if let Ok(mut service) = start_service(
+        let mut service = start_service(
             &c,
             None,
             ApiListenerMode::Insecure,
             SwitchTlsRoots::default(),
         )
         .await
-        {
-            service.stop().await;
-        }
+        .expect("start_service should succeed with OS-assigned ports");
+        service.stop().await;
     }
 }

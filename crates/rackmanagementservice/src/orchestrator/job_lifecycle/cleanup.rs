@@ -1,13 +1,18 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+ * SPDX-License-Identifier: Apache-2.0
  *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 use std::path::PathBuf;
@@ -21,10 +26,10 @@ use super::registry::JobRegistry;
 /// Async cleanup owned by a tracked job supervisor.
 #[derive(Debug, Clone)]
 pub enum CleanupPlan {
-    RemoveDir {
+    Immediate {
         path: PathBuf,
     },
-    RemoveDirAfterJobsTerminate {
+    AfterJobsTerminate {
         child_job_ids: Vec<JobId>,
         path: PathBuf,
         timeout: Option<Duration>,
@@ -39,7 +44,7 @@ pub enum CleanupPlan {
 impl CleanupPlan {
     /// Removes a directory after the worker exits.
     pub fn remove_dir(path: impl Into<PathBuf>) -> Self {
-        Self::RemoveDir { path: path.into() }
+        Self::Immediate { path: path.into() }
     }
 
     /// Removes a directory after all child jobs terminate.
@@ -48,7 +53,7 @@ impl CleanupPlan {
         path: impl Into<PathBuf>,
         timeout: Option<Duration>,
     ) -> Self {
-        Self::RemoveDirAfterJobsTerminate {
+        Self::AfterJobsTerminate {
             child_job_ids,
             path: path.into(),
             timeout,
@@ -57,8 +62,8 @@ impl CleanupPlan {
 
     pub(crate) async fn run<D: JobDomain>(self, registry: Arc<JobRegistry<D>>) -> CleanupReport {
         match self {
-            Self::RemoveDir { path } => remove_dir(path).await,
-            Self::RemoveDirAfterJobsTerminate {
+            Self::Immediate { path } => remove_dir(path).await,
+            Self::AfterJobsTerminate {
                 child_job_ids,
                 path,
                 timeout,

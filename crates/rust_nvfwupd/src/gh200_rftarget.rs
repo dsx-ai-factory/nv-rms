@@ -1,13 +1,18 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+ * SPDX-License-Identifier: Apache-2.0
  *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 //! GH200RFTarget implementation for GH200 platforms.
@@ -20,7 +25,7 @@ use serde_json::{json, Value};
 
 use crate::bmc_access::BmcAccess;
 use crate::gh_rftarget;
-use crate::rf_target::{CmdArgs, PkgParser, RFTarget};
+use crate::rf_target::{multipart_update_uri_from_service, CmdArgs, PkgParser, RFTarget};
 use crate::util::{BailAction, TraceFlags, Util};
 use crate::utils::Util as NvUtils;
 
@@ -65,7 +70,7 @@ pub fn gh200_version_compare(pkg_version: &str, sys_version: &str) -> bool {
 // GH200RFTarget
 // ---------------------------------------------------------------------------
 
-/// Platform-specific RFTarget for GH200 systems
+/// Platform-specific RFTarget for GH200 systems.
 ///
 /// Extends GH behavior with multipart upload for certain board
 /// configurations and a custom `get_update_uri` override.
@@ -145,15 +150,10 @@ impl RFTarget for GH200RFTarget {
 
     /// Returns the multipart HTTP push URI from the UpdateService response.
     fn get_update_uri(&self, update_service_response: &Value) -> String {
-        // Try to extract MultipartHttpPushUri from the UpdateService response
-        if let Some(uri) = update_service_response
-            .get("MultipartHttpPushUri")
-            .and_then(|v| v.as_str())
-        {
-            return uri.to_string();
-        }
-
-        "/redfish/v1/UpdateService/update-multipart".to_string()
+        multipart_update_uri_from_service(
+            update_service_response,
+            "/redfish/v1/UpdateService/update-multipart",
+        )
     }
 
     // ------------------------------------------------------------------
@@ -607,5 +607,34 @@ impl RFTarget for GH200RFTarget {
         ap_name: &str,
     ) -> Option<String> {
         gh_rftarget::gh_get_version_sku(identifier, pldm_version_dict, ap_name)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn get_update_uri_ignores_unsafe_device_supplied_values() {
+        let target = GH200RFTarget::new(BmcAccess::default_stub(), None);
+
+        assert_eq!(
+            target.get_update_uri(&json!({
+                "MultipartHttpPushUri": "/redfish/v1/UpdateService/custom-multipart"
+            })),
+            "/redfish/v1/UpdateService/custom-multipart"
+        );
+
+        for invalid_uri in [
+            "https://attacker.example/upload",
+            "http://attacker.example/upload",
+            "//attacker.example/upload",
+            "/redfish/v1/UpdateService/update-multipart\nX-Injected: yes",
+        ] {
+            assert_eq!(
+                target.get_update_uri(&json!({ "MultipartHttpPushUri": invalid_uri })),
+                "/redfish/v1/UpdateService/update-multipart"
+            );
+        }
     }
 }

@@ -1,13 +1,18 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+ * SPDX-License-Identifier: Apache-2.0
  *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 //! Persistence contract for firmware object catalog and apply history.
@@ -145,7 +150,35 @@ pub trait FirmwareObjectStore: Send + Sync {
 
     /// Mark `id` as the default bundle for its `rack_hardware_type`. Clears
     /// any previously-default bundle of the same hardware type. Atomic.
+    ///
+    /// Returns the resulting row for `id` (`is_default = true`, `updated`
+    /// bumped). Callers should use this returned row rather than one read
+    /// before the call: it is the only view that reflects the post-update
+    /// state.
     async fn set_default(&self, id: &str) -> Result<FirmwareObject>;
+
+    /// Make `id` the default for its hardware type *only if that hardware type
+    /// has no default yet*; if one already exists it is left untouched.
+    ///
+    /// This is the atomic form of "check [`has_default`], then [`set_default`]"
+    /// used when adding firmware. It serializes with other default changes for
+    /// the same hardware type (Postgres: a transaction-scoped advisory lock;
+    /// memory: the catalog write lock), so two concurrent first-time adds
+    /// cannot both observe an empty slot and both claim the default — and
+    /// therefore cannot collide on the partial unique index.
+    ///
+    /// Returns the authoritative post-call row for `id` whether or not it
+    /// became the default: its `is_default` is `true` when this bundle now
+    /// holds (or already held) the slot, and `false` when another bundle owns
+    /// it. Callers must use this returned row rather than a value captured
+    /// before the call (e.g. the row from [`create`]) — that earlier row
+    /// predates the default-selection update and would misreport `is_default`
+    /// and `updated`.
+    ///
+    /// [`create`]: FirmwareObjectStore::create
+    /// [`has_default`]: FirmwareObjectStore::has_default
+    /// [`set_default`]: FirmwareObjectStore::set_default
+    async fn set_default_if_none(&self, id: &str) -> Result<FirmwareObject>;
 
     /// Whether any bundle is currently default for `hw`.
     async fn has_default(&self, hw: &RackHardwareType) -> Result<bool>;

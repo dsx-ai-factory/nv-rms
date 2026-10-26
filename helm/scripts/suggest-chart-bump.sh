@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 # Suggest semver bump kind (patch|minor|major) from staged Helm chart package changes.
 # Prints: "<kind>\t<reason>" (tab-separated, one line).
 set -euo pipefail

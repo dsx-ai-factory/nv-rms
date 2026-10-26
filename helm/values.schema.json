@@ -190,15 +190,48 @@
             "pattern": ".*\\S.*"
           },
           "additionalProperties": {
-            "type": "array",
-            "minItems": 1,
-            "items": {
-              "type": "string",
-              "minLength": 1,
-              "pattern": ".*\\S.*"
-            }
+            "oneOf": [
+              {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "pattern": ".*\\S.*"
+                }
+              },
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "apNames": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                      "type": "string",
+                      "minLength": 1,
+                      "pattern": ".*\\S.*"
+                    }
+                  },
+                  "flintDevices": {
+                    "type": "object",
+                    "minProperties": 1,
+                    "additionalProperties": false,
+                    "properties": {
+                      "cx7": { "type": "integer", "minimum": 0 },
+                      "cx8": { "type": "integer", "minimum": 0 },
+                      "bf3Nic": { "type": "integer", "minimum": 0 }
+                    }
+                  }
+                },
+                "anyOf": [
+                  { "required": ["apNames"] },
+                  { "required": ["flintDevices"] }
+                ]
+              }
+            ]
           },
-          "description": "Opaque expected-inventory profile identifiers mapped to NVFWUPD AP names (config.toml [workflows.expected_inventory_profiles])."
+          "description": "Opaque expected-inventory profile identifiers mapped to NVFWUPD AP names and optional physical Flint device counts (config.toml [workflows.expected_inventory_profiles])."
         },
         "logLevel": {
           "type": "string",

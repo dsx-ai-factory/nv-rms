@@ -2,6 +2,7 @@
 name = "rackmanagementservice"
 version = "0.1.0"
 edition = "2024"
+license.workspace = true
 
 [features]
 default = []
@@ -37,6 +38,7 @@ rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
 secrecy = { workspace = true }
 serde = { workspace = true }
+serde_ignored = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 sqlx = { workspace = true }
@@ -49,6 +51,7 @@ tonic = { workspace = true }
 tonic-prost = { workspace = true }
 tonic_prometheus_layer = { workspace = true }
 tower = { workspace = true }
+common = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }
 uuid = { workspace = true }
@@ -64,7 +67,6 @@ figment = { workspace = true, features = ["test"] }
 hyper = { workspace = true }
 hyper-util = { workspace = true, features = ["tokio", "server-auto"] }
 librms = { workspace = true, features = ["client", "serde"] }
-portpicker = { workspace = true }
 rcgen = { workspace = true }
 redfish_test_support = { workspace = true }
 tar = { workspace = true }

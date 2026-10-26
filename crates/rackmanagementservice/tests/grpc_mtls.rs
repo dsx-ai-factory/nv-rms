@@ -1,13 +1,18 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+ * SPDX-License-Identifier: Apache-2.0
  *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 //! End-to-end mTLS tests for the gRPC server.
@@ -150,14 +155,6 @@ async fn start_mtls_server(fx: &MtlsFixture) -> (GrpcServer, u16) {
 
     let rm = Arc::new(RackManager::new());
     let jt = Arc::new(JobTracker::new());
-    let port = portpicker::pick_unused_port().expect("no free port");
-    let _metrics_registry = metrics::init(&metrics::MetricsInfo {
-        grpc_port: port,
-        firmware_dir: "firmware".to_string(),
-        persistence_type: "memory".to_string(),
-        tls_mode: TlsMode::Mtls,
-    })
-    .unwrap();
 
     let tls = TlsConfig::resolve(
         fx.server_cert_path.to_str(),
@@ -168,10 +165,26 @@ async fn start_mtls_server(fx: &MtlsFixture) -> (GrpcServer, u16) {
     .expect("failed to resolve server TLS material")
     .expect("mTLS fixture always provides cert + key");
 
-    let mut server = GrpcServer::new(port, rm, jt, Backends::memory()).with_tls(tls);
-    server.start().await.unwrap();
+    let mut server = GrpcServer::new(0, rm, jt, Backends::memory()).with_tls(tls);
 
-    // Give the listener a beat to actually bind.
+    // Bind an OS-assigned port and hold the listener, so the port cannot be
+    // claimed by anyone else between selection and serving. `metrics::init`
+    // needs the port up front, which is why the bind is split from the start.
+    let (incoming, port) = server
+        .bind_localhost_ephemeral_port()
+        .expect("bind mTLS server port");
+
+    let _metrics_registry = metrics::init(&metrics::MetricsInfo {
+        grpc_port: port,
+        firmware_dir: "firmware".to_string(),
+        persistence_type: "memory".to_string(),
+        tls_mode: TlsMode::Mtls,
+    })
+    .unwrap();
+
+    server.start_with_bound_incoming(incoming).await.unwrap();
+
+    // Give the serving task a beat to start accepting on the bound listener.
     tokio::time::sleep(Duration::from_millis(150)).await;
 
     (server, port)

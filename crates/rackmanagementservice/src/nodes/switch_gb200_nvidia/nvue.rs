@@ -1,17 +1,23 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+ * SPDX-License-Identifier: Apache-2.0
  *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 //! NVUE client, HTTP transport, revision, and action helpers for NVIDIA GB200 switches.
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use super::{
@@ -21,6 +27,7 @@ use crate::domain::rack::EndpointConfig;
 use crate::transport::http_client::HttpClient;
 use crate::utilities::error::{ErrorCode, Result, RmsError};
 
+use nvue_client::action::SimpleAction;
 use nvue_client::revision::{
     REVISION_ENDPOINT, RevisionApplyStatus, RevisionCreate, RevisionIdResponse, RevisionResponse,
     RevisionUpdate, applied_revision_endpoint, revision_endpoint,
@@ -30,7 +37,21 @@ use nvue_client::{
     ClientEndpoint as NvueEndpoint, DEFAULT_TIMEOUT as NVUE_DEFAULT_TIMEOUT,
     SharedClient as SharedNvueClient,
 };
+use serde::Serialize;
 use serde_json::Value;
+
+#[derive(Serialize)]
+struct SwitchChassisLocationInfo {
+    switch_info: SwitchChassisLocationFields,
+}
+
+#[derive(Serialize)]
+struct SwitchChassisLocationFields {
+    chassis_sn: String,
+    slot_number: String,
+    topology_id: String,
+    tray_index: String,
+}
 
 pub(super) fn build_nvue_connect_config(
     host_endpoint: &EndpointConfig,
@@ -743,11 +764,16 @@ impl SwitchGb200Nvidia {
                     if status.state == "action_success" || status.percent == 100 {
                         return Ok(());
                     }
-                    let message = if status.message.is_empty() {
-                        format!("NVUE action {action_id} failed with state {}", status.state)
-                    } else {
-                        status.message
-                    };
+                    // Always embed a stable "failed with state" marker (with any
+                    // switch-provided detail appended) so callers can reliably
+                    // tell a definitively failed action job apart from a
+                    // transport blip.
+                    let mut message =
+                        format!("NVUE action {action_id} failed with state {}", status.state);
+                    if !status.message.is_empty() {
+                        message.push_str(": ");
+                        message.push_str(&status.message);
+                    }
                     return Err(RmsError::internal(message));
                 }
                 Ok(_) => {}
@@ -775,18 +801,20 @@ impl SwitchGb200Nvidia {
         Err(RmsError::timeout(message))
     }
 
-    pub(crate) async fn nvue_start_action(
+    pub(crate) async fn nvue_start_action<P>(
         &self,
         endpoint: &str,
         action: &str,
-        parameters: Value,
-    ) -> Result<()> {
-        let payload = serde_json::json!({
-            action: {
-                "state": "start",
-                "parameters": parameters,
-            }
-        });
+        parameters: P,
+    ) -> Result<()>
+    where
+        P: Serialize,
+    {
+        let payload =
+            serde_json::to_value(BTreeMap::from([(action, SimpleAction::start(parameters))]))
+                .map_err(|error| {
+                    RmsError::internal(format!("failed to serialize NVUE {action} action: {error}"))
+                })?;
 
         self.nvue_run_action_payload(endpoint, action, payload)
             .await
@@ -838,14 +866,40 @@ impl SwitchGb200Nvidia {
         let revision_id = self.create_revision().await?;
         for (path, payload) in patches {
             let endpoint = format!("{path}?rev={revision_id}");
-            self.nvue_http_patch(&endpoint, payload, HttpClient::DEFAULT_TIMEOUT)
+            if let Err(e) = self
+                .nvue_http_patch(&endpoint, payload, HttpClient::DEFAULT_TIMEOUT)
                 .await
-                .map_err(|e| {
-                    RmsError::internal(format!("NVUE PATCH {endpoint} failed: {}", e.message))
-                })?;
+            {
+                // Staging failed before the revision was ever applied, so the
+                // candidate would otherwise linger on the switch. Discard it
+                // best-effort and surface the original staging error regardless
+                // of the discard outcome.
+                self.discard_candidate_revision_best_effort(&revision_id)
+                    .await;
+
+                return Err(RmsError::internal(format!(
+                    "NVUE PATCH {endpoint} failed: {}",
+                    e.message
+                )));
+            }
         }
 
         Ok(revision_id)
+    }
+
+    /// Discards a candidate revision without masking a prior error.
+    ///
+    /// Used on staging error paths: the caller is already returning a failure,
+    /// so a failed discard is logged rather than propagated.
+    async fn discard_candidate_revision_best_effort(&self, revision_id: &str) {
+        if let Err(discard_err) = self.discard_candidate_revision(revision_id).await {
+            tracing::warn!(
+                node = %self.id,
+                revision = %revision_id,
+                error = %discard_err.message,
+                "failed to discard candidate revision after staging error; it may linger on the switch"
+            );
+        }
     }
 
     pub(crate) async fn nvue_finish_config_revision(&self, revision_id: &str) -> Result<()> {
@@ -906,20 +960,23 @@ impl SwitchGb200Nvidia {
     }
 
     pub async fn get_chassis_location_info(&self) -> Result<Value> {
-        let resp = self
-            .nvue_http_get(
-                "/nvue_v1/platform/chassis-location",
-                HttpClient::DEFAULT_TIMEOUT,
-            )
+        let location = self
+            .nvue_client()?
+            .get_chassis_location(HttpClient::DEFAULT_TIMEOUT)
             .await?;
 
-        Ok(serde_json::json!({
-            "switch_info": {
-                "chassis_sn": resp.get("chassis-sn").and_then(|v| v.as_str()).unwrap_or_default(),
-                "slot_number": resp.get("slot-number").and_then(|v| v.as_str()).unwrap_or_default(),
-                "topology_id": resp.get("topology-id").and_then(|v| v.as_str()).unwrap_or_default(),
-                "tray_index": resp.get("tray-index").and_then(|v| v.as_str()).unwrap_or_default(),
-            }
-        }))
+        serde_json::to_value(SwitchChassisLocationInfo {
+            switch_info: SwitchChassisLocationFields {
+                chassis_sn: location.chassis_sn.unwrap_or_default(),
+                slot_number: location.slot_number.unwrap_or_default(),
+                topology_id: location.topology_id.unwrap_or_default(),
+                tray_index: location.tray_index.unwrap_or_default(),
+            },
+        })
+        .map_err(|error| {
+            RmsError::internal(format!(
+                "failed to serialize chassis location response: {error}"
+            ))
+        })
     }
 }

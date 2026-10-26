@@ -1,13 +1,18 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+ * SPDX-License-Identifier: Apache-2.0
  *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 use std::io::Write;
@@ -109,11 +114,11 @@ fn switch_redfish_power_node(
 
 #[tokio::test]
 async fn mockup_server_starts_and_serves_json() {
-    let port = portpicker::pick_unused_port().expect("no free port");
     let server = RedfishSimulator::builder()
-        .add_gb200_compute(port)
+        .add_gb200_compute(0)
         .start()
         .await;
+    let port = server.ports()[0];
 
     let client = reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
@@ -135,13 +140,13 @@ async fn mockup_server_starts_and_serves_json() {
 
 #[tokio::test]
 async fn mockup_server_firmware_upload_and_task_poll() {
-    let port = portpicker::pick_unused_port().expect("no free port");
     let server = RedfishSimulator::builder()
         .with_task_delay(0.1)
         .never_fail_firmware_updates()
-        .add_gb200_compute(port)
+        .add_gb200_compute(0)
         .start()
         .await;
+    let port = server.ports()[0];
 
     let client = reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
@@ -664,11 +669,11 @@ async fn compute_firmware_uploads_work_against_mock_server() -> TestResult {
 
 #[tokio::test]
 async fn mockup_server_config_endpoint() {
-    let port = portpicker::pick_unused_port().expect("no free port");
     let server = RedfishSimulator::builder()
-        .add_gb200_compute(port)
+        .add_gb200_compute(0)
         .start()
         .await;
+    let port = server.ports()[0];
 
     let client = reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
@@ -721,11 +726,11 @@ async fn mockup_server_config_endpoint() {
 
 #[tokio::test]
 async fn mockup_server_404_for_unknown_path() {
-    let port = portpicker::pick_unused_port().expect("no free port");
     let server = RedfishSimulator::builder()
-        .add_gb200_compute(port)
+        .add_gb200_compute(0)
         .start()
         .await;
+    let port = server.ports()[0];
 
     let client = reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
@@ -745,14 +750,15 @@ async fn mockup_server_404_for_unknown_path() {
 
 #[tokio::test]
 async fn mockup_server_multi_port() {
-    let port1 = portpicker::pick_unused_port().expect("no free port");
-    let port2 = portpicker::pick_unused_port().expect("no free port");
-
+    // Using port 0 for OS-assigned port
     let server = RedfishSimulator::builder()
-        .add_gb200_compute(port1)
-        .add_gb200_compute(port2)
+        .add_gb200_compute(0)
+        .add_gb200_compute(0)
         .start()
         .await;
+    let [port1, port2] = server.ports() else {
+        panic!("expected two bound simulator ports");
+    };
 
     let client = reqwest::Client::builder()
         .danger_accept_invalid_certs(true)

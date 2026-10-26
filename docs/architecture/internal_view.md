@@ -15,13 +15,14 @@ existing code.
 ### API gateway (`api/grpc`)
 
 Protocol-specific entry points. The `RackManager` gRPC service runs on the
-configured port (default `8801`). Handlers are thin translation layers with no
-business logic: `conversions.rs` maps protobuf types to and from domain types,
-and each handler group (`power_handlers`, `inventory_handlers`,
+configured port (default `8801`). Handlers translate protobuf requests and
+coordinate domain or node operations. `conversions.rs` maps protobuf types to
+and from domain types. Handler groups include `power_handlers`,
+`inventory_handlers`,
 `firmware_handlers`, `switch_handlers`, `switch_image_handlers`,
-`switch_certificate_handlers`, `switch_security_handlers`,
-`scaleupfabricmanager_handlers`) delegates to the orchestrator. `server.rs` sets
-up TLS/mTLS. See [Operations](../operations/overview.md) for the RPCs.
+`switch_attestation_handlers`, `switch_certificate_handlers`,
+`switch_security_handlers`, and `scaleupfabricmanager_handlers`. `server.rs`
+sets up TLS/mTLS. See [Operations](../operations/overview.md) for the RPCs.
 
 ### Orchestrator (`orchestrator`)
 
@@ -34,11 +35,46 @@ The **job tracker** (`job_tracker.rs`, over the generic primitives in
 `job_lifecycle/`) manages the async job lifecycle for both firmware and switch
 OS-image work. It supports parent/child job hierarchies for batch operations, is
 bounded by `max_tracked_jobs`, and evicts terminal (completed/failed) job records
-after `terminal_job_ttl_seconds` via a background reaper. `stage_timeline.rs`
-records per-stage timing for a job. Batch workflows create their top-level job
-first and dynamically attach admitted child jobs while that job remains
-non-terminal. See
+after `terminal_job_ttl_seconds` via a background reaper. Batch workflows create
+their top-level job first and dynamically attach admitted child jobs while that
+job remains non-terminal. See
 [Operations: the async job model](../operations/overview.md#the-async-job-model).
+
+`stage_timeline.rs` breaks a long-running job into `Stage`s - the smallest
+measurable unit of work a job progresses through (e.g. "stage image", "trigger
+install", "wait for target steady state"). Each `Stage` has an immutable
+`name` and imperative `description` fixed at construction, plus a `status`
+(`queued` -> `running` -> `completed`/`failed`/`skipped`), timestamps, an
+opaque `details` payload, and a `message` populated only on failure. A
+`Stage` does not carry its own `job_id`: every stage in a timeline belongs
+to the same job, so `job_id` - like the `node`/`rack` a timeline's stages
+run against - is stored once, on the `StageTimeline` itself, rather than
+duplicated per stage. A `StageTimeline` is built once, up front, from a job
+type's predefined, ordered `Vec<Stage>` (e.g.
+`switch_system_image_job_stages`), then driven forward purely by an
+internal cursor: `start_current` marks the stage at the
+cursor running, `complete_current` finishes it and advances the cursor, and
+`fail_current` finishes it as failed without advancing - a job's failure is
+always terminal, so the cursor simply stops there. Handlers never re-type a
+stage's name at each call site; they just call these cursor methods in the
+same order the job actually performs its work, and `to_json()` serializes the
+whole planned pipeline (not just the stages reached so far) for status
+polling. Each of the three cursor methods also centrally logs a generic
+`"stage starting"` / `"stage completed"` / `"stage cancelled"` / `"stage failed"`
+event (with `job_id`, `node`, `rack`, `stage`, and, for failures,
+`error`), so handler call sites only need to add stage-specific context
+beyond that.
+
+A stage can end up `skipped` in two different situations, so a handler
+never has to report a no-op as if it were real work: if a stage starts but
+turns out to have nothing to do (e.g. no unused partition image to clean
+up), the handler calls `skip_current` instead of `complete_current`; and
+when a job exits early - a stage failed, was cancelled, or a precondition
+check failed before any stage started - handlers call `skip_remaining`
+once, right before sealing the job's terminal state, which moves every
+still-`queued` stage to `skipped`. Both paths log `"stage skipped"` so the
+timeline never shows unreached stages stuck at `queued` forever, or a
+no-op stage misreported as `completed`.
 
 ### Racks (`racks`)
 
@@ -58,7 +94,8 @@ Trait-based. Each node type encapsulates its management protocol behind the
   `powershelf_gb300_liteon`, `powershelf_gb300_delta`) - Redfish over HTTPS; the
   Delta shelves additionally use the embedded nvfwupd workflow.
 - **Switch** (`switch_gb200_nvidia`, `switch_gb300_nvidia`) - NVUE REST plus
-  SSH/SFTP, with NMX-C gRPC and gNMI for fabric and telemetry.
+  SSH/SFTP, including NVUE-based SPDM attestation evidence collection. NMX-C
+  gRPC and gNMI provide fabric and telemetry operations.
 
 Adding a new node type means implementing the `Node` trait - no changes to
 existing code. Adding a new rack type means implementing the `Rack` trait with its
@@ -96,6 +133,11 @@ compile-time-embedded migrations); the active backend is selected at startup fro
 `[postgres] db_url` / `DATABASE_URL`. Only workflow data is persisted - firmware
 objects, cached artifact metadata, and apply history - never rack topology. See
 [Development: adding a persistence domain](../reference/development.md#adding-a-persistence-domain).
+
+Switch SPDM attestation evidence collection (see
+[Switch management](../operations/switch-management.md#spdm-attestation-evidence))
+is stateless in RMS: it holds no lock and persists nothing. The caller (NICo)
+owns job state, quarantine, and retry decisions.
 
 ### Cross-cutting
 

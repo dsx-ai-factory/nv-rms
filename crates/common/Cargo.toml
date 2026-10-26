@@ -1,0 +1,16 @@
+[package]
+name = "common"
+version = "0.1.0"
+edition = "2024"
+description = "Shared, dependency-light primitives: secret redaction, log sanitization, and network/URL safety helpers"
+
+[lib]
+name = "common"
+path = "src/lib.rs"
+
+[dependencies]
+regex = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+url = { workspace = true }

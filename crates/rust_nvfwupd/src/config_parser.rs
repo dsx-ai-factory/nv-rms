@@ -1,13 +1,18 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+ * SPDX-License-Identifier: Apache-2.0
  *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 //! YAML configuration file parser for nvfwupd.
@@ -37,7 +42,7 @@ use crate::utils::Util as NvUtils;
 /// - A top-level `Targets` list (multi-target mode), or
 /// - Flat keys `BMC_IP`, `RF_USERNAME`, `RF_PASSWORD`, and optionally
 ///   `TUNNEL_TCP_PORT`, `VERIFY_TLS`, `BMC_CA_CERT`, `SSH_KNOWN_HOSTS`, and
-///   `SSH_HOST_KEY_MODE` (single-target shorthand).
+///   `SSH_HOST_KEY_MODE`, and `ALLOW_HTTP` (single-target shorthand).
 #[derive(Clone)]
 pub struct ConfigParser {
     /// The full parsed YAML content (as a JSON [`Value`] for uniform access).
@@ -145,8 +150,9 @@ impl ConfigParser {
     ///
     /// If a `Targets` key exists its value is used directly; otherwise a
     /// single target is synthesised from the flat `BMC_IP`, `RF_USERNAME`,
-    /// `RF_PASSWORD` (and optional `TUNNEL_TCP_PORT`, `VERIFY_TLS`, and
-    /// `BMC_CA_CERT`, `SSH_KNOWN_HOSTS`, and `SSH_HOST_KEY_MODE`) keys.
+    /// `RF_PASSWORD` (and optional `TUNNEL_TCP_PORT`, `VERIFY_TLS`,
+    /// `ALLOW_HTTP`, `BMC_CA_CERT`, `SSH_KNOWN_HOSTS`, and
+    /// `SSH_HOST_KEY_MODE`) keys.
     fn make_targets_list(&mut self) -> Result<(), String> {
         let config = match &self.config_dict {
             Some(c) => c,
@@ -181,6 +187,9 @@ impl ConfigParser {
         }
         if let Some(v) = config.get("VERIFY_TLS") {
             target.insert("VERIFY_TLS".to_string(), v.clone());
+        }
+        if let Some(v) = config.get("ALLOW_HTTP") {
+            target.insert("ALLOW_HTTP".to_string(), v.clone());
         }
         if let Some(v) = config.get("BMC_CA_CERT") {
             target.insert("BMC_CA_CERT".to_string(), v.clone());
@@ -359,6 +368,7 @@ BMC_IP: 192.0.2.20
 RF_USERNAME: admin
 RF_PASSWORD: password
 VERIFY_TLS: true
+ALLOW_HTTP: true
 BMC_CA_CERT: /tmp/bmc-ca.pem
 ",
         )
@@ -372,6 +382,7 @@ BMC_CA_CERT: /tmp/bmc-ca.pem
 
         assert_eq!(parser.targets.len(), 1);
         assert_eq!(parser.targets[0]["VERIFY_TLS"], true);
+        assert_eq!(parser.targets[0]["ALLOW_HTTP"], true);
         assert_eq!(parser.targets[0]["BMC_CA_CERT"], "/tmp/bmc-ca.pem");
     }
 

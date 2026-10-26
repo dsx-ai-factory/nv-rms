@@ -116,12 +116,19 @@ apiServer:
   # Retention period for completed and failed job records, in seconds
   # (config.toml [workflows] terminal_job_ttl_seconds).
   terminalJobTtlSeconds: 86400
-  # Opaque deployment-defined profile identifiers mapped to NVFWUPD AP names.
+  # Opaque deployment-defined profile identifiers mapped to NVFWUPD AP names
+  # and, optionally, expected physical Flint device counts.
   # Nodes select one with NodeDescriptor.attributes["inventory_profile"].
   expectedInventoryProfiles: {}
   #  gb200-compute-variant-a:
   #    - FW_BMC_0
   #    - HGX_FW_GPU_0
+  #  sku-gb200:
+  #    apNames: [FW_BMC_0, HGX_FW_GPU_0]
+  #    flintDevices:
+  #      cx7: 4
+  #      cx8: 0
+  #      bf3Nic: 2
   # Optional log level / filter directive, replacing RUST_LOG (config.toml [logging] log_level).
   # Leave empty to use the default `info` level plus dependency caps.
   logLevel: ""
@@ -329,5 +336,11 @@ grafana:
     # Use alphanumeric characters, hyphens, underscores, or dots only.
     # Leave empty to place the dashboard in the Grafana root (General) folder.
     folder: "RackManagement"
+
+    # UID of the Grafana datasource used by all dashboard panels.
+    # Must match the datasource UID configured in Grafana for this site.
+    #   - VictoriaMetrics (Prometheus-compatible):  "prom-victoriametrics"
+    #   - Plain Prometheus (kube-prometheus-stack):  "prometheus"
+    datasourceUid: "prom-victoriametrics"
 
 commonLabels: {}

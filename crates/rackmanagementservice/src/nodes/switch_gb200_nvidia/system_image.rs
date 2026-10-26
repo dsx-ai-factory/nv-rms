@@ -1,13 +1,18 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+ * SPDX-License-Identifier: Apache-2.0
  *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 //! System-image state and workflows for NVIDIA GB200 switches.
@@ -21,6 +26,9 @@ use crate::transport::http_client::HttpClient;
 use crate::transport::ssh_client::{SftpUploadOptions, SshClient};
 use crate::utilities::error::{ErrorCode, Result, RmsError};
 
+use nvue_client::system::{
+    SystemImageFetchRequest, SystemImageInstallRequest, SystemImageUninstallRequest,
+};
 use regex::Regex;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
@@ -275,12 +283,13 @@ pub fn describe_install_poll(status: &FirmwareTaskStatus) -> String {
 
 impl SwitchGb200Nvidia {
     pub async fn fetch_system_image(&self, remote_url: &str) -> Result<String> {
-        let payload = serde_json::json!({
-            "@fetch": {
-                "state": "start",
-                "parameters": {"remote-url": remote_url}
-            }
-        });
+        let payload =
+            serde_json::to_value(SystemImageFetchRequest::new(remote_url)).map_err(|error| {
+                RmsError::internal(format!(
+                    "failed to serialize system image fetch request: {error}"
+                ))
+            })?;
+
         let resp = self
             .nvue_http_post(
                 "/nvue_v1/system/image",
@@ -299,12 +308,16 @@ impl SwitchGb200Nvidia {
             ));
         }
 
-        let payload = serde_json::json!({
-            "@install": {
-                "state": "start",
-                "parameters": {"force": true, "image-file": image_filename}
-            }
-        });
+        let payload = serde_json::to_value(SystemImageInstallRequest::with_image_file(
+            true,
+            image_filename,
+        ))
+        .map_err(|error| {
+            RmsError::internal(format!(
+                "failed to serialize system image install request: {error}"
+            ))
+        })?;
+
         let endpoint = format!("/nvue_v1/system/image/files/{image_filename}");
         let resp = self
             .nvue_http_post(&endpoint, &payload, HttpClient::DEFAULT_TIMEOUT)
@@ -321,12 +334,13 @@ impl SwitchGb200Nvidia {
     /// Returns the NVOS action job ID.
     pub async fn uninstall_system_image(&self) -> Result<String> {
         // No need to specify image-id, NVUE will infer it from the current system image state
-        let payload = serde_json::json!({
-            "@uninstall": {
-                "state": "start",
-                "parameters": {"force": true}
-            }
-        });
+        let payload =
+            serde_json::to_value(SystemImageUninstallRequest::new(true)).map_err(|error| {
+                RmsError::internal(format!(
+                    "failed to serialize system image uninstall request: {error}"
+                ))
+            })?;
+
         let resp = self
             .nvue_http_post(
                 "/nvue_v1/system/image",

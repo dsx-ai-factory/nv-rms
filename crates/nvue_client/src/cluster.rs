@@ -1,13 +1,18 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+ * SPDX-License-Identifier: Apache-2.0
  *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 //! Types for the NVUE `/cluster` API area.
@@ -382,36 +387,25 @@ impl Default for ClusterAppStopRequest {
 pub struct NoActionParameters {}
 
 /// Request body for `POST /cluster/apps/{app-name}/manager` `@update`.
+///
+/// Serializes to `{"@update":{"state":"start","parameters":{"state":<state>}}}`.
+/// The `state:"start"` field is the NVUE action trigger (identical envelope to
+/// other cluster-app manager actions); `parameters.state` is the desired
+/// manager state (`enabled`/`disabled`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ClusterAppManagerUpdateRequest {
     /// Update action.
     #[serde(rename = "@update")]
-    pub update: ClusterAppManagerUpdateAction,
+    pub update: SimpleAction<ClusterAppManagerUpdateParameters>,
 }
 
 impl ClusterAppManagerUpdateRequest {
     /// Create a manager-state update request.
     pub fn new(state: impl Into<String>) -> Self {
         Self {
-            update: ClusterAppManagerUpdateAction::new(state),
-        }
-    }
-}
-
-/// Action body for cluster app manager `@update`.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ClusterAppManagerUpdateAction {
-    /// Update parameters.
-    pub parameters: ClusterAppManagerUpdateParameters,
-}
-
-impl ClusterAppManagerUpdateAction {
-    /// Create an update action body.
-    pub fn new(state: impl Into<String>) -> Self {
-        Self {
-            parameters: ClusterAppManagerUpdateParameters {
+            update: SimpleAction::start(ClusterAppManagerUpdateParameters {
                 state: state.into(),
-            },
+            }),
         }
     }
 }
@@ -485,6 +479,7 @@ impl NmxcConnection {
 
 /// Minimal view of `schema-cluster-cluster-app` needed around manager actions.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(from = "ClusterAppWire")]
 pub struct ClusterApp {
     /// App health/status string.
     #[serde(default)]
@@ -494,13 +489,44 @@ pub struct ClusterApp {
     #[serde(default)]
     pub reason: Option<String>,
 
-    /// Additional app state. The OpenAPI field is typoed as `addition-info`.
-    #[serde(default, rename = "addition-info", alias = "additional-info")]
+    /// Additional app state. NVUE responses may use `addition-info` or `additional-info`.
+    #[serde(default, rename = "addition-info")]
     pub addition_info: Option<String>,
 
     /// Cluster app manager state.
     #[serde(default)]
     pub manager: Option<ClusterAppManager>,
+}
+
+/// Wire shape for [`ClusterApp`] that reads `addition-info` and `additional-info` as
+/// independent fields so a response carrying both does not hard-error as a duplicate.
+#[derive(Debug, Deserialize)]
+struct ClusterAppWire {
+    #[serde(default)]
+    status: Option<String>,
+
+    #[serde(default)]
+    reason: Option<String>,
+
+    #[serde(default, rename = "addition-info")]
+    addition_info: Option<String>,
+
+    #[serde(default, rename = "additional-info")]
+    additional_info: Option<String>,
+
+    #[serde(default)]
+    manager: Option<ClusterAppManager>,
+}
+
+impl From<ClusterAppWire> for ClusterApp {
+    fn from(wire: ClusterAppWire) -> Self {
+        ClusterApp {
+            status: wire.status,
+            reason: wire.reason,
+            addition_info: wire.additional_info.or(wire.addition_info),
+            manager: wire.manager,
+        }
+    }
 }
 
 impl ClusterApp {
@@ -642,7 +668,10 @@ mod tests {
         assert_eq!(cluster, r#"{"state":"enabled"}"#);
         assert!(start.contains(r#""@start""#));
         assert!(stop.contains(r#""@stop""#));
-        assert_eq!(manager, r#"{"@update":{"parameters":{"state":"enabled"}}}"#);
+        assert_eq!(
+            manager,
+            r#"{"@update":{"state":"start","parameters":{"state":"enabled"}}}"#
+        );
     }
 
     #[test]
@@ -862,5 +891,18 @@ mod tests {
                 "{state} must not satisfy configured convergence"
             );
         }
+    }
+
+    #[test]
+    fn addition_info_tolerates_both_spellings_present() {
+        let app = decode_cluster_app(
+            r#"{"addition-info":"CONTROL_PLANE_STATE_UNCONFIGURED","additional-info":"CONTROL_PLANE_STATE_CONFIGURED"}"#,
+        );
+
+        assert_eq!(
+            app.addition_info.as_deref(),
+            Some("CONTROL_PLANE_STATE_CONFIGURED")
+        );
+        assert!(app.is_control_plane_configured());
     }
 }

@@ -11,7 +11,7 @@ Terms used throughout the RMS documentation.
 </ParamField>
 
 <ParamField path="Firmware manifest">
-  The JSON, distributed per firmware milestone, that describes board SKUs, components, versions, and artifact locations. RMS parses it into a firmware object. See the [sample manifest](https://github.com/NVIDIA/nv-rms/tree/main/sample_firmware_manifest).
+  The JSON, distributed per firmware milestone, that describes board SKUs, components, versions, and artifact locations. RMS parses it into a firmware object. See the [sample manifest](https://github.com/dsx-ai-factory/nv-rms/tree/main/sample_firmware_manifest).
 </ParamField>
 
 <ParamField path="Firmware object">
@@ -51,7 +51,7 @@ Terms used throughout the RMS documentation.
 </ParamField>
 
 <ParamField path="librms">
-  The external crate ([`nv-rms-client`](https://github.com/NVIDIA/nv-rms-client)) providing the `rack_manager.proto` gRPC service definitions, pinned by `rev` and fetched by Cargo.
+  The external crate ([`nv-rms-client`](https://github.com/dsx-ai-factory/nv-rms-client)) providing the `rack_manager.proto` gRPC service definitions, pinned by `rev` and fetched by Cargo.
 </ParamField>
 
 <ParamField path="MNNVLink topology">

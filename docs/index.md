@@ -26,4 +26,4 @@ asynchronous jobs that clients poll to completion.
 - [Hardware Compatibility List](reference/hcl.md) - Supported racks, trays, and power shelves
 - [Configuration Reference](configuration/configuring-rms.md) - Every `config.toml` key and its Helm value
 - [Operations](operations/overview.md) - The `RackManager` gRPC RPCs
-- [GitHub](https://github.com/NVIDIA/nv-rms)
+- [GitHub](https://github.com/dsx-ai-factory/nv-rms)

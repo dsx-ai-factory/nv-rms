@@ -1,13 +1,18 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+ * SPDX-License-Identifier: Apache-2.0
  *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 use std::collections::HashMap;
@@ -103,6 +108,17 @@ impl Node for WiwynnGb200Compute {
             .await
     }
 
+    async fn update_firmware_group(
+        &self,
+        targets: &[FirmwareTarget],
+        force_update: bool,
+        options: FirmwareUpdateOptions,
+    ) -> Result<FirmwareUpdateOutcome> {
+        self.inner
+            .update_firmware_group(targets, force_update, options)
+            .await
+    }
+
     async fn start_firmware_upload(
         &self,
         target: &FirmwareTarget,
@@ -177,5 +193,35 @@ mod tests {
             error.message,
             "create_node not supported for compute_gb200_nvidia nodes"
         );
+    }
+
+    #[tokio::test]
+    async fn grouped_flint_updates_delegate_to_shared_gb200_implementation() {
+        let compute =
+            WiwynnGb200Compute::from_config(&config(NodeType::ComputeGb200Wiwynn), "rack-01")
+                .unwrap();
+        let targets = [
+            FirmwareTarget {
+                component: "CX7".to_owned(),
+                firmware_file: "/tmp/cx7-a.bin".to_owned(),
+                expected_version: None,
+            },
+            FirmwareTarget {
+                component: "CX7".to_owned(),
+                firmware_file: "/tmp/cx7-b.bin".to_owned(),
+                expected_version: None,
+            },
+        ];
+
+        let error = compute
+            .update_firmware_group(&targets, false, FirmwareUpdateOptions::default())
+            .await
+            .expect_err("missing host endpoint should fail before Flint access");
+
+        assert_eq!(
+            error.code,
+            crate::utilities::error::ErrorCode::FailedPrecondition
+        );
+        assert!(error.message.contains("host_endpoint is required"));
     }
 }

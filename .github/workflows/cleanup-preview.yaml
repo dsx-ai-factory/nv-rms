@@ -1,0 +1,53 @@
+name: Clean Up Preview Links
+
+# Companion to preview-docs.yaml, following Fern's reference workflow at
+# https://buildwithfern.com/learn/docs/preview-publish/preview-changes#preview-links
+# Deletes the preview under the same `--id` (the `pull-request/<number>` branch
+# name) that preview-docs.yaml generated it with. Fern previews never expire on
+# their own.
+#
+# Self-hosted runners do not run `pull_request` events, so instead of the PR
+# closing, the trigger is copy-pr-bot deleting that branch, which it does when
+# the PR closes or merges.
+on:
+  delete:
+
+permissions:
+  contents: read
+
+# Same group as preview-docs.yaml: cancel a publication still running for this
+# branch before deleting its preview, or it could publish after the deletion.
+concurrency:
+  group: preview-docs-${{ github.event.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cleanup:
+    name: Delete Preview
+    # `delete` has no branch filter. This runs for every closed PR, docs or not;
+    # deleting a preview that was never generated is harmless.
+    if: ${{ github.event.ref_type == 'branch' && startsWith(github.event.ref, 'pull-request/') }}
+    runs-on: linux-amd64-cpu4
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Setup Fern CLI
+        uses: fern-api/setup-fern-cli@d07601425e9c9ede8745d71ca75c4c462d98755d
+
+      - name: Delete preview deployment
+        env:
+          FERN_TOKEN: ${{ secrets.FERN_TOKEN }}
+          PREVIEW_ID: ${{ github.event.ref }}
+        run: |
+          echo "Deleting preview for branch: $PREVIEW_ID"
+          fern docs preview delete --id "$PREVIEW_ID" \
+            || echo "Preview deletion returned non-zero - it may already be gone"

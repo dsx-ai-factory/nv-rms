@@ -1,7 +1,7 @@
 # Kubernetes Deployment with Helm
 
 RMS ships a Helm chart under
-[`helm/`](https://github.com/NVIDIA/nv-rms/tree/main/helm) that deploys the API
+[`helm/`](https://github.com/dsx-ai-factory/nv-rms/tree/main/helm) that deploys the API
 server and, optionally, in-cluster PostgreSQL. The API server applies its embedded
 sqlx migrations automatically on startup. Make sure the
 [deployment prerequisites](prerequisites.md) - persistence, certificates, and
@@ -33,7 +33,7 @@ The chart uses two independent version axes:
 
 Set `global.image.tag` (or per-component `apiServer.image.tag`) at
 install/upgrade to pick the application build. See
-[`helm/README.md`](https://github.com/NVIDIA/nv-rms/blob/main/helm/README.md) for
+[`helm/README.md`](https://github.com/dsx-ai-factory/nv-rms/blob/main/helm/README.md) for
 the full chart-version policy and automation.
 
 ## Install from NGC
@@ -134,7 +134,7 @@ helm upgrade --install rack ./helm \
 The repo ships override examples under `helm/examples/overrides/`
 (`local-dev-values.yaml`, `switch-insecure-values.yaml`,
 `firmware-pvc-values.yaml`) and documents `insecureSwitch` test cases in
-[`helm/INSECURE_SWITCH_TESTING.md`](https://github.com/NVIDIA/nv-rms/blob/main/helm/INSECURE_SWITCH_TESTING.md).
+[`helm/INSECURE_SWITCH_TESTING.md`](https://github.com/dsx-ai-factory/nv-rms/blob/main/helm/INSECURE_SWITCH_TESTING.md).
 
 ## Upgrade
 

@@ -1,13 +1,18 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+ * SPDX-License-Identifier: Apache-2.0
  *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 //! CLI schema loader and accessor.
@@ -188,7 +193,7 @@ pub struct CLISchema {
 
 /// The CLI schema YAML embedded at compile time.
 ///
-///  Keeping this as `include_str!`
+/// Keeping this as `include_str!`
 /// (rather than loading from disk at startup) means:
 ///   1. The shipped binary is fully standalone — no external file required
 ///      at runtime.
@@ -296,7 +301,7 @@ impl CLISchema {
 /// Return the path to `cli_schema.yaml` located next to the running
 /// executable.
 ///
-/// The schema file is expected to live in the same directory as the binary
+/// The schema file is expected to live in the same directory as the binary.
 pub fn get_schema_path() -> String {
     let filename = "cli_schema.yaml";
 
@@ -310,6 +315,7 @@ pub fn get_schema_path() -> String {
         }
     }
 
+    // 2. Check a sibling nvfwupd source directory.
     if let Ok(exe) = std::env::current_exe() {
         // exe is e.g. .../rust_nvfwupd/target/release/nvfwupd
         // walk up until we find the nvfwupd/ sibling that has cli_schema.yaml

@@ -1,13 +1,18 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+ * SPDX-License-Identifier: Apache-2.0
  *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 use std::io::Cursor;
@@ -83,6 +88,7 @@ fn powershelf_target_args(server: &MockServer) -> Vec<String> {
         "password=test".to_string(),
         format!("port={port}"),
         "servertype=powershelf".to_string(),
+        "allow_http=true".to_string(),
     ]
 }
 
@@ -189,6 +195,33 @@ fn golden_stdout_for_package_only_command_paths() {
         String::from_utf8_lossy(&unpack.stdout).replace(&package_arg, "<PACKAGE>");
     assert_eq!(unpack.status.code(), Some(0));
     assert_eq!(normalized_unpack, expected_unpack);
+}
+
+#[test]
+fn show_pkg_content_invalid_fwpkg_exits_nonzero() {
+    let tmp = tempfile::tempdir().unwrap();
+    let package = tmp.path().join("invalid.fwpkg");
+    std::fs::write(&package, b"not a valid PLDM package").unwrap();
+    let package_arg = package.to_string_lossy().to_string();
+
+    let output = run_nvfwupd(
+        &[
+            "show_pkg_content".to_string(),
+            "-p".to_string(),
+            package_arg.clone(),
+        ],
+        tmp.path(),
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "unexpected exit status: stdout={stdout}, stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(stdout.contains("is not a valid PLDM package"), "{stdout}");
+    assert!(stdout.contains("Error Code: 1"), "{stdout}");
 }
 
 #[test]

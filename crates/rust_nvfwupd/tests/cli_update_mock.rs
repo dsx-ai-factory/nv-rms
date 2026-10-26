@@ -1,13 +1,18 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+ * SPDX-License-Identifier: Apache-2.0
  *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 use std::io::Cursor;
@@ -125,6 +130,7 @@ async fn update_fw_cli_runs_against_mock_bmc() {
         "password=secret from cli".to_string(),
         format!("port={port}"),
         "servertype=powershelf".to_string(),
+        "allow_http=true".to_string(),
         "update_fw".to_string(),
         "-p".to_string(),
         package.to_string_lossy().to_string(),
@@ -191,6 +197,7 @@ async fn update_fw_cli_verbose_writes_timestamped_log_file() {
         "password=secret from cli".to_string(),
         format!("port={port}"),
         "servertype=powershelf".to_string(),
+        "allow_http=true".to_string(),
         "update_fw".to_string(),
         "-p".to_string(),
         package.to_string_lossy().to_string(),
@@ -261,6 +268,7 @@ async fn update_fw_cli_verbose_without_path_uses_default_log_file() {
         "password=test".to_string(),
         format!("port={port}"),
         "servertype=powershelf".to_string(),
+        "allow_http=true".to_string(),
         "update_fw".to_string(),
         "-p".to_string(),
         package.to_string_lossy().to_string(),

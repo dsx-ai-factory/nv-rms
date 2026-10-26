@@ -1,13 +1,18 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+ * SPDX-License-Identifier: Apache-2.0
  *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 //! NVUE mTLS certificate and service configuration queries for NVIDIA GB200 switches.
@@ -17,6 +22,7 @@ use super::super::validation::is_valid_identifier;
 use crate::transport::http_client::HttpClient;
 use crate::utilities::error::{Result, RmsError};
 
+use nvue_client::system::MtlsConfiguration;
 use serde_json::Value;
 
 impl SwitchGb200Nvidia {
@@ -64,16 +70,17 @@ impl SwitchGb200Nvidia {
         .await
     }
 
-    pub(crate) async fn get_gnmi_server_mtls_configuration(&self) -> Result<Value> {
-        self.nvue_http_get(
-            "/nvue_v1/system/gnmi-server/mtls",
-            HttpClient::DEFAULT_TIMEOUT,
-        )
-        .await
+    pub(crate) async fn get_gnmi_server_mtls_configuration(&self) -> Result<MtlsConfiguration> {
+        self.nvue_client()?
+            .get_gnmi_server_mtls(HttpClient::DEFAULT_TIMEOUT)
+            .await
+            .map_err(Into::into)
     }
 
-    pub(crate) async fn get_nvue_api_mtls_configuration(&self) -> Result<Value> {
-        self.nvue_http_get("/nvue_v1/system/api/mtls", HttpClient::DEFAULT_TIMEOUT)
+    pub(crate) async fn get_nvue_api_mtls_configuration(&self) -> Result<MtlsConfiguration> {
+        self.nvue_client()?
+            .get_system_api_mtls(HttpClient::DEFAULT_TIMEOUT)
             .await
+            .map_err(Into::into)
     }
 }

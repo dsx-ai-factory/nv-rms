@@ -1,13 +1,18 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+ * SPDX-License-Identifier: Apache-2.0
  *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 //! Abstract base module defining firmware update operations via Redfish protocol.
@@ -74,6 +79,50 @@ fn json_value_has_content(value: &Value) -> bool {
         Value::Object(values) => !values.is_empty(),
         _ => true,
     }
+}
+
+/// Return whether a URI can be safely appended to the selected target base URL.
+pub(crate) fn valid_same_origin_request_path(uri: &str) -> bool {
+    NvUtils::valid_same_origin_request_path(uri)
+}
+
+/// Return a safe same-origin request path, or fall back to `default_uri`.
+///
+/// Unsafe device/config supplied values are ignored rather than used as
+/// authenticated request destinations.
+pub(crate) fn same_origin_path_or_default(
+    candidate: Option<&str>,
+    default_uri: &str,
+    description: &str,
+) -> String {
+    if let Some(uri) = candidate {
+        if valid_same_origin_request_path(uri) {
+            return NvUtils::same_origin_request_path(uri)
+                .expect("valid path checked above")
+                .to_string();
+        }
+        tracing::warn!(
+            "Ignoring invalid {}: {}",
+            description,
+            NvUtils::sanitize_log(uri.trim())
+        );
+    }
+
+    default_uri.to_string()
+}
+
+/// Resolve a multipart update URI from an UpdateService response.
+pub(crate) fn multipart_update_uri_from_service(
+    update_service_response: &Value,
+    default_uri: &str,
+) -> String {
+    same_origin_path_or_default(
+        update_service_response
+            .get("MultipartHttpPushUri")
+            .and_then(Value::as_str),
+        default_uri,
+        "MultipartHttpPushUri from UpdateService",
+    )
 }
 
 const COMPLETION_MESSAGE_SUPPRESS_TARGETS: &[&str] = &[
@@ -2375,6 +2424,32 @@ pub fn format_duration_hms(dur: &chrono::Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn multipart_update_uri_from_service_rejects_off_origin_values() {
+        assert_eq!(
+            multipart_update_uri_from_service(
+                &json!({"MultipartHttpPushUri": " /redfish/v1/UpdateService/custom "}),
+                "/redfish/v1/UpdateService/update-multipart",
+            ),
+            "/redfish/v1/UpdateService/custom"
+        );
+
+        for uri in [
+            "https://attacker.example/upload",
+            "http://attacker.example/upload",
+            "//attacker.example/upload",
+            "/redfish/v1/UpdateService/update-multipart\nX: y",
+        ] {
+            assert_eq!(
+                multipart_update_uri_from_service(
+                    &json!({"MultipartHttpPushUri": uri}),
+                    "/redfish/v1/UpdateService/update-multipart",
+                ),
+                "/redfish/v1/UpdateService/update-multipart"
+            );
+        }
+    }
 
     struct FailingPreconditionTarget {
         bmc_access: BmcAccess,
