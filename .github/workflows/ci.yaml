@@ -101,7 +101,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Build builder image (amd64)
-        uses: dsx-ai-factory/dsx-github-actions/.github/actions/docker-build@v1.17.2
+        uses: dsx-ai-factory/dsx-github-actions/.github/actions/docker-build@911d86017e6e0715cef26cb3105d66c2fcd985fb # reviewed commit 911d860 (upstream #94, pending merge)
         with:
           image: rms-builder
           tags: ${{ needs.prepare.outputs.version }}-amd64
@@ -123,7 +123,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Build builder image (arm64)
-        uses: dsx-ai-factory/dsx-github-actions/.github/actions/docker-build@v1.17.2
+        uses: dsx-ai-factory/dsx-github-actions/.github/actions/docker-build@911d86017e6e0715cef26cb3105d66c2fcd985fb # reviewed commit 911d860 (upstream #94, pending merge)
         with:
           image: rms-builder
           tags: ${{ needs.prepare.outputs.version }}-arm64
@@ -565,7 +565,7 @@ jobs:
           fi
 
       - name: Validate Helm chart
-        uses: dsx-ai-factory/dsx-github-actions/.github/actions/helm-validate@v1.17.2
+        uses: dsx-ai-factory/dsx-github-actions/.github/actions/helm-validate@911d86017e6e0715cef26cb3105d66c2fcd985fb # reviewed commit 911d860 (upstream #94, pending merge)
         with:
           chart-path: helm
           lint: 'true'
@@ -590,7 +590,7 @@ jobs:
           fetch-depth: 0
 
       - name: Package and push Helm chart to NGC
-        uses: dsx-ai-factory/dsx-github-actions/.github/actions/helm-package-push@v1.17.2
+        uses: dsx-ai-factory/dsx-github-actions/.github/actions/helm-package-push@911d86017e6e0715cef26cb3105d66c2fcd985fb # reviewed commit 911d860 (upstream #94, pending merge)
         with:
           chart-path: helm
           chart-version: ${{ needs.prepare.outputs.helm_version }}-OSS
