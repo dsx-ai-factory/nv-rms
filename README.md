@@ -27,10 +27,11 @@ and an embedded **nvfwupd** firmware-update workflow library.
   telemetry, rotate passwords, and install certificates.
 - **Observability:** expose Prometheus metrics and structured tracing/logging.
 
-RMS runs on Linux on x86-64 and arm64 and manages supported NVIDIA GB200 and
-GB300 compute trays, NVSwitch trays, and power shelves. See the
-[Hardware Compatibility List](docs/reference/hcl.md) for validated hardware and
-[Operations](docs/operations/overview.md) for the RPCs and job model.
+RMS runs on Linux on x86-64 and arm64. It manages GB200 and GB300 compute trays,
+NVSwitch trays, and power shelves, plus VR NVL72 compute and switch nodes. See the
+[Hardware Compatibility List](docs/reference/hcl.md) for compatibility details and
+node descriptors, and [Operations](docs/operations/overview.md) for the RPCs and
+job model.
 
 ## Documentation
 
