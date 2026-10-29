@@ -1,5 +1,8 @@
 # Rack Management Service
 
+[![RMS CI](https://github.com/dsx-ai-factory/nv-rms/actions/workflows/ci.yaml/badge.svg?branch=main)](https://github.com/dsx-ai-factory/nv-rms/actions/workflows/ci.yaml)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+
 Manages data-center racks at scale — power control, inventory, firmware updates,
 and switch configuration — exposed via a single gRPC API.
 
@@ -12,6 +15,23 @@ asynchronous jobs that clients poll to completion.
 Built in Rust on **tokio** (async I/O), **tonic** (gRPC), **reqwest**
 (Redfish/NVUE), **russh** (SSH/SFTP), **sqlx** (optional Postgres persistence),
 and an embedded **nvfwupd** firmware-update workflow library.
+
+## Capabilities
+
+- **Power control:** set and query node power states.
+- **Inventory:** register and list nodes and racks, and query device information
+  and firmware inventory.
+- **Firmware updates:** start single-node and batch updates, track asynchronous
+  jobs, and manage stored firmware objects.
+- **Switch management:** install NVOS system images, configure NMX-C and gNMI
+  telemetry, rotate passwords, and install certificates.
+- **Observability:** expose Prometheus metrics and structured tracing/logging.
+
+RMS runs on Linux on x86-64 and arm64. It manages GB200 and GB300 compute trays,
+NVSwitch trays, and power shelves, plus VR NVL72 compute and switch nodes. See the
+[Hardware Compatibility List](docs/reference/hcl.md) for compatibility details and
+node descriptors, and [Operations](docs/operations/overview.md) for the RPCs and
+job model.
 
 ## Documentation
 
