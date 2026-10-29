@@ -81,6 +81,13 @@ apiServer:
     repository: nvcr.io/0837451325059433/rms-dev/rms-api
     pullPolicy: ""
   replicaCount: 1
+  # Deployment rollout strategy (spec.strategy). Omit for the Kubernetes
+  # default RollingUpdate. Set type: Recreate when the firmware volume is a
+  # ReadWriteOncePod claim — a RollingUpdate creates the replacement pod
+  # before the old one terminates and it cannot mount the claim, stalling the
+  # rollout. rollingUpdate.maxSurge: 0 replaces pods instead of surging,
+  # avoiding Multi-Attach stalls with ReadWriteOnce claims.
+  strategy: {}
   port: 8801
   metrics:
     # Dedicated Prometheus /metrics listener port (independent of gRPC API port).
@@ -91,8 +98,30 @@ apiServer:
       enabled: false
   # Existing PersistentVolumeClaim for firmware artifacts. Leave empty (or omit) to
   # use firmwareStoragePath hostPath; set a valid PVC name in a site override
-  # passed with -f.
+  # passed with -f. When apiServer.firmwarePvc.create is true this also names the
+  # PVC the chart creates (defaults to "<fullname>-firmware" when left empty).
   firmwarePersistentVolumeClaim: ""
+  # Let the chart own the firmware PVC instead of requiring a pre-created one or a
+  # hostPath. hostPath is unavailable to unprivileged pods on clusters that enforce
+  # the restricted Pod Security Standard, so create a PVC there. When create is
+  # true the chart creates the PVC named firmwarePersistentVolumeClaim when set
+  # (else "<fullname>-firmware") and the Deployment mounts it instead of the
+  # hostPath. Overriding the whole block to null is treated as create: false
+  # (falls back to firmwarePersistentVolumeClaim or the hostPath).
+  firmwarePvc:
+    create: false
+    # Keep the created PVC (and its firmware artifacts) on helm uninstall via
+    # the helm.sh/resource-policy: keep annotation. Default true; null is
+    # treated as unset (true) — only an explicit false lets uninstall delete
+    # the claim. A kept claim outlives the release: a same-name reinstall
+    # fails until the claim is deleted or adopted with --take-ownership.
+    keep: true
+    size: 20Gi
+    # StorageClass for the created PVC. "" uses the cluster default; "-" disables
+    # dynamic provisioning (bind an existing PV). Ignored when create is false.
+    storageClass: ""
+    accessModes:
+      - ReadWriteOnce
   # Host directory on the node (hostPath volume source).
   firmwareStoragePath: /mnt/data
   # In-container mount for firmware artifacts; rendered into config.toml as

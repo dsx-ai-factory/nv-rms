@@ -324,7 +324,9 @@ your values or via `--set-file`; see the site and insecure-mode examples below.
   `NodeDescriptor.attributes["inventory_profile"]`. Default: `{}`.
 - `logLevel` — optional log level / filter directive replacing `RUST_LOG` (config.toml `[logging] log_level`). Empty uses the default `info` level plus dependency caps.
 - `enableTimestamps` — assuming a logging collector is adding its own timestamps, so this is disabled by default to prevent duplicate timestamp fields. If no logging collector is being used, set true to output timestamps natively (config.toml `[logging] enable_timestamps`). Default: `false`.
-- `firmwarePersistentVolumeClaim` — existing PVC to mount at `firmwareMountPath` for firmware downloads. Leave empty to use the default `firmwareStoragePath` hostPath.
+- `firmwarePersistentVolumeClaim` — PVC name to mount at `firmwareMountPath` for firmware downloads. When `firmwarePvc.create` is `false` this must reference an existing PVC; leave empty to use the default `firmwareStoragePath` hostPath. When `firmwarePvc.create` is `true` it names the PVC the chart creates (defaults to `<fullname>-firmware` when empty).
+- `firmwarePvc` — let the chart own the firmware PVC instead of a pre-created claim or a hostPath. `hostPath` is unavailable to unprivileged pods on clusters that enforce the restricted Pod Security Standard, so set `firmwarePvc.create: true` there. Sub-keys: `create` (default `false`), `keep` (default `true`, preserve the claim and its artifacts on `helm uninstall` via `helm.sh/resource-policy: keep`; `null` means unset, only an explicit `false` disables), `size` (default `20Gi`), `storageClass` (`""` = cluster default, `"-"` = disable dynamic provisioning), `accessModes` (default `[ReadWriteOnce]`; `ReadWriteOncePod` must be the sole entry). Ignored when `create` is `false`; setting the whole block to `null` is treated as `create: false`.
+- `strategy` — Deployment rollout strategy (`spec.strategy`). Omit for the Kubernetes default `RollingUpdate`. Set `type: Recreate` to pair with a `ReadWriteOncePod` firmware claim (a rolling update creates the replacement pod before the old one terminates and cannot mount the claim), or `rollingUpdate.maxSurge: 0` to avoid Multi-Attach stalls with `ReadWriteOnce` claims. `rollingUpdate` is rejected with `type: Recreate`, and `maxSurge: 0` with `maxUnavailable: 0` (Kubernetes refuses both combinations).
 - `sftpUploadTimeoutSeconds` — overall SFTP upload wall-clock timeout (seconds); config.toml `[workflows] sftp_upload_timeout_seconds`. Default: `3600`.
 - `sftpStepTimeoutSeconds` — per-step SFTP stall timeout (seconds); config.toml `[workflows] sftp_step_timeout_seconds`. Must be <= `sftpUploadTimeoutSeconds`. Default: `30`.
 
@@ -488,28 +490,68 @@ the restart or re-push happens.
 ### Firmware PVC
 
 The firmware download filesystem defaults to a node `hostPath` from
-`apiServer.firmwareStoragePath`. To use persistent cluster storage, create a
-site override with an existing claim name. Keep `apiServer.firmwarePersistentVolumeClaim`
-empty in `helm/values.yaml`; set it only in a site values file layered with `-f`.
+`apiServer.firmwareStoragePath`. That default does not work on clusters that
+deny unprivileged pods `hostPath` access (e.g. those enforcing the restricted
+Pod Security Standard), so back it with a PVC there. There are two ways to do so.
+
+Mount an existing claim you (or an operator) provisioned separately. Keep
+`apiServer.firmwarePersistentVolumeClaim` empty in `helm/values.yaml`; set it
+only in a site values file layered with `-f`:
 
 ```yaml
 apiServer:
   firmwarePersistentVolumeClaim: rms-firmware-downloads
 ```
 
+Or let the chart create and own the PVC:
+
+```yaml
+apiServer:
+  firmwarePvc:
+    create: true
+    keep: true             # survive helm uninstall (default); false lets uninstall delete the claim
+    size: 20Gi
+    storageClass: ""      # "" = cluster default, "-" = disable dynamic provisioning
+    accessModes:
+      - ReadWriteOnce
+  # Optional: name the created claim; defaults to "<fullname>-firmware".
+  firmwarePersistentVolumeClaim: rms-firmware
+```
+
 When `apiServer.replicaCount` is greater than 1, use a PVC backed by storage
 that supports mounting from every scheduled API server pod, such as
 `ReadWriteMany`. `ReadWriteOnce` volumes from common block storage classes can
 usually attach to only one node at a time, causing additional replicas on other
-nodes to fail with Multi-Attach errors. If you use `ReadWriteOncePod`, keep the
-deployment constrained to a single pod/node.
+nodes to fail with Multi-Attach errors. `ReadWriteOncePod` must be the only
+entry in `accessModes` (Kubernetes rejects combining it with another mode); it
+also blocks the
+default `RollingUpdate` strategy: the replacement pod is created before the old
+one terminates and cannot mount a claim the old pod still holds, so the rollout
+stalls. Keep the deployment to a single pod with that mode and pair it with a
+delete-before-create rollout: set `apiServer.strategy.type: Recreate`.
 
-Install or upgrade with the PVC override after the base values:
+By default the created claim carries the `helm.sh/resource-policy: keep`
+annotation (`apiServer.firmwarePvc.keep`, default `true`), so downloaded
+firmware artifacts survive `helm uninstall`; only an explicit `keep: false`
+lets the uninstall delete the claim and free its storage — a nulled `keep`
+means unset, not false. A kept claim outlives its
+release: installing a release with the same name in the same namespace fails
+with an already-exists error, so delete the claim
+(`kubectl delete pvc <claim> -n <namespace>`) or install with
+`--take-ownership` to adopt it. `storageClassName` and `accessModes` are
+immutable on an existing claim; only `size` can grow, and only when the
+StorageClass allows volume expansion.
+
+Install or upgrade with a PVC override after the base values —
+[`firmware-pvc-values.yaml`](./examples/overrides/firmware-pvc-values.yaml) mounts a
+pre-existing claim, and
+[`firmware-pvc-create-values.yaml`](./examples/overrides/firmware-pvc-create-values.yaml)
+lets the chart create one:
 
 ```bash
 helm upgrade --install rack ./helm \
   -f helm/values.yaml \
-  -f helm/examples/overrides/firmware-pvc-values.yaml \
+  -f helm/examples/overrides/firmware-pvc-create-values.yaml \
   --set global.image.tag=<APP_TAG> \
   -n rack-manager --create-namespace
 ```
@@ -702,8 +744,25 @@ full value → `config.toml` key mapping.
   (`[workflows.expected_inventory_profiles]`; default `{}`).
 - `logLevel` — log level / filter directive (`[logging] log_level`; empty →
   `info` plus caps).
-- `firmwarePersistentVolumeClaim` — existing PVC mounted at
-  `firmwareMountPath`; empty uses the `firmwareStoragePath` hostPath.
+- `firmwarePersistentVolumeClaim` — PVC name mounted at `firmwareMountPath`
+  for firmware downloads. When `firmwarePvc.create` is `false` it must
+  reference an existing PVC; empty falls back to the `firmwareStoragePath`
+  hostPath. When `firmwarePvc.create` is `true` it names the PVC the chart
+  creates (defaults to `<fullname>-firmware` when empty).
+- `firmwarePvc` — let the chart own the firmware PVC instead of a pre-created
+  claim or a hostPath; set `create: true` where unprivileged pods cannot use
+  `hostPath` (clusters enforcing the restricted Pod Security Standard).
+  Sub-keys: `create` (default `false`), `keep` (default `true`, preserve the
+  claim on `helm uninstall`; `null` = unset), `size` (default `20Gi`),
+  `storageClass` (`""` = cluster default, `"-"` = disable dynamic
+  provisioning), `accessModes` (default `[ReadWriteOnce]`; `ReadWriteOncePod`
+  must be the sole entry). Ignored when
+  `create` is `false`; `null` is treated as `create: false`.
+- `strategy` — Deployment rollout strategy; `type: Recreate` pairs with a
+  `ReadWriteOncePod` firmware claim and `rollingUpdate.maxSurge: 0` avoids
+  Multi-Attach stalls with `ReadWriteOnce` claims (`rollingUpdate` is rejected
+  with `type: Recreate`, and `maxSurge: 0` with `maxUnavailable: 0`).
+  Default: omitted (Kubernetes `RollingUpdate`).
 - `sftpUploadTimeoutSeconds` — overall SFTP upload timeout
   (`[workflows] sftp_upload_timeout_seconds`; default `3600`).
 - `sftpStepTimeoutSeconds` — per-step SFTP stall timeout
@@ -720,22 +779,41 @@ cases and `helm/examples/overrides/` for ready-made override files.
 ```text
 .
 ├── Chart.yaml
+├── INSECURE_SWITCH_TESTING.md
+├── README.md
+├── examples/
+│   └── overrides/
+│       ├── firmware-pvc-create-values.yaml
+│       ├── firmware-pvc-values.yaml
+│       ├── local-dev-values.yaml
+│       ├── site-certificates-values.yaml
+│       ├── switch-insecure-values.yaml
+│       └── switch-mtls-values.yaml
 ├── scripts/
+│   ├── bump-chart-version.sh
+│   ├── pre-commit-bump-chart.sh
+│   ├── suggest-chart-bump.sh
 │   └── test-chart.sh
 ├── tests/
-│   └── api-server-firmware-storage_test.yaml
+│   ├── api-server-config_test.yaml
+│   ├── api-server-firmware-pvc_test.yaml
+│   ├── api-server-firmware-storage_test.yaml
+│   ├── api-server-insecure-gate_test.yaml
+│   ├── api-server-strategy_test.yaml
+│   ├── api-server-tls-secret_test.yaml
+│   └── certificates_test.yaml
 ├── values.yaml
 ├── values.schema.json
 └── templates/
     ├── _helpers.tpl
     ├── namespace.yaml
-    ├── api-server-deployment.yaml
+    ├── api-server-config.yaml
     ├── api-server-configmap.yaml
+    ├── api-server-deployment.yaml
+    ├── api-server-firmware-pvc.yaml
+    ├── api-server-servicemonitor.yaml
     ├── api-server-tls-secret.yaml
     ├── certificates.yaml
-    ├── api-server-servicemonitor.yaml
-    ├── grafana-dashboard.yaml
-    ├── api-server-servicemonitor.yaml
     ├── grafana-dashboard.yaml
     ├── postgres.yaml
     ├── postgres-credentials-secret.yaml

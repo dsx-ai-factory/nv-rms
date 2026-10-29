@@ -1,0 +1,34 @@
+{{- /* firmwarePvc may be null (e.g. a site override resetting the block); treat that as create=false, like the firmwareUsePvc helper. Sub-key nulls fall back to the values.yaml defaults, mirroring Helm's coalescing of missing keys. */}}
+{{- $firmwarePvc := .Values.apiServer.firmwarePvc | default dict -}}
+{{- /* keep defaults to true unless explicitly false: Helm drops null'd keys, so a null keep means "unset", and treating it as false would silently drop the retention annotation and lose firmware artifacts on uninstall. */}}
+{{- $keep := $firmwarePvc.keep }}
+{{- if not (kindIs "bool" $keep) }}
+{{- $keep = true }}
+{{- end }}
+{{- if and .Values.apiServer.enabled $firmwarePvc.create }}
+{{- $accessModes := $firmwarePvc.accessModes | default (list "ReadWriteOnce") }}
+{{- /* Kubernetes requires ReadWriteOncePod to be the sole access mode on a claim. */}}
+{{- if and (has "ReadWriteOncePod" $accessModes) (gt (len $accessModes) 1) }}
+{{- fail "apiServer.firmwarePvc.accessModes cannot combine ReadWriteOncePod with other access modes; Kubernetes requires it to be the only access mode" }}
+{{- end }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "rack-manager.firmwarePvcName" . }}
+  namespace: {{ include "rack-manager.namespace" . }}
+  labels:
+    {{- include "rack-manager.labels" . | nindent 4 }}
+  {{- if $keep }}
+  annotations:
+    helm.sh/resource-policy: keep
+  {{- end }}
+spec:
+  accessModes:
+    {{- toYaml $accessModes | nindent 4 }}
+  resources:
+    requests:
+      storage: {{ $firmwarePvc.size | default "20Gi" | quote }}
+  {{- with ($firmwarePvc.storageClass | default "" | trim) }}
+  storageClassName: {{ eq . "-" | ternary "" . | quote }}
+  {{- end }}
+{{- end }}

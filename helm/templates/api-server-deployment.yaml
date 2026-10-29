@@ -1,6 +1,7 @@
 {{- if .Values.apiServer.enabled }}
 {{- include "rack-manager.validateSftpOptions" . -}}
-{{- $firmwarePersistentVolumeClaim := .Values.apiServer.firmwarePersistentVolumeClaim | default "" | trim }}
+{{- $firmwareUsePvc := eq (include "rack-manager.firmwareUsePvc" .) "true" }}
+{{- $firmwarePvcName := include "rack-manager.firmwarePvcName" . }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -14,6 +15,39 @@ spec:
     matchLabels:
       app: rms-api-server
   replicas: {{ .Values.apiServer.replicaCount }}
+  {{- /* Rendered field by field (not toYaml passthrough) so null sub-keys are
+       skipped like unset; kindIs guards (not `with`) keep maxSurge/maxUnavailable
+       renderable at 0, which is falsy but meaningful. */}}
+  {{- $strategy := .Values.apiServer.strategy | default dict }}
+  {{- /* Kubernetes rejects a Deployment that sets rollingUpdate alongside
+       type: Recreate; fail at render time instead of at apply time. The
+       default "" keeps eq safe when type is null/absent. */}}
+  {{- if and $strategy.rollingUpdate (eq ($strategy.type | default "") "Recreate") }}
+  {{- fail "apiServer.strategy.rollingUpdate is not allowed when apiServer.strategy.type is Recreate; Kubernetes rejects that Deployment strategy combination" }}
+  {{- end }}
+  {{- /* Kubernetes also rejects a strategy that can neither surge nor replace
+       pods: maxSurge 0 combined with maxUnavailable 0. The dict default keeps
+       the field access safe when rollingUpdate is null/absent, and toString
+       normalizes Helm's float64 numbers before the comparison. */}}
+  {{- $ru := $strategy.rollingUpdate | default dict }}
+  {{- if and (has ($ru.maxSurge | toString) (list "0" "0%")) (has ($ru.maxUnavailable | toString) (list "0" "0%")) }}
+  {{- fail "apiServer.strategy.rollingUpdate cannot set both maxSurge and maxUnavailable to 0; Kubernetes rejects that Deployment strategy combination" }}
+  {{- end }}
+  {{- if or $strategy.type $strategy.rollingUpdate }}
+  strategy:
+    {{- with $strategy.type }}
+    type: {{ . }}
+    {{- end }}
+    {{- with $strategy.rollingUpdate }}
+    rollingUpdate:
+      {{- if not (kindIs "invalid" .maxSurge) }}
+      maxSurge: {{ .maxSurge }}
+      {{- end }}
+      {{- if not (kindIs "invalid" .maxUnavailable) }}
+      maxUnavailable: {{ .maxUnavailable }}
+      {{- end }}
+    {{- end }}
+  {{- end }}
   template:
     metadata:
       labels:
@@ -179,9 +213,9 @@ spec:
           configMap:
             name: rms-api-config
         - name: firmware-storage
-          {{- if $firmwarePersistentVolumeClaim }}
+          {{- if $firmwareUsePvc }}
           persistentVolumeClaim:
-            claimName: {{ $firmwarePersistentVolumeClaim | quote }}
+            claimName: {{ $firmwarePvcName | quote }}
           {{- else }}
           hostPath:
             path: {{ .Values.apiServer.firmwareStoragePath }}

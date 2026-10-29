@@ -156,11 +156,71 @@
             }
           }
         },
+        "strategy": {
+          "type": ["object", "null"],
+          "description": "Deployment rollout strategy (spec.strategy). Omit or null for the Kubernetes default RollingUpdate. Set type Recreate to pair with a ReadWriteOncePod firmware claim; set rollingUpdate.maxSurge 0 to avoid Multi-Attach stalls with ReadWriteOnce claims. rollingUpdate is rejected with type Recreate (Kubernetes refuses the combination).",
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": ["Recreate", "RollingUpdate"],
+              "description": "Deployment strategy type. Recreate deletes the old pod before creating its replacement, which a ReadWriteOncePod claim requires: its volume cannot be mounted while the previous pod holds it."
+            },
+            "rollingUpdate": {
+              "type": "object",
+              "description": "Rolling-update tuning. maxSurge and maxUnavailable cannot both be 0; Kubernetes rejects a Deployment whose strategy can neither surge nor make pods unavailable.",
+              "additionalProperties": false,
+              "properties": {
+                "maxUnavailable": {
+                  "type": ["integer", "string"],
+                  "description": "Pods that may be unavailable during a rolling update (integer or percentage string, e.g. \"25%\")."
+                },
+                "maxSurge": {
+                  "type": ["integer", "string"],
+                  "description": "Pods that may be created above the desired count during a rolling update (integer or percentage string). 0 replaces pods instead of surging, avoiding Multi-Attach stalls with ReadWriteOnce claims."
+                }
+              }
+            }
+          }
+        },
         "firmwarePersistentVolumeClaim": {
           "type": "string",
           "maxLength": 253,
           "pattern": "^$|^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)*$",
           "description": "Existing PVC claimName for the firmware download filesystem. Empty string uses apiServer.firmwareStoragePath hostPath. Non-empty values must be valid Kubernetes DNS subdomain names."
+        },
+        "firmwarePvc": {
+          "type": ["object", "null"],
+          "description": "Chart-owned firmware PVC configuration. null is treated as create=false: the firmware filesystem falls back to apiServer.firmwarePersistentVolumeClaim or the apiServer.firmwareStoragePath hostPath.",
+          "additionalProperties": false,
+          "properties": {
+            "create": {
+              "type": ["boolean", "null"],
+              "description": "When true, the chart creates the firmware PersistentVolumeClaim (named apiServer.firmwarePersistentVolumeClaim, or \"<fullname>-firmware\" when unset) instead of requiring a pre-created PVC or hostPath. The Deployment then mounts the created claim. null is treated as false (unset)."
+            },
+            "keep": {
+              "type": ["boolean", "null"],
+              "description": "When true (default), the created firmware PVC carries helm.sh/resource-policy: keep so it and its firmware artifacts survive helm uninstall. null is treated as unset (true); only an explicit false lets uninstall delete the claim. A kept claim outlives the release: a same-name reinstall fails with an already-exists error until the claim is deleted or adopted with --take-ownership. Ignored when create is false."
+            },
+            "size": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Requested storage size for the created firmware PVC (e.g. 20Gi). Ignored when create is false."
+            },
+            "storageClass": {
+              "type": "string",
+              "description": "StorageClass for the created firmware PVC. Empty string uses the cluster default; \"-\" disables dynamic provisioning. Ignored when create is false."
+            },
+            "accessModes": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "string",
+                "enum": ["ReadWriteOnce", "ReadOnlyMany", "ReadWriteMany", "ReadWriteOncePod"]
+              },
+              "description": "Access modes for the created firmware PVC. ReadWriteOncePod must be the only entry in the list (Kubernetes rejects combining it with another mode) and limits the deployment to one pod, blocking RollingUpdate rollouts since the replacement pod cannot mount the claim until the old pod terminates; pair it with a delete-before-create (Recreate) strategy. Ignored when create is false."
+            }
+          }
         },
         "nmxGatewayId": {
           "type": "string",
