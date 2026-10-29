@@ -362,6 +362,28 @@ apiServer:
     existingSecret: rms-api-server-tls
 ```
 
+When the chart reads the username and password from `database.credentialsSecret`
+(`external` mode, or `standalone` mode with `postgres.enabled: false`), it uses
+the keys `username` and `password` by default (the common Zalando naming). Some
+operators publish those under different keys — for example
+[CrunchyData/postgres-operator](https://github.com/CrunchyData/postgres-operator)
+writes the role name under `user` — so `database.credentialsSecretKeys` lets the
+chart consume an operator-managed secret directly, with no re-mapping step:
+
+```yaml
+database:
+  credentialsSecret: my-cluster-pguser-rms
+  credentialsSecretKeys:
+    username: user      # Crunchy publishes the role name under "user"
+    password: password
+```
+
+`credentialsSecretKeys` is consulted whenever the chart reads
+`database.credentialsSecret` — `external` mode and `standalone` mode with
+`postgres.enabled: false`. Only chart-managed Postgres (`standalone` mode with
+`postgres.enabled: true`, whose credentials secret the chart writes itself)
+always uses the fixed `username`/`password` keys.
+
 Install or upgrade:
 
 ```bash
