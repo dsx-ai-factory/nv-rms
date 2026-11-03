@@ -14481,7 +14481,7 @@ DEALINGS IN THE SOFTWARE.
 
 [[third_party_libraries]]
 package_name = "pageant"
-package_version = "0.2.1"
+package_version = "0.2.5"
 repository = "https://github.com/warp-tech/russh"
 license = "Apache-2.0"
 
