@@ -647,9 +647,19 @@ jobs:
       - name: Run TruffleHog Scan
         uses: dsx-ai-factory/dsx-github-actions/.github/actions/trufflehog-scan@9a9ce3a7770a8b53d2726afa920be3276bc3ddd7
         with:
-          extra-args: '--results=verified,unknown --only-verified'
+          # Skip the nvfwupd third-party source archive; it bundles upstream crate test keys.
+          extra-args: '--results=verified,unknown --only-verified --exclude-paths=/tmp/.github/trufflehog-exclude-paths.txt'
           post-pr-comment: 'false'
           fail-on-findings: 'true'
+
+      - name: Verify the excluded nvfwupd source archive
+        if: hashFiles('crates/rust_nvfwupd/OpenSourceSoftware/OpenSourceSoftware.tar.gz') != ''
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}:/workspace" \
+            -w /workspace \
+            rust:1.96-bookworm \
+            sh -ec 'export RUSTUP_TOOLCHAIN="$(rustup default | cut -d" " -f1)"; python3 ci/generate_nvfwupd_open_source_bundle.py --check'
 
   # Slack notification via nico's ported reusable workflow. Runs after every job
   # (always()), so it fires on all three triggers this workflow allows: PR
