@@ -40,6 +40,7 @@ fn phase_4b1_workflow_module_is_the_canonical_public_import_path() {
         ip: "192.0.2.20".to_string(),
         username: "admin".to_string(),
         password: "secret".to_string(),
+        session_token: None,
         port: Some(443),
         server_type: nvfwupd::workflow::ServerType::GB200Switch,
         verify_tls: false,
@@ -55,6 +56,12 @@ fn phase_4b1_workflow_module_is_the_canonical_public_import_path() {
         target.server_type,
         nvfwupd::workflow::ServerType::GB200Switch
     );
+
+    let token_target = target.clone().with_bmc_session_token("session-token");
+
+    assert!(token_target.username.is_empty());
+    assert!(token_target.password.is_empty());
+    assert_eq!(token_target.session_token.as_deref(), Some("session-token"));
 
     let request: nvfwupd::workflow::FirmwareUpdateRequest =
         nvfwupd::workflow::FirmwareUpdateRequest {
@@ -195,12 +202,13 @@ fn phase_4b1_workflow_module_is_the_canonical_public_import_path() {
         nvfwupd::workflow::ServerType::GB200,
         nvfwupd::workflow::ServerType::GB300,
         nvfwupd::workflow::ServerType::VRNVL72,
+        nvfwupd::workflow::ServerType::LP30,
         nvfwupd::workflow::ServerType::GB200Switch,
         nvfwupd::workflow::ServerType::GB300Switch,
         nvfwupd::workflow::ServerType::VRNVL72Switch,
         nvfwupd::workflow::ServerType::PowerShelf,
     ];
-    assert_eq!(server_variants.len(), 15);
+    assert_eq!(server_variants.len(), 16);
 
     let staged_variants = [
         nvfwupd::workflow::StagedMode::None,
@@ -247,6 +255,7 @@ fn phase_4b2_workflow_api_facade_functions_are_public_async_entrypoints() {
         ip: "192.0.2.21".to_string(),
         username: "admin".to_string(),
         password: "secret".to_string(),
+        session_token: None,
         port: Some(443),
         server_type: nvfwupd::workflow::ServerType::GB200,
         verify_tls: false,
@@ -365,6 +374,7 @@ fn public_workflow_types_are_constructible() {
         ip: "192.0.2.10".to_string(),
         username: "admin".to_string(),
         password: "secret".to_string(),
+        session_token: None,
         port: Some(443),
         server_type: ServerType::GB200,
         verify_tls: false,
@@ -541,6 +551,8 @@ fn phase_2c_rftarget_async_contract_is_send_sync() {
         access_type: AccessType::Login,
         ssh_known_hosts: None,
         ssh_host_key_mode: "tofu".to_string(),
+        compute_timing: None,
+        compute_power_paths: Default::default(),
         client: reqwest::Client::builder()
             .danger_accept_invalid_certs(true)
             .build()

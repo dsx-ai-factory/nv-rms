@@ -23,17 +23,42 @@ use super::super::validation::is_valid_identifier;
 use super::super::{SwitchGb200Nvidia, config};
 use super::RETRY_WAIT_DELAY;
 use crate::transport::http_client::HttpClient;
-use crate::transport::ssh_client::SshClient;
 use crate::utilities::error::{ErrorCode, Result, RmsError};
 use crate::utilities::insert_json_field;
 
+use nvswitch_cli::{ClusterApp as CliClusterApp, ManagerEncryption, NvCommand};
+use nvue_client::ClientError;
 use nvue_client::DEFAULT_TIMEOUT as NVUE_DEFAULT_TIMEOUT;
 use nvue_client::cluster::{
     Cluster, ClusterApp, ClusterAppManagerState, ClusterAppManagerUpdateRequest,
-    ClusterAppStartRequest, ClusterAppStatus, ClusterAppStopRequest, ClusterState, NmxcConnection,
-    NmxcConnectionState, app_endpoint, app_manager_endpoint,
+    ClusterAppStartRequest, ClusterAppStopRequest, ClusterState, NMX_CONTROLLER_APP_NAME,
+    NmxcConnection, NmxcConnectionState, app_endpoint, app_manager_endpoint,
 };
 use serde_json::Value;
+
+/// Outcome of waiting for a cluster app to accept NVUE manager updates.
+///
+/// NVUE does not always report the fields that carry app readiness, so an app
+/// that is not ready and an app whose readiness cannot be observed are distinct
+/// results. Callers pick their own policy for each: a caller about to submit a
+/// manager configuration update fails on `Exhausted` and proceeds through
+/// `NotObservable`.
+enum ClusterAppManagerReadiness {
+    /// NVUE reported the cluster and the app ready, with the app status and the
+    /// raw status response that proved it.
+    Ready(ClusterApp, Value),
+
+    /// Readiness could not be read, because either:
+    /// 1. NVUE reported neither app status nor control-plane state,
+    /// 2. the cluster or app read itself failed, or
+    /// 3. the app reported ready while the cluster reported no NMX-C connection.
+    ///
+    /// The caller proceeds and lets the manager request surface any error.
+    NotObservable,
+
+    /// NVUE kept reporting the app transitional until the retry budget ran out.
+    Exhausted,
+}
 
 async fn test_port_connectivity(
     hostname: &str,
@@ -72,15 +97,6 @@ fn app_ready_for_manager_action(app: &ClusterApp) -> bool {
 
 fn app_waiting_for_manager_action(app: &ClusterApp) -> bool {
     !app_ready_for_manager_action(app) && (app.status.is_some() || app.addition_info.is_some())
-}
-
-fn app_stopped_for_manager_action(app: &ClusterApp) -> bool {
-    app.status
-        .as_deref()
-        .is_some_and(|status| status.eq_ignore_ascii_case(ClusterAppStatus::Stopped.as_str()))
-        || app
-            .control_plane_state()
-            .is_some_and(|state| state.is_stopped())
 }
 
 fn app_manager_reached_state(app: &ClusterApp, desired: &str) -> bool {
@@ -160,6 +176,43 @@ fn is_nonretryable_encryption_bind_error(err: &RmsError) -> bool {
 }
 
 impl SwitchGb200Nvidia {
+    /// Requires app absence (HTTP 404), or explicit stopped runtime without a
+    /// contradictory ready observation and with an explicitly down NMX-C connection.
+    /// Transport errors and missing fields cannot establish controller shutdown.
+    pub(super) async fn wait_for_cluster_controller_stopped(&self) -> Result<()> {
+        let nvue = self.nvue_client()?;
+
+        for attempt in 0..=config::MAX_RETRY_ATTEMPTS {
+            let app = match nvue
+                .get_cluster_app(NMX_CONTROLLER_APP_NAME, NVUE_DEFAULT_TIMEOUT)
+                .await
+            {
+                Ok(app) => app,
+                Err(ClientError::HttpStatus { status: 404, .. }) => return Ok(()),
+                Err(error) => return Err(error.into()),
+            };
+
+            if app.is_stopped() && !app_ready_for_manager_action(&app) {
+                let cluster = nvue.get_cluster(NVUE_DEFAULT_TIMEOUT).await?;
+
+                if cluster.nmxc_conn.as_ref().and_then(NmxcConnection::state)
+                    == Some(NmxcConnectionState::Down.as_str())
+                {
+                    return Ok(());
+                }
+            }
+
+            if attempt < config::MAX_RETRY_ATTEMPTS {
+                tokio::time::sleep(RETRY_WAIT_DELAY).await;
+            }
+        }
+
+        Err(RmsError::new(
+            ErrorCode::Timeout,
+            "cluster controller stopped state was not verified",
+        ))
+    }
+
     /// Builds the typed readiness view while preserving the augmented status response.
     ///
     /// `ClusterApp` intentionally ignores RMS reporting fields such as `installed`.
@@ -294,11 +347,14 @@ impl SwitchGb200Nvidia {
                 .wait_for_cluster_app_manager_action_ready(app_name)
                 .await?
             {
-                Some((status, response)) if app_manager_reached_state(&status, desired) => {
+                ClusterAppManagerReadiness::Ready(status, response)
+                    if app_manager_reached_state(&status, desired) =>
+                {
                     return Ok(response);
                 }
-                Some(_) => {}
-                None => {
+                ClusterAppManagerReadiness::Ready(..) => {}
+                ClusterAppManagerReadiness::NotObservable
+                | ClusterAppManagerReadiness::Exhausted => {
                     tracing::warn!(
                         node = %self.id,
                         app_name,
@@ -331,11 +387,11 @@ impl SwitchGb200Nvidia {
     async fn wait_for_cluster_app_manager_action_ready(
         &self,
         app_name: &str,
-    ) -> Result<Option<(ClusterApp, Value)>> {
+    ) -> Result<ClusterAppManagerReadiness> {
         // NVOS can report the cluster enabled before the app manager callback
         // accepts manager actions. Wait only while NVUE reports an explicit
-        // transitional state; when readiness is not observable, let the NVUE
-        // manager action proceed and surface any error itself.
+        // transitional state, and tell the caller which of the two non-ready
+        // outcomes it got so it can pick its own failure policy.
         let mut start_requested = false;
 
         for attempt in 0..=config::MAX_RETRY_ATTEMPTS {
@@ -349,6 +405,11 @@ impl SwitchGb200Nvidia {
                 Ok(cluster) => {
                     let cluster_ready = cluster.is_ready_for_app_manager_action();
 
+                    // `cluster_ready` also requires `nmxc-conn == up`. An app
+                    // that already reports `status: ok` accepts manager
+                    // updates via its own configCallback even while that
+                    // connection is still down. Other ready control-plane
+                    // states still wait for the connection.
                     let nmxc_conn_pending = cluster
                         .nmxc_conn
                         .as_ref()
@@ -359,11 +420,12 @@ impl SwitchGb200Nvidia {
 
                     match self.read_cluster_app_status(app_name).await {
                         Ok((app_status, response))
-                            if cluster_ready && app_ready_for_manager_action(&app_status) =>
+                            if app_status.status.as_deref() == Some("ok")
+                                || (cluster_ready && app_ready_for_manager_action(&app_status)) =>
                         {
-                            return Ok(Some((app_status, response)));
+                            return Ok(ClusterAppManagerReadiness::Ready(app_status, response));
                         }
-                        Ok((app_status, _)) if app_stopped_for_manager_action(&app_status) => {
+                        Ok((app_status, _)) if app_status.is_stopped() => {
                             if !start_requested {
                                 tracing::info!(
                                     node = %self.id,
@@ -406,7 +468,7 @@ impl SwitchGb200Nvidia {
             };
 
             if !should_wait {
-                return Ok(None);
+                return Ok(ClusterAppManagerReadiness::NotObservable);
             }
 
             if attempt < config::MAX_RETRY_ATTEMPTS {
@@ -415,15 +477,31 @@ impl SwitchGb200Nvidia {
         }
 
         if start_requested {
-            Err(RmsError::internal(format!(
+            return Err(RmsError::internal(format!(
                 "cluster app {app_name} did not become ready after start"
-            )))
-        } else {
-            Ok(None)
+            )));
         }
+
+        Ok(ClusterAppManagerReadiness::Exhausted)
     }
 
-    pub(crate) async fn ensure_cluster_app_manager_action_ready(
+    /// Waits for `app_name` to accept NVUE manager updates, failing when it
+    /// stays unready.
+    ///
+    /// NVOS applies a cluster-app manager field update (`certificate`,
+    /// `ca-certificate`, `encryption`) by writing `user_config.json` and then
+    /// POSTing the app's own `configCallback` URL, so the update fails with
+    /// `CallBack to nmx app manager failed` while the app is still starting,
+    /// even once the manager state has converged to `enabled`. The app status
+    /// NVOS derives from that app's health-check callback is the closest signal
+    /// RMS has that the configuration callback will be accepted, so waiting on
+    /// it holds back an update the app cannot yet service.
+    ///
+    /// The wait is best-effort in one direction. When readiness cannot be read
+    /// at all, because NVUE reports none of the fields it is read from or
+    /// because the cluster or app read fails, the update is submitted anyway
+    /// and NVUE remains the authoritative source of the failure.
+    pub(crate) async fn require_cluster_app_manager_action_ready(
         &self,
         app_name: &str,
     ) -> Result<()> {
@@ -433,19 +511,25 @@ impl SwitchGb200Nvidia {
             )));
         }
 
-        if self
+        match self
             .wait_for_cluster_app_manager_action_ready(app_name)
             .await?
-            .is_none()
         {
-            tracing::warn!(
-                node = %self.id,
-                app_name,
-                "cluster app manager-action readiness was not observed; attempting action"
-            );
-        }
+            ClusterAppManagerReadiness::Ready(..) => Ok(()),
+            ClusterAppManagerReadiness::NotObservable => {
+                tracing::warn!(
+                    node = %self.id,
+                    app_name,
+                    "cluster app readiness was not observable; submitting manager \
+                     configuration anyway"
+                );
 
-        Ok(())
+                Ok(())
+            }
+            ClusterAppManagerReadiness::Exhausted => Err(RmsError::internal(format!(
+                "cluster app {app_name} did not become ready for manager configuration"
+            ))),
+        }
     }
 
     /// Starts a stopped cluster app through the NVUE `@start` action
@@ -585,8 +669,11 @@ impl SwitchGb200Nvidia {
                     "NVUE encryption bind failed (transport/transient); retrying via SSH nvCLI (cert-install backstop)"
                 );
 
-                self.run_cluster_app_manager_encryption_ssh_fallback(app_name, "mtls")
-                    .await
+                self.run_cluster_app_manager_encryption_ssh_fallback(
+                    app_name,
+                    ManagerEncryption::Mtls,
+                )
+                .await
             }
         }
     }
@@ -601,30 +688,14 @@ impl SwitchGb200Nvidia {
     async fn run_cluster_app_manager_encryption_ssh_fallback(
         &self,
         app_name: &str,
-        mode: &str,
+        encryption: ManagerEncryption,
     ) -> Result<()> {
-        if !is_valid_identifier(app_name) {
-            return Err(RmsError::invalid_argument(format!(
-                "invalid cluster app name: {app_name}"
-            )));
-        }
+        let app = CliClusterApp::new(app_name)?;
 
-        if !is_valid_identifier(mode) {
-            return Err(RmsError::invalid_argument(format!(
-                "invalid encryption mode: {mode}"
-            )));
-        }
-
-        let cmd = format!("nv action update cluster apps {app_name} manager encryption {mode}");
-
-        #[cfg(test)]
-        if let Some(exec) = &self.ssh_exec_for_test {
-            exec(&cmd)?;
-            return Ok(());
-        }
-
-        let ssh = SshClient::connect(self.ssh_endpoint()?, SshClient::DEFAULT_TIMEOUT).await?;
-        ssh.exec(&cmd, SshClient::DEFAULT_TIMEOUT).await?;
+        self.nv_cli()
+            .await?
+            .run(NvCommand::cluster_app_manager_encryption(&app, encryption)?)
+            .await?;
 
         Ok(())
     }
@@ -729,8 +800,268 @@ impl SwitchGb200Nvidia {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_nonretryable_encryption_bind_error, nvue_http_status_from_message};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    use super::{
+        ClusterAppManagerReadiness, is_nonretryable_encryption_bind_error,
+        nvue_http_status_from_message,
+    };
+    use crate::nodes::switch_gb200_nvidia::{SwitchGb200Nvidia, config};
     use crate::utilities::error::{ErrorCode, RmsError};
+
+    use serde_json::{Value, json};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    async fn mock_controller_runtime(server: &MockServer, runtime: Value, reads: u64) {
+        Mock::given(method("GET"))
+            .and(path("/nvue_v1/cluster/apps/nmx-controller"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(runtime))
+            .up_to_n_times(reads)
+            .expect(reads)
+            .mount(server)
+            .await;
+    }
+
+    async fn mock_controller_connection(server: &MockServer, connection: Value, reads: u64) {
+        Mock::given(method("GET"))
+            .and(path("/nvue_v1/cluster"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"nmxc-conn": connection})),
+            )
+            .expect(reads)
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn manager_readiness_recovers_after_activation_start_fails() {
+        for stopped_runtime in [
+            json!({"status": "stopped"}),
+            json!({
+                "status": "not ok",
+                "reason": "stopped by user",
+                "addition-info": "CONTROL_PLANE_STATE_UNDEFINED",
+            }),
+            json!({"addition-info": "CONTROL_PLANE_STATE_STOPPED"}),
+        ] {
+            let server = MockServer::start().await;
+            let stopped = Arc::new(AtomicBool::new(false));
+            let start_attempts = Arc::new(AtomicUsize::new(0));
+
+            Mock::given(method("GET"))
+                .and(path("/nvue_v1/cluster"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(json!({"state": "enabled", "nmxc-conn": "down"})),
+                )
+                .mount(&server)
+                .await;
+
+            let runtime_stopped = Arc::clone(&stopped);
+
+            Mock::given(method("GET"))
+                .and(path("/nvue_v1/cluster/apps/nmx-controller"))
+                .respond_with(move |_: &wiremock::Request| {
+                    let runtime = if runtime_stopped.load(Ordering::SeqCst) {
+                        stopped_runtime.clone()
+                    } else {
+                        json!({"status": "ok", "manager": {"state": "enabled"}})
+                    };
+
+                    ResponseTemplate::new(200).set_body_json(runtime)
+                })
+                .mount(&server)
+                .await;
+
+            let action_stopped = Arc::clone(&stopped);
+            let action_start_attempts = Arc::clone(&start_attempts);
+
+            Mock::given(method("POST"))
+                .and(path("/nvue_v1/cluster/apps/nmx-controller"))
+                .respond_with(move |request: &wiremock::Request| {
+                    let action: Value = request.body_json().expect("NVUE action payload");
+
+                    if action.get("@stop").is_some() {
+                        action_stopped.store(true, Ordering::SeqCst);
+
+                        return ResponseTemplate::new(200).set_body_json(json!({}));
+                    }
+
+                    assert!(action.get("@start").is_some(), "expected start action");
+
+                    if action_start_attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                        return ResponseTemplate::new(400).set_body_string("start failed");
+                    }
+
+                    action_stopped.store(false, Ordering::SeqCst);
+
+                    ResponseTemplate::new(200).set_body_json(json!({}))
+                })
+                .mount(&server)
+                .await;
+
+            let switch = SwitchGb200Nvidia::for_test(&server.uri());
+
+            let error = switch
+                .restart_cluster_app("nmx-controller")
+                .await
+                .expect_err("activation start fails after a successful stop");
+
+            assert!(error.message.contains("@start"), "{}", error.message);
+            assert!(stopped.load(Ordering::SeqCst));
+            assert_eq!(start_attempts.load(Ordering::SeqCst), 1);
+
+            let readiness = switch
+                .wait_for_cluster_app_manager_action_ready("nmx-controller")
+                .await
+                .expect("a retry starts the stopped controller before manager actions");
+
+            assert!(matches!(readiness, ClusterAppManagerReadiness::Ready(_, _)));
+            assert!(!stopped.load(Ordering::SeqCst));
+            assert_eq!(start_attempts.load(Ordering::SeqCst), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_controller_stop_accepts_explicit_stopped_runtime_and_connection_down() {
+        for (runtime, connection) in [
+            (json!({"status": "stopped"}), json!("down")),
+            (
+                json!({"status": "notok", "reason": "stopped by user"}),
+                json!({"state": "down"}),
+            ),
+            (
+                json!({"addition-info": "CONTROL_PLANE_STATE_STOPPED"}),
+                json!("down"),
+            ),
+        ] {
+            let server = MockServer::start().await;
+
+            mock_controller_runtime(&server, runtime, 1).await;
+            mock_controller_connection(&server, connection, 1).await;
+
+            SwitchGb200Nvidia::for_test(&server.uri())
+                .wait_for_cluster_controller_stopped()
+                .await
+                .expect("explicit stopped runtime and disconnected controller prove shutdown");
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_controller_stop_polls_transitional_runtime() {
+        let server = MockServer::start().await;
+
+        mock_controller_runtime(&server, json!({"status": "notok", "reason": "stopping"}), 1).await;
+        mock_controller_runtime(&server, json!({"status": "stopped"}), 1).await;
+        mock_controller_connection(&server, json!("down"), 1).await;
+
+        SwitchGb200Nvidia::for_test(&server.uri())
+            .wait_for_cluster_controller_stopped()
+            .await
+            .expect("transitional runtime must be polled until stopped");
+    }
+
+    #[tokio::test]
+    async fn managed_controller_stop_distinguishes_absence_from_failed_reads() {
+        for status in [404, 401, 503] {
+            let server = MockServer::start().await;
+
+            Mock::given(method("GET"))
+                .and(path("/nvue_v1/cluster/apps/nmx-controller"))
+                .respond_with(ResponseTemplate::new(status))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let result = SwitchGb200Nvidia::for_test(&server.uri())
+                .wait_for_cluster_controller_stopped()
+                .await;
+
+            assert_eq!(result.is_ok(), status == 404, "HTTP {status}");
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_controller_stop_rejects_transport_failure() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .expect("reserve a loopback port for the disconnected transport");
+
+        let address = listener
+            .local_addr()
+            .expect("read reserved loopback address");
+
+        let switch = SwitchGb200Nvidia::for_test(&format!("http://{address}"));
+
+        drop(listener);
+
+        switch
+            .wait_for_cluster_controller_stopped()
+            .await
+            .expect_err("connection failure cannot prove controller absence");
+    }
+
+    #[tokio::test]
+    async fn managed_controller_stop_times_out_on_unknown_or_contradictory_runtime() {
+        for (runtime, connection_reads) in [
+            (json!({}), 0),
+            (json!({"status": "notok"}), 0),
+            (json!({"status": "ok", "reason": "stopped by user"}), 0),
+            (
+                json!({"status": "stopped"}),
+                u64::from(config::MAX_RETRY_ATTEMPTS) + 1,
+            ),
+        ] {
+            let server = MockServer::start().await;
+
+            mock_controller_runtime(&server, runtime, u64::from(config::MAX_RETRY_ATTEMPTS) + 1)
+                .await;
+
+            mock_controller_connection(&server, json!("up"), connection_reads).await;
+
+            let error = SwitchGb200Nvidia::for_test(&server.uri())
+                .wait_for_cluster_controller_stopped()
+                .await
+                .expect_err("unknown, contradictory, or connected runtime cannot prove shutdown");
+
+            assert_eq!(error.code, ErrorCode::Timeout);
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_controller_stop_requires_readable_down_connection() {
+        for connection in [json!(null), json!({}), json!("n/a"), json!("unknown")] {
+            let server = MockServer::start().await;
+            let reads = u64::from(config::MAX_RETRY_ATTEMPTS) + 1;
+
+            mock_controller_runtime(&server, json!({"status": "stopped"}), reads).await;
+            mock_controller_connection(&server, connection, reads).await;
+
+            let error = SwitchGb200Nvidia::for_test(&server.uri())
+                .wait_for_cluster_controller_stopped()
+                .await
+                .expect_err("missing or unknown connection state cannot prove shutdown");
+
+            assert_eq!(error.code, ErrorCode::Timeout);
+        }
+
+        let server = MockServer::start().await;
+
+        mock_controller_runtime(&server, json!({"status": "stopped"}), 1).await;
+
+        Mock::given(method("GET"))
+            .and(path("/nvue_v1/cluster"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        SwitchGb200Nvidia::for_test(&server.uri())
+            .wait_for_cluster_controller_stopped()
+            .await
+            .expect_err("failed connection read cannot prove shutdown");
+    }
 
     #[test]
     fn nvue_http_status_from_message_extracts_status() {

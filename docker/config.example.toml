@@ -1,0 +1,248 @@
+# Example RMS configuration file.
+#
+# RMS reads all runtime configuration from a single TOML file. Point the binary
+# at it with `--config <path>`; the default path is `/etc/rms/config.toml`.
+#
+# Every key below is optional and shown with its default value. Delete, or comment
+# out the ones you do not need to override. Booleans, integers, and strings are
+# parsed with their natural TOML types. Configuration beyond the top-level `port`
+# is grouped into sections ([metrics], [tls], [switches], [bmc], [postgres], [logging],
+# [workflows]); omitting a section entirely is equivalent to writing it with all
+# of its keys left at their defaults.
+#
+# Docker (secure): bind-mount this file read-only into the container and inject
+# the database password out-of-band rather than committing it here, e.g.
+#
+#   docker run \
+#     -v "$PWD/docker/config.example.toml:/etc/rms/config.toml:ro" \
+#     -e DATABASE_URL="postgres://user:pass@host:5432/rms?sslmode=require" \
+#     -p 8801:8801 -p 8802:8802 \
+#     rms-api:latest
+#
+# Only two environment inputs are honored, both sourced outside this file:
+#   * DATABASE_URL -- when set, overrides the `postgres.db_url` key below so the
+#     connection string (which embeds a password) can come from a secret store.
+#   * RMS_ALLOW_INSECURE -- must be set to 1, in addition to `tls.insecure = true`
+#     below, before RMS will bind plaintext gRPC. This independent gate means a
+#     stale config alone cannot downgrade the API to unauthenticated plaintext.
+
+# gRPC server port.
+port = 8801
+
+[metrics]
+# Prometheus /metrics listener port (must differ from `port`).
+port = 8802
+
+# Serve /metrics over TLS using the gRPC server certificate (no client auth).
+# Requires tls.cert and tls.key to be set.
+tls = false
+
+[tls]
+# gRPC TLS material. Set all three for mTLS. Leave unset only in development
+# together with insecure = true (see below).
+# cert = "/var/run/secrets/rms-api/tls.crt"
+# key  = "/var/run/secrets/rms-api/tls.key"
+# ca   = "/var/run/secrets/rms-api/ca.crt"
+
+# Disable gRPC TLS (plaintext, UNAUTHENTICATED). Development/testing ONLY.
+# Production MUST leave this false. Even when true, RMS binds plaintext only if
+# the RMS_ALLOW_INSECURE=1 environment gate is also set (an independent safeguard).
+insecure = false
+
+[switches]
+# Root directory of switch-side certificate material to install. Each NVLink
+# domain lives under <switch_cert_root>/<domain>/ (ca.pem, client.pem, client.key).
+# switch_cert_root = "/var/run/secrets/switch-cert"
+
+# Root directory of RMS client mTLS material for outbound switch connections.
+# Required unless insecure_switch = true.
+# client_tls_root = "/var/run/secrets/client-tls"
+
+# Default NVLink domain used when a switch RPC omits `domain`. Required when
+# client_tls_root is set.
+# default_switch_domain = "site-wide"
+
+# Optional DNS domain used as the TLS server name (SNI) authority for switches.
+# dns_domain = "switch.example.com"
+
+# Disable outbound switch client mTLS. NVUE uses unverified HTTPS and NMX-C uses
+# plaintext HTTP. Development/testing only.
+insecure_switch = false
+
+# gateway_id sent on NMX-C gRPC requests from RMS.
+nmx_gateway_id = "rack-manager-grpc-client"
+
+[bmc]
+# Skip BMC/Redfish HTTPS server certificate verification. Historical default is
+# true because BMC certificates are typically self-signed. Set false after BMC
+# certificates are issued by a CA the RMS process trusts.
+insecure_bmc = true
+
+[postgres]
+# Postgres connection URL. If unset (and no DATABASE_URL env var is provided),
+# RMS falls back to in-memory persistence -- data is lost on restart.
+# db_url = "postgres://user:pass@host:5432/rms?sslmode=require"
+
+# Maximum size of the Postgres connection pool (must be greater than 0).
+db_pool_max = 20
+
+[workflows]
+# Delay between fabric configuration wait logs, in seconds. Must be greater than zero.
+# Does not change device polling or workflow timeouts.
+fabric_config_wait_log_interval = 30
+
+# Directory where RMS stores and reads firmware artifacts.
+firmware_dir = "firmware"
+
+# Optional replacement for the hardware update profiles distributed with RMS.
+# Empty/partial directories are valid; missing platform profiles use code defaults.
+# Loaded and validated once at startup. Profile edits and path changes require
+# an RMS restart; running requests and jobs continue using the startup catalog.
+# hardware_profiles_dir = "/etc/rms/hardware-profiles/v1"
+
+# Overall timeout (seconds) for switch NVOS SFTP image uploads.
+sftp_upload_timeout_seconds = 3600
+
+# Stall timeout (seconds) for one SFTP upload step (must be <= upload timeout).
+sftp_step_timeout_seconds = 30
+
+# Upper bound (seconds) on polling one firmware task for completion.
+firmware_task_timeout_seconds = 10800
+
+# Wait after ONIE starts installing until NVOS SSH is ready.
+onie_recovery_timeout_seconds = 900
+
+# Wait for NVUE to save recovered credentials after boot.
+recovered_credential_save_timeout_seconds = 300
+
+# Delay (seconds) between polls of an in-flight firmware task (must be <= the
+# firmware task timeout). One poll emits one log line, so lower values are
+# noisier.
+firmware_task_poll_interval_seconds = 30
+
+# How long (seconds) to tolerate consecutive firmware task-status read failures
+# before failing the update. Reset by any successful read.
+firmware_task_transient_error_timeout_seconds = 900
+
+# How long (seconds) a compute firmware update waits for the tray to report
+# power On after the power-on that opens the flow. The default, one minute, is
+# the VR NVL72 bound for this power-on, and GB200 and GB300 use it too. The
+# power-on step arrives in a following change. Until it lands, RMS validates and
+# stores both values and nothing reads them.
+compute_power_on_timeout_seconds = 60
+
+# Delay (seconds) between power-state reads during that wait (must be <= the
+# compute power-on timeout).
+compute_power_on_poll_interval_seconds = 5
+
+# When true, every HTTP(S) firmware artifact must include a Sha256 digest
+# (CWE-494, download of code without integrity check). Digests that are
+# present are always verified even when this is false. Default is unrestricted.
+# See docs/configuration/configuring-rms.md#artifact-download-policy.
+artifact_require_sha256 = false
+# HTTP(S) firmware-object downloads. Defaults are unrestricted.
+# See docs/configuration/configuring-rms.md#artifact-download-policy.
+#
+# Hostname or *.suffix allow-list (*.suffix matches the suffix and its
+# subdomains). Empty allows any host.
+# Non-empty lists mitigate CWE-918 (server-side request forgery) by refusing
+# unexpected artifact hosts, including after redirects.
+# artifact_https_hosts = ["artifactory.example.com", "*.jfrog.io"]
+artifact_https_hosts = []
+
+# When false, reject IANA special-purpose HTTP(S) artifact targets (loopback,
+# RFC1918/ULA, CGNAT, NAT64, reserved), including after redirects. Complements
+# the host allow-list for CWE-918 (SSRF to internal addresses). Leave true for
+# lab Artifactory and loopback tests.
+artifact_allow_private_targets = true
+
+# Maximum number of async job records the tracker retains.
+max_tracked_jobs = 10000
+
+# Retention period (seconds) for completed and failed job records.
+terminal_job_ttl_seconds = 86400
+
+# Optional deployment-defined expected firmware inventories. Profile names are
+# opaque and are selected by NodeDescriptor.attributes["inventory_profile"].
+# One profile per hardware variant a deployment runs, on any NVFWUPD-backed
+# compute platform. The lists here are shortened examples.
+# [workflows.expected_inventory_profiles]
+# "gb200-compute-variant-a" = [
+#     "FW_BMC_0",
+#     "HGX_FW_GPU_0",
+# ]
+# "vrnvl72-compute" = [
+#     "FW_BMC_0",
+#     "HGX_FW_BMC_0",
+#     "HGX_FW_GPU_0",
+# ]
+#
+# Structured profiles can also validate physical host adapters before an
+# in-band Flint update. A zero count explicitly requires that family be absent.
+# [workflows.expected_inventory_profiles."sku-gb200"]
+# ap_names = ["FW_BMC_0", "HGX_FW_GPU_0"]
+# [workflows.expected_inventory_profiles."sku-gb200".flint_devices]
+# cx7 = 4
+# cx8 = 0
+# bf3_nic = 2
+
+# Optional per-profile recovery rosters. A node selects its profile with the
+# same inventory_profile attribute used for expected_inventory_profiles
+# above. RMS keeps the table opaque; the node type that binds to it parses
+# the fields it understands (GB200 NVIDIA compute today) and rejects the
+# rest at add_nodes. FW_BMC_0 stays out: expected to be present, but not
+# bundle-recoverable - it is the transport the recovery runs through.
+# [workflows.recovery_profiles."gb200-compute-variant-a"]
+# presence = ["HGX_FW_BMC_0", "HGX_FW_ERoT_BMC_0"]      # must be back after the AC cycle
+# push_then_cycle = ["HGX_FW_FPGA_0", "HGX_FW_FPGA_1"]  # regular HMC bundle, then an AC cycle, one per round
+# push_only = [                                          # HMC recovery bundle, one push, no cycle
+#     "HGX_FW_ERoT_CPU_0",
+#     "HGX_FW_ERoT_CPU_1",
+#     "HGX_FW_GPU_0",
+#     "HGX_FW_GPU_1",
+#     "HGX_FW_GPU_2",
+#     "HGX_FW_GPU_3",
+# ]
+
+[logging]
+# Log level / filter directive. When unset, the default `info` level plus
+# dependency caps apply.
+# log_level = "info,carbide=debug"
+
+# Assuming a logging collector is adding its own timestamps, so this is
+# disabled by default to prevent duplicate timestamp fields. If no logging
+# collector is being used, set this to true to output timestamps natively.
+enable_timestamps = false
+
+[tracing]
+# Optional OTLP endpoint. Use HTTPS with a Collector certificate trusted by RMS.
+# Plaintext HTTP is allowed only for a loopback IP address, such as a sidecar
+# Collector at http://127.0.0.1:4317. When omitted, RMS still creates real
+# trace/span IDs for local log correlation but does not export spans.
+#
+# gRPC example:
+# endpoint = "https://collector.example:4317"
+#
+# HTTP/protobuf requires the complete signal URL:
+# endpoint = "https://collector.example:4318/v1/traces"
+
+# OTLP transport: "grpc" or "http_protobuf".
+protocol = "grpc"
+
+# Fraction of traces to record in RMS, independent of caller sampling flags.
+# Must be greater than 0 and at most 1.
+sampling_ratio = 1.0
+
+# Bounded batching and shutdown behavior.
+max_queue_size = 2048
+max_export_batch_size = 512
+scheduled_delay_ms = 5000
+export_attempt_timeout_ms = 10000
+export_timeout_ms = 30000
+shutdown_timeout_ms = 5000
+
+# Temporary export failures use bounded exponential backoff with jitter.
+max_retries = 3
+retry_initial_delay_ms = 100
+retry_max_delay_ms = 1600
+retry_jitter_ms = 100

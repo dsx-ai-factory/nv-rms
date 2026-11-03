@@ -77,7 +77,7 @@ pub fn gh200_version_compare(pkg_version: &str, sys_version: &str) -> bool {
 pub struct GH200RFTarget {
     /// BMC connection handle.
     pub bmc_access: BmcAccess,
-    /// Component names treated as fungible (default: `["gpu"]`).
+    /// Component names treated as fungible (default: `["sma"]`).
     pub fungible_components: Vec<String>,
     /// Message displayed upon successful update completion.
     pub update_completion_msg: String,
@@ -92,7 +92,7 @@ impl GH200RFTarget {
     pub fn new(bmc_access: BmcAccess, config_dict: Option<Value>) -> Self {
         Self {
             bmc_access,
-            fungible_components: vec!["gpu".to_string()],
+            fungible_components: vec!["sma".to_string()],
             update_completion_msg: "Refer to 'NVIDIA Firmware Update Document' on \
                                     activation steps for new firmware to take effect."
                 .to_string(),
@@ -277,9 +277,13 @@ impl RFTarget for GH200RFTarget {
     // factory_reset override — inherits GH behavior
     // ------------------------------------------------------------------
 
-    /// GH200 inherits factory_reset from GH: always sends
-    /// `{"ResetToDefaultsType": "ResetAll"}`.
-    async fn factory_reset(&mut self, _reset_params: Option<&Value>) -> (bool, Value) {
+    /// GH200 inherits factory_reset from GH: sends
+    /// `{"ResetToDefaultsType": "ResetAll"}` unless the caller supplies a body.
+    async fn factory_reset(&mut self, reset_params: Option<&Value>) -> (bool, Value) {
+        if reset_params.is_some() {
+            return self.redfish_factory_reset(reset_params).await;
+        }
+
         // Delegate to GH-style factory reset (same as GHRFTarget override)
         let params = json!({"ResetToDefaultsType": "ResetAll"});
         let (status, response_dict) = self
@@ -313,15 +317,15 @@ impl RFTarget for GH200RFTarget {
     // get_expected_task_type_from_package override
     // ------------------------------------------------------------------
 
-    /// Determine if the package will create a BMC or HMC task.
-    ///
-    /// Python: checks recipe filenames for HGX platform indicators
-    /// (P4059, P4764, P4974, P4975, GB200-NVL4, HMC). Returns "HMC" if
-    /// any match, otherwise "BMC".
+    /// Uses GH filename fallback indicators when explicit UpdateParameters
+    /// `Targets` were not provided to the running-task preflight.
     fn get_expected_task_type_from_package(&self, recipe_list: &[String]) -> String {
-        let hgx_platforms = ["P4059", "P4764", "P4974", "P4975", "GB200-NVL4", "HMC"];
         for package_file in recipe_list {
-            if hgx_platforms.iter().any(|p| package_file.contains(p)) {
+            let package_name = std::path::Path::new(package_file)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(package_file);
+            if gh_rftarget::GHRFTarget::is_hgx_pkg(package_name) {
                 return "HMC".to_string();
             }
         }
@@ -582,9 +586,12 @@ impl RFTarget for GH200RFTarget {
         .await
     }
 
-    /// GH200 has no fungible components.
-    fn is_fungible_component(&self, _component_name: &str) -> bool {
-        false
+    /// GH200 SMA components are fungible and match package metadata by SKU.
+    fn is_fungible_component(&self, component_name: &str) -> bool {
+        let lower = component_name.to_lowercase();
+        self.fungible_components
+            .iter()
+            .any(|component| lower.contains(component))
     }
 
     async fn get_component_version(
@@ -606,7 +613,41 @@ impl RFTarget for GH200RFTarget {
         pldm_version_dict: &Value,
         ap_name: &str,
     ) -> Option<String> {
-        gh_rftarget::gh_get_version_sku(identifier, pldm_version_dict, ap_name)
+        let base_version = gh_rftarget::gh_get_version_sku(identifier, pldm_version_dict, ap_name);
+        if base_version
+            .as_deref()
+            .is_some_and(|version| version != "N/A")
+        {
+            return base_version;
+        }
+
+        if !ap_name.to_lowercase().contains("sma") {
+            return base_version;
+        }
+
+        let outer = pldm_version_dict.as_object()?;
+        for pkg_dict_val in outer.values() {
+            let Some(pkg_dict) = pkg_dict_val.as_object() else {
+                continue;
+            };
+            for (pkg_ap, pkg_version_val) in pkg_dict {
+                if !pkg_ap.to_lowercase().contains("sma") {
+                    continue;
+                }
+                let Some(pkg_data) = pkg_version_val.as_array() else {
+                    continue;
+                };
+                let pkg_identifier = pkg_data.get(1).and_then(|v| v.as_str()).unwrap_or("");
+                if pkg_identifier.eq_ignore_ascii_case(identifier) {
+                    return pkg_data
+                        .first()
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                }
+            }
+        }
+
+        base_version
     }
 }
 
@@ -636,5 +677,51 @@ mod tests {
                 "/redfish/v1/UpdateService/update-multipart"
             );
         }
+    }
+
+    #[test]
+    fn gh200_hmc_package_fallback_is_case_insensitive() {
+        let target = GH200RFTarget::new(BmcAccess::default_stub(), None);
+
+        assert_eq!(
+            target.get_expected_task_type_from_package(&["vr-nvl-hmc-p4109.fwpkg".to_string()]),
+            "HMC"
+        );
+        assert_eq!(
+            target.get_expected_task_type_from_package(&["vr-nvl-bmc-p4110.fwpkg".to_string()]),
+            "BMC"
+        );
+        assert_eq!(
+            target.get_expected_task_type_from_package(&[
+                "/tmp/HMC-staging/BMC-update-001.fwpkg".to_string()
+            ]),
+            "BMC"
+        );
+    }
+
+    #[test]
+    fn gh200_treats_sma_components_as_fungible() {
+        let target = GH200RFTarget::new(BmcAccess::default_stub(), None);
+
+        assert!(target.is_fungible_component("HGX_FW_GPU_SMA_0"));
+        assert!(target.is_fungible_component("FW_IO_Board_SMA_0"));
+        assert!(!target.is_fungible_component("HGX_FW_GPU_0"));
+        assert!(!target.is_fungible_component("HGX_InfoROM_GPU_0"));
+    }
+
+    #[test]
+    fn gh200_matches_sma_package_version_by_sku() {
+        let target = GH200RFTarget::new(BmcAccess::default_stub(), None);
+        let dict = json!({
+            "GH200-package": {
+                "SMA:GPU:,TEST-SMA-SKU": ["0050.02.0001.1001", "TEST-SMA-SKU"],
+                "GPU,0x99000002": ["97.00.B9.00.99", "0x99000002"]
+            }
+        });
+
+        assert_eq!(
+            target.get_version_sku("test-sma-sku", &dict, "HGX_FW_GPU_SMA_0"),
+            Some("0050.02.0001.1001".to_string())
+        );
     }
 }

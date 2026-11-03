@@ -4,7 +4,7 @@ Simultaneously Updating the Firmware for Separate Rack Trays
 NVFWUPD v2.0.5 and later supports the ability to update separate server rack trays simultaneously.
 
 
-.. image:: ../images/nvfwupd_full_rack_update_dag_mermaid.svg
+.. image:: ../images/nvfwupd_full_rack_update_dag_mermaid.png
    :alt: NVFWUPD Full Rack Firmware Update DAG — dependency graph showing update ordering and parallelism across compute, switch, power shelf, and host NIC lanes
    :width: 100%
 
@@ -120,7 +120,7 @@ The beginning of the task output shows a message indicating the delay before the
 
 .. code-block::
 
-    nvfwupd -c paralel_test_different_bmc.yaml update_fw
+    nvfwupd -c parallel_test_different_bmc.yaml update_fw
     Updating ip address: ip=XXXX
     Updating ip address: ip=XXXX
     FW package: ['UpdatePackages/nvfw_GB200-P4975_0009_251020.1.1_custom_dbg-signed.fwpkg']

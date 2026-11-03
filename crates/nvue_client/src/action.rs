@@ -128,6 +128,14 @@ pub struct ActionIdFields {
     /// Location URI field.
     #[serde(default)]
     pub location: Option<String>,
+
+    /// NVOS install action path.
+    #[serde(default)]
+    pub path: Option<String>,
+
+    /// Alternate NVOS install task path.
+    #[serde(default)]
+    pub task: Option<String>,
 }
 
 impl ActionIdFields {
@@ -139,6 +147,8 @@ impl ActionIdFields {
             .or_else(|| uri_tail(self.odata_id.as_deref()))
             .or_else(|| uri_tail(self.href.as_deref()))
             .or_else(|| uri_tail(self.location.as_deref()))
+            .or_else(|| uri_tail(self.path.as_deref()))
+            .or_else(|| uri_tail(self.task.as_deref()))
     }
 }
 
@@ -643,6 +653,19 @@ mod tests {
         assert_eq!(location.action_id().as_deref(), Some("job-3"));
         assert_eq!(action_id_from_body(r#""job-4""#).as_deref(), Some("job-4"));
         assert_eq!(action_id_from_body("{}"), None);
+    }
+
+    #[test]
+    fn extract_action_id_accepts_nvos_install_paths() {
+        for field in ["path", "task"] {
+            let response = serde_json::json!({field: "/action/install-10"});
+            assert_eq!(extract_action_id(&response).unwrap(), "install-10");
+            assert!(extract_action_id(&serde_json::json!({field: ""})).is_err());
+        }
+        assert_eq!(
+            extract_action_id(&serde_json::json!({"path": "", "task": "/action/10"})).unwrap(),
+            "10"
+        );
     }
 
     #[test]

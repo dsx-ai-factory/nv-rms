@@ -128,6 +128,16 @@ Image pull policy: component override, then global.image.pullPolicy.
 {{- end -}}
 
 {{/*
+NVSSVT sidecar image reference. Versioned independently of RMS, so it does not
+fall back to global.image.tag the way the RMS components do.
+*/}}
+{{- define "rack-manager.nvssvtImage" -}}
+{{- $repository := required "nvssvt.image.repository must be set when nvssvt.enabled is true" .Values.nvssvt.image.repository -}}
+{{- $tag := required "nvssvt.image.tag must be set when nvssvt.enabled is true" .Values.nvssvt.image.tag -}}
+{{- printf "%s:%s" $repository $tag -}}
+{{- end -}}
+
+{{/*
 Validate SFTP upload timeout tunables.
 Fails helm rendering when the constraint sftpStepTimeoutSeconds <= sftpUploadTimeoutSeconds
 is violated, or when either value is zero (the binary rejects both at startup).
@@ -158,6 +168,117 @@ misconfiguration at template time rather than silently at runtime.
 {{- end -}}
 
 {{/*
+Validate firmware task poll tunables.
+Fails helm rendering when any value is zero or when the constraint
+firmwareTaskPollIntervalSeconds <= firmwareTaskTimeoutSeconds is violated
+(the binary rejects all of these at startup).
+*/}}
+{{- define "rack-manager.validateFirmwareTaskOptions" -}}
+{{- $timeout := .Values.apiServer.firmwareTaskTimeoutSeconds | int -}}
+{{- $interval := .Values.apiServer.firmwareTaskPollIntervalSeconds | int -}}
+{{- $transient := .Values.apiServer.firmwareTaskTransientErrorTimeoutSeconds | int -}}
+{{- if le $timeout 0 -}}
+{{- fail "apiServer.firmwareTaskTimeoutSeconds must be greater than 0" -}}
+{{- end -}}
+{{- if le $interval 0 -}}
+{{- fail "apiServer.firmwareTaskPollIntervalSeconds must be greater than 0" -}}
+{{- end -}}
+{{- if le $transient 0 -}}
+{{- fail "apiServer.firmwareTaskTransientErrorTimeoutSeconds must be greater than 0" -}}
+{{- end -}}
+{{- if gt $interval $timeout -}}
+{{- fail "apiServer.firmwareTaskPollIntervalSeconds must be <= apiServer.firmwareTaskTimeoutSeconds" -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Validate the compute power-on tunables.
+Fails helm rendering when a value is zero or when
+computePowerOnPollIntervalSeconds <= computePowerOnTimeoutSeconds is violated
+(the binary rejects both at startup).
+*/}}
+{{- define "rack-manager.validateComputePowerOnOptions" -}}
+{{- $timeout := .Values.apiServer.computePowerOnTimeoutSeconds | int -}}
+{{- $interval := .Values.apiServer.computePowerOnPollIntervalSeconds | int -}}
+{{- if le $timeout 0 -}}
+{{- fail "apiServer.computePowerOnTimeoutSeconds must be greater than 0" -}}
+{{- end -}}
+{{- if le $interval 0 -}}
+{{- fail "apiServer.computePowerOnPollIntervalSeconds must be greater than 0" -}}
+{{- end -}}
+{{- if gt $interval $timeout -}}
+{{- fail "apiServer.computePowerOnPollIntervalSeconds must be <= apiServer.computePowerOnTimeoutSeconds" -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Validate bounded tracing settings that depend on more than one value.
+*/}}
+{{- define "rack-manager.validateTracingOptions" -}}
+{{- $tracing := .Values.apiServer.tracing | default dict -}}
+{{- $endpoint := dig "endpoint" "" $tracing -}}
+{{- $protocol := dig "protocol" "grpc" $tracing -}}
+{{- $ratio := dig "samplingRatio" 1.0 $tracing | float64 -}}
+{{- $queue := dig "maxQueueSize" 2048 $tracing | int -}}
+{{- $batch := dig "maxExportBatchSize" 512 $tracing | int -}}
+{{- $attemptTimeout := dig "exportAttemptTimeoutMs" 10000 $tracing | int -}}
+{{- $exportTimeout := dig "exportTimeoutMs" 30000 $tracing | int -}}
+{{- $retryInitial := dig "retryInitialDelayMs" 100 $tracing | int -}}
+{{- $retryMax := dig "retryMaxDelayMs" 1600 $tracing | int -}}
+{{- $shutdownTimeout := dig "shutdownTimeoutMs" 5000 $tracing | int -}}
+{{- $terminationGrace := include "rack-manager.terminationGracePeriodSeconds" . | int -}}
+{{- $requiredGrace := add 305 (div (add $shutdownTimeout 999) 1000) -}}
+{{- if or (le $ratio 0.0) (gt $ratio 1.0) -}}
+{{- fail "apiServer.tracing.samplingRatio must be in (0.0, 1.0]" -}}
+{{- end -}}
+{{- if gt $batch $queue -}}
+{{- fail "apiServer.tracing.maxExportBatchSize must be <= apiServer.tracing.maxQueueSize" -}}
+{{- end -}}
+{{- if gt $attemptTimeout $exportTimeout -}}
+{{- fail "apiServer.tracing.exportAttemptTimeoutMs must be <= apiServer.tracing.exportTimeoutMs" -}}
+{{- end -}}
+{{- if gt $retryInitial $retryMax -}}
+{{- fail "apiServer.tracing.retryInitialDelayMs must be <= apiServer.tracing.retryMaxDelayMs" -}}
+{{- end -}}
+{{- if $endpoint -}}
+{{- if regexMatch "\\s" $endpoint -}}
+{{- fail "apiServer.tracing.endpoint must not contain whitespace" -}}
+{{- end -}}
+{{- if or (contains "?" $endpoint) (contains "#" $endpoint) -}}
+{{- fail "apiServer.tracing.endpoint must not contain a query or fragment" -}}
+{{- end -}}
+{{- if regexMatch "^[A-Za-z][A-Za-z0-9+.-]*://[^/@]+@" $endpoint -}}
+{{- fail "apiServer.tracing.endpoint must not contain user information" -}}
+{{- end -}}
+{{- $parsed := urlParse $endpoint -}}
+{{- /* Plaintext only to a standard loopback IP literal, matching RMS's own check. */ -}}
+{{- $loopback := or (regexMatch "^127(\\.(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])){3}$" $parsed.hostname) (eq $parsed.hostname "::1") -}}
+{{- if not (or (eq $parsed.scheme "https") (and (eq $parsed.scheme "http") $loopback)) -}}
+{{- fail "apiServer.tracing.endpoint scheme must be https; plaintext http is allowed only for a loopback IP address such as 127.0.0.1 or [::1]" -}}
+{{- end -}}
+{{- if $parsed.userinfo -}}
+{{- fail "apiServer.tracing.endpoint must not contain user information" -}}
+{{- end -}}
+{{- if not $parsed.hostname -}}
+{{- fail "apiServer.tracing.endpoint must include a host" -}}
+{{- end -}}
+{{- if and (eq $protocol "grpc") $parsed.path (ne $parsed.path "/") -}}
+{{- fail "apiServer.tracing.endpoint must not contain a path for grpc" -}}
+{{- end -}}
+{{- if and (eq $protocol "http_protobuf") (not (hasSuffix "/v1/traces" $parsed.path)) -}}
+{{- fail "apiServer.tracing.endpoint must end with /v1/traces for http_protobuf" -}}
+{{- end -}}
+{{- end -}}
+{{- if lt $terminationGrace $requiredGrace -}}
+{{- fail (printf "apiServer.terminationGracePeriodSeconds must be at least %d for the RMS job drain, tracing shutdown timeout, and margin" $requiredGrace) -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "rack-manager.terminationGracePeriodSeconds" -}}
+{{- dig "terminationGracePeriodSeconds" 330 .Values.apiServer -}}
+{{- end -}}
+
+{{/*
 Guard against values that still use the old rmsPostgres.patchForgeCluster key
 (renamed to rmsPostgres.patchExternalCluster). values.schema.json does not
 constrain rmsPostgres, so Helm silently merges the stale key and would
@@ -177,8 +298,8 @@ Defined as a named template so both the ConfigMap and the Deployment's
 checksum/config annotation share a single source of truth. The database
 connection string is intentionally omitted; it is injected via DATABASE_URL.
 Configuration beyond the top-level `port` is grouped into TOML sections
-([metrics], [tls], [switches], [postgres], [workflows], [logging]) matching
-the Rust `RmsConfig` struct.
+([metrics], [tls], [switches], [bmc], [postgres], [workflows], [tracing], [logging])
+matching the Rust `RmsConfig` struct.
 */}}
 {{- define "rack-manager.apiServerConfigToml" -}}
 port = {{ .Values.apiServer.port }}
@@ -196,6 +317,7 @@ ca = {{ printf "%s/ca.crt" .Values.apiServer.tls.secretMountPath | quote }}
 {{- end }}
 {{- end }}
 insecure = {{ .Values.apiServer.allowInsecure }}
+cert_reload_interval_seconds = {{ .Values.apiServer.tls.certReloadIntervalSeconds | default 300 }}
 
 [switches]
 insecure_switch = {{ .Values.apiServer.insecureSwitch }}
@@ -213,6 +335,9 @@ dns_domain = {{ .Values.apiServer.dnsDomain | quote }}
 {{- end }}
 nmx_gateway_id = {{ .Values.apiServer.nmxGatewayId | quote }}
 
+[bmc]
+insecure_bmc = {{ .Values.apiServer.insecureBmc }}
+
 [postgres]
 db_pool_max = {{ .Values.apiServer.dbPoolMax }}
 
@@ -222,6 +347,16 @@ max_tracked_jobs = {{ .Values.apiServer.maxTrackedJobs }}
 terminal_job_ttl_seconds = {{ .Values.apiServer.terminalJobTtlSeconds }}
 sftp_upload_timeout_seconds = {{ .Values.apiServer.sftpUploadTimeoutSeconds }}
 sftp_step_timeout_seconds = {{ .Values.apiServer.sftpStepTimeoutSeconds }}
+firmware_task_timeout_seconds = {{ .Values.apiServer.firmwareTaskTimeoutSeconds }}
+onie_recovery_timeout_seconds = {{ .Values.apiServer.onieRecoveryTimeoutSeconds }}
+recovered_credential_save_timeout_seconds = {{ .Values.apiServer.recoveredCredentialSaveTimeoutSeconds }}
+firmware_task_poll_interval_seconds = {{ .Values.apiServer.firmwareTaskPollIntervalSeconds }}
+firmware_task_transient_error_timeout_seconds = {{ .Values.apiServer.firmwareTaskTransientErrorTimeoutSeconds }}
+compute_power_on_timeout_seconds = {{ .Values.apiServer.computePowerOnTimeoutSeconds }}
+compute_power_on_poll_interval_seconds = {{ .Values.apiServer.computePowerOnPollIntervalSeconds }}
+artifact_require_sha256 = {{ .Values.apiServer.artifactRequireSha256 }}
+artifact_https_hosts = {{ default (list) .Values.apiServer.artifactHttpsHosts | toJson }}
+artifact_allow_private_targets = {{ .Values.apiServer.artifactAllowPrivateTargets }}
 {{- if .Values.apiServer.expectedInventoryProfiles }}
 
 {{- range $profile := keys .Values.apiServer.expectedInventoryProfiles | sortAlpha }}
@@ -249,6 +384,38 @@ bf3_nic = {{ index $flintDevices "bf3Nic" }}
 {{- end }}
 {{- end }}
 {{- end }}
+
+{{- $tracing := .Values.apiServer.tracing | default dict }}
+{{- $traceEndpoint := dig "endpoint" "" $tracing }}
+{{- $traceProtocol := dig "protocol" "grpc" $tracing }}
+{{- $traceSamplingRatio := dig "samplingRatio" 1.0 $tracing }}
+{{- $traceMaxQueueSize := dig "maxQueueSize" 2048 $tracing }}
+{{- $traceMaxExportBatchSize := dig "maxExportBatchSize" 512 $tracing }}
+{{- $traceScheduledDelayMs := dig "scheduledDelayMs" 5000 $tracing }}
+{{- $traceExportAttemptTimeoutMs := dig "exportAttemptTimeoutMs" 10000 $tracing }}
+{{- $traceExportTimeoutMs := dig "exportTimeoutMs" 30000 $tracing }}
+{{- $traceShutdownTimeoutMs := dig "shutdownTimeoutMs" 5000 $tracing }}
+{{- $traceMaxRetries := dig "maxRetries" 3 $tracing }}
+{{- $traceRetryInitialDelayMs := dig "retryInitialDelayMs" 100 $tracing }}
+{{- $traceRetryMaxDelayMs := dig "retryMaxDelayMs" 1600 $tracing }}
+{{- $traceRetryJitterMs := dig "retryJitterMs" 100 $tracing }}
+
+[tracing]
+{{- if $traceEndpoint }}
+endpoint = {{ $traceEndpoint | quote }}
+{{- end }}
+protocol = {{ $traceProtocol | quote }}
+sampling_ratio = {{ printf "%.17e" ($traceSamplingRatio | float64) }}
+max_queue_size = {{ $traceMaxQueueSize }}
+max_export_batch_size = {{ $traceMaxExportBatchSize }}
+scheduled_delay_ms = {{ $traceScheduledDelayMs }}
+export_attempt_timeout_ms = {{ $traceExportAttemptTimeoutMs }}
+export_timeout_ms = {{ $traceExportTimeoutMs }}
+shutdown_timeout_ms = {{ $traceShutdownTimeoutMs }}
+max_retries = {{ $traceMaxRetries }}
+retry_initial_delay_ms = {{ $traceRetryInitialDelayMs }}
+retry_max_delay_ms = {{ $traceRetryMaxDelayMs }}
+retry_jitter_ms = {{ $traceRetryJitterMs }}
 
 [logging]
 {{- if .Values.apiServer.logLevel }}

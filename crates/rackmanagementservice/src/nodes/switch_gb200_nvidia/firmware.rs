@@ -26,14 +26,16 @@ use super::validation::{
     firmware_inventory_endpoint_component, is_valid_component, is_valid_firmware_filename,
     is_valid_firmware_inventory_component,
 };
-use super::{SwitchGb200Nvidia, config, shell_quote};
+use super::{SwitchGb200Nvidia, config};
 use crate::domain::node::FirmwareTaskStatus;
 #[cfg(test)]
 use crate::domain::node::FirmwareType;
+use crate::domain::rack::EndpointCredentials;
 use crate::nodes::nvfwupd_adapter;
 use crate::transport::http_client::HttpClient;
 use crate::transport::ssh_client::SshClient;
 use crate::utilities::error::{Result, RmsError};
+use nvswitch_cli::RemotePath;
 
 #[cfg(test)]
 pub(super) fn classify_firmware_type_switch(name: &str) -> FirmwareType {
@@ -185,14 +187,20 @@ pub(super) fn extract_action_issue_message(response: &Value) -> String {
 }
 
 impl SwitchGb200Nvidia {
-    pub(super) fn nvfwupd_target_config(&self) -> Result<nvfwupd::workflow::TargetConfig> {
+    pub(in crate::nodes) fn nvfwupd_target_config(
+        &self,
+    ) -> Result<nvfwupd::workflow::TargetConfig> {
         let Some(host_endpoint) = self.host_endpoint.as_ref() else {
             return Err(RmsError::failed_precondition(
                 "switch host endpoint is required for NVUE/NVOS operations",
             ));
         };
 
-        let Some(credentials) = host_endpoint.credentials.as_ref() else {
+        let Some((username, password)) = host_endpoint
+            .credentials
+            .as_ref()
+            .and_then(EndpointCredentials::user_pass_secret)
+        else {
             return Err(RmsError::failed_precondition(
                 "switch host credentials are required for NVUE/NVOS operations",
             ));
@@ -202,16 +210,26 @@ impl SwitchGb200Nvidia {
             self.node_type,
             &host_endpoint.endpoint.ip_address,
             host_endpoint.endpoint.port,
-            &credentials.username,
-            &credentials.password,
+            username,
+            password,
             !host_endpoint.dangerously_accept_invalid_certs,
         ))
     }
 
-    pub(super) fn nvfwupd_workflow(&self) -> Result<nvfwupd::workflow_api::WorkflowContext> {
+    pub(in crate::nodes) fn nvfwupd_workflow(
+        &self,
+    ) -> Result<nvfwupd::workflow_api::WorkflowContext> {
         Ok(nvfwupd::workflow_api::WorkflowContext::with_nvue_client(
             self.nvue_client()?.clone(),
         ))
+    }
+
+    /// Verify and heal the NVOS ASIC auto-update settings before a system-image update.
+    pub(crate) async fn ensure_nvos_asic_firmware_config(&self) -> Result<()> {
+        self.nvfwupd_workflow()?
+            .ensure_nvos_asic_firmware_config(self.nvfwupd_target_config()?)
+            .await
+            .map_err(nvfwupd_adapter::map_error)
     }
 
     pub async fn list_firmware(&self, component: &str, list_files: bool) -> Result<Value> {
@@ -289,16 +307,9 @@ impl SwitchGb200Nvidia {
         )
         .await?;
 
-        let verify_cmd = format!("test -f {} && echo ok", shell_quote(&remote_path));
-        let verify_out = ssh.exec(&verify_cmd, SshClient::DEFAULT_TIMEOUT).await?;
-
-        if !verify_out.contains("ok") {
-            return Err(RmsError::internal(format!(
-                "SFTP upload verification failed for {remote_path}"
-            )));
-        }
-
-        Ok(())
+        self.nv_cli_over(ssh)?
+            .confirm_file(&RemotePath::new(remote_path)?, "SFTP upload")
+            .await
     }
 
     pub(super) async fn poll_nvue_action_task(&self, task_id: &str) -> Result<FirmwareTaskStatus> {

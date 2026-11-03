@@ -2,6 +2,15 @@
 Document History 
 =================
 
+* **2.1.3** - Sep 4, 2026
+
+  - Added support for Flex PowerShelf platforms.
+  - Disabled cleartext HTTP connections by default unless explicitly enabled.
+  - Added optional expected inventory checks before firmware updates.
+  - Added global and per-component write-protect pre-checks for GB200, GB300, and Vera Rubin NVL72.
+  - Added BackgroundCopy pre-checks for GB200, GB300, and Vera Rubin NVL72.
+  - Added NVOS image update support for GB200Switch, GB300Switch, and Vera Rubin NVL72 Switch platforms.
+
 * **2.1.2** - Jul 6, 2026
 
   - Added support for Megmeet PowerShelf platforms.

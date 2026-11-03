@@ -30,7 +30,7 @@ use crate::persistence::firmware_object::{
     FirmwareObjectStore, RackHardwareType,
 };
 use crate::persistence::postgres::error::DatabaseError;
-use crate::utilities::error::Result;
+use crate::utilities::error::{Result, RmsError};
 
 pub struct PostgresFirmwareObjectStore {
     pool: PgPool,
@@ -234,6 +234,23 @@ impl FirmwareObjectStore for PostgresFirmwareObjectStore {
         Ok(row)
     }
 
+    async fn finish_preparation(
+        &self,
+        id: &str,
+        created: chrono::DateTime<chrono::Utc>,
+        metadata: serde_json::Value,
+        available: bool,
+    ) -> Result<FirmwareObject> {
+        sqlx::query_as("UPDATE rack_firmware SET parsed_components = $2::jsonb, available = $3, updated = NOW() WHERE id = $1 AND created = $4 RETURNING *")
+            .bind(id)
+            .bind(Json(metadata))
+            .bind(available)
+            .bind(created)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|error| DatabaseError::not_found_or_query("firmware object incarnation", id, error).into())
+    }
+
     async fn set_default(&self, id: &str) -> Result<FirmwareObject> {
         // Atomic: clear any previous default for this hardware type, then mark
         // the target row default. Wrapping both writes in a transaction makes
@@ -397,6 +414,41 @@ impl FirmwareObjectStore for PostgresFirmwareObjectStore {
             .execute(&self.pool)
             .await
             .map_err(|e| DatabaseError::query(q, e))?;
+        Ok(())
+    }
+
+    async fn record_apply_for_incarnation(
+        &self,
+        object_id: &str,
+        created: chrono::DateTime<Utc>,
+        rack_id: &str,
+        firmware_type: &str,
+        hw_type: RackHardwareType,
+        node_ids: &[String],
+    ) -> Result<()> {
+        // The row lock serializes with DELETE until this statement's INSERT
+        // commits. A plain INSERT ... SELECT without FOR SHARE can see an old
+        // MVCC snapshot while a concurrent delete/recreate commits.
+        let q = "WITH current_object AS (\
+                     SELECT id FROM rack_firmware WHERE id = $1 AND created = $2 FOR SHARE\
+                 ) INSERT INTO rack_firmware_apply_history \
+                     (object_id, rack_id, firmware_type, rack_hardware_type, node_ids) \
+                 SELECT id, $3, $4, $5, $6 FROM current_object";
+        let result = sqlx::query(q)
+            .bind(object_id)
+            .bind(created)
+            .bind(rack_id)
+            .bind(firmware_type)
+            .bind(hw_type)
+            .bind(node_ids)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| DatabaseError::query(q, e))?;
+        if result.rows_affected() == 0 {
+            return Err(RmsError::not_found(format!(
+                "firmware object incarnation {object_id} not found"
+            )));
+        }
         Ok(())
     }
 

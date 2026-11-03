@@ -66,6 +66,35 @@ pub(super) fn ssh_command_log_value(command: &str) -> String {
     }
 }
 
+/// Placeholder left behind by [`strip_ssh_command_text`].
+pub(crate) const SSH_COMMAND_PLACEHOLDER: &str = "<command>";
+
+/// Remove `command` from `message`, for error text that will reach a client.
+///
+/// [`SshError::CommandFailed`](super::error::SshError::CommandFailed) and its
+/// siblings name the command they ran, which is what a log wants and what an
+/// API payload must not carry: the command line is an implementation detail of
+/// how RMS drives the device. Callers that surface a transport error to a
+/// client strip it here instead of reformatting the error, so the device's own
+/// diagnostics -- exit status, stdout, stderr -- survive.
+///
+/// The command is removed by matching the exact text the error embedded, which
+/// is [`ssh_command_log_value`] rather than the raw command, so redaction and
+/// clipping are reproduced instead of guessed at.
+pub(crate) fn strip_ssh_command_text(message: &str, command: &str) -> String {
+    let logged = ssh_command_log_value(command);
+    if logged.is_empty() {
+        return message.to_owned();
+    }
+
+    // The `#[error]` templates render the command with `{:?}`, so replace the
+    // quoted form first; the bare form covers any caller that interpolates it
+    // directly.
+    message
+        .replace(&format!("{logged:?}"), SSH_COMMAND_PLACEHOLDER)
+        .replace(&logged, SSH_COMMAND_PLACEHOLDER)
+}
+
 /// Redact password prompt values and echoed replacement passwords.
 ///
 /// This intentionally does not redact space-delimited `password <word>` forms

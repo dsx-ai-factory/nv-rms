@@ -77,7 +77,8 @@ impl GHRFTarget {
 
     /// Check whether a package version string belongs to an HGX-tray package.
     pub fn is_hgx_pkg(pkg_name: &str) -> bool {
-        HGX_PLATFORM_TOKENS.iter().any(|tok| pkg_name.contains(tok))
+        let upper = pkg_name.to_uppercase();
+        HGX_PLATFORM_TOKENS.iter().any(|tok| upper.contains(tok))
     }
 }
 
@@ -278,8 +279,12 @@ impl RFTarget for GHRFTarget {
     // Factory reset override
     // ------------------------------------------------------------------
 
-    /// Perform factory reset with `{"ResetToDefaultsType": "ResetAll"}`.
-    async fn factory_reset(&mut self, _reset_params: Option<&Value>) -> (bool, Value) {
+    /// Perform factory reset with `{"ResetToDefaultsType": "ResetAll"}` unless the caller supplies a body.
+    async fn factory_reset(&mut self, reset_params: Option<&Value>) -> (bool, Value) {
+        if reset_params.is_some() {
+            return self.redfish_factory_reset(reset_params).await;
+        }
+
         let params = json!({"ResetToDefaultsType": "ResetAll"});
         // Delegate to the default implementation with GH-specific params
         let (status, response_dict) = self
@@ -580,7 +585,9 @@ pub fn gh_get_component_version(pldm_version_dict: &Value, ap_name: &str) -> Opt
 
 /// GH-style `get_identifier_from_chassis` via `RelatedItem[0]` -> `SKU`.
 pub async fn gh_get_identifier_from_chassis(bmc: &BmcAccess, ap_inv_uri: &str) -> Option<String> {
-    let (status, fw_inv_dict) = bmc.dispatch_request("GET", ap_inv_uri, None, None).await;
+    let (status, fw_inv_dict) = bmc
+        .dispatch_request_full("GET", ap_inv_uri, None, None, 30, true, None)
+        .await;
     if !status {
         return None;
     }
@@ -592,7 +599,9 @@ pub async fn gh_get_identifier_from_chassis(bmc: &BmcAccess, ap_inv_uri: &str) -
         .and_then(|item| item.get("@odata.id"))
         .and_then(|v| v.as_str())?;
 
-    let (status2, chassis_dict) = bmc.dispatch_request("GET", chassis_uri, None, None).await;
+    let (status2, chassis_dict) = bmc
+        .dispatch_request_full("GET", chassis_uri, None, None, 30, true, None)
+        .await;
     if !status2 {
         return None;
     }
@@ -641,4 +650,17 @@ pub fn gh_get_version_sku(
         }
     }
     Some("N/A".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GHRFTarget;
+
+    #[test]
+    fn is_hgx_pkg_matches_existing_hmc_tokens_case_insensitively() {
+        assert!(GHRFTarget::is_hgx_pkg("hmc_firmware.fwpkg"));
+        assert!(!GHRFTarget::is_hgx_pkg(
+            "vr-nvl-bmc-p4110_VRH-2608-00.01_prod.fwpkg"
+        ));
+    }
 }

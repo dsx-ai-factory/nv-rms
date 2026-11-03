@@ -15,28 +15,12 @@
  * limitations under the License.
  */
 
-//! Validation and shell quoting for NVIDIA GB200 switch operations.
+//! Validation for NVIDIA GB200 switch operations.
 //!
 //! Validates user-supplied identifiers, filenames, usernames, and component
-//! names, and safely quotes command arguments before transport calls.
+//! names.
 
 use super::config;
-
-pub(crate) fn shell_quote(s: &str) -> String {
-    let mut quoted = String::with_capacity(s.len() + 2);
-    quoted.push('\'');
-
-    for c in s.chars() {
-        if c == '\'' {
-            quoted.push_str("'\\''");
-        } else {
-            quoted.push(c);
-        }
-    }
-
-    quoted.push('\'');
-    quoted
-}
 
 pub(crate) fn is_valid_identifier(s: &str) -> bool {
     !s.is_empty()
@@ -62,7 +46,7 @@ pub(super) fn is_valid_component(component: &str) -> bool {
     config::VALID_COMPONENTS.iter().any(|&v| lower == v)
 }
 
-pub(super) fn is_valid_firmware_inventory_component(component: &str) -> bool {
+pub(in crate::nodes) fn is_valid_firmware_inventory_component(component: &str) -> bool {
     if is_valid_component(component) {
         return true;
     }

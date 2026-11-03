@@ -61,16 +61,21 @@
 //! still-active job failed with [`JobDomain::dropped_failure`].
 //!
 //! Because the worker task owns its [`JobHandle`], unwinding or aborting the
-//! task drops the handle and records the same abandoned failure. The supervisor
-//! then runs the attached [`CleanupPlan`]. This is why cleanup should use
+//! task drops the handle and records an abandoned failure, or
+//! [`JobDomain::shutdown_failure`] when its cancellation token is set. The
+//! supervisor then runs the attached [`CleanupPlan`], even when shutdown rejects
+//! starting the worker. Cleanup remains subject to the shutdown drain deadline.
+//! This is why cleanup should use
 //! [`JobRegistry::spawn_job_with_cleanup`] instead of being placed after
 //! awaited work inside the worker body.
 //!
 //! Cleanup plans that wait for child jobs treat a missing job ID as done. The
 //! registry only receives IDs for jobs that were already created, so a missing
-//! child means the terminal record was collected by TTL cleanup.
+//! child means the terminal record was collected by TTL cleanup. Terminal-job
+//! TTL is measured on a monotonic clock so NTP or manual wall-clock steps
+//! cannot evict a still-young job or retain an expired one.
 //!
-//! Cleanup itself runs in its own supervised task instrumented with the job's
+//! Cleanup runs inside the supervisor task instrumented with the job's
 //! tracing span. A panic during cleanup is caught, logged within that span (so
 //! the `job_id` and other span fields are attached automatically), and returned
 //! as [`CleanupReport::Panicked`] instead of surfacing as a context-free Tokio
@@ -85,7 +90,7 @@
 //! use std::time::Duration;
 //!
 //! use rackmanagementservice::orchestrator::job_lifecycle::{
-//!     JobDomain, JobFailure, JobId, JobLifecycleState, JobRegistry, JobSpec,
+//!     JobDomain, JobFailure, JobId, JobLifecycleState, JobRegistry, JobScope, JobSpec,
 //! };
 //!
 //! struct FirmwareJobs;
@@ -116,6 +121,13 @@
 //!
 //!     fn shutting_down_failure() -> JobFailure {
 //!         JobFailure::new(anyhow::anyhow!("shutting down"), "server is shutting down")
+//!     }
+//!
+//!     fn scope_busy_failure(scope: &JobScope, owner_id: &JobId) -> JobFailure {
+//!         JobFailure::new(
+//!             anyhow::anyhow!("scope busy"),
+//!             format!("{scope:?} busy (owner {owner_id})"),
+//!         )
 //!     }
 //!
 //!     fn parent_unavailable_failure(parent_job_id: &JobId) -> JobFailure {
@@ -169,7 +181,7 @@
 //! use std::time::Duration;
 //!
 //! use rackmanagementservice::orchestrator::job_lifecycle::{
-//!     CleanupPlan, JobDomain, JobFailure, JobId, JobRegistry, JobSpec,
+//!     CleanupPlan, JobDomain, JobFailure, JobId, JobRegistry, JobScope, JobSpec,
 //! };
 //!
 //! struct CleanupJobs;
@@ -200,6 +212,13 @@
 //!
 //!     fn shutting_down_failure() -> JobFailure {
 //!         JobFailure::new(anyhow::anyhow!("shutting down"), "server is shutting down")
+//!     }
+//!
+//!     fn scope_busy_failure(scope: &JobScope, owner_id: &JobId) -> JobFailure {
+//!         JobFailure::new(
+//!             anyhow::anyhow!("scope busy"),
+//!             format!("{scope:?} busy (owner {owner_id})"),
+//!         )
 //!     }
 //!
 //!     fn parent_unavailable_failure(parent_job_id: &JobId) -> JobFailure {
@@ -284,10 +303,14 @@ mod store;
 pub use cleanup::{CleanupFailure, CleanupOperation, CleanupPlan, CleanupReport};
 pub use domain::{JobDomain, JobFailure};
 pub use error::JobError;
+pub(crate) use error::job_error_of;
 pub use handle::{JobHandle, JobJoinHandle};
 pub use ids::JobId;
 pub use job_type::JobType;
-pub use registry::{JobLifecycleState, JobRegistry, JobSnapshot, JobSpec, MAX_TRACKED_JOBS};
+pub use registry::{
+    JobLifecycleState, JobRegistry, JobScope, JobSnapshot, JobSpec, MAX_TRACKED_JOBS,
+    MutationReservation,
+};
 pub use state::JobState;
 
 #[cfg(test)]
@@ -301,12 +324,192 @@ mod tests {
 
     const TTL: Duration = Duration::from_secs(60);
 
+    #[tokio::test]
+    async fn result_metadata_survives_success_failure_drop_and_panic() {
+        for outcome in ["success", "verified_success", "failure", "drop", "panic"] {
+            let registry = Arc::new(JobRegistry::<TestDomain>::new(TTL));
+            let pending = registry
+                .create_leaf(test_spec("rack", "node"))
+                .unwrap()
+                .with_result_metadata(serde_json::Map::from_iter([(
+                    "configuration".to_owned(),
+                    serde_json::json!("trusted"),
+                )]));
+            let job_id = pending.id().clone();
+            let handle = registry.spawn_job(pending, move |job| async move {
+                match outcome {
+                    "success" => job.complete("done", r#"{"status":"ok","configuration":"wrong"}"#),
+                    "verified_success" => {
+                        job.complete_verified("done", r#"{"status":"ok","configuration":"wrong"}"#)
+                    }
+                    "failure" => job.fail(
+                        JobFailure::new(TestFailure::Dropped, "original failure")
+                            .with_result_json(r#"{"phase":"upload","configuration":"wrong"}"#),
+                    ),
+                    "drop" => drop(job),
+                    "panic" => panic!("simulated worker panic"),
+                    _ => unreachable!(),
+                }
+            });
+
+            handle.wait().await.unwrap();
+            let snapshot = registry.get(&job_id).unwrap();
+            let result_json = match snapshot.state {
+                JobLifecycleState::Completed { result_json, .. } => result_json,
+                JobLifecycleState::Failed {
+                    result_json,
+                    message,
+                    ..
+                } => {
+                    assert!(message.contains(if outcome == "failure" {
+                        "original failure"
+                    } else {
+                        "abandoned"
+                    }));
+                    result_json
+                }
+                state => panic!("expected terminal state, got {state:?}"),
+            };
+            let result: serde_json::Value = serde_json::from_str(&result_json).unwrap();
+            assert_eq!(result["configuration"], "trusted", "{outcome}");
+            if matches!(outcome, "success" | "verified_success") {
+                assert_eq!(result["status"], "ok");
+            } else if outcome == "failure" {
+                assert_eq!(result["phase"], "upload");
+            }
+        }
+    }
+
+    #[test]
+    fn result_metadata_preserves_shutdown_failure_on_cancelled_drop() {
+        use crate::orchestrator::job_tracker::RmsJobDomain;
+
+        let registry = Arc::new(JobRegistry::<RmsJobDomain>::new(TTL));
+        let pending = registry
+            .create_leaf(test_spec("rack", "node"))
+            .unwrap()
+            .with_result_metadata(serde_json::Map::from_iter([(
+                "configuration".to_owned(),
+                serde_json::json!("trusted"),
+            )]));
+        let job_id = pending.id().clone();
+
+        pending.cancellation_token().cancel();
+        drop(pending);
+
+        let JobLifecycleState::Failed {
+            description,
+            message,
+            failure,
+            result_json,
+            ..
+        } = registry.get(&job_id).unwrap().state
+        else {
+            panic!("expected shutdown failure");
+        };
+        assert_eq!(description, "Cancelled");
+        assert_eq!(message, "job cancelled because the server is shutting down");
+        assert_eq!(job_error_of(&failure), JobError::Other);
+        let result: serde_json::Value = serde_json::from_str(&result_json).unwrap();
+        assert_eq!(result["configuration"], "trusted");
+    }
+
+    #[test]
+    fn result_metadata_preserves_non_object_payloads() {
+        for (payload, expected) in [
+            ("", None),
+            ("[1,2]", Some(serde_json::json!([1, 2]))),
+            ("null", Some(serde_json::Value::Null)),
+            ("plain text", Some(serde_json::json!("plain text"))),
+        ] {
+            let registry = Arc::new(JobRegistry::<TestDomain>::new(TTL));
+            let pending = registry
+                .create_leaf(test_spec("rack", "node"))
+                .unwrap()
+                .with_result_metadata(serde_json::Map::from_iter([(
+                    "configuration".to_owned(),
+                    serde_json::json!("trusted"),
+                )]));
+            let job_id = pending.id().clone();
+            pending.complete("done", payload);
+            let JobLifecycleState::Completed { result_json, .. } =
+                registry.get(&job_id).unwrap().state
+            else {
+                panic!("expected completion");
+            };
+            let result: serde_json::Value = serde_json::from_str(&result_json).unwrap();
+            assert_eq!(result["configuration"], "trusted");
+            assert_eq!(result.get("result"), expected.as_ref());
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_outcomes_survive_eviction_while_other_jobs_are_pending() {
+        let registry = Arc::new(JobRegistry::<TestDomain>::new(TTL));
+        let completed = registry
+            .create_leaf(test_spec("rack", "completed"))
+            .unwrap();
+        let pending = registry.create_leaf(test_spec("rack", "pending")).unwrap();
+        let completed_id = completed.id().clone();
+        let pending_id = pending.id().clone();
+        let missing = JobId::from("missing");
+        completed.complete("done", "");
+        let ids = [completed_id.clone(), pending_id.clone(), missing.clone()];
+        let (outcomes, ()) = tokio::join!(
+            biased;
+            registry.wait_for_terminal_outcomes(&ids, Some(Duration::from_secs(1))),
+            async {
+                registry.age_job_for_test(&completed_id, TTL * 2);
+                registry.cleanup_expired();
+                assert!(registry.get(&completed_id).is_none());
+                pending.complete("done", "");
+            }
+        );
+        assert!(outcomes.pending.is_empty());
+        assert_eq!(outcomes.missing, [missing]);
+        assert_eq!(outcomes.terminal.len(), 2);
+        assert!(
+            registry
+                .wait_for_terminal_jobs(&ids, Some(Duration::ZERO))
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_outcomes_timeout_preserves_partial_results_without_cancelling_jobs() {
+        let registry = Arc::new(JobRegistry::<TestDomain>::new(TTL));
+        let completed = registry
+            .create_leaf(test_spec("rack", "completed"))
+            .unwrap();
+        let pending = registry.create_leaf(test_spec("rack", "pending")).unwrap();
+        let ids = [completed.id().clone(), pending.id().clone()];
+        completed.complete("done", "");
+        let outcomes = registry
+            .wait_for_terminal_outcomes(&ids, Some(Duration::from_millis(20)))
+            .await;
+        assert_eq!(outcomes.terminal.len(), 1);
+        assert!(outcomes.pending.contains(pending.id()));
+        assert!(
+            !registry
+                .get(pending.id())
+                .unwrap()
+                .cancellation_token
+                .is_cancelled()
+        );
+        assert!(
+            !registry
+                .wait_for_terminal_jobs(&ids, Some(Duration::ZERO))
+                .await
+        );
+    }
+
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum TestFailure {
         Dropped,
         Explicit,
         AtCapacity,
         NodeBusy,
+        ScopeBusy,
         ShuttingDown,
         ParentUnavailable,
     }
@@ -344,12 +547,80 @@ mod tests {
             JobFailure::new(TestFailure::ShuttingDown, "registry shutting down")
         }
 
+        fn scope_busy_failure(scope: &JobScope, owner_id: &JobId) -> JobFailure {
+            JobFailure::new(
+                TestFailure::ScopeBusy,
+                format!("{scope:?} busy (owner {owner_id})"),
+            )
+        }
+
         fn parent_unavailable_failure(parent_job_id: &JobId) -> JobFailure {
             JobFailure::new(
                 TestFailure::ParentUnavailable,
                 format!("parent {parent_job_id} is unavailable"),
             )
         }
+    }
+
+    #[test]
+    fn direct_reservation_conflicts_use_the_domain_scope_error() {
+        let registry = Arc::new(JobRegistry::<TestDomain>::new(TTL));
+        let scope = JobScope::endpoint("switch.example", 443);
+        let reservation = registry.reserve_mutation(vec![scope.clone()]).unwrap();
+
+        let refused = registry.reserve_mutation(vec![scope]);
+
+        let Err(failure) = refused else {
+            panic!("an occupied endpoint must return the domain scope error");
+        };
+
+        assert_eq!(
+            failure.error.downcast_ref::<TestFailure>(),
+            Some(&TestFailure::ScopeBusy)
+        );
+
+        assert!(failure.message.contains("owner"));
+        assert!(!failure.message.contains("job"));
+
+        drop(reservation);
+    }
+
+    #[test]
+    fn progress_accepts_active_updates_and_rejects_terminal_updates() {
+        let registry = Arc::new(JobRegistry::<TestDomain>::new(TTL));
+        let job = registry.create_leaf(test_spec("rack", "node")).unwrap();
+        let job_id = job.id().clone();
+
+        assert!(job.progress("Uploading"));
+        assert!(job.progress("Verifying"));
+
+        assert_eq!(
+            registry.get(&job_id).unwrap().state.description(),
+            "Verifying"
+        );
+
+        registry.fail_non_terminal_for_shutdown(std::slice::from_ref(&job_id));
+
+        let terminal = registry.get(&job_id).unwrap();
+
+        assert!(!job.progress("Late progress"));
+
+        let retained = registry.get(&job_id).unwrap();
+
+        assert!(matches!(retained.state, JobLifecycleState::Failed { .. }));
+        assert_eq!(retained.state.description(), terminal.state.description());
+        assert_eq!(retained.updated_at_mono, terminal.updated_at_mono);
+    }
+
+    #[test]
+    fn progress_rejects_updates_after_queued_job_rollback() {
+        let registry = Arc::new(JobRegistry::<TestDomain>::new(TTL));
+        let job = registry.create_leaf(test_spec("rack", "node")).unwrap();
+        let job_id = job.id().clone();
+
+        assert!(registry.remove_queued_leaf(&job_id));
+        assert!(!job.progress("Late progress"));
+        assert!(registry.get(&job_id).is_none());
     }
 
     #[tokio::test]
@@ -399,6 +670,84 @@ mod tests {
         assert!(!cleanup_dir.exists());
         let snapshot = registry.get(&job_id).unwrap();
         assert_failed(snapshot.state, TestFailure::Dropped, "abandoned");
+    }
+
+    #[tokio::test]
+    async fn cleanup_reports_survive_worker_admission_outcomes() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        for shutting_down in [false, true] {
+            for case in ["directory", "missing", "file", "panic", "none"] {
+                let registry = Arc::new(JobRegistry::<TestDomain>::new(TTL));
+                let pending = registry.create_leaf(test_spec("rack", "node")).unwrap();
+                let job_id = pending.id().clone();
+                let temp = tempfile::tempdir().unwrap();
+                let path = temp.path().join("cache");
+                match case {
+                    "file" => std::fs::write(&path, "artifact").unwrap(),
+                    "missing" => {}
+                    _ => {
+                        std::fs::create_dir(&path).unwrap();
+                        std::fs::write(path.join("artifact"), "artifact").unwrap();
+                    }
+                }
+                let plan = match case {
+                    "none" => None,
+                    "panic" => Some(CleanupPlan::panic_for_test(path.clone())),
+                    _ => Some(CleanupPlan::remove_dir(path.clone())),
+                };
+                let started = Arc::new(AtomicBool::new(false));
+                let worker_started = started.clone();
+                if shutting_down {
+                    registry.begin_shutdown();
+                }
+                let run = move |job: JobHandle<TestDomain>| async move {
+                    worker_started.store(true, Ordering::SeqCst);
+                    job.complete("Completed", "{}");
+                };
+                let handle = match plan {
+                    Some(plan) => registry.spawn_job_with_cleanup(pending, plan, run),
+                    None => registry.spawn_job(pending, run),
+                };
+                let report = tokio::time::timeout(Duration::from_secs(1), handle.wait())
+                    .await
+                    .expect("cleanup must finish")
+                    .expect("rejecting a worker must not cancel cleanup");
+
+                match case {
+                    "directory" => assert_eq!(report, CleanupReport::Removed),
+                    "missing" => assert_eq!(report, CleanupReport::NotFound),
+                    "file" => {
+                        let CleanupReport::Failed(failure) = report else {
+                            panic!("expected file cleanup failure, shutdown={shutting_down}");
+                        };
+                        assert_eq!(failure.path, path);
+                        assert_eq!(failure.operation, CleanupOperation::RemoveDir);
+                        assert!(!failure.message.is_empty());
+                    }
+                    "panic" => assert_eq!(
+                        report,
+                        CleanupReport::Panicked("simulated cleanup panic".to_owned())
+                    ),
+                    "none" => assert_eq!(report, CleanupReport::Skipped),
+                    _ => unreachable!(),
+                }
+                assert_eq!(
+                    path.exists(),
+                    matches!(case, "file" | "panic" | "none"),
+                    "{case}, shutdown={shutting_down}"
+                );
+                assert_eq!(started.load(Ordering::SeqCst), !shutting_down);
+                assert!(registry.task_job_ids().is_empty());
+                let snapshot = registry.get(&job_id).unwrap();
+                if shutting_down {
+                    assert!(snapshot.cancellation_token.is_cancelled());
+                    assert_failed(snapshot.state, TestFailure::Dropped, "abandoned");
+                } else {
+                    assert_completed(&snapshot.state, "Completed", "{}");
+                }
+            }
+        }
     }
 
     #[tokio::test]

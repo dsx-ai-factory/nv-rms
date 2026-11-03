@@ -75,12 +75,41 @@ databaseMode: external
 # Set to false to keep the database on helm uninstall.
 dropDatabaseOnUninstall: true
 
+# NVSSVT system validation scanner (nvssvt_server.py launcher API).
+#
+# Runs as a second container in the API server pod rather than as its own
+# Deployment: containers in a pod share a network namespace, so RMS reaches the
+# launcher on 127.0.0.1 with no Service, DNS, or cross-pod networking, and the
+# two are scheduled, scaled, and restarted as one unit.
+#
+# Disabled by default because the image is site-specific -- an install that
+# does not set `image.repository` would otherwise get a pod stuck on
+# ImagePullBackOff. With it disabled, RMS starts normally and only
+# StartSystemValidation is affected: each node's scan fails to launch with an
+# unreachable-launcher error, reported in that node's NodeOperationResult
+# rather than failing the call itself (nothing is listening on 127.0.0.1:8000).
+nvssvt:
+  enabled: false
+  image:
+    repository: nvssvt-server
+    tag: latest
+    # Defaults to IfNotPresent rather than global.image.pullPolicy: the NVSSVT
+    # image is versioned independently of RMS, and a locally built/loaded tag
+    # must not be re-pulled from a registry.
+    pullPolicy: IfNotPresent
+  resources: {}
+
 apiServer:
   enabled: true
   image:
     repository: nvcr.io/0837451325059433/rms-dev/rms-api
     pullPolicy: ""
   replicaCount: 1
+  # Covers RMS's five-minute job drain plus trace flush and scheduling margin.
+  terminationGracePeriodSeconds: 330
+  # Extra RMS Pod annotations, such as sidecar.opentelemetry.io/inject to have
+  # the OpenTelemetry Operator add a sidecar Collector. Values must be strings.
+  podAnnotations: {}
   port: 8801
   metrics:
     # Dedicated Prometheus /metrics listener port (independent of gRPC API port).
@@ -123,6 +152,10 @@ apiServer:
   #  gb200-compute-variant-a:
   #    - FW_BMC_0
   #    - HGX_FW_GPU_0
+  #  vrnvl72-compute:
+  #    - FW_BMC_0
+  #    - HGX_FW_BMC_0
+  #    - HGX_FW_GPU_0
   #  sku-gb200:
   #    apNames: [FW_BMC_0, HGX_FW_GPU_0]
   #    flintDevices:
@@ -136,6 +169,27 @@ apiServer:
   # prevent duplicate timestamp fields. If no logging collector is being used, set true to output
   # timestamps natively (config.toml [logging] enable_timestamps).
   enableTimestamps: false
+  # Backend-neutral OpenTelemetry trace export. RMS always creates real
+  # trace/span IDs for approved spans; setting endpoint enables OTLP export.
+  tracing:
+    # HTTPS is required, with a Collector certificate trusted by RMS, except for
+    # a Collector on a loopback IP address such as a sidecar: http://127.0.0.1:4317
+    # gRPC: https://collector.example:4317
+    # HTTP/protobuf: https://collector.example:4318/v1/traces
+    endpoint: ""
+    # grpc or http_protobuf; both use TLS unless the endpoint is a loopback IP.
+    protocol: grpc
+    samplingRatio: 1.0
+    maxQueueSize: 2048
+    maxExportBatchSize: 512
+    scheduledDelayMs: 5000
+    exportAttemptTimeoutMs: 10000
+    exportTimeoutMs: 30000
+    shutdownTimeoutMs: 5000
+    maxRetries: 3
+    retryInitialDelayMs: 100
+    retryMaxDelayMs: 1600
+    retryJitterMs: 100
   # When false (default), outbound switch connectivity uses mTLS over HTTPS for nvue_api,
   # gRPC over HTTPS for scale_up_fabric_manager, and mTLS for secure-only gNMI checks.
   # Requires clientTlsCertificates and defaultSwitchDomain.
@@ -143,11 +197,56 @@ apiServer:
   # without client mTLS or server verification, scale_up_fabric_manager uses plaintext
   # HTTP, and direct gNMI connectivity checks are skipped.
   insecureSwitch: false
+  # When true (historical default), config.toml sets [bmc] insecure_bmc = true:
+  # RMS skips BMC/Redfish HTTPS server certificate verification because BMC
+  # certificates are typically self-signed. Set false after BMC certificates
+  # are issued by a CA the RMS process trusts.
+  insecureBmc: true
   # Overall wall-clock timeout (seconds) for switch NVOS SFTP image uploads.
   sftpUploadTimeoutSeconds: 3600
   # Stall timeout (seconds) for one SFTP setup/read/write/flush step during
   # switch NVOS image uploads. Must be <= sftpUploadTimeoutSeconds.
   sftpStepTimeoutSeconds: 30
+  # Upper bound (seconds) on polling one firmware task for completion. Covers
+  # the slowest component, since one loop serves every firmware task.
+  firmwareTaskTimeoutSeconds: 10800
+  # Wait after ONIE starts installing until NVOS SSH is ready.
+  onieRecoveryTimeoutSeconds: 900
+  # Wait for NVUE to save recovered credentials after boot.
+  recoveredCredentialSaveTimeoutSeconds: 300
+  # Delay (seconds) between polls of an in-flight firmware task. Must be <=
+  # firmwareTaskTimeoutSeconds. Each poll emits one log line, so lower values
+  # make a running firmware update noisier.
+  firmwareTaskPollIntervalSeconds: 30
+  # How long (seconds) to tolerate consecutive firmware task-status read
+  # failures before failing the update. Reset by any successful read.
+  # On Supermicro GB300 BMC targets the task legitimately disappears mid-flash,
+  # so this window doubles as the grace period before RMS falls back to
+  # verifying the installed version. Setting it far below the flash duration
+  # verifies against pre-update firmware and reports a version mismatch.
+  firmwareTaskTransientErrorTimeoutSeconds: 900
+  # How long (seconds) a compute firmware update waits for the tray to report
+  # power On after the power-on that opens the flow. The default, one minute,
+  # is the VR NVL72 bound for this power-on, and GB200 and GB300 use it too.
+  # The power-on step arrives in a following change. Until it lands, RMS
+  # validates and stores both values and nothing reads them.
+  computePowerOnTimeoutSeconds: 60
+  # Delay (seconds) between power-state reads during that wait. Must be <=
+  # computePowerOnTimeoutSeconds.
+  computePowerOnPollIntervalSeconds: 5
+  # When true, HTTP(S) firmware artifacts must include a SHA-256 digest
+  # (config.toml [workflows] artifact_require_sha256). Default false.
+  # See docs/configuration/configuring-rms.md#artifact-download-policy.
+  artifactRequireSha256: false
+  # HTTP(S) firmware-object download policy. Defaults are unrestricted.
+  # To enable: populate artifactHttpsHosts and/or set
+  # artifactAllowPrivateTargets false.
+  # See docs/configuration/configuring-rms.md#artifact-download-policy.
+  # Hostname or *.suffix allow-list (*.suffix matches the suffix and its
+  # subdomains; config.toml [workflows] artifact_https_hosts).
+  artifactHttpsHosts: []
+  # When false, reject loopback/private/link-local HTTP(S) targets including redirects.
+  artifactAllowPrivateTargets: true
 
   # Switch-side cert material to install on switches. Each entry mounts a secret at
   # {switchCertRoot}/{domain}/ (ca.pem, client.pem, client.key).
@@ -185,6 +284,10 @@ apiServer:
     # Client CA for mTLS; required by the RMS binary whenever TLS is enabled.
     caEnabled: true
     ca: ""
+    # How often the API server re-reads tls.crt and tls.key, in seconds.
+    # New handshakes use a renewed leaf within one interval. The client CA
+    # is still read only at startup. Must be greater than 0.
+    certReloadIntervalSeconds: 300
   # ServiceMonitor for the metrics endpoint on the dedicated metrics port
   serviceMonitor:
     enabled: true
@@ -217,10 +320,10 @@ apiServer:
 # The Certificate is named after, and writes to, the secret each entry already
 # references, so no secret name is repeated.
 #
-# Renewal only rewrites the Secret. Nothing here restarts the API server or
-# re-pushes to switches, so only the switch client material is picked up
-# automatically; see "Rotation and renewal" in helm/README.md before shortening
-# the lifetimes below.
+# Renewal only rewrites the Secret. The API server re-reads its leaf cert and
+# key on tls.certReloadIntervalSeconds; the client CA and switch server
+# material are not picked up automatically. See "Rotation and renewal" in
+# helm/README.md before shortening the lifetimes below.
 certificates:
   enabled: false
   issuerRef:
@@ -250,6 +353,9 @@ certificates:
     dnsNames: []
   switchServer:
     enabled: true
+    privateKey:
+      algorithm: ECDSA
+      size: 256
     # NVOS switches consume the combined key+cert PEM written by this format.
     additionalOutputFormats:
       - CombinedPEM
@@ -300,7 +406,9 @@ rmsPostgres:
     # Required when enabled; see example my-site-values.yaml above.
     sourceSecretKey: ""
     sourceSecretVersion: v1
-  # Patch the target PostgreSQL CR to add RMS DB/user (requires RBAC in postgres namespace)
+  # Patch the target PostgreSQL CR to add the RMS database and a LOGIN
+  # role that owns it (requires RBAC in the postgres namespace). The role
+  # is not SUPERUSER and cannot create databases.
   patchExternalCluster:
     enabled: false
     postgresqlNamespace: postgres

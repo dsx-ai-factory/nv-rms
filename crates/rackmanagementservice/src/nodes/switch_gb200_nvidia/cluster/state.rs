@@ -17,16 +17,83 @@
 
 //! Cluster state configuration and convergence polling.
 
+use std::time::Duration;
+
 use super::super::{SwitchGb200Nvidia, config};
 use super::RETRY_WAIT_DELAY;
 use crate::transport::http_client::HttpClient;
-use crate::utilities::error::{Result, RmsError};
+use crate::utilities::error::{ErrorCode, Result, RmsError};
 use crate::utilities::insert_json_field;
 
 use nvue_client::cluster::{CLUSTER_ENDPOINT, Cluster, ClusterState, ClusterUpdate};
 use serde_json::Value;
 
+/// Explicit saved cluster configuration; omitted state uses the NVOS disabled default.
+const CLUSTER_STARTUP_CONFIG_ENDPOINT: &str = "/nvue_v1/?rev=startup&filled=false";
+
 impl SwitchGb200Nvidia {
+    /// Persists cluster disable and verifies the controller stopped without changing
+    /// node-server routing. Unknown runtime state or read failures cannot prove shutdown.
+    ///
+    /// The existing controller-convergence deadline includes lock acquisition and
+    /// device I/O. An error or timeout leaves the shutdown outcome unverified.
+    pub(crate) async fn stop_cluster_controller(&self) -> Result<()> {
+        tokio::time::timeout(
+            Duration::from_secs(config::NMX_CONTROLLER_CONFIGURED_TIMEOUT_SECONDS),
+            async {
+                let _op_guard = self.op_lock.lock().await;
+
+                self.set_cluster_state_unlocked(false).await?;
+
+                if self.startup_cluster_state().await? != ClusterState::Disabled {
+                    self.save_current_applied_config().await?;
+
+                    if self.startup_cluster_state().await? != ClusterState::Disabled {
+                        return Err(RmsError::failed_precondition(
+                            "saved cluster configuration is not disabled",
+                        ));
+                    }
+                }
+
+                self.wait_for_cluster_controller_stopped().await
+            },
+        )
+        .await
+        .map_err(|_| RmsError::new(ErrorCode::Timeout, "cluster controller shutdown timed out"))?
+    }
+
+    /// Reads saved cluster state from the root because default-valued subtrees may
+    /// be omitted. Only absent cluster/state means disabled; malformed or failed
+    /// reads cannot prove persistence.
+    pub(crate) async fn startup_cluster_state(&self) -> Result<ClusterState> {
+        let response = self
+            .nvue_http_get(CLUSTER_STARTUP_CONFIG_ENDPOINT, HttpClient::DEFAULT_TIMEOUT)
+            .await?;
+
+        let root = response.as_object().ok_or_else(|| {
+            RmsError::failed_precondition("saved configuration root is not an object")
+        })?;
+
+        let Some(cluster) = root.get("cluster") else {
+            return Ok(ClusterState::Disabled);
+        };
+
+        let cluster = cluster.as_object().ok_or_else(|| {
+            RmsError::failed_precondition("saved cluster configuration is not an object")
+        })?;
+
+        let Some(state) = cluster.get("state") else {
+            return Ok(ClusterState::Disabled);
+        };
+
+        let state = state
+            .as_str()
+            .ok_or_else(|| RmsError::failed_precondition("saved cluster state is not a string"))?;
+
+        ClusterState::try_from(state)
+            .map_err(|_| RmsError::failed_precondition("saved cluster state is unknown"))
+    }
+
     fn desired_cluster_state(enabled: bool) -> ClusterState {
         if enabled {
             ClusterState::Enabled
@@ -205,5 +272,261 @@ impl SwitchGb200Nvidia {
         }
 
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use nvue_client::revision::{RevisionCreate, RevisionUpdate};
+    use serde_json::json;
+    use wiremock::matchers::{body_json, method, path, query_param};
+    use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+    async fn mock_disabled_cluster(server: &MockServer) {
+        Mock::given(method("GET"))
+            .and(path(CLUSTER_ENDPOINT))
+            .and(|request: &Request| request.url.query().is_none())
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"state": "disabled"})))
+            .mount(server)
+            .await;
+    }
+
+    async fn mock_startup_cluster(server: &MockServer, state: Value, reads: u64) {
+        Mock::given(method("GET"))
+            .and(path("/nvue_v1/"))
+            .and(query_param("rev", "startup"))
+            .and(query_param("filled", "false"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"cluster": state})))
+            .up_to_n_times(reads)
+            .expect(reads)
+            .mount(server)
+            .await;
+    }
+
+    async fn mock_absent_controller(server: &MockServer) {
+        Mock::given(method("GET"))
+            .and(path("/nvue_v1/cluster/apps/nmx-controller"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn startup_cluster_reads_default_from_successful_root() {
+        for (root, expected) in [
+            (json!({}), ClusterState::Disabled),
+            (json!({"cluster": {}}), ClusterState::Disabled),
+            (
+                json!({"cluster": {"state": "disabled"}}),
+                ClusterState::Disabled,
+            ),
+            (
+                json!({"cluster": {"state": "enabled"}}),
+                ClusterState::Enabled,
+            ),
+        ] {
+            let server = MockServer::start().await;
+
+            Mock::given(method("GET"))
+                .and(path("/nvue_v1/"))
+                .and(query_param("rev", "startup"))
+                .and(query_param("filled", "false"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(root))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let state = SwitchGb200Nvidia::for_test(&server.uri())
+                .startup_cluster_state()
+                .await
+                .expect("root configuration proves saved cluster state");
+
+            assert_eq!(state, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_cluster_rejects_malformed_root_or_state() {
+        for root in [
+            json!(null),
+            json!([]),
+            json!({"cluster": null}),
+            json!({"cluster": []}),
+            json!({"cluster": {"state": null}}),
+            json!({"cluster": {"state": true}}),
+            json!({"cluster": {"state": "unknown"}}),
+        ] {
+            let server = MockServer::start().await;
+
+            Mock::given(method("GET"))
+                .and(path("/nvue_v1/"))
+                .and(query_param("rev", "startup"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(root))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let error = SwitchGb200Nvidia::for_test(&server.uri())
+                .startup_cluster_state()
+                .await
+                .expect_err("malformed saved configuration cannot prove persistence");
+
+            assert_eq!(error.code, ErrorCode::FailedPrecondition);
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_cluster_propagates_failed_root_read() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/nvue_v1/"))
+            .and(query_param("rev", "startup"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let error = SwitchGb200Nvidia::for_test(&server.uri())
+            .startup_cluster_state()
+            .await
+            .expect_err("HTTP failure cannot prove a disabled saved configuration");
+
+        assert_eq!(error.code, ErrorCode::NotFound);
+    }
+
+    #[tokio::test]
+    async fn managed_stop_preserves_matching_disabled_configuration() {
+        for startup in [json!({"state": "disabled"}), json!({})] {
+            let server = MockServer::start().await;
+
+            mock_disabled_cluster(&server).await;
+            mock_startup_cluster(&server, startup, 1).await;
+            mock_absent_controller(&server).await;
+
+            SwitchGb200Nvidia::for_test(&server.uri())
+                .stop_cluster_controller()
+                .await
+                .expect("persisted disabled cluster and absent controller prove shutdown");
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_stop_saves_only_when_startup_is_enabled() {
+        let server = MockServer::start().await;
+
+        mock_disabled_cluster(&server).await;
+        mock_startup_cluster(&server, json!({"state": "enabled"}), 1).await;
+        mock_startup_cluster(&server, json!({"state": "disabled"}), 1).await;
+        mock_absent_controller(&server).await;
+
+        Mock::given(method("PATCH"))
+            .and(path("/nvue_v1/revision/applied"))
+            .and(body_json(RevisionUpdate::save_with_yes_prompt()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        SwitchGb200Nvidia::for_test(&server.uri())
+            .stop_cluster_controller()
+            .await
+            .expect("startup repair must be verified after save");
+    }
+
+    #[tokio::test]
+    async fn managed_stop_disables_through_saved_revision() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path(CLUSTER_ENDPOINT))
+            .and(|request: &Request| request.url.query().is_none())
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"state": "enabled"})))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        mock_disabled_cluster(&server).await;
+        mock_startup_cluster(&server, json!({"state": "disabled"}), 1).await;
+        mock_absent_controller(&server).await;
+
+        Mock::given(method("POST"))
+            .and(path("/nvue_v1/revision"))
+            .and(body_json(RevisionCreate::default()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!("managed-stop")))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("PATCH"))
+            .and(path(CLUSTER_ENDPOINT))
+            .and(query_param("rev", "managed-stop"))
+            .and(body_json(ClusterUpdate::new("disabled")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("PATCH"))
+            .and(path("/nvue_v1/revision/managed-stop"))
+            .and(body_json(RevisionUpdate::apply_with_yes_prompt()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/nvue_v1/revision/managed-stop"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"state": "applied"})))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("PATCH"))
+            .and(path("/nvue_v1/revision/applied"))
+            .and(body_json(RevisionUpdate::save_with_yes_prompt()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        SwitchGb200Nvidia::for_test(&server.uri())
+            .stop_cluster_controller()
+            .await
+            .expect("disable must apply and save before shutdown proof");
+    }
+
+    #[tokio::test]
+    async fn managed_stop_rejects_unverified_startup_configuration() {
+        for startup in [json!({"state": "unknown"}), json!({"state": true})] {
+            let server = MockServer::start().await;
+
+            mock_disabled_cluster(&server).await;
+            mock_startup_cluster(&server, startup, 1).await;
+
+            let error = SwitchGb200Nvidia::for_test(&server.uri())
+                .stop_cluster_controller()
+                .await
+                .expect_err("unknown startup state cannot prove persistence");
+
+            assert_eq!(error.code, ErrorCode::FailedPrecondition);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn managed_stop_bounds_lock_wait_by_existing_controller_deadline() {
+        let switch = SwitchGb200Nvidia::for_test("http://127.0.0.1:1");
+        let _guard = switch.op_lock.lock().await;
+
+        let error = switch
+            .stop_cluster_controller()
+            .await
+            .expect_err("lock contention must not exceed the controller deadline");
+
+        assert_eq!(error.code, ErrorCode::Timeout);
     }
 }

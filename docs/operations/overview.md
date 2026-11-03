@@ -1,11 +1,14 @@
 # Operations Overview
 
-RMS exposes a single gRPC service, **`RackManager`**, whose service definition
-comes from the external [`librms`](https://github.com/dsx-ai-factory/nv-rms-client) crate.
+RMS exposes two gRPC services, **`RackManager`** and **`RackManagerV2`**, whose
+service definitions come from the external
+[`librms`](https://github.com/dsx-ai-factory/nv-rms-client) crate.
 The RPCs are documented by capability across the pages in this section:
 [Power Control](power-control.md), [Inventory](inventory.md),
-[Firmware](firmware.md), [Switch Management](switch-management.md), and
-[Utility](utility.md).
+[Firmware](firmware.md), [Switch Management](switch-management.md),
+[System Validation](validation.md), and [Utility](utility.md).
+For the request and response fields of every RPC, refer to the
+[gRPC API reference](../api-reference/index.md).
 
 This page covers the [conventions](#conventions) shared across all of them and
 [the async job model](#the-async-job-model) behind the long-running RPCs.
@@ -16,8 +19,11 @@ Two conventions run through the whole API:
 
 - **In-band failures.** Business and validation failures are returned as a
   `Failure` status *inside* a successful gRPC response, not as a gRPC error code.
-  RMS returns a real gRPC error (`INVALID_ARGUMENT`, `UNIMPLEMENTED`) only when
-  rejecting an invalid enum or an unimplemented method.
+  RMS returns a gRPC error for malformed or unservable requests, such as
+  `INVALID_ARGUMENT` for an invalid enum, `NOT_FOUND` for an unknown job, and
+  `UNIMPLEMENTED` for an unimplemented method. Each RPC page in the
+  [API reference](../api-reference/index.md) lists the gRPC errors verified for
+  that RPC.
 - **Registered vs. ephemeral targets.** Some RPCs act on nodes previously
   registered with `CreateNodes` (looked up by `rack_id` / `node_id`). "Batch" RPCs
   act on caller-supplied **ephemeral** nodes whose endpoints and credentials
@@ -66,6 +72,13 @@ like any other refused node, either as `duplicate target rack_id/node_id:
 the ordinary "node busy" rejection where nodes are admitted one at a time and the
 first occurrence already owns the node.
 
+NVSSVT uses the fixed `nvssvt` rack namespace and the DUT's BMC address for
+exclusion. RMS refuses another scan for the same BMC while a non-terminal
+NVSSVT job targets that BMC.
+Per-node scan results retain the request's `node_id`, including duplicate, busy,
+and capacity refusals, so callers can correlate each result with its request
+entry.
+
 ### Parent / child batches
 
 Every batch RPC creates the **parent** job first, then dynamically attaches one
@@ -95,11 +108,14 @@ status RPCs return the single, parent-aggregated job.
 
 ### Retention and cleanup
 
-Terminal jobs are retained for `terminal_job_ttl_seconds` (default 24h). A
+Terminal jobs are retained for `terminal_job_ttl_seconds` (default 24h), measured
+from the last lifecycle update on a monotonic clock (immune to NTP steps). A
 background reaper sweeps on an interval sized to the TTL (clamped to 1-300s): it
 refreshes parent state, evicts expired terminal jobs, and prunes bookkeeping.
 Eviction is child-protected - a parent is reaped only after its children - so
 polling a parent never races cleanup. Ephemeral apply paths
 (`ApplyFirmwareObject`, `ApplySwitchSystemImage`) additionally register a cleanup
 plan that deletes their temporary artifact cache once all children reach a
-terminal state.
+terminal state. If shutdown rejects starting an already-created worker, its
+cleanup plan still runs under the tracked supervisor. Cleanup is best effort
+and remains subject to shutdown drain deadlines.

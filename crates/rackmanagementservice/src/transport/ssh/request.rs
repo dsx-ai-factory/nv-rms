@@ -32,6 +32,9 @@ pub(super) enum ChannelRequestFailureCode {
     /// Map the request failure to an operation failure.
     OperationFailed,
 
+    /// A reboot command may close the channel before its confirmation.
+    RebootingCommand,
+
     /// Map the request failure to transport unavailability.
     Unavailable,
 }
@@ -65,11 +68,31 @@ pub(super) async fn wait_for_channel_request_confirmation(
     loop {
         match channel_request_event(channel.wait().await) {
             ChannelRequestEvent::Confirmed => return Ok(deferred_messages),
+            ChannelRequestEvent::Closed { .. }
+                if matches!(failure_code, ChannelRequestFailureCode::RebootingCommand) =>
+            {
+                // Preserve any exit status or signal received before closure.
+                // The reboot-aware exec caller validates those messages.
+                return Ok(deferred_messages);
+            }
             ChannelRequestEvent::Rejected { details } | ChannelRequestEvent::Closed { details } => {
                 return Err(channel_request_error(failure_code, operation, details));
             }
             ChannelRequestEvent::Deferred(message) => {
+                let failed_reboot =
+                    matches!(failure_code, ChannelRequestFailureCode::RebootingCommand)
+                        && matches!(&message,
+                        ChannelMsg::ExitStatus { exit_status } if *exit_status != 0);
+
+                let signaled_reboot =
+                    matches!(failure_code, ChannelRequestFailureCode::RebootingCommand)
+                        && matches!(&message, ChannelMsg::ExitSignal { .. });
+
                 deferred_messages.push(message);
+
+                if failed_reboot || signaled_reboot {
+                    return Ok(deferred_messages);
+                }
             }
         }
     }
@@ -102,7 +125,8 @@ fn channel_request_error(
     details: String,
 ) -> SshError {
     match failure_code {
-        ChannelRequestFailureCode::OperationFailed => {
+        ChannelRequestFailureCode::OperationFailed
+        | ChannelRequestFailureCode::RebootingCommand => {
             SshError::OperationFailed { operation, details }
         }
         ChannelRequestFailureCode::Unavailable => SshError::Unavailable { operation, details },

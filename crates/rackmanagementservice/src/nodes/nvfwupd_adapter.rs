@@ -23,33 +23,99 @@ use serde_json::Value;
 use crate::domain::node::{
     FirmwareActivationCommand, FirmwareActivationMode, FirmwareActivationRequest,
     FirmwareActivationSummary, FirmwareInfo, FirmwareTarget, FirmwareTaskHandle,
-    FirmwareTaskStatus, FirmwareType, FirmwareUpdateOptions, FirmwareUpdateOutcome,
-    FirmwareUpdateSummary, FirmwareVersionCheckSummary, NodeType, NvfwupdServerProfile,
+    FirmwareTaskRejection, FirmwareTaskStatus, FirmwareType, FirmwareUpdateOptions,
+    FirmwareUpdateOutcome, FirmwareUpdateSummary, FirmwareVersionCheckSummary, NodeType,
+    NvfwupdServerProfile,
 };
+use crate::domain::rack::EndpointCredentials;
 use crate::utilities::error::RmsError;
 
 use nvfwupd::workflow as nv;
 
+impl From<crate::domain::compute_timing::ComputeFirmwareTiming>
+    for nvfwupd::compute_timing::ComputeFirmwareTiming
+{
+    fn from(timing: crate::domain::compute_timing::ComputeFirmwareTiming) -> Self {
+        Self {
+            connect_timeout: timing.connect_timeout,
+            request_timeout: timing.request_timeout,
+            upload_timeout: timing.upload_timeout,
+            reachability_timeout: timing.reachability_timeout,
+            precondition_query_timeout: timing.precondition_query_timeout,
+            background_copy_timeout: timing.background_copy_timeout,
+            background_copy_poll_interval: timing.background_copy_poll_interval,
+            write_protect_inventory_attempts: timing.write_protect_inventory_attempts,
+            write_protect_inventory_retry_interval: timing.write_protect_inventory_retry_interval,
+            power_off_delay: timing.power_off_delay,
+            ac_cycle_attempts: timing.ac_cycle_attempts,
+            ac_cycle_stabilization: timing.ac_cycle_stabilization,
+            activation_command_retries: timing.activation_command_retries,
+            activation_command_retry_interval: timing.activation_command_retry_interval,
+            bmc_recovery_attempts: timing.bmc_recovery_attempts,
+            bmc_recovery_interval: timing.bmc_recovery_interval,
+            power_on_attempts: timing.power_on_attempts,
+            power_on_interval: timing.power_on_interval,
+            power_on_resend_interval: timing.power_on_resend_interval,
+            recovery_probe_timeout: timing.recovery_probe_timeout,
+            inventory_recovery_retries: timing.inventory_recovery_retries,
+            inventory_recovery_retry_interval: timing.inventory_recovery_retry_interval,
+        }
+    }
+}
+
+impl From<&crate::domain::compute_power::ComputePowerPaths>
+    for nvfwupd::compute_power::ComputePowerPaths
+{
+    fn from(paths: &crate::domain::compute_power::ComputePowerPaths) -> Self {
+        Self {
+            system_state_path: paths
+                .system_state_path
+                .as_ref()
+                .map(|path| path.as_str().into()),
+            system_reset_path: paths
+                .system_reset_path
+                .as_ref()
+                .map(|path| path.as_str().into()),
+            aux_power_cycle_path: paths
+                .aux_power_cycle_path
+                .as_ref()
+                .map(|path| path.as_str().into()),
+            bmc_ready_path: paths
+                .bmc_ready_path
+                .as_ref()
+                .map(|path| path.as_str().into()),
+        }
+    }
+}
+
 fn to_target_config(
-    node_type: NodeType,
+    server_profile: NvfwupdServerProfile,
     host: &str,
     port: u16,
-    user: &str,
-    password: &str,
+    username: String,
+    password: String,
+    bmc_session_token: Option<String>,
     verify_tls: bool,
 ) -> nv::TargetConfig {
-    nv::TargetConfig {
+    let target = nv::TargetConfig {
         ip: host.to_owned(),
-        username: user.to_owned(),
-        password: password.to_owned(),
+        username,
+        password,
+        session_token: None,
         port: Some(port),
-        server_type: to_server_type(node_type),
+        server_type: to_server_type(server_profile),
         verify_tls,
         allow_http: false,
         ssh_known_hosts: None,
         // RMS does not manage an NVFWUPD known_hosts file yet, so preserve the
         // existing RMS SSH/SFTP behavior until RMS can provide explicit policy.
         ssh_host_key_mode: nv::SshHostKeyMode::Disabled,
+    };
+
+    if let Some(token) = bmc_session_token {
+        target.with_bmc_session_token(token)
+    } else {
+        target
     }
 }
 
@@ -62,22 +128,111 @@ pub fn to_target_config_with_secret(
     verify_tls: bool,
 ) -> nv::TargetConfig {
     to_target_config(
-        node_type,
+        node_type.nvfwupd_server_profile(),
         host,
         port,
-        user,
-        password.expose_secret(),
+        user.to_owned(),
+        password.expose_secret().to_owned(),
+        None,
         verify_tls,
     )
+}
+
+/// Build an NVFWUPD target from an explicitly configured server profile.
+///
+/// Generic profile-driven node adapters use this entrypoint so their runtime
+/// behavior does not depend on a hard-coded [`NodeType`] mapping.
+pub fn to_target_config_for_server_profile_with_secret(
+    server_profile: NvfwupdServerProfile,
+    host: &str,
+    port: u16,
+    user: &str,
+    password: &SecretString,
+    verify_tls: bool,
+) -> nv::TargetConfig {
+    to_target_config(
+        server_profile,
+        host,
+        port,
+        user.to_owned(),
+        password.expose_secret().to_owned(),
+        None,
+        verify_tls,
+    )
+}
+
+/// Convert optional RMS BMC credentials into an NVFWUPD target configuration.
+pub fn to_target_config_with_credentials(
+    node_type: NodeType,
+    host: &str,
+    port: u16,
+    credentials: Option<&EndpointCredentials>,
+    verify_tls: bool,
+) -> nv::TargetConfig {
+    let (username, password, bmc_session_token) = match credentials {
+        Some(EndpointCredentials::UserPass { username, password }) => (
+            username.to_owned(),
+            password.expose_secret().to_owned(),
+            None,
+        ),
+        Some(EndpointCredentials::BmcSessionToken(token)) => (
+            String::new(),
+            String::new(),
+            Some(token.expose_secret().to_owned()),
+        ),
+        None => (String::new(), String::new(), None),
+    };
+
+    to_target_config(
+        node_type.nvfwupd_server_profile(),
+        host,
+        port,
+        username,
+        password,
+        bmc_session_token,
+        verify_tls,
+    )
+}
+
+/// Render a resolved destination only at the NVFWUPD transport boundary.
+pub(crate) fn firmware_target_selector(target: &FirmwareTarget) -> &str {
+    use crate::domain::firmware_target::FirmwareDestination;
+    match target
+        .resolution
+        .as_ref()
+        .map(|resolved| &resolved.destination)
+    {
+        Some(FirmwareDestination::Redfish(path)) => path.as_str(),
+        Some(FirmwareDestination::Multipart(paths)) => match paths.as_slice() {
+            [path] => path.as_str(),
+            _ => "",
+        },
+        Some(FirmwareDestination::DriverDefault) => "",
+        None => &target.component,
+    }
 }
 
 pub fn to_update_request(
     target: &FirmwareTarget,
     force_update: bool,
-    options: FirmwareUpdateOptions,
+    mut options: FirmwareUpdateOptions,
 ) -> nv::FirmwareUpdateRequest {
+    if let Some(resolved) = &target.resolution {
+        if let Some(parameters) = &resolved.update_parameters {
+            options.special_json = Some(Value::Object(parameters.clone()));
+            if parameters.contains_key("ApplyTime") {
+                options.apply_time = None;
+            }
+        }
+        if let Some(parameters) = &resolved.oem_parameters {
+            options.oem_parameters = Some(Value::Object(parameters.clone()));
+        }
+    }
+
+    let force_update = effective_force_update(target, force_update, &options);
+
     nv::FirmwareUpdateRequest {
-        component: target.component.clone(),
+        component: firmware_target_selector(target).to_owned(),
         firmware_file: target.firmware_file.clone(),
         force_update,
         options: nv::UpdateOptions {
@@ -91,6 +246,69 @@ pub fn to_update_request(
     }
 }
 
+/// Returns the force policy sent to nvfwupd after profile parameters override options.
+pub fn effective_force_update(
+    target: &FirmwareTarget,
+    force_update: bool,
+    options: &FirmwareUpdateOptions,
+) -> bool {
+    let profile_parameters = target
+        .resolution
+        .as_ref()
+        .and_then(|resolution| resolution.update_parameters.as_ref());
+
+    let force_setting = match profile_parameters {
+        Some(parameters) => parameters.get("ForceUpdate"),
+        None => options
+            .special_json
+            .as_ref()
+            .and_then(|parameters| parameters.get("ForceUpdate")),
+    };
+
+    force_update || force_setting.and_then(Value::as_bool).unwrap_or(false)
+}
+
+/// Use embedded parameter defaults for legacy calls without a resolved profile.
+///
+/// Returns an error if the binary's embedded catalog has no matching target.
+pub(super) fn default_update_options(
+    node_type: NodeType,
+    component: &str,
+    mut options: FirmwareUpdateOptions,
+) -> crate::utilities::error::Result<FirmwareUpdateOptions> {
+    let target = default_update_target(node_type, component)?;
+    if options.special_json.is_none() {
+        options.special_json = target.update_parameters().cloned().map(Value::Object);
+    }
+    if options.oem_parameters.is_none() {
+        options.oem_parameters = target.oem_parameters().cloned().map(Value::Object);
+    }
+    Ok(options)
+}
+
+/// Resolve a code-default target without imposing its component keys on custom profiles.
+pub(super) fn default_update_target(
+    node_type: NodeType,
+    component: &str,
+) -> crate::utilities::error::Result<&'static crate::config::hardware_profiles::FirmwareTargetPlan>
+{
+    let target = crate::config::hardware_profiles::built_in_profile(node_type)
+        .and_then(|profile| {
+            profile
+                .stages()
+                .iter()
+                .flat_map(|stage| stage.targets())
+                .find(|target| target.component_key() == component)
+        })
+        .ok_or_else(|| {
+            RmsError::internal(format!(
+                "embedded hardware profile for {} has no firmware target {component:?}",
+                node_type.as_str()
+            ))
+        })?;
+    Ok(target)
+}
+
 pub fn to_activation_request(request: FirmwareActivationRequest) -> nv::ActivationRequest {
     nv::ActivationRequest {
         mode: to_activation_mode(request.mode),
@@ -101,9 +319,24 @@ pub fn to_activation_request(request: FirmwareActivationRequest) -> nv::Activati
 pub fn to_version_check_targets(targets: &[FirmwareTarget]) -> Vec<nv::FirmwareVersionCheckTarget> {
     targets
         .iter()
-        .map(|target| nv::FirmwareVersionCheckTarget {
-            component: target.component.clone(),
-            firmware_file: target.firmware_file.clone(),
+        .flat_map(|target| {
+            use crate::domain::firmware_target::FirmwareDestination;
+            let components = match target
+                .resolution
+                .as_ref()
+                .map(|resolved| &resolved.destination)
+            {
+                Some(FirmwareDestination::Multipart(paths)) if !paths.is_empty() => {
+                    paths.iter().map(|path| path.as_str()).collect::<Vec<_>>()
+                }
+                _ => vec![firmware_target_selector(target)],
+            };
+            components
+                .into_iter()
+                .map(|component| nv::FirmwareVersionCheckTarget {
+                    component: component.to_owned(),
+                    firmware_file: target.firmware_file.clone(),
+                })
         })
         .collect()
 }
@@ -159,6 +392,11 @@ pub fn map_error(error: nv::NvFwUpdError) -> RmsError {
             sanitize(&path),
             sanitize(&message)
         )),
+        nv::NvFwUpdError::SubmissionFailed { details } => {
+            let details = sanitize(&details.to_string());
+            tracing::warn!(submission_diagnostic = %details, "NVFWUPD firmware submission failed");
+            RmsError::internal(format!("NVFWUPD firmware submission failed: {details}"))
+        }
         nv::NvFwUpdError::TaskFailed {
             task_id: Some(task_id),
             message,
@@ -171,7 +409,7 @@ pub fn map_error(error: nv::NvFwUpdError) -> RmsError {
             task_id: None,
             message,
         } => RmsError::internal(format!(
-            "NVFWUPD update failed before task creation: {}",
+            "NVFWUPD update failed without a usable task reference: {}",
             sanitize(&message)
         )),
         nv::NvFwUpdError::Timeout { operation, seconds } => RmsError::timeout(format!(
@@ -260,6 +498,27 @@ pub fn to_firmware_info(component: nv::FirmwareComponent) -> FirmwareInfo {
         target
     );
 
+    let status = details.get("Status");
+    let health = status
+        .and_then(|value| value.get("Health"))
+        .and_then(Value::as_str)
+        .unwrap_or("Unknown")
+        .to_owned();
+    let raw_state = status
+        .and_then(|value| value.get("State"))
+        .and_then(Value::as_str);
+    // A Critical component with no State reads as not-in-recovery
+    // downstream, because the recovery signature needs an exact
+    // StandbyOffline. The recovery flow will not pick it up. Surface the
+    // reading rather than hide it behind the "Unknown" fallback.
+    if health == "Critical" && raw_state.is_none() {
+        tracing::warn!(
+            component = %name,
+            "firmware reports Critical health with no Status.State; \
+             recovery detection cannot classify it"
+        );
+    }
+
     FirmwareInfo {
         firmware_type: classify_firmware_type(&type_hint),
         name,
@@ -269,12 +528,8 @@ pub fn to_firmware_info(component: nv::FirmwareComponent) -> FirmwareInfo {
             .and_then(Value::as_bool)
             .unwrap_or(false),
         target,
-        health: details
-            .get("Status")
-            .and_then(|status| status.get("Health"))
-            .and_then(Value::as_str)
-            .unwrap_or("Unknown")
-            .to_owned(),
+        health,
+        state: raw_state.unwrap_or("Unknown").to_owned(),
         sku: details
             .get("SKU")
             .and_then(Value::as_str)
@@ -293,17 +548,89 @@ pub fn to_task_status(status: nv::TaskStatus) -> FirmwareTaskStatus {
         .unwrap_or(&state)
         .to_owned();
 
+    let rejection = (status.state == nv::TaskState::Failed
+        && task_status.eq_ignore_ascii_case("Critical")
+        && identical_image_rejection_from_details(&status.details))
+    .then_some(FirmwareTaskRejection::IdenticalImage);
+
     FirmwareTaskStatus {
         completed: is_terminal_task_state(status.state),
         percent: i32::from(status.progress_percent.unwrap_or(0)),
         state,
         status: task_status,
         message: status.message.unwrap_or_default(),
+        rejection,
     }
 }
 
-fn to_server_type(node_type: NodeType) -> nv::ServerType {
-    match node_type.nvfwupd_server_profile() {
+fn identical_image_rejection_from_details(details: &Value) -> bool {
+    let Some(messages) = details.get("Messages").and_then(Value::as_array) else {
+        return false;
+    };
+
+    let mut found_rejection = false;
+
+    for message in messages {
+        let message_id = message.get("MessageId").and_then(Value::as_str);
+
+        if message_id
+            .is_some_and(|id| id.ends_with(".UpdateSuccessful") || id.ends_with(".AwaitToActivate"))
+        {
+            return false;
+        }
+
+        let severity = message
+            .get("Severity")
+            .or_else(|| message.get("MessageSeverity"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+
+        if severity.eq_ignore_ascii_case("OK") {
+            continue;
+        }
+
+        if message_id.is_some_and(|id| id.starts_with("TaskEvent.")) {
+            continue;
+        }
+
+        if message_id.is_none()
+            && message
+                .get("Message")
+                .and_then(Value::as_str)
+                .is_some_and(|text| {
+                    text.starts_with("The task with Id '")
+                        && text.ends_with("' has completed with errors.")
+                })
+        {
+            continue;
+        }
+
+        let identical_image = message_id.is_some_and(|id| {
+            id.starts_with("ResourceEvent.") && id.ends_with(".ResourceErrorsDetected")
+        }) && message
+            .get("MessageArgs")
+            .and_then(Value::as_array)
+            .and_then(|arguments| arguments.get(1))
+            .and_then(Value::as_str)
+            == Some("Component image is identical");
+
+        if !identical_image {
+            return false;
+        }
+
+        found_rejection = true;
+    }
+
+    found_rejection
+}
+
+/// Reports the identical-image rejection classified from the complete Redfish task details.
+pub fn is_identical_image_rejection(status: &FirmwareTaskStatus) -> bool {
+    status.rejection == Some(FirmwareTaskRejection::IdenticalImage)
+}
+
+pub(crate) fn to_server_type(server_profile: NvfwupdServerProfile) -> nv::ServerType {
+    match server_profile {
         NvfwupdServerProfile::ComputeGb200 => nv::ServerType::GB200,
         NvfwupdServerProfile::ComputeGb300 => nv::ServerType::GB300,
         NvfwupdServerProfile::ComputeVrnvl72 => nv::ServerType::VRNVL72,
@@ -366,7 +693,7 @@ fn classify_firmware_type(value: &str) -> FirmwareType {
     let lower = value.to_ascii_lowercase();
     if lower.contains("bmc") {
         FirmwareType::BMC
-    } else if lower.contains("bios") || lower.contains("uefi") || lower.contains("sbios") {
+    } else if lower.contains("bios") || lower.contains("uefi") || lower.contains("fw_cpu_") {
         FirmwareType::BIOS
     } else if lower.contains("cpld") {
         FirmwareType::CPLD
@@ -424,6 +751,39 @@ mod tests {
     use crate::utilities::error::ErrorCode;
     use serde_json::json;
     use tokio_util::sync::CancellationToken;
+
+    #[test]
+    fn missing_embedded_target_returns_a_contextual_error() {
+        for (node_type, component) in [
+            (NodeType::ComputeGb300Lenovo, "MISSING"),
+            (NodeType::ComputeGb300Supermicro, "MISSING"),
+            (NodeType::SwitchGb200Nvidia, "HMC"),
+        ] {
+            let error =
+                default_update_options(node_type, component, FirmwareUpdateOptions::default())
+                    .expect_err("missing defaults must not panic");
+            assert_eq!(error.code, ErrorCode::Internal);
+            assert!(error.message.contains(node_type.as_str()));
+            assert!(error.message.contains(component));
+        }
+    }
+
+    #[test]
+    fn embedded_defaults_preserve_explicit_multipart_objects() {
+        let options = default_update_options(
+            NodeType::ComputeGb300Lenovo,
+            "BMC",
+            FirmwareUpdateOptions {
+                special_json: Some(json!({"ForceUpdate": false})),
+                oem_parameters: Some(json!({})),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(options.special_json, Some(json!({"ForceUpdate": false})));
+        assert_eq!(options.oem_parameters, Some(json!({})));
+    }
 
     #[test]
     fn target_config_maps_node_type_and_secret_credentials() {
@@ -557,6 +917,30 @@ mod tests {
         );
         assert_eq!(
             to_target_config_with_secret(
+                NodeType::PowershelfVrnvl72Delta,
+                "10.0.0.10",
+                443,
+                "u",
+                &SecretString::from("p".to_owned()),
+                true
+            )
+            .server_type,
+            nv::ServerType::PowerShelf
+        );
+        assert_eq!(
+            to_target_config_with_secret(
+                NodeType::PowershelfVrnvl72Liteon,
+                "10.0.0.10",
+                443,
+                "u",
+                &SecretString::from("p".to_owned()),
+                true
+            )
+            .server_type,
+            nv::ServerType::PowerShelf
+        );
+        assert_eq!(
+            to_target_config_with_secret(
                 NodeType::SwitchGb300Nvidia,
                 "10.0.0.8",
                 8443,
@@ -582,6 +966,63 @@ mod tests {
     }
 
     #[test]
+    fn target_config_maps_bmc_session_token_without_exposing_it() {
+        let credentials = EndpointCredentials::from_session_token("session-token");
+
+        let config = to_target_config_with_credentials(
+            NodeType::ComputeGb200Nvidia,
+            "10.0.0.9",
+            443,
+            Some(&credentials),
+            true,
+        );
+
+        assert!(config.username.is_empty());
+        assert!(config.password.is_empty());
+        assert_eq!(config.session_token.as_deref(), Some("session-token"));
+        assert!(!format!("{config:?}").contains("session-token"));
+    }
+
+    #[test]
+    fn target_config_maps_bmc_session_token_for_powershelf() {
+        let credentials = EndpointCredentials::from_session_token("shelf-token");
+
+        let config = to_target_config_with_credentials(
+            NodeType::PowershelfGb200Delta,
+            "10.0.0.11",
+            443,
+            Some(&credentials),
+            true,
+        );
+
+        assert_eq!(config.server_type, nv::ServerType::PowerShelf);
+        assert!(config.username.is_empty());
+        assert!(config.password.is_empty());
+        assert_eq!(config.session_token.as_deref(), Some("shelf-token"));
+        assert!(!format!("{config:?}").contains("shelf-token"));
+    }
+
+    #[test]
+    fn credentials_none_produces_empty_config_fields() {
+        let config = to_target_config_with_credentials(
+            NodeType::ComputeGb200Nvidia,
+            "10.0.0.9",
+            443,
+            None,
+            true,
+        );
+
+        assert!(
+            config.username.is_empty(),
+            "no credentials should produce empty username"
+        );
+        assert!(
+            config.password.is_empty(),
+            "no credentials should produce empty password"
+        );
+    }
+
+    #[test]
     fn update_request_preserves_targets_force_options_and_cancellation() {
         let token = CancellationToken::new();
         let request = to_update_request(
@@ -589,6 +1030,8 @@ mod tests {
                 component: "BMC".to_owned(),
                 firmware_file: "/tmp/fw.fwpkg".to_owned(),
                 expected_version: None,
+                resolution: None,
+                linkx_policy: None,
             },
             true,
             FirmwareUpdateOptions {
@@ -680,7 +1123,7 @@ mod tests {
             message: "password=secret connection refused".to_owned(),
         });
         assert_eq!(err.code, ErrorCode::Internal);
-        assert!(err.message.contains("before task creation"));
+        assert!(err.message.contains("without a usable task reference"));
         assert!(!err.message.contains("secret"));
 
         let err = map_error(nv::NvFwUpdError::TaskFailed {
@@ -693,6 +1136,19 @@ mod tests {
 
         let err = map_error(nv::NvFwUpdError::Unsupported("full activation"));
         assert_eq!(err.code, ErrorCode::Unimplemented);
+    }
+
+    #[test]
+    fn submission_error_preserves_bounded_diagnostics_in_adapter_error() {
+        let err = map_error(nv::NvFwUpdError::SubmissionFailed {
+            details: serde_json::json!({"category":"http_rejection", "http_status":409,
+                "body":"busy ".repeat(700), "password":"secret-value"}),
+        });
+        assert_eq!(err.code, ErrorCode::Internal);
+        assert!(err.message.contains("http_rejection"));
+        assert!(err.message.contains("409"));
+        assert!(err.message.len() > 3500);
+        assert!(!err.message.contains("secret-value"));
     }
 
     #[test]
@@ -750,7 +1206,7 @@ mod tests {
             inventory_path: Some("/redfish/v1/UpdateService/FirmwareInventory/BMC".to_owned()),
             details: json!({
                 "Updateable": false,
-                "Status": {"Health": "OK"},
+                "Status": {"Health": "OK", "State": "StandbyOffline"},
                 "SKU": "sku-1"
             }),
         });
@@ -760,6 +1216,7 @@ mod tests {
         assert_eq!(info.firmware_type, FirmwareType::BMC);
         assert!(!info.updateable);
         assert_eq!(info.health, "OK");
+        assert_eq!(info.state, "StandbyOffline");
         assert_eq!(info.sku, "sku-1");
         assert_eq!(
             info.target,
@@ -777,6 +1234,26 @@ mod tests {
             !missing_updateable.updateable,
             "missing Updateable should preserve RMS's conservative false default"
         );
+        assert_eq!(
+            missing_updateable.state, "Unknown",
+            "missing Status.State should mirror the health fallback"
+        );
+    }
+
+    #[test]
+    fn redfish_cpu_firmware_is_classified_as_bios() {
+        for name in ["MGX_FW_CPU_0", "FW_CPU_0"] {
+            let info = to_firmware_info(nv::FirmwareComponent {
+                name: name.to_owned(),
+                version: Some("0ACTV_01.01.030".to_owned()),
+                device_class: Some("0x00DA".to_owned()),
+                inventory_path: Some(format!(
+                    "/redfish/v1/UpdateService/FirmwareInventory/{name}"
+                )),
+                details: json!({}),
+            });
+            assert_eq!(info.firmware_type, FirmwareType::BIOS);
+        }
     }
 
     #[test]
@@ -794,6 +1271,108 @@ mod tests {
         assert_eq!(status.state, "Completed");
         assert_eq!(status.status, "OK");
         assert_eq!(status.message, "firmware update complete");
+    }
+
+    #[test]
+    fn task_status_mapping_preserves_identical_image_response_for_rms() {
+        let message = "The resource property 'FW_COMPONENT_0' has detected errors of type 'Component image is identical'.";
+
+        let details = json!({
+            "Id": "firmware-task",
+            "TaskState": "Exception",
+            "TaskStatus": "Critical",
+            "Messages": [
+                {
+                    "Message": "The task with Id 'firmware-task' has started.",
+                    "MessageSeverity": "OK"
+                },
+                {
+                    "MessageId": "TaskEvent.1.0.3.TaskAborted",
+                    "MessageSeverity": "Critical",
+                    "Message": "The task with Id 'firmware-task' was aborted."
+                },
+                {
+                    "MessageSeverity": "Critical",
+                    "Message": "The task with Id 'firmware-task' has completed with errors."
+                },
+                {
+                    "MessageId": "ResourceEvent.1.0.3.ResourceErrorsDetected",
+                    "Severity": "Critical",
+                    "Message": message,
+                    "MessageArgs": ["FW_COMPONENT_0", "Component image is identical"]
+                }
+            ]
+        });
+
+        let status = to_task_status(nv::TaskStatus {
+            task_id: "firmware-task".to_owned(),
+            state: nv::TaskState::Failed,
+            message: Some(message.to_owned()),
+            progress_percent: None,
+            details,
+        });
+
+        assert!(status.completed);
+        assert_eq!(status.state, "Failed");
+        assert_eq!(status.message, message);
+
+        assert_eq!(
+            status.rejection,
+            Some(FirmwareTaskRejection::IdenticalImage)
+        );
+
+        assert!(is_identical_image_rejection(&status));
+    }
+
+    #[test]
+    fn task_status_mapping_rejects_mixed_or_unproven_identical_image_responses() {
+        let rejection = json!({
+            "MessageId": "ResourceEvent.1.0.ResourceErrorsDetected",
+            "Severity": "Critical",
+            "MessageArgs": ["FW_COMPONENT_0", "Component image is identical"]
+        });
+
+        for messages in [
+            json!([]),
+            json!([{
+                "MessageId": "ResourceEvent.1.0.ResourceErrorsDetected",
+                "Severity": "Critical",
+                "MessageArgs": ["FW_COMPONENT_0", "Firmware image verification failed"]
+            }]),
+            json!([rejection, {
+                "MessageId": "ResourceEvent.1.0.ResourceErrorsDetected",
+                "Severity": "Critical",
+                "MessageArgs": ["FW_COMPONENT_1", "Firmware image verification failed"]
+            }]),
+            json!([rejection, {
+                "MessageId": "Update.1.0.UpdateSuccessful",
+                "Severity": "OK",
+                "Message": "Another component was flashed"
+            }]),
+            json!([rejection, {
+                "MessageId": "Update.1.0.AwaitToActivate",
+                "Severity": "OK",
+                "Message": "Another component awaits activation"
+            }]),
+            json!([rejection, {
+                "MessageId": "TaskEvent.1.0.3.TaskAborted",
+                "Severity": "Critical"
+            }, {
+                "Severity": "Critical",
+                "Message": "An unclassified component failure occurred"
+            }]),
+        ] {
+            let status = to_task_status(nv::TaskStatus {
+                task_id: "firmware-task".to_owned(),
+                state: nv::TaskState::Failed,
+                message: Some("The resource property 'FW_COMPONENT_0' has detected errors of type 'Component image is identical'.".to_owned()),
+                progress_percent: None,
+                details: json!({"TaskStatus": "Critical", "Messages": messages}),
+            });
+
+            assert_eq!(status.rejection, None);
+            assert!(!is_identical_image_rejection(&status), "{status:?}");
+        }
     }
 
     #[test]

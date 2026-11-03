@@ -1,0 +1,79 @@
+suite: API server Pod annotations
+templates:
+  - templates/api-server-deployment.yaml
+tests:
+  - it: renders only the config checksum by default
+    set:
+      global.image.tag: test
+    documentSelector:
+      path: kind
+      value: Deployment
+    asserts:
+      - matchRegex:
+          path: spec.template.metadata.annotations["checksum/config"]
+          pattern: ^[a-f0-9]{64}$
+      - notExists:
+          path: spec.template.metadata.annotations["sidecar.opentelemetry.io/inject"]
+
+  - it: adds podAnnotations beside the config checksum
+    set:
+      global.image.tag: test
+      apiServer.podAnnotations:
+        sidecar.opentelemetry.io/inject: dsx-obs/default-sidecar
+    documentSelector:
+      path: kind
+      value: Deployment
+    asserts:
+      - equal:
+          path: spec.template.metadata.annotations["sidecar.opentelemetry.io/inject"]
+          value: dsx-obs/default-sidecar
+      - matchRegex:
+          path: spec.template.metadata.annotations["checksum/config"]
+          pattern: ^[a-f0-9]{64}$
+
+  - it: keeps the chart's config checksum when podAnnotations sets the same key
+    set:
+      global.image.tag: test
+      apiServer.podAnnotations:
+        checksum/config: overridden
+    documentSelector:
+      path: kind
+      value: Deployment
+    asserts:
+      - matchRegex:
+          path: spec.template.metadata.annotations["checksum/config"]
+          pattern: ^[a-f0-9]{64}$
+
+  - it: renders only the config checksum when podAnnotations is null
+    set:
+      global.image.tag: test
+      apiServer.podAnnotations: null
+    documentSelector:
+      path: kind
+      value: Deployment
+    asserts:
+      - matchRegex:
+          path: spec.template.metadata.annotations["checksum/config"]
+          pattern: ^[a-f0-9]{64}$
+
+  - it: renders an annotation value that looks like a boolean as a string
+    set:
+      global.image.tag: test
+      apiServer.podAnnotations:
+        sidecar.opentelemetry.io/inject: "true"
+    documentSelector:
+      path: kind
+      value: Deployment
+    asserts:
+      - equal:
+          path: spec.template.metadata.annotations["sidecar.opentelemetry.io/inject"]
+          value: "true"
+
+  - it: rejects a non-string annotation value
+    set:
+      global.image.tag: test
+      apiServer.podAnnotations:
+        sidecar.opentelemetry.io/inject: true
+    asserts:
+      - failedTemplate:
+          errorPattern: podAnnotations

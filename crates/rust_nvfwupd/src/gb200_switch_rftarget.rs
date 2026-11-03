@@ -26,12 +26,13 @@ use std::time::Duration;
 use nvue_client::Client as NvueClient;
 use serde_json::{json, Value};
 
-use crate::bmc_access::BmcAccess;
+use crate::bmc_access::{BmcAccess, ObservedRead};
 use crate::nvos_image;
 use crate::rf_target::{CmdArgs, PkgParser, RFTarget, UpdatePreconditionMode};
 use crate::ssh_transport;
 use crate::util::{BailAction, Util};
 use crate::utils::Util as NvUtils;
+use nvswitch_cli::RemotePath;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -76,6 +77,7 @@ const PARALLEL_UPDATE_URL_PREFIX: &str = "/nvue_v1/platform/firmware/files";
 
 /// Temporary upload path for VRNVL72 parallel updates.
 const PARALLEL_UPLOAD_PATH: &str = "/tmp/";
+const PARALLEL_SFTP_UPLOAD_TIMEOUT_SECS: u64 = 15 * 60;
 
 const ASIC_FIRMWARE_CONFIG_URI: &str = "/nvue_v1/platform/firmware/ASIC";
 const NVUE_REVISION_URI: &str = "/nvue_v1/revision";
@@ -86,14 +88,35 @@ const NVOS_SFTP_UPLOAD_TIMEOUT_SECS: u64 = 60 * 60;
 const DEFAULT_REBOOT_WAIT_MINUTES: u64 = 4;
 const NVOS_REBOOT_WAIT_MINUTES: u64 = 30;
 
+// A freshly SFTP-uploaded NVOS image is indexed into the NVUE
+// `/nvue_v1/system/image/files` listing asynchronously, and that lag is more
+// pronounced on older NVOS releases. Poll the listing for a bounded window
+// instead of checking exactly once, so a slow index does not spuriously abort
+// (and then clean up) an otherwise-successful upload.
+#[cfg(not(test))]
+const NVOS_IMAGE_VISIBLE_TIMEOUT: Duration = Duration::from_secs(60);
+#[cfg(not(test))]
+const NVOS_IMAGE_VISIBLE_POLL_INTERVAL: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const NVOS_IMAGE_VISIBLE_TIMEOUT: Duration = Duration::from_millis(30);
+#[cfg(test)]
+const NVOS_IMAGE_VISIBLE_POLL_INTERVAL: Duration = Duration::from_millis(5);
+
 /// nvfwupd status/exit codes returned by firmware update workflows.
 const NVFWUPD_STATUS_OK: i32 = 0;
 const NVFWUPD_STATUS_ERR: i32 = 1;
 
 const POWER_CYCLE_COMMAND: &str = "NVUE_PWR_CYCLE";
+
+/// Timeout for the SSH command that stages the firmware upload directory.
+const UPLOAD_STAGING_TIMEOUT_SECS: u64 = 30;
 const POWER_CYCLE_POST_TIMEOUT_SECS: u64 = 120;
 const POWER_CYCLE_ACTION_RETRIES: u32 = 3;
 const POWER_CYCLE_ACTION_RETRY_INTERVAL_SECS: u64 = 5;
+#[cfg(not(test))]
+const POWER_CYCLE_ACTION_STATUS_TIMEOUT_SECS: u64 = 1200;
+#[cfg(test)]
+const POWER_CYCLE_ACTION_STATUS_TIMEOUT_SECS: u64 = 1;
 
 #[derive(Clone, Copy)]
 enum SwitchNvueAccess<'a> {
@@ -140,6 +163,55 @@ impl SwitchNvueAccess<'_> {
         }
     }
 
+    /// Read one action-status GET, keeping HTTP answers distinct from a switch
+    /// that did not respond.
+    async fn observe_action_status(&self, legacy_access: &BmcAccess, path: &str) -> ObservedRead {
+        match self {
+            Self::Legacy => {
+                legacy_access
+                    .observe_nvue_get(path, POWER_CYCLE_ACTION_STATUS_TIMEOUT_SECS)
+                    .await
+            }
+            Self::Hosted(client) => {
+                match client
+                    .get(
+                        path,
+                        Duration::from_secs(POWER_CYCLE_ACTION_STATUS_TIMEOUT_SECS),
+                    )
+                    .await
+                {
+                    Ok(response) if response.status == 200 => {
+                        match serde_json::from_str::<Value>(&response.body) {
+                            Ok(value) => ObservedRead::Readable(value),
+                            Err(_) => ObservedRead::answered_unparsed(),
+                        }
+                    }
+                    Ok(response) if response.value.is_null() => ObservedRead::answered_unparsed(),
+                    Ok(response) => ObservedRead::Answered(response.value),
+                    // A body or decode failure still means the switch answered.
+                    Err(nvue_client::ClientError::Request { source, .. })
+                        if source.is_body() || source.is_decode() =>
+                    {
+                        ObservedRead::Answered(json!({ "error": source.to_string() }))
+                    }
+                    Err(
+                        error @ (nvue_client::ClientError::Request { .. }
+                        | nvue_client::ClientError::ResolveHost { .. }
+                        | nvue_client::ClientError::NoResolvedAddress { .. }),
+                    ) => ObservedRead::NoResponse(error.to_string()),
+                    Err(error) => ObservedRead::Answered(json!({ "error": error.to_string() })),
+                }
+            }
+        }
+    }
+
+    /// Suppressed variant of [`Self::get`] for retry pollers: a transient
+    /// failure must not pollute the caller's JSON output, since a later attempt
+    /// (or the post-loop failure event) records the real outcome. The Legacy
+    /// path passes the `quiet` flag to `dispatch_request_full`; the Hosted path
+    /// must match that by logging failures rather than recording them into
+    /// `json_output` -- otherwise a transient poll failure would leave a stale
+    /// `"Error Code": 1` in an update that ultimately succeeds.
     async fn get_suppressed(
         &self,
         legacy_access: &BmcAccess,
@@ -159,14 +231,14 @@ impl SwitchNvueAccess<'_> {
                     match serde_json::from_str::<Value>(&response.body) {
                         Ok(value) => (true, value),
                         Err(error) => {
-                            record_hosted_nvue_error(json_output, &error.to_string());
+                            log_hosted_nvue_error(&error.to_string());
                             (false, json!({"error": error.to_string()}))
                         }
                     }
                 }
                 Ok(response) => (false, response.value),
                 Err(error) => {
-                    record_hosted_nvue_error(json_output, &error.to_string());
+                    log_hosted_nvue_error(&error.to_string());
                     (false, json!({"error": error.to_string()}))
                 }
             },
@@ -251,8 +323,15 @@ impl SwitchNvueAccess<'_> {
     }
 }
 
-fn record_hosted_nvue_error(json_output: Option<&mut Value>, message: &str) {
+/// Log a failed hosted (RMS-orchestrated) NVUE request without touching the
+/// caller's JSON output. Used by suppressed pollers whose transient failures
+/// must not leave a stale error in a result that ultimately succeeds.
+fn log_hosted_nvue_error(message: &str) {
     tracing::warn!(error = %message, "NVUE request failed");
+}
+
+fn record_hosted_nvue_error(json_output: Option<&mut Value>, message: &str) {
+    log_hosted_nvue_error(message);
 
     let Some(output) = json_output.and_then(Value::as_object_mut) else {
         return;
@@ -288,13 +367,67 @@ struct SwitchSerialAction {
     final_state: String,
 }
 
+/// What the action-status read window observed before recovery polling.
+///
+/// Six of the eight combinations occur. An unreadable status never reports its
+/// progress, so `action_pending` is only ever set alongside `was_readable`.
+///
+/// ```text
+/// outage  readable  pending  the read window saw            recovery
+/// ------  --------  -------  -----------------------------  --------
+/// no      yes       no       finished, no outage            watch
+/// yes     yes       no       finished, outage already seen  accept
+/// no      yes       yes      still running                  watch
+/// yes     yes       yes      still running, earlier outage  watch
+/// no      no        no       unread, answered throughout    watch
+/// yes     no        no       unread, stopped answering      accept
+/// ```
+///
+/// `accept` lets recovery finish on an endpoint that is already reachable,
+/// because the switch went down and returned before polling began. `watch`
+/// makes it wait to see that endpoint go down and come back itself.
+///
+/// A watching row whose endpoint never changes times out, which is what drives
+/// the GB200 and GB300 BMC auxiliary AC cycle. The one exception is the unread
+/// row that answered throughout: that switch was alive for the whole wait, so
+/// its action failed rather than left a reboot outstanding, and activation
+/// fails without the AC cycle.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct StatusReadOutcome {
+    /// True when a read showed the switch stopped answering, or a non-200
+    /// answer reported a reboot.
+    ///
+    /// This survives a later readable status: the switch can stop answering and
+    /// be back before its status becomes readable, and recovery needs that
+    /// evidence to accept an already-reachable endpoint.
+    pub(crate) saw_outage: bool,
+    /// True when a read returned a readable body.
+    ///
+    /// A switch that answered an unreadable status and never went down was
+    /// alive for the whole wait, so its action failed. A readable status
+    /// instead leaves a reboot outstanding, which stays a recovery timeout so
+    /// the BMC auxiliary AC cycle can finish activation.
+    pub(crate) was_readable: bool,
+    /// True when the readable status still reported the action in progress.
+    ///
+    /// The reboot such an action will cause has not happened yet, so an outage
+    /// from an earlier read cannot stand in for it. Recovery has to watch the
+    /// switch go down itself before it accepts a reachable endpoint.
+    pub(crate) action_pending: bool,
+}
+
 /// Summary returned after a switch NVUE power-cycle action is accepted.
 #[derive(Debug, Clone)]
 pub struct SwitchPowerCycleSummary {
     /// NVUE action id created by the power-cycle request.
     pub action_id: String,
-    /// Queried action status/details returned by the NVUE action endpoint.
+    /// Action status returned by the NVUE action endpoint.
+    ///
+    /// When that status never became readable, this is the last status body.
+    /// It is an empty object when every read produced no HTTP response.
     pub details: Value,
+    /// What the status-read window observed before recovery polling started.
+    pub(crate) status_read: StatusReadOutcome,
 }
 
 impl SwitchPowerCycleSummary {
@@ -327,6 +460,11 @@ pub enum SwitchPowerCycleError {
         action_id: String,
         /// Structured status-query failure details.
         details: Value,
+        /// True when a read in this window showed the switch stopped answering
+        /// or a non-200 answer reported a reboot.
+        saw_outage: bool,
+        /// Transport cause of the last read that went unanswered, when any did.
+        cause: Option<String>,
     },
     /// The NVUE action reached a failed state.
     ActionFailed {
@@ -430,6 +568,13 @@ fn push_switch_action_failure(json_dict: &mut Value, job_id: &str, details: &Val
             "action_id": job_id,
             "error": NvUtils::redact_secret_json_value(details),
         }));
+    }
+}
+
+/// Append only a task id, matching legacy JSON background update output.
+fn push_switch_task_id(json_dict: &mut Value, job_id: &str) {
+    if let Some(output) = switch_output_mut(json_dict) {
+        output.push(json!({ "Id": job_id }));
     }
 }
 
@@ -537,6 +682,67 @@ pub struct GB200SwitchRFTarget {
 }
 
 impl GB200SwitchRFTarget {
+    /// Return the default upload timeout for NVOS system-image transfers.
+    pub(crate) fn default_nvos_sftp_upload_timeout_secs() -> u64 {
+        NVOS_SFTP_UPLOAD_TIMEOUT_SECS
+    }
+
+    /// Resolve the SFTP upload timeout used by NVOS updates.
+    ///
+    /// A zero timeout is treated as unspecified and falls back to the NVOS
+    /// default. Non-zero values come from the caller's update timeout.
+    fn nvos_sftp_upload_timeout_secs(requested_timeout_secs: u64) -> u64 {
+        if requested_timeout_secs == 0 {
+            Self::default_nvos_sftp_upload_timeout_secs()
+        } else {
+            requested_timeout_secs
+        }
+    }
+
+    /// Format an upload timeout for user-facing CLI progress text.
+    fn format_upload_timeout(timeout_secs: u64) -> String {
+        if timeout_secs.is_multiple_of(60) {
+            format!("{} minutes", timeout_secs / 60)
+        } else {
+            format!("{timeout_secs} seconds")
+        }
+    }
+
+    /// Convert multiline NVUE task strings into line arrays for CLI display.
+    ///
+    /// The raw NVUE response is left unchanged for JSON mode and library callers,
+    /// but non-JSON console output becomes readable instead of showing escaped
+    /// `\n` sequences inside long JSON strings.
+    fn split_multiline_task_field_for_console(task_dict: &mut Value, field: &str) {
+        let Some(map) = task_dict.as_object_mut() else {
+            return;
+        };
+        let Some(text) = map.get(field).and_then(Value::as_str) else {
+            return;
+        };
+        if !text.contains('\n') {
+            return;
+        }
+
+        let lines: Vec<Value> = text
+            .lines()
+            .map(str::trim_end)
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| Value::String(line.to_string()))
+            .collect();
+        if !lines.is_empty() {
+            map.insert(field.to_string(), Value::Array(lines));
+        }
+    }
+
+    /// Return a console-only representation of NVUE task status JSON.
+    fn task_dict_for_console(task_dict: &Value) -> Value {
+        let mut rendered = task_dict.clone();
+        Self::split_multiline_task_field_for_console(&mut rendered, "status");
+        Self::split_multiline_task_field_for_console(&mut rendered, "detail");
+        rendered
+    }
+
     /// Create a new `GB200SwitchRFTarget` with sensible defaults.
     pub fn new(bmc_access: BmcAccess, config_dict: Option<Value>) -> Self {
         Self {
@@ -605,41 +811,91 @@ impl GB200SwitchRFTarget {
             },
         )?;
 
-        let details = self.query_power_cycle_action(access, &action_id).await?;
+        let (details, status_read) = self.query_power_cycle_action(access, &action_id).await?;
 
-        Ok(SwitchPowerCycleSummary { action_id, details })
+        Ok(SwitchPowerCycleSummary {
+            action_id,
+            details,
+            status_read,
+        })
     }
 
+    /// Returns the last action-status body and what the read window observed.
+    ///
+    /// The outage flag survives a later readable status: the switch can stop
+    /// answering and be back before the status becomes readable, and recovery
+    /// needs that evidence to accept an already-reachable endpoint. It does not
+    /// survive a status that is still running, since the reboot that action
+    /// owes is still ahead of recovery rather than behind it.
     async fn query_power_cycle_action(
         &self,
         access: SwitchNvueAccess<'_>,
         action_id: &str,
-    ) -> std::result::Result<Value, SwitchPowerCycleError> {
-        let (status, details) = self
-            .get_job_status_with_retry(
-                access,
-                action_id,
-                POWER_CYCLE_ACTION_RETRIES,
-                POWER_CYCLE_ACTION_RETRY_INTERVAL_SECS,
-                true,
-            )
-            .await;
+    ) -> std::result::Result<(Value, StatusReadOutcome), SwitchPowerCycleError> {
+        let url = format!("{}/{}", NVUE_ACTION_URL, action_id);
+        let mut saw_outage = false;
+        let mut last_details = json!({});
+        let mut last_cause = None;
+        let mut readable = false;
 
-        if !status {
-            return Err(SwitchPowerCycleError::ActionStatusUnavailable {
-                action_id: action_id.to_string(),
-                details,
-            });
+        // One extra read after the retry budget matches the historical poll.
+        for attempt in 0..=POWER_CYCLE_ACTION_RETRIES {
+            match access.observe_action_status(&self.bmc_access, &url).await {
+                ObservedRead::Readable(details) => {
+                    last_details = details;
+                    readable = true;
+                    break;
+                }
+                ObservedRead::Answered(details) => {
+                    if Self::status_details_signal_reboot(&details) {
+                        saw_outage = true;
+                    }
+                    last_details = details;
+                }
+                // Keep the status body from any earlier answer, and record why
+                // this read went unanswered so the caller can report it.
+                ObservedRead::NoResponse(cause) => {
+                    saw_outage = true;
+                    last_cause = Some(cause);
+                }
+            }
+
+            if attempt < POWER_CYCLE_ACTION_RETRIES.saturating_sub(1) {
+                tokio::time::sleep(std::time::Duration::from_secs(
+                    POWER_CYCLE_ACTION_RETRY_INTERVAL_SECS,
+                ))
+                .await;
+            }
         }
 
-        if Self::task_is_failed(&details) {
+        // The last read can be a failed action. That is not an outage, so it
+        // must fail activation before an unavailable status becomes recovery.
+        if Self::task_is_failed(&last_details) {
             return Err(SwitchPowerCycleError::ActionFailed {
                 action_id: action_id.to_string(),
-                details,
+                details: last_details,
             });
         }
 
-        Ok(details)
+        if !readable {
+            return Err(SwitchPowerCycleError::ActionStatusUnavailable {
+                action_id: action_id.to_string(),
+                details: last_details,
+                saw_outage,
+                cause: last_cause,
+            });
+        }
+
+        let action_pending = Self::task_is_pending(&last_details);
+
+        Ok((
+            last_details,
+            StatusReadOutcome {
+                saw_outage,
+                was_readable: true,
+                action_pending,
+            },
+        ))
     }
 
     fn bundle_to_target() -> HashMap<&'static str, &'static str> {
@@ -936,7 +1192,9 @@ impl GB200SwitchRFTarget {
                 }
 
                 match last_state.as_str() {
-                    "applied" => return Ok(()),
+                    // Some NVOS builds apply and save in one step and report
+                    // the combined state instead of plain `applied`.
+                    "applied" | "applied_and_saved" => return Ok(()),
                     "failed" | "error" | "invalid" => {
                         return Err(format!(
                             "NVUE revision {revision_id} failed while applying ASIC firmware precondition config: {}",
@@ -1030,7 +1288,7 @@ impl GB200SwitchRFTarget {
     }
 
     /// Ensure switch ASIC firmware config allows safe NVOS system-image updates.
-    async fn ensure_nvos_asic_firmware_config(
+    async fn ensure_nvos_asic_firmware_config_with_access(
         &self,
         access: SwitchNvueAccess<'_>,
         mut json_dict: Option<&mut Value>,
@@ -1186,7 +1444,9 @@ impl GB200SwitchRFTarget {
         mut json_dict: Option<&mut Value>,
         update_delay: u64,
         skip_pre_flight_checks: bool,
+        upload_timeout_secs: u64,
     ) -> (i32, Vec<String>) {
+        let upload_timeout_secs = Self::nvos_sftp_upload_timeout_secs(upload_timeout_secs);
         let image_file_name = match nvos_image::safe_image_file_name(recipe) {
             Ok(file_name) => file_name,
             Err(message) => {
@@ -1209,6 +1469,7 @@ impl GB200SwitchRFTarget {
         let target_version =
             nvos_image::package_version_from_image_path(recipe).unwrap_or_else(|| "unknown".into());
         let is_json = json_dict.is_some();
+        let json_task_ids_only = is_json && (cmd_args.background || parallel_update);
 
         if update_delay > 0 {
             if !is_json {
@@ -1222,7 +1483,7 @@ impl GB200SwitchRFTarget {
 
         if !skip_pre_flight_checks {
             if let Err(message) = self
-                .ensure_nvos_asic_firmware_config(access, json_dict.as_deref_mut())
+                .ensure_nvos_asic_firmware_config_with_access(access, json_dict.as_deref_mut())
                 .await
             {
                 if let Some(ref mut jd) = json_dict {
@@ -1245,21 +1506,24 @@ impl GB200SwitchRFTarget {
             }
         }
 
-        if let Some(ref mut jd) = json_dict {
-            push_switch_progress_event(
-                jd,
-                "upload",
-                Some(nvos_image::NVOS_AP_NAME),
-                None,
-                Some("running"),
-                None,
-                Some(json!({
-                    "local_file": recipe,
-                    "remote_dir": nvos_image::NVOS_UPLOAD_DIR,
-                    "remote_name": image_file_name,
-                    "target_version": target_version,
-                })),
-            );
+        if !json_task_ids_only {
+            if let Some(ref mut jd) = json_dict {
+                push_switch_progress_event(
+                    jd,
+                    "upload",
+                    Some(nvos_image::NVOS_AP_NAME),
+                    None,
+                    Some("running"),
+                    None,
+                    Some(json!({
+                        "local_file": recipe,
+                        "remote_dir": nvos_image::NVOS_UPLOAD_DIR,
+                        "remote_name": image_file_name,
+                        "target_version": target_version,
+                        "upload_timeout_secs": upload_timeout_secs,
+                    })),
+                );
+            }
         }
         tracing::info!(
             log_only = true,
@@ -1268,15 +1532,16 @@ impl GB200SwitchRFTarget {
             local_file = recipe,
             remote_dir = nvos_image::NVOS_UPLOAD_DIR,
             remote_name = image_file_name,
-            upload_timeout_secs = NVOS_SFTP_UPLOAD_TIMEOUT_SECS,
+            upload_timeout_secs,
             "uploading NVOS image via SFTP"
         );
         if !is_json {
-            println!(
-                "Uploading NVOS image via SFTP to {} (timeout: {} minutes). This may take several minutes.",
+            let msg = format!(
+                "Uploading NVOS image via SFTP to {} (timeout: {}). This may take several minutes.",
                 nvos_image::NVOS_UPLOAD_DIR,
-                NVOS_SFTP_UPLOAD_TIMEOUT_SECS / 60
+                Self::format_upload_timeout(upload_timeout_secs)
             );
+            println!("{}", BmcAccess::format_switch_sftp_status_line(&msg));
         }
 
         let dest_path = match self
@@ -1286,7 +1551,7 @@ impl GB200SwitchRFTarget {
                 nvos_image::NVOS_UPLOAD_DIR,
                 &image_file_name,
                 is_json,
-                NVOS_SFTP_UPLOAD_TIMEOUT_SECS,
+                upload_timeout_secs,
             )
             .await
         {
@@ -1316,30 +1581,54 @@ impl GB200SwitchRFTarget {
             }
         };
 
-        if let Some(ref mut jd) = json_dict {
-            push_switch_progress_event(
-                jd,
-                "upload",
-                Some(nvos_image::NVOS_AP_NAME),
-                None,
-                Some("success"),
-                None,
-                Some(json!({
-                    "local_file": recipe,
-                    "remote_path": dest_path,
-                    "target_version": target_version,
-                })),
-            );
+        if !json_task_ids_only {
+            if let Some(ref mut jd) = json_dict {
+                push_switch_progress_event(
+                    jd,
+                    "upload",
+                    Some(nvos_image::NVOS_AP_NAME),
+                    None,
+                    Some("success"),
+                    None,
+                    Some(json!({
+                        "local_file": recipe,
+                        "remote_path": dest_path,
+                        "target_version": target_version,
+                    })),
+                );
+            }
         }
 
-        let (files_ok, files_response) = access
-            .get(
-                &self.bmc_access,
-                nvos_image::SYSTEM_IMAGE_FILES_URI,
-                NVUE_REQUEST_TIMEOUT_SECS,
-                json_dict.as_deref_mut(),
-            )
-            .await;
+        // Poll the image-files listing until the uploaded image appears or the
+        // bounded window elapses; NVUE can lag the SFTP upload by a few seconds.
+        let visible_deadline = std::time::Instant::now() + NVOS_IMAGE_VISIBLE_TIMEOUT;
+        let mut files_ok;
+        let mut files_response;
+        loop {
+            // Suppressed: a transient failure here is expected while NVUE lags
+            // the SFTP upload, so it must not leave a stale error in the JSON
+            // output of an update that then succeeds. The post-loop check below
+            // records a real failure if the image never becomes visible.
+            let (ok, response) = access
+                .get_suppressed(
+                    &self.bmc_access,
+                    nvos_image::SYSTEM_IMAGE_FILES_URI,
+                    NVUE_REQUEST_TIMEOUT_SECS,
+                    json_dict.as_deref_mut(),
+                )
+                .await;
+            files_ok = ok;
+            files_response = response;
+            if files_ok
+                && nvos_image::response_contains_file_name(&files_response, &image_file_name)
+            {
+                break;
+            }
+            if std::time::Instant::now() + NVOS_IMAGE_VISIBLE_POLL_INTERVAL >= visible_deadline {
+                break;
+            }
+            tokio::time::sleep(NVOS_IMAGE_VISIBLE_POLL_INTERVAL).await;
+        }
         if !files_ok || !nvos_image::response_contains_file_name(&files_response, &image_file_name)
         {
             let message = format!(
@@ -1369,10 +1658,11 @@ impl GB200SwitchRFTarget {
         }
 
         if !is_json {
-            println!(
+            let msg = format!(
                 "Starting NVOS image update for: {}",
                 nvos_image::NVOS_AP_NAME
             );
+            println!("{}", BmcAccess::format_switch_sftp_status_line(&msg));
         }
 
         let install_url = format!("{}/{}", nvos_image::SYSTEM_IMAGE_FILES_URI, image_file_name);
@@ -1380,27 +1670,28 @@ impl GB200SwitchRFTarget {
             "@install": {
                 "state": "start",
                 "parameters": {
-                    "force": false,
                     "reboot": "no",
                     "image-file": image_file_name,
                 }
             }
         });
 
-        if let Some(ref mut jd) = json_dict {
-            push_switch_progress_event(
-                jd,
-                "install",
-                Some(nvos_image::NVOS_AP_NAME),
-                None,
-                Some("posting"),
-                None,
-                Some(json!({
-                    "url": install_url,
-                    "remote_path": dest_path,
-                    "target_version": target_version,
-                })),
-            );
+        if !json_task_ids_only {
+            if let Some(ref mut jd) = json_dict {
+                push_switch_progress_event(
+                    jd,
+                    "install",
+                    Some(nvos_image::NVOS_AP_NAME),
+                    None,
+                    Some("posting"),
+                    None,
+                    Some(json!({
+                        "url": install_url,
+                        "remote_path": dest_path,
+                        "target_version": target_version,
+                    })),
+                );
+            }
         }
 
         let (post_status, post_details, resp_text) = access
@@ -1466,7 +1757,11 @@ impl GB200SwitchRFTarget {
             return (NVFWUPD_STATUS_ERR, Vec::new());
         }
 
-        if let Some(ref mut jd) = json_dict {
+        if json_task_ids_only {
+            if let Some(ref mut jd) = json_dict {
+                push_switch_task_id(jd, &job_id);
+            }
+        } else if let Some(ref mut jd) = json_dict {
             push_switch_progress_event(
                 jd,
                 "install",
@@ -1550,8 +1845,10 @@ impl GB200SwitchRFTarget {
             }
         }
 
+        // The final read is reported unavailable. Install and fetch polling
+        // depend on that historical result; the power-cycle path no longer
+        // uses this helper.
         let (_, resp) = access.get(&self.bmc_access, &url, 1200, None).await;
-
         (false, resp)
     }
 
@@ -1689,7 +1986,9 @@ impl GB200SwitchRFTarget {
                     &format!(
                         "Failure status for job {}: Error {}",
                         task_id,
-                        NvUtils::redacted_json_pretty_4space(&resp_dict)
+                        NvUtils::redacted_json_pretty_4space(&Self::task_dict_for_console(
+                            &resp_dict
+                        ))
                     ),
                     BailAction::DoNothing,
                     None,
@@ -1711,7 +2010,8 @@ impl GB200SwitchRFTarget {
     }
 
     fn print_task_completion_inner(&self, task_dict: &Value) {
-        println!("{}", NvUtils::redacted_json_pretty_4space(task_dict));
+        let rendered = Self::task_dict_for_console(task_dict);
+        println!("{}", NvUtils::redacted_json_pretty_4space(&rendered));
         println!();
     }
 
@@ -1743,6 +2043,15 @@ impl GB200SwitchRFTarget {
             .or_else(|| task_dict.get("PercentComplete"))
             .and_then(|v| v.as_i64().or_else(|| v.as_u64().map(|n| n as i64)))
             .unwrap_or(0)
+    }
+
+    /// A status body that reports the reboot itself, rather than a failed read.
+    ///
+    /// Only consulted for a non-200 answer. A readable status is trusted to
+    /// describe the action, not to stand in for watching the switch go down.
+    fn status_details_signal_reboot(details: &Value) -> bool {
+        Self::task_status_indicates_reboot(&Self::task_status_text(details))
+            || Self::task_status_indicates_reboot(&Self::task_state(details))
     }
 
     /// Detect action-error text that actually means the switch is rebooting.
@@ -1778,6 +2087,11 @@ impl GB200SwitchRFTarget {
             || (state == "action_error"
                 && Self::task_percent(task_dict) < 100
                 && !Self::task_status_indicates_reboot(&status))
+    }
+
+    /// Decide whether an NVUE task response still reports work in progress.
+    fn task_is_pending(task_dict: &Value) -> bool {
+        PENDING_TASK_STATES.contains(&Self::task_state(task_dict).as_str())
     }
 
     /// Return true for terminal success state labels used by NVUE actions.
@@ -1987,7 +2301,7 @@ impl GB200SwitchRFTarget {
 
     /// Translate a PLDM bundle AP name (e.g. "ERoT,BMC::,0x4d35368b") into the
     /// target-side component name (e.g. "erot").
-    fn get_target_apname(bundle_ap: &str) -> String {
+    pub(crate) fn get_target_apname(bundle_ap: &str) -> String {
         let mut ap_name: &str = bundle_ap.split(':').next().unwrap_or(bundle_ap);
         if ap_name.contains(',') {
             ap_name = bundle_ap.split(',').next().unwrap_or(ap_name);
@@ -2020,8 +2334,18 @@ impl GB200SwitchRFTarget {
     /// For example, on GB200, cpld1-cpld4 all normalise to "cpld1" because
     /// the package stores a single combined CPLD version string.
     fn normalize_component_name(ap_name: &str, platform_type: &str) -> String {
-        let lower = ap_name.to_lowercase();
+        let lower = if platform_type == "VRNVL72" {
+            Self::normalize_inventory_component(ap_name)
+        } else {
+            ap_name.to_lowercase()
+        };
+        // NVUE may expose one EROT entry per device. All use the package's
+        // EROT version, including EROT-BMC (which must not match BMC instead).
+        if lower.starts_with("erot") {
+            return "erot".to_string();
+        }
         match platform_type {
+            "VRNVL72" if lower == "cpld" => "cpld1".to_string(),
             "GB200" if ["cpld1", "cpld2", "cpld3", "cpld4"].contains(&lower.as_str()) => {
                 "cpld1".to_string()
             }
@@ -2029,6 +2353,38 @@ impl GB200SwitchRFTarget {
             "VRNVL72" if ["cpld1", "cpld2"].contains(&lower.as_str()) => "cpld1".to_string(),
             _ => lower,
         }
+    }
+
+    /// Resolve switch Redfish AP names to the same logical components as NVUE.
+    /// Resource paths/Ids remain unchanged in inventory and comparison results.
+    pub(crate) fn normalize_inventory_component(ap_name: &str) -> String {
+        let lower = ap_name
+            .trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .unwrap_or(ap_name)
+            .to_ascii_lowercase();
+        let component = lower
+            .strip_prefix("mgx_fw_")
+            .or_else(|| lower.strip_prefix("hgx_fw_"))
+            .or_else(|| lower.strip_prefix("fw_"))
+            .unwrap_or(&lower);
+        match component {
+            "bmc_0" => "bmc",
+            "cpu_0" | "sbios_0" | "sbios" => "bios",
+            "fpga_0" | "smr" => "fpga",
+            // BMC CPLD_0 is the combined version, not NVUE's first split CPLD.
+            "cpld_0" => "cpld",
+            value
+                if value.strip_prefix("nvswitch_sma_").is_some_and(|index| {
+                    !index.is_empty() && index.bytes().all(|b| b.is_ascii_digit())
+                }) =>
+            {
+                "sma"
+            }
+            other => other,
+        }
+        .to_owned()
     }
 
     /// Extract a component version from PLDM package data after name normalization.
@@ -2132,23 +2488,25 @@ impl GB200SwitchRFTarget {
 
         let connection_ip = self.bmc_access.ip.replace('[', "").replace(']', "");
         let ssh_host_key_policy = self.bmc_access.ssh_host_key_policy();
-        if let Err(e) = ssh_transport::execute_command_async(
-            &connection_ip,
-            22,
-            &self.bmc_access.user,
-            &self.bmc_access.password,
-            30,
-            &format!("mkdir -p {}", upload_path),
-            None,
-            ssh_host_key_policy.clone(),
-        )
-        .await
-        {
-            if !json_dict {
-                println!("SSH mkdir failed for upload: {}", e);
-            }
-            return None;
-        }
+
+        let staging_dir = RemotePath::new(upload_path.clone())
+            .inspect_err(|e| {
+                if !json_dict {
+                    println!("Invalid upload path: {}", e);
+                }
+            })
+            .ok()?;
+
+        self.bmc_access
+            .switch_cli(UPLOAD_STAGING_TIMEOUT_SECS)
+            .create_directory_tree(&staging_dir)
+            .await
+            .inspect_err(|e| {
+                if !json_dict {
+                    println!("SSH mkdir failed for upload: {}", e);
+                }
+            })
+            .ok()?;
 
         // Build remote file path
         let local_name = std::path::Path::new(file_path)
@@ -2162,7 +2520,7 @@ impl GB200SwitchRFTarget {
             22,
             &self.bmc_access.user,
             &self.bmc_access.password,
-            300,
+            PARALLEL_SFTP_UPLOAD_TIMEOUT_SECS,
             std::path::Path::new(file_path).to_path_buf(),
             remote_file.clone(),
             ssh_host_key_policy,
@@ -2362,19 +2720,24 @@ impl GB200SwitchRFTarget {
         }
 
         if let Some(ref mut jd) = json_dict {
-            if let Some(output) = jd.get_mut("Output").and_then(|v| v.as_array_mut()) {
-                output.push(json!({"Id": &job_id}));
-            }
+            push_switch_task_id(jd, &job_id);
         }
 
         if !is_json {
             println!("Parallel FW update task was created with ID {}", job_id);
         }
 
+        let task_id_list = vec![job_id.clone()];
+        if cmd_args.background {
+            if !is_json {
+                println!("Parallel update method initiated successfully for all components");
+            }
+            return (true, task_id_list, NVFWUPD_STATUS_OK);
+        }
+
         let (ret_code, job_status, task_dict) = self
             .get_task_status(access, &job_id, json_dict.as_deref_mut())
             .await;
-
         if task_dict.is_none() || ret_code == 1 {
             if !is_json {
                 println!("Parallel FW update task failed with ID {}", job_id);
@@ -2395,8 +2758,6 @@ impl GB200SwitchRFTarget {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-
-        let mut task_id_list = vec![job_id.clone()];
 
         if parallel_update {
             if !is_json {
@@ -2546,7 +2907,7 @@ impl GB200SwitchRFTarget {
         recipe_list: &[String],
         pkg_parser: &mut dyn PkgParser,
         cmd_args: &CmdArgs,
-        _time_out: u64,
+        time_out: u64,
         parallel_update: bool,
         mut json_dict: Option<&mut Value>,
         update_delay: u64,
@@ -2567,6 +2928,7 @@ impl GB200SwitchRFTarget {
                         json_dict,
                         update_delay,
                         _skip_pre_flight_checks,
+                        time_out,
                     )
                     .await;
             }
@@ -2777,22 +3139,24 @@ impl GB200SwitchRFTarget {
             };
 
             let is_json = json_dict.is_some();
-            if let Some(ref mut jd) = json_dict {
-                push_switch_progress_event(
-                    jd,
-                    "upload",
-                    Some(&plan.target),
-                    None,
-                    Some("running"),
-                    None,
-                    Some(json!({
-                        "target_index": idx + 1,
-                        "target_count": all_targets.len(),
-                        "local_file": &plan.file_path,
-                        "remote_dir": &plan.remote_dir,
-                        "remote_name": &plan.remote_name,
-                    })),
-                );
+            if !cmd_args.background {
+                if let Some(ref mut jd) = json_dict {
+                    push_switch_progress_event(
+                        jd,
+                        "upload",
+                        Some(&plan.target),
+                        None,
+                        Some("running"),
+                        None,
+                        Some(json!({
+                            "target_index": idx + 1,
+                            "target_count": all_targets.len(),
+                            "local_file": &plan.file_path,
+                            "remote_dir": &plan.remote_dir,
+                            "remote_name": &plan.remote_name,
+                        })),
+                    );
+                }
             }
 
             let dest_path = match self
@@ -2806,21 +3170,23 @@ impl GB200SwitchRFTarget {
                 .await
             {
                 Ok(p) => {
-                    if let Some(ref mut jd) = json_dict {
-                        push_switch_progress_event(
-                            jd,
-                            "upload",
-                            Some(&plan.target),
-                            None,
-                            Some("success"),
-                            None,
-                            Some(json!({
-                                "target_index": idx + 1,
-                                "target_count": all_targets.len(),
-                                "local_file": &plan.file_path,
-                                "remote_path": &p,
-                            })),
-                        );
+                    if !cmd_args.background {
+                        if let Some(ref mut jd) = json_dict {
+                            push_switch_progress_event(
+                                jd,
+                                "upload",
+                                Some(&plan.target),
+                                None,
+                                Some("success"),
+                                None,
+                                Some(json!({
+                                    "target_index": idx + 1,
+                                    "target_count": all_targets.len(),
+                                    "local_file": &plan.file_path,
+                                    "remote_path": &p,
+                                })),
+                            );
+                        }
                     }
                     p
                 }
@@ -2860,21 +3226,23 @@ impl GB200SwitchRFTarget {
                     }
                 }
             });
-            if let Some(ref mut jd) = json_dict {
-                push_switch_progress_event(
-                    jd,
-                    "install",
-                    Some(&plan.target),
-                    None,
-                    Some("posting"),
-                    None,
-                    Some(json!({
-                        "target_index": idx + 1,
-                        "target_count": all_targets.len(),
-                        "url": &url,
-                        "remote_path": &dest_path,
-                    })),
-                );
+            if !cmd_args.background {
+                if let Some(ref mut jd) = json_dict {
+                    push_switch_progress_event(
+                        jd,
+                        "install",
+                        Some(&plan.target),
+                        None,
+                        Some("posting"),
+                        None,
+                        Some(json!({
+                            "target_index": idx + 1,
+                            "target_count": all_targets.len(),
+                            "url": &url,
+                            "remote_path": &dest_path,
+                        })),
+                    );
+                }
             }
 
             let (post_status, post_details, resp_text) = access
@@ -2912,19 +3280,23 @@ impl GB200SwitchRFTarget {
             }
 
             if let Some(ref mut jd) = json_dict {
-                push_switch_progress_event(
-                    jd,
-                    "install",
-                    Some(&plan.target),
-                    Some(&job_id),
-                    Some("accepted"),
-                    None,
-                    Some(json!({
-                        "target_index": idx + 1,
-                        "target_count": all_targets.len(),
-                        "url": &url,
-                    })),
-                );
+                if cmd_args.background {
+                    push_switch_task_id(jd, &job_id);
+                } else {
+                    push_switch_progress_event(
+                        jd,
+                        "install",
+                        Some(&plan.target),
+                        Some(&job_id),
+                        Some("accepted"),
+                        None,
+                        Some(json!({
+                            "target_index": idx + 1,
+                            "target_count": all_targets.len(),
+                            "url": &url,
+                        })),
+                    );
+                }
             }
 
             if json_dict.is_none() {
@@ -3037,9 +3409,14 @@ impl GB200SwitchRFTarget {
         let platform_type = Self::get_platform_type(pldm_version_dict)?;
         let ap_version =
             Self::extract_component_version(pldm_version_dict, ap_name, platform_type)?;
+        let ap_name = if platform_type == "VRNVL72" {
+            Self::normalize_inventory_component(ap_name)
+        } else {
+            ap_name.to_owned()
+        };
         Some(Self::format_component_version(
             &ap_version,
-            ap_name,
+            &ap_name,
             platform_type,
         ))
     }
@@ -3138,7 +3515,11 @@ impl GB200SwitchRFTarget {
             }
             Util::bail_nvfwupd(
                 NVFWUPD_STATUS_ERR,
-                &format!("Failure status for job {}: Error {:?}", task_id, redacted),
+                &format!(
+                    "Failure status for job {}: Error {}",
+                    task_id,
+                    NvUtils::redacted_json_pretty_4space(&Self::task_dict_for_console(&redacted))
+                ),
                 BailAction::DoNothing,
                 print_json.as_deref(),
             );
@@ -3170,6 +3551,19 @@ impl GB200SwitchRFTarget {
             model,
         )
         .await
+    }
+
+    pub(crate) async fn ensure_nvos_asic_firmware_config(&self) -> Result<(), String> {
+        self.ensure_nvos_asic_firmware_config_with_access(SwitchNvueAccess::Legacy, None)
+            .await
+    }
+
+    pub(crate) async fn ensure_nvos_asic_firmware_config_with_client(
+        &self,
+        client: &NvueClient,
+    ) -> Result<(), String> {
+        self.ensure_nvos_asic_firmware_config_with_access(SwitchNvueAccess::Hosted(client), None)
+            .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3394,7 +3788,7 @@ impl RFTarget for GB200SwitchRFTarget {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::io::Write;
 
     use wiremock::matchers::{body_string_contains, method, path, path_regex};
@@ -3444,6 +3838,32 @@ mod tests {
     }
 
     #[test]
+    fn console_task_status_splits_multiline_status_fields() {
+        let status = "EROT-BMC         ... Successfully updated\nEROT-CPU         ... Successfully updated\nBIOS             ... Skipped (same version)\nBMC              ... In progress";
+        let task = json!({
+            "http_status": 200,
+            "state": "running",
+            "status": status,
+            "detail": format!("\n{status}\n"),
+        });
+
+        let rendered = GB200SwitchRFTarget::task_dict_for_console(&task);
+
+        assert_eq!(task["status"], status);
+        assert_eq!(
+            rendered["status"],
+            json!([
+                "EROT-BMC         ... Successfully updated",
+                "EROT-CPU         ... Successfully updated",
+                "BIOS             ... Skipped (same version)",
+                "BMC              ... In progress"
+            ])
+        );
+        assert_eq!(rendered["detail"], rendered["status"]);
+        assert!(!NvUtils::redacted_json_pretty_4space(&rendered).contains("\\n"));
+    }
+
+    #[test]
     fn nvos_reboot_handoff_uses_longer_wait_window() {
         assert_eq!(
             GB200SwitchRFTarget::reboot_wait_minutes_for_target(Some(nvos_image::NVOS_AP_NAME)),
@@ -3456,6 +3876,53 @@ mod tests {
         assert_eq!(
             GB200SwitchRFTarget::reboot_wait_minutes_for_target(None),
             DEFAULT_REBOOT_WAIT_MINUTES
+        );
+    }
+
+    #[test]
+    fn nvos_sftp_upload_timeout_defaults_when_unspecified() {
+        assert_eq!(
+            GB200SwitchRFTarget::nvos_sftp_upload_timeout_secs(0),
+            NVOS_SFTP_UPLOAD_TIMEOUT_SECS
+        );
+        assert_eq!(GB200SwitchRFTarget::nvos_sftp_upload_timeout_secs(90), 90);
+        assert_eq!(
+            GB200SwitchRFTarget::format_upload_timeout(3600),
+            "60 minutes"
+        );
+        assert_eq!(GB200SwitchRFTarget::format_upload_timeout(90), "90 seconds");
+    }
+
+    #[tokio::test]
+    async fn vrnvl72_parallel_sftp_upload_uses_firmware_timeout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let update_file = tmp.path().join("switch_bundle.fwpkg");
+        let mut package_file = std::fs::File::create(&update_file).unwrap();
+        package_file.write_all(b"SWITCH-FIRMWARE").unwrap();
+        drop(package_file);
+
+        let mock_host = "mock-vrnvl72-parallel-upload-timeout";
+        ssh_transport::install_mock_for_host(mock_host);
+        let target = GB200SwitchRFTarget::new(
+            BmcAccess::mock_with_base_url_and_type(
+                "https://mock-switch.example",
+                mock_host,
+                crate::bmc_access::AccessType::NVSwitch,
+            ),
+            None,
+        );
+
+        let remote_path = target
+            .upload_image(&update_file.to_string_lossy(), true, true)
+            .await
+            .expect("parallel upload should succeed");
+
+        let ssh = ssh_transport::take_mock_snapshot(mock_host).unwrap();
+        assert_eq!(remote_path, "/tmp/switch_bundle.fwpkg");
+        assert_eq!(ssh.upload_calls.len(), 1);
+        assert_eq!(
+            ssh.upload_calls[0].timeout_secs, PARALLEL_SFTP_UPLOAD_TIMEOUT_SECS,
+            "VRNVL72 parallel upload should use the firmware SFTP timeout"
         );
     }
 
@@ -3522,13 +3989,13 @@ mod tests {
         assert!(target.query_job_status("job", None).await.0);
     }
 
-    struct SyntheticSwitchComponent<'a> {
-        ap_name: &'a str,
-        version: &'a str,
-        payload: &'a [u8],
+    pub(crate) struct SyntheticSwitchComponent<'a> {
+        pub(crate) ap_name: &'a str,
+        pub(crate) version: &'a str,
+        pub(crate) payload: &'a [u8],
     }
 
-    fn build_synthetic_switch_pldm_package(
+    pub(crate) fn build_synthetic_switch_pldm_package(
         package_version: &str,
         components: &[SyntheticSwitchComponent<'_>],
     ) -> Vec<u8> {
@@ -4130,9 +4597,90 @@ mod tests {
         );
 
         target
-            .ensure_nvos_asic_firmware_config(SwitchNvueAccess::Legacy, None)
+            .ensure_nvos_asic_firmware_config()
             .await
             .expect("concrete revision save fallback should allow NVOS preflight");
+    }
+
+    #[tokio::test]
+    async fn nvos_asic_preflight_accepts_applied_and_saved_revision_state() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/nvue_v1/platform/firmware/ASIC"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "auto-update": "disabled",
+                "fw-source": "custom"
+            })))
+            .expect(1)
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/nvue_v1/revision"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "revision-id": "rev-43"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path("/nvue_v1/platform/firmware/ASIC"))
+            .and(body_string_contains("\"auto-update\":\"enabled\""))
+            .and(body_string_contains("\"fw-source\":\"default\""))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path("/nvue_v1/revision/rev-43"))
+            .and(body_string_contains("\"state\":\"apply\""))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .expect(1)
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        // NVOS applied and saved in one step; the poller must treat the
+        // combined state as terminal success rather than polling to timeout.
+        Mock::given(method("GET"))
+            .and(path("/nvue_v1/revision/rev-43"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "state": "applied_and_saved"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/nvue_v1/platform/firmware/ASIC"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "auto-update": "enabled",
+                "fw-source": "default"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path("/nvue_v1/revision/applied"))
+            .and(body_string_contains("\"state\":\"save\""))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "state": "save"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let target = GB200SwitchRFTarget::new(
+            BmcAccess::mock_with_base_url_and_type(
+                server.uri(),
+                "mock-switch-applied-and-saved",
+                crate::bmc_access::AccessType::NVSwitch,
+            ),
+            None,
+        );
+
+        target
+            .ensure_nvos_asic_firmware_config()
+            .await
+            .expect("applied_and_saved revision state should allow NVOS preflight");
     }
 
     fn count_ssh_command(ssh: &ssh_transport::MockSshSnapshot, command: &str) -> usize {
@@ -4182,7 +4730,6 @@ mod tests {
                 "/nvue_v1/system/image/files/nvos-amd64-25.02.4440.bin",
             ))
             .and(body_string_contains("@install"))
-            .and(body_string_contains("\"force\":false"))
             .and(body_string_contains("\"reboot\":\"no\""))
             .and(body_string_contains(
                 "\"image-file\":\"nvos-amd64-25.02.4440.bin\"",
@@ -4250,10 +4797,8 @@ mod tests {
             "/host/nos-images/nvos-amd64-25.02.4440.bin"
         );
         assert_eq!(
-            ssh.upload_calls[0].timeout_secs,
-            NVOS_SFTP_UPLOAD_TIMEOUT_SECS,
-            "NVOS image uploads should allow a full {}-minute transfer window",
-            NVOS_SFTP_UPLOAD_TIMEOUT_SECS / 60
+            ssh.upload_calls[0].timeout_secs, 1200,
+            "NVOS image uploads should use the caller-provided update timeout"
         );
         assert_eq!(
             count_ssh_command(&ssh, "rm -f '/host/nos-images/nvos-amd64-25.02.4440.bin'"),
@@ -4273,8 +4818,274 @@ mod tests {
             })
             .expect("NVOS install request");
         let body = String::from_utf8_lossy(&install_request.body);
+        assert!(!body.contains("\"force\""));
         assert!(!body.contains("skip-reboot"));
         assert!(body.contains("\"reboot\":\"no\""));
+    }
+
+    #[tokio::test]
+    async fn switch_nvos_bin_install_proceeds_when_listing_lags_then_lists_image() {
+        // NVUE can report an empty image listing immediately after the SFTP
+        // upload and only include the file on a later poll. The bounded
+        // visibility poll must ride out that lag and still drive the install
+        // instead of aborting (and cleaning up) the good upload.
+        struct ListingAppearsAfter {
+            calls: std::sync::atomic::AtomicUsize,
+            appear_on_call: usize,
+        }
+        impl wiremock::Respond for ListingAppearsAfter {
+            fn respond(&self, _request: &wiremock::Request) -> ResponseTemplate {
+                let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                let images = if call >= self.appear_on_call {
+                    json!(["nvos-amd64-25.02.4440.bin"])
+                } else {
+                    json!([])
+                };
+                ResponseTemplate::new(200).set_body_json(json!({ "images": images }))
+            }
+        }
+
+        let server = MockServer::start().await;
+        mock_nvos_asic_preflight_ready_and_saved(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/nvue_v1/system/image/files"))
+            .respond_with(ListingAppearsAfter {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                appear_on_call: 2,
+            })
+            .expect(2..)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(
+                "/nvue_v1/system/image/files/nvos-amd64-25.02.4440.bin",
+            ))
+            .and(body_string_contains("@install"))
+            .respond_with(ResponseTemplate::new(202).set_body_string("job-nvos-install"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/nvue_v1/action/job-nvos-install"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "state": "action_success",
+                "status": "NVOS image installed"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let update_file = tmp.path().join("nvos-amd64-25.02.4440.bin");
+        let mut package_file = std::fs::File::create(&update_file).unwrap();
+        package_file.write_all(b"NVOS-IMAGE").unwrap();
+        drop(package_file);
+
+        let mock_host = "mock-switch-nvos-listing-lag";
+        ssh_transport::install_mock_for_host(mock_host);
+        let mut target = GB200SwitchRFTarget::new(
+            BmcAccess::mock_with_base_url_and_type(
+                server.uri(),
+                mock_host,
+                crate::bmc_access::AccessType::NVSwitch,
+            ),
+            None,
+        );
+        let mut parser = RealSwitchPkgParser {
+            inner: PLDM::new(),
+            parse_calls: 0,
+            unpack_calls: 0,
+        };
+        let args = cmd_args();
+
+        let (err_code, task_ids) = target
+            .start_update_monitor(
+                &[update_file.to_string_lossy().to_string()],
+                &mut parser,
+                &args,
+                1200,
+                false,
+                None,
+                0,
+                false,
+                Some(UpdatePreconditionMode::SingleShot),
+            )
+            .await;
+
+        assert_eq!(
+            err_code, 0,
+            "install should proceed once the listing includes the uploaded image"
+        );
+        assert_eq!(task_ids, vec!["job-nvos-install".to_string()]);
+        let files_gets = server
+            .received_requests()
+            .await
+            .expect("request recording enabled")
+            .iter()
+            .filter(|request| {
+                request.method.to_string() == "GET"
+                    && request.url.path() == "/nvue_v1/system/image/files"
+            })
+            .count();
+        assert!(
+            files_gets >= 2,
+            "expected the visibility poll to retry the listing (got {files_gets} GET(s))"
+        );
+    }
+
+    #[tokio::test]
+    async fn switch_nvos_json_background_update_outputs_task_id_only() {
+        let server = MockServer::start().await;
+        mock_nvos_asic_preflight_ready_and_saved(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/nvue_v1/system/image/files"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "images": ["nvos-amd64-25.02.4440.bin"]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(
+                "/nvue_v1/system/image/files/nvos-amd64-25.02.4440.bin",
+            ))
+            .and(body_string_contains("@install"))
+            .respond_with(ResponseTemplate::new(202).set_body_string("job-nvos-install"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let update_file = tmp.path().join("nvos-amd64-25.02.4440.bin");
+        let mut package_file = std::fs::File::create(&update_file).unwrap();
+        package_file.write_all(b"NVOS-IMAGE").unwrap();
+        drop(package_file);
+
+        let mock_host = "mock-switch-nvos-json-background-ids-only";
+        ssh_transport::install_mock_for_host(mock_host);
+        let mut target = GB200SwitchRFTarget::new(
+            BmcAccess::mock_with_base_url_and_type(
+                server.uri(),
+                mock_host,
+                crate::bmc_access::AccessType::NVSwitch,
+            ),
+            None,
+        );
+        let mut parser = RealSwitchPkgParser {
+            inner: PLDM::new(),
+            parse_calls: 0,
+            unpack_calls: 0,
+        };
+        let mut args = cmd_args();
+        args.background = true;
+        let mut json_output = json!({"Error": [], "Error Code": 0, "Output": []});
+
+        let (err_code, task_ids) = target
+            .start_update_monitor(
+                &[update_file.to_string_lossy().to_string()],
+                &mut parser,
+                &args,
+                1200,
+                false,
+                Some(&mut json_output),
+                0,
+                false,
+                Some(UpdatePreconditionMode::SingleShot),
+            )
+            .await;
+
+        let ssh = ssh_transport::take_mock_snapshot(mock_host).unwrap();
+        assert_eq!(err_code, 0);
+        assert_eq!(task_ids, vec!["job-nvos-install".to_string()]);
+        assert_eq!(parser.parse_calls, 0);
+        assert_eq!(parser.unpack_calls, 0);
+        assert_eq!(ssh.upload_calls.len(), 1);
+        assert_eq!(
+            json_output["Output"],
+            json!([
+                {"Id": "job-nvos-install"},
+            ])
+        );
+
+        let requests = server
+            .received_requests()
+            .await
+            .expect("request recording enabled");
+        assert!(
+            !requests.iter().any(|request| {
+                request.method.to_string() == "GET"
+                    && request.url.path() == "/nvue_v1/action/job-nvos-install"
+            }),
+            "background NVOS update should not poll task status after task creation"
+        );
+    }
+
+    /// B3: on the Hosted/RMS-orchestrated path a transient NVUE failure during a
+    /// suppressed retry poll must not leave a stale `"Error Code": 1` in the JSON
+    /// output. `get_suppressed` logs the failure only; `get` still records it.
+    #[tokio::test]
+    async fn hosted_get_suppressed_does_not_record_transient_error() {
+        let server = MockServer::start().await;
+        // A 200 with an unparseable body drives the hosted error-record path
+        // without needing to tear the server down mid-test.
+        Mock::given(method("GET"))
+            .and(path("/nvue_v1/system/image/files"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("this is not json {"))
+            .mount(&server)
+            .await;
+
+        let client = NvueClient::connect(
+            nvue_client::ClientConfig {
+                endpoint: nvue_client::ClientEndpoint::http("127.0.0.1", server.address().port()),
+                credentials: nvue_client::ClientCredentials::new("admin", "secret"),
+                dangerously_accept_invalid_certs: false,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        let access = SwitchNvueAccess::Hosted(client.as_ref());
+
+        let mock_host = "mock-b3-suppressed";
+        ssh_transport::install_mock_for_host(mock_host);
+        let bmc = BmcAccess::mock_with_base_url_and_type(
+            "http://127.0.0.1",
+            mock_host,
+            crate::bmc_access::AccessType::NVSwitch,
+        );
+
+        let mut suppressed = json!({"Error": [], "Error Code": 0, "Output": []});
+        let (ok, _response) = access
+            .get_suppressed(
+                &bmc,
+                nvos_image::SYSTEM_IMAGE_FILES_URI,
+                5,
+                Some(&mut suppressed),
+            )
+            .await;
+        assert!(!ok);
+        assert_eq!(
+            suppressed["Error Code"],
+            json!(0),
+            "get_suppressed must not record a transient error: {suppressed}"
+        );
+        assert!(suppressed["Error"].as_array().unwrap().is_empty());
+
+        let mut recorded = json!({"Error": [], "Error Code": 0, "Output": []});
+        let (ok2, _response2) = access
+            .get(
+                &bmc,
+                nvos_image::SYSTEM_IMAGE_FILES_URI,
+                5,
+                Some(&mut recorded),
+            )
+            .await;
+        assert!(!ok2);
+        assert_eq!(
+            recorded["Error Code"],
+            json!(1),
+            "non-suppressed get must still record surfaced errors: {recorded}"
+        );
     }
 
     #[tokio::test]
@@ -4359,7 +5170,9 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "images": []
             })))
-            .expect(1)
+            // The visibility check now polls, so the listing is queried one or
+            // more times before the bounded window elapses and cleanup runs.
+            .expect(1..)
             .mount(&server)
             .await;
 
@@ -4770,6 +5583,217 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn switch_json_background_update_outputs_task_ids_only() {
+        let server = MockServer::start().await;
+        for (target_name, job_id) in [
+            ("BMC", "job-bmc-install"),
+            ("EROT", "job-erot-install"),
+            ("FPGA", "job-fpga-install"),
+        ] {
+            Mock::given(method("POST"))
+                .and(path(format!(
+                    "/nvue_v1/platform/firmware/{target_name}/files/switch_bundle.fwpkg"
+                )))
+                .and(body_string_contains("@install"))
+                .respond_with(ResponseTemplate::new(202).set_body_string(job_id))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let update_file = tmp.path().join("switch_bundle.fwpkg");
+        let package = build_synthetic_switch_pldm_package(
+            "GB200-P4978_0004_260413.1.0",
+            &[
+                SyntheticSwitchComponent {
+                    ap_name: "BMC",
+                    version: "88.0002.1979",
+                    payload: b"BMC-PAYLOAD",
+                },
+                SyntheticSwitchComponent {
+                    ap_name: "ERoT",
+                    version: "01.04.0049.0000_n04",
+                    payload: b"EROT-PAYLOAD",
+                },
+                SyntheticSwitchComponent {
+                    ap_name: "SMR",
+                    version: "0.24",
+                    payload: b"FPGA-PAYLOAD",
+                },
+            ],
+        );
+        let mut package_file = std::fs::File::create(&update_file).unwrap();
+        package_file.write_all(&package).unwrap();
+        drop(package_file);
+
+        let mock_host = "mock-switch-json-background-ids-only";
+        ssh_transport::install_mock_for_host(mock_host);
+        let mut target = GB200SwitchRFTarget::new(
+            BmcAccess::mock_with_base_url_and_type(
+                server.uri(),
+                mock_host,
+                crate::bmc_access::AccessType::NVSwitch,
+            ),
+            None,
+        );
+        let mut parser = RealSwitchPkgParser {
+            inner: PLDM::new(),
+            parse_calls: 0,
+            unpack_calls: 0,
+        };
+        let mut args = cmd_args();
+        args.background = true;
+        let mut json_output = json!({"Error": [], "Error Code": 0, "Output": []});
+
+        let (err_code, task_ids) = target
+            .start_update_monitor(
+                &[update_file.to_string_lossy().to_string()],
+                &mut parser,
+                &args,
+                1200,
+                false,
+                Some(&mut json_output),
+                0,
+                true,
+                Some(UpdatePreconditionMode::SingleShot),
+            )
+            .await;
+
+        let ssh = ssh_transport::take_mock_snapshot(mock_host).unwrap();
+        assert_eq!(err_code, 0);
+        assert_eq!(
+            task_ids,
+            vec![
+                "job-bmc-install".to_string(),
+                "job-erot-install".to_string(),
+                "job-fpga-install".to_string(),
+            ]
+        );
+        assert_eq!(ssh.upload_calls.len(), 3);
+        assert_eq!(
+            json_output["Output"],
+            json!([
+                {"Id": "job-bmc-install"},
+                {"Id": "job-erot-install"},
+                {"Id": "job-fpga-install"},
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn vrnvl72_parallel_json_background_update_outputs_task_id_only() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/nvue_v1/platform/firmware"))
+            .and(body_string_contains("@fetch"))
+            .respond_with(ResponseTemplate::new(202).set_body_string("job-fetch"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/nvue_v1/action/job-fetch"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "http_status": 200,
+                "state": "action_success",
+                "status": "fetch completed"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(
+                "/nvue_v1/platform/firmware/files/vrnvl72_switch_bundle.fwpkg",
+            ))
+            .and(body_string_contains("@install"))
+            .respond_with(ResponseTemplate::new(202).set_body_string("job-install"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let update_file = tmp.path().join("vrnvl72_switch_bundle.fwpkg");
+        let package = build_synthetic_switch_pldm_package(
+            "VR-NVL72-N6100-LD_0001_260826.1.0",
+            &[
+                SyntheticSwitchComponent {
+                    ap_name: "BMC",
+                    version: "88.0002.1979",
+                    payload: b"BMC-PAYLOAD",
+                },
+                SyntheticSwitchComponent {
+                    ap_name: "SBIOS",
+                    version: "0ACTV_00.01.022",
+                    payload: b"SBIOS-PAYLOAD",
+                },
+                SyntheticSwitchComponent {
+                    ap_name: "SMA",
+                    version: "35.2014.2184",
+                    payload: b"SMA-PAYLOAD",
+                },
+                SyntheticSwitchComponent {
+                    ap_name: "ERoT",
+                    version: "01.04.0049.0000_n04",
+                    payload: b"EROT-PAYLOAD",
+                },
+                SyntheticSwitchComponent {
+                    ap_name: "CPLD",
+                    version: "000370_REV0600_000377_REV1900",
+                    payload: b"CPLD-VME-PAYLOAD",
+                },
+            ],
+        );
+        let mut package_file = std::fs::File::create(&update_file).unwrap();
+        package_file.write_all(&package).unwrap();
+        drop(package_file);
+
+        let mock_host = "mock-vrnvl72-parallel-json-background-ids-only";
+        ssh_transport::install_mock_for_host(mock_host);
+        let mut target = GB200SwitchRFTarget::new(
+            BmcAccess::mock_with_base_url_and_type(
+                server.uri(),
+                mock_host,
+                crate::bmc_access::AccessType::NVSwitch,
+            ),
+            None,
+        );
+        let mut parser = RealSwitchPkgParser {
+            inner: PLDM::new(),
+            parse_calls: 0,
+            unpack_calls: 0,
+        };
+        let mut args = cmd_args();
+        args.background = true;
+        let mut json_output = json!({"Error": [], "Error Code": 0, "Output": []});
+
+        let (err_code, task_ids) = target
+            .start_update_monitor(
+                &[update_file.to_string_lossy().to_string()],
+                &mut parser,
+                &args,
+                1200,
+                false,
+                Some(&mut json_output),
+                0,
+                true,
+                Some(UpdatePreconditionMode::SingleShot),
+            )
+            .await;
+
+        let requests = server
+            .received_requests()
+            .await
+            .expect("request recording enabled");
+        assert_eq!(err_code, 0);
+        assert_eq!(task_ids, vec!["job-install".to_string()]);
+        assert_eq!(json_output["Output"], json!([{"Id": "job-install"}]));
+        assert!(!requests.iter().any(|request| {
+            request.method.to_string() == "GET"
+                && request.url.path() == "/nvue_v1/action/job-install"
+        }));
+    }
+
+    #[tokio::test]
     async fn switch_json_update_monitors_nvue_action_failure() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -4929,5 +5953,110 @@ mod tests {
         let ret_code = target.run_oob_activation(&args).await;
 
         assert_eq!(ret_code, 1);
+    }
+
+    fn hosted_client(server: &MockServer) -> std::sync::Arc<NvueClient> {
+        NvueClient::new(nvue_client::ClientConfig {
+            endpoint: nvue_client::ClientEndpoint::http("127.0.0.1", server.address().port()),
+            credentials: nvue_client::ClientCredentials::new("admin", "secret"),
+            dangerously_accept_invalid_certs: false,
+        })
+        .expect("hosted NVUE client")
+    }
+
+    /// Both access paths classify a read the same way. A divergence here lets
+    /// one transport treat a reboot as an outage while the other does not.
+    #[tokio::test]
+    async fn both_access_paths_classify_a_read_identically() {
+        let server = MockServer::start().await;
+        let cases = [
+            (
+                "/nvue_v1/readable",
+                200,
+                r#"{"state":"action_success"}"#,
+                ObservedRead::Readable(json!({"state": "action_success"})),
+            ),
+            (
+                "/nvue_v1/answered-json",
+                503,
+                r#"{"status":"System is rebooting"}"#,
+                ObservedRead::Answered(json!({"status": "System is rebooting"})),
+            ),
+            (
+                "/nvue_v1/unparsed-success",
+                200,
+                "not json at all",
+                ObservedRead::answered_unparsed(),
+            ),
+            (
+                "/nvue_v1/unparsed-error",
+                503,
+                "<html>503</html>",
+                ObservedRead::answered_unparsed(),
+            ),
+        ];
+
+        for (case_path, status, body, _) in &cases {
+            Mock::given(method("GET"))
+                .and(path(*case_path))
+                .respond_with(ResponseTemplate::new(*status).set_body_string(*body))
+                .expect(2)
+                .mount(&server)
+                .await;
+        }
+
+        let legacy_access = BmcAccess::mock_with_base_url_and_type(
+            server.uri(),
+            "mock-switch",
+            crate::bmc_access::AccessType::NVSwitch,
+        );
+        let client = hosted_client(&server);
+
+        for (case_path, status, _, expected) in &cases {
+            let legacy = SwitchNvueAccess::Legacy
+                .observe_action_status(&legacy_access, case_path)
+                .await;
+            let hosted = SwitchNvueAccess::Hosted(&client)
+                .observe_action_status(&legacy_access, case_path)
+                .await;
+
+            assert_eq!(
+                &legacy, expected,
+                "unexpected Legacy outcome for HTTP {status} at {case_path}"
+            );
+            assert_eq!(
+                &hosted, expected,
+                "unexpected Hosted outcome for HTTP {status} at {case_path}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn hosted_access_reports_a_missing_response_with_its_cause() {
+        let server = MockServer::start().await;
+        // The response outlives the status-read timeout, so no response arrives.
+        Mock::given(method("GET"))
+            .and(path("/nvue_v1/action/job-power-cycle"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(5)))
+            .mount(&server)
+            .await;
+
+        let legacy_access = BmcAccess::mock_with_base_url_and_type(
+            server.uri(),
+            "mock-switch",
+            crate::bmc_access::AccessType::NVSwitch,
+        );
+        let client = hosted_client(&server);
+
+        match SwitchNvueAccess::Hosted(&client)
+            .observe_action_status(&legacy_access, "/nvue_v1/action/job-power-cycle")
+            .await
+        {
+            ObservedRead::NoResponse(cause) => assert!(
+                !cause.is_empty(),
+                "a missing response must carry its transport cause"
+            ),
+            other => panic!("an unreachable switch must not look answered: {other:?}"),
+        }
     }
 }

@@ -16,79 +16,61 @@
  */
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
 
 use crate::api::grpc::conversions::{
-    failed_node_results, flatten_node_info, proto_node_type_to_domain, timestamp_from_datetime,
+    failed_node_results, flatten_node_info, timestamp_from_datetime,
 };
 use crate::api::grpc::firmware_task_util::terminal_firmware_task_error;
 use crate::api::grpc::node_type_resolver::{
     resolve_firmware_target_selectors, resolve_node_info, resolve_node_type,
 };
+use crate::config::FirmwareTaskPollOptions;
+use crate::config::hardware_profiles::{
+    ActivationStrategy, FirmwareTargetPlan, HardwareProfileCatalog, HardwareUpdatePlan,
+    VerificationPolicy,
+};
 use crate::domain::node::{
     ExpectedInventoryPolicy, FirmwareActivationMode, FirmwareActivationRequest, FirmwareInfo,
     FirmwareTarget, FirmwareTaskStatus, FirmwareType, FirmwareUpdateOptions, FirmwareUpdateOutcome,
-    FirmwareUpdateSummary, FirmwareVersionCheckSummary, Node, NodeKind, NodeType,
+    FirmwareUpdateSummary, FirmwareVersionCheckSummary, Node, NodeKind, NodeType, Recoverable,
+    RecoveryBundles, RecoveryProfile,
 };
 use crate::domain::rack::NodeConfig;
 use crate::nodes::NodeInstance;
-use crate::nodes::compute_gb200_nvidia::flint_device_family;
+use crate::nodes::compute_gb200_nvidia::flint_family_for_target;
 use crate::nodes::compute_gb300_supermicro::{
     SUPERMICRO_BIOS_TARGET, SUPERMICRO_BMC_TARGET, SUPERMICRO_HGX_TARGET, supermicro_bmc_target,
 };
-use crate::orchestrator::job_lifecycle::{JobError, JobId};
+use crate::nodes::nvfwupd_adapter::{effective_force_update, is_identical_image_rejection};
+use crate::orchestrator::job_lifecycle::{JobError, JobFailure, JobId};
 use crate::orchestrator::job_tracker::{JobTracker, JobType, RmsJobHandle, job_error_of};
+use crate::persistence::FirmwareObjectStore;
 use crate::utilities::error::{ErrorCode, Result, RmsError};
 use crate::utilities::insert_json_field;
 use librms::protos::rack_manager as rm;
 
 use super::server::{RackManagerServiceImpl, find_node, find_rack};
 
-// Upper bound on how long to poll a single firmware task for completion before
-// giving up, keyed by node kind (see `firmware_poll_timeout`). These are
-// conservative safety ceilings, not tuned SLAs: the poll loop exits the moment
-// the task reaches a terminal state, so a bound only matters for a wedged task
-// (stuck in `running` on a device hang or network partition) that would
-// otherwise hold the node's single active-leaf slot. Switch = 3h is the original
-// uniform bound, kept for the longest path (image upload + install + reboot /
-// activate). Compute = 90m and powershelf = 60m are bounded tighter, ordered by
-// relative update-path length, so a wedged task frees the node sooner.
-//
-// Live GB200 runs corroborate the headroom: a single compute FW_BMC_0 flash
-// (incl. activation/reboot/background-copy) ran ~20-22 min (staging ~13-14 min),
-// and a full switch NVOS flash ~22-23 min -- leaving roughly 4x headroom on
-// compute and 7-8x on switch. Powershelf was not exercised live, so its bound
-// rests on the relative-ordering argument (shorter path than compute).
-const SWITCH_FIRMWARE_POLL_TIMEOUT: Duration = Duration::from_secs(3 * 60 * 60);
-const COMPUTE_FIRMWARE_POLL_TIMEOUT: Duration = Duration::from_secs(90 * 60);
-const POWERSHELF_FIRMWARE_POLL_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+mod profile_trace;
 
-/// Returns the firmware-task poll timeout for a node, keyed by its kind.
-fn firmware_poll_timeout(node_type: NodeType) -> Duration {
-    match node_type.kind() {
-        NodeKind::Switch => SWITCH_FIRMWARE_POLL_TIMEOUT,
-        NodeKind::Compute => COMPUTE_FIRMWARE_POLL_TIMEOUT,
-        NodeKind::Powershelf => POWERSHELF_FIRMWARE_POLL_TIMEOUT,
-    }
-}
-/// Delay between successive polls of an in-flight firmware task.
-const FIRMWARE_POLL_INTERVAL: Duration = Duration::from_secs(5);
-/// How long to tolerate task-status read failures before surfacing the error.
-const FIRMWARE_TRANSIENT_POLL_ERROR_RETRY_TIMEOUT: Duration = Duration::from_secs(15 * 60);
-#[cfg(not(test))]
-const SUPERMICRO_BMC_TASK_LOSS_RECOVERY_GRACE_PERIOD: Duration =
-    FIRMWARE_TRANSIENT_POLL_ERROR_RETRY_TIMEOUT;
-// Keep recovery tests fast while still exercising a nonzero retry window.
-#[cfg(test)]
-const SUPERMICRO_BMC_TASK_LOSS_RECOVERY_GRACE_PERIOD: Duration = Duration::from_millis(10);
 const POST_ACTIVATION_VERSION_CHECK_ATTEMPTS: usize = 5;
+/// Probes of the management API after activation before the readiness poll,
+/// the budget the GB200 power cycle gives NVUE to come back (45 x 15 s).
+const POST_ACTIVATION_REACHABILITY_ATTEMPTS: usize = 45;
 /// Maximum number of stateless firmware inventory reads performed concurrently.
 const FIRMWARE_INVENTORY_FETCH_CONCURRENCY: usize = 16;
+/// Upper bound on the pause before re-reading a task that already reported a
+/// terminal failure, to catch a late-arriving diagnostic message. Bounded
+/// independently of the poll interval so that tuning poll verbosity does not
+/// slow failure reporting.
+const TERMINAL_TASK_REFETCH_GRACE: Duration = Duration::from_secs(5);
 
 pub(crate) type FirmwareTargetExpectedVersions = HashMap<NodeType, HashMap<String, String>>;
 
@@ -99,6 +81,7 @@ mod timing {
         Duration::from_secs(60);
     pub(super) const POST_ACTIVATION_VERSION_CHECK_RETRY_INTERVAL: Duration =
         Duration::from_secs(60);
+    pub(super) const POST_ACTIVATION_REACHABILITY_INTERVAL: Duration = Duration::from_secs(15);
 }
 
 #[cfg(test)]
@@ -106,12 +89,17 @@ mod timing {
     use std::time::Duration;
     pub(super) const POST_ACTIVATION_VERSION_CHECK_INITIAL_DELAY: Duration = Duration::ZERO;
     pub(super) const POST_ACTIVATION_VERSION_CHECK_RETRY_INTERVAL: Duration = Duration::ZERO;
+    pub(super) const POST_ACTIVATION_REACHABILITY_INTERVAL: Duration = Duration::ZERO;
 }
 
+use crate::api::grpc::firmware_object_handlers::{
+    firmware_versions_match, resolve_recovery_bundles_from_latest_object,
+};
 use crate::api::grpc::node_recovery::{attempt_bmc_aux_powercycle_recovery, is_unreachable_err};
 
 use timing::{
-    POST_ACTIVATION_VERSION_CHECK_INITIAL_DELAY, POST_ACTIVATION_VERSION_CHECK_RETRY_INTERVAL,
+    POST_ACTIVATION_REACHABILITY_INTERVAL, POST_ACTIVATION_VERSION_CHECK_INITIAL_DELAY,
+    POST_ACTIVATION_VERSION_CHECK_RETRY_INTERVAL,
 };
 
 /// Sleeps for `duration` unless `cancel` fires first. Returns `true` if the
@@ -144,21 +132,26 @@ fn post_activation_version_check_cancelled_error() -> RmsError {
     RmsError::cancelled("post-activation firmware version check cancelled before completion")
 }
 
+/// Distinguishes a completed device task from a failed task eligible for a skip.
+#[derive(Debug)]
+enum PolledFirmwareTask {
+    Completed(FirmwareTaskStatus),
+    IdenticalImageRejected(FirmwareTaskStatus),
+}
+
 // Poll `node.poll_firmware_task(task_id)` until completion, returning poll
 // errors, timeouts, and failed terminal task states as RMS errors.
 #[cfg(test)]
-pub(crate) async fn poll_firmware_task_until_complete<N: Node>(
+async fn poll_firmware_task_until_complete<N: Node>(
     node: &N,
     task_id: &str,
-    timeout: Duration,
-    interval: Duration,
-) -> Result<FirmwareTaskStatus> {
+    options: FirmwareTaskPollOptions,
+) -> Result<PolledFirmwareTask> {
     poll_firmware_task_until_complete_with_retry_timeout(
         node,
         task_id,
-        timeout,
-        interval,
-        FIRMWARE_TRANSIENT_POLL_ERROR_RETRY_TIMEOUT,
+        options,
+        false,
         &CancellationToken::new(),
     )
     .await
@@ -167,12 +160,17 @@ pub(crate) async fn poll_firmware_task_until_complete<N: Node>(
 async fn poll_firmware_task_until_complete_with_retry_timeout<N: Node>(
     node: &N,
     task_id: &str,
-    timeout: Duration,
-    interval: Duration,
-    transient_error_retry_timeout: Duration,
+    options: FirmwareTaskPollOptions,
+    allow_identical_image_skip: bool,
     cancel: &CancellationToken,
-) -> Result<FirmwareTaskStatus> {
-    let deadline = Instant::now() + timeout;
+) -> Result<PolledFirmwareTask> {
+    let FirmwareTaskPollOptions {
+        timeout,
+        interval,
+        transient_error_timeout,
+    } = options;
+
+    let deadline = tokio::time::Instant::now() + timeout;
     let mut transient_poll_error_started_at = None;
     loop {
         if cancel.is_cancelled() {
@@ -182,30 +180,50 @@ async fn poll_firmware_task_until_complete_with_retry_timeout<N: Node>(
         match node.poll_firmware_task(task_id).await {
             Ok(st) if st.completed => {
                 if let Some(error) = terminal_firmware_task_error("firmware task", task_id, &st) {
-                    return Err(refetch_terminal_firmware_task_error(
-                        node, task_id, st, error, interval,
+                    let initial_identical_image = is_identical_image_rejection(&st);
+
+                    let (status, error) = refetch_terminal_firmware_task_failure(
+                        node, task_id, st, error, interval, cancel,
                     )
-                    .await);
+                    .await?;
+
+                    if allow_identical_image_skip
+                        && initial_identical_image
+                        && status.completed
+                        && is_identical_image_rejection(&status)
+                    {
+                        if cancel.is_cancelled() {
+                            return Err(firmware_poll_cancelled_error(task_id));
+                        }
+
+                        return Ok(PolledFirmwareTask::IdenticalImageRejected(status));
+                    }
+
+                    return Err(error);
                 }
-                return Ok(st);
+
+                return Ok(PolledFirmwareTask::Completed(st));
             }
             Ok(_) => {
                 transient_poll_error_started_at = None;
-                if Instant::now() >= deadline {
+                let now = tokio::time::Instant::now();
+
+                if now >= deadline {
                     tracing::error!(node = %node.id(), timeout_secs = timeout.as_secs(), task_id, "polling firmware task exceeded timeout");
                     return Err(RmsError::internal(format!(
                         "polling firmware task {task_id} exceeded timeout of {}s",
                         timeout.as_secs()
                     )));
                 }
-                if !sleep_unless_cancelled(interval, cancel).await {
+                let sleep_for = std::cmp::min(interval, deadline.saturating_duration_since(now));
+                if !sleep_unless_cancelled(sleep_for, cancel).await {
                     return Err(firmware_poll_cancelled_error(task_id));
                 }
             }
             Err(e) if is_retryable_firmware_poll_error(&e) => {
-                let now = Instant::now();
+                let now = tokio::time::Instant::now();
                 let retry_started_at = *transient_poll_error_started_at.get_or_insert(now);
-                let retry_deadline = retry_started_at + transient_error_retry_timeout;
+                let retry_deadline = retry_started_at + transient_error_timeout;
                 let error_deadline = std::cmp::min(deadline, retry_deadline);
 
                 if now >= error_deadline {
@@ -234,31 +252,51 @@ fn is_retryable_firmware_poll_error(error: &RmsError) -> bool {
         && message.contains("failed to retrieve task status")
 }
 
-async fn refetch_terminal_firmware_task_error<N: Node>(
+/// Re-reads a failed terminal task after a short grace to catch late Redfish messages.
+/// Cancellation returns the initial result so the caller can preserve a failure or reject a skip.
+async fn refetch_terminal_firmware_task_failure<N: Node>(
     node: &N,
     task_id: &str,
     initial_status: FirmwareTaskStatus,
     initial_error: RmsError,
     interval: Duration,
-) -> RmsError {
-    if !interval.is_zero() {
-        tokio::time::sleep(interval).await;
+    cancel: &CancellationToken,
+) -> Result<(FirmwareTaskStatus, RmsError)> {
+    let grace = std::cmp::min(interval, TERMINAL_TASK_REFETCH_GRACE);
+
+    if !sleep_unless_cancelled(grace, cancel).await {
+        return Ok((initial_status, initial_error));
     }
 
-    let Ok(refetched_status) = node.poll_firmware_task(task_id).await else {
-        return initial_error;
+    let refetched = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => return Ok((initial_status, initial_error)),
+        result = node.poll_firmware_task(task_id) => result,
     };
+
+    let Ok(refetched_status) = refetched else {
+        // An unreadable second response cannot confirm an identical-image-only rejection.
+        return Err(initial_error);
+    };
+
     let Some(refetched_error) =
         terminal_firmware_task_error("firmware task", task_id, &refetched_status)
     else {
-        return initial_error;
+        return Ok((refetched_status, initial_error));
     };
 
-    if refetched_status.completed && refetched_status.message.len() > initial_status.message.len() {
+    let newly_discovered_failure = is_identical_image_rejection(&initial_status)
+        && !is_identical_image_rejection(&refetched_status);
+
+    let error = if refetched_status.message.len() > initial_status.message.len()
+        || newly_discovered_failure
+    {
         refetched_error
     } else {
         initial_error
-    }
+    };
+
+    Ok((refetched_status, error))
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -343,9 +381,40 @@ fn validate_firmware_request_with_policy(
     activate: bool,
     allow_mixed_inband_oob: bool,
 ) -> Result<()> {
+    if node_type == NodeType::ComputeGb200Dell {
+        crate::nodes::compute_gb200_dell::validate_firmware_targets(targets)?;
+    }
+    let linkx: Vec<_> = targets.iter().filter(|t| is_linkx_target(t)).collect();
+    if !linkx.is_empty() {
+        if node_type != NodeType::ComputeVrnvl72Nvidia {
+            return Err(RmsError::invalid_argument(
+                "LINKX is supported only on NVIDIA VRNVL72 compute trays",
+            ));
+        }
+        if linkx.len() != 1 {
+            return Err(RmsError::invalid_argument(
+                "select exactly one LINKX image for the four physical connectors",
+            ));
+        }
+        if !activate {
+            return Err(RmsError::failed_precondition(
+                "LINKX requires activate=true because the flash command activates the module immediately",
+            ));
+        }
+        if linkx[0].linkx_policy.is_none() {
+            return Err(RmsError::failed_precondition(
+                "LINKX requires ApplyFirmwareObject with a LinkxRollout policy",
+            ));
+        }
+        if targets.len() != 1 && !allow_mixed_inband_oob {
+            return Err(RmsError::invalid_argument(
+                "out-of-band and LINKX targets cannot be mixed in a direct request",
+            ));
+        }
+    }
     let inband_count = targets
         .iter()
-        .filter(|target| flint_device_family(&target.component).is_some())
+        .filter(|target| flint_family_for_target(target).is_some())
         .count();
     if targets
         .iter()
@@ -383,7 +452,7 @@ fn firmware_update_groups(
     if node_type.supports_flint_inband_firmware()
         && targets
             .iter()
-            .all(|target| flint_device_family(&target.component).is_some())
+            .all(|target| flint_family_for_target(target).is_some())
     {
         vec![targets.to_vec()]
     } else {
@@ -391,17 +460,22 @@ fn firmware_update_groups(
     }
 }
 
+fn is_linkx_target(target: &FirmwareTarget) -> bool {
+    target.component.trim().eq_ignore_ascii_case("LINKX")
+}
+
 async fn update_firmware_group_with_bmc_recovery<N: Node>(
     node: &N,
     targets: &[FirmwareTarget],
     force_update: bool,
+    poll_options: FirmwareTaskPollOptions,
     progress: Option<FirmwareTaskProgress<'_>>,
     cancel: &CancellationToken,
 ) -> std::result::Result<FirmwareTargetDisposition, FirmwareTargetUpdateError> {
     let inband = node.node_type().supports_flint_inband_firmware()
         && targets
             .iter()
-            .all(|target| flint_device_family(&target.component).is_some());
+            .all(|target| flint_family_for_target(target).is_some());
     if !inband {
         let [target] = targets else {
             return Err(FirmwareTargetUpdateError::Update(
@@ -414,6 +488,7 @@ async fn update_firmware_group_with_bmc_recovery<N: Node>(
             node,
             target,
             force_update,
+            poll_options,
             progress,
             cancel,
         )
@@ -442,7 +517,16 @@ async fn update_firmware_group_with_bmc_recovery<N: Node>(
         )
         .await
         .map_err(FirmwareTargetUpdateError::Update)?;
-    firmware_update_outcome_until_done(node, progress_target, outcome, progress, cancel).await
+    firmware_update_outcome_until_done(
+        node,
+        progress_target,
+        outcome,
+        force_update,
+        poll_options,
+        progress,
+        cancel,
+    )
+    .await
 }
 
 /// Wraps `update_firmware_target_until_done_with_progress` with a single
@@ -452,6 +536,7 @@ async fn update_firmware_target_with_bmc_recovery<N: Node>(
     node: &N,
     target: &FirmwareTarget,
     force_update: bool,
+    poll_options: FirmwareTaskPollOptions,
     progress: Option<FirmwareTaskProgress<'_>>,
     cancel: &CancellationToken,
 ) -> std::result::Result<FirmwareTargetDisposition, FirmwareTargetUpdateError> {
@@ -459,6 +544,7 @@ async fn update_firmware_target_with_bmc_recovery<N: Node>(
         node,
         target,
         force_update,
+        poll_options,
         progress,
         cancel,
     )
@@ -482,6 +568,7 @@ async fn update_firmware_target_with_bmc_recovery<N: Node>(
                         node,
                         target,
                         force_update,
+                        poll_options,
                         None,
                         cancel,
                     )
@@ -525,11 +612,13 @@ async fn update_firmware_target_until_done<N: Node>(
     node: &N,
     target: &FirmwareTarget,
     force_update: bool,
+    poll_options: FirmwareTaskPollOptions,
 ) -> std::result::Result<FirmwareTargetDisposition, FirmwareTargetUpdateError> {
     update_firmware_target_until_done_with_progress(
         node,
         target,
         force_update,
+        poll_options,
         None,
         &CancellationToken::new(),
     )
@@ -542,6 +631,7 @@ async fn update_firmware_target_until_done_with_progress<N: Node>(
     node: &N,
     target: &FirmwareTarget,
     force_update: bool,
+    poll_options: FirmwareTaskPollOptions,
     progress: Option<FirmwareTaskProgress<'_>>,
     cancel: &CancellationToken,
 ) -> std::result::Result<FirmwareTargetDisposition, FirmwareTargetUpdateError> {
@@ -570,13 +660,24 @@ async fn update_firmware_target_until_done_with_progress<N: Node>(
         Err(e) => return Err(FirmwareTargetUpdateError::Update(e)),
     };
 
-    firmware_update_outcome_until_done(node, target, outcome, progress, cancel).await
+    firmware_update_outcome_until_done(
+        node,
+        target,
+        outcome,
+        force_update,
+        poll_options,
+        progress,
+        cancel,
+    )
+    .await
 }
 
 async fn firmware_update_outcome_until_done<N: Node>(
     node: &N,
     target: &FirmwareTarget,
     outcome: FirmwareUpdateOutcome,
+    force_update: bool,
+    poll_options: FirmwareTaskPollOptions,
     progress: Option<FirmwareTaskProgress<'_>>,
     cancel: &CancellationToken,
 ) -> std::result::Result<FirmwareTargetDisposition, FirmwareTargetUpdateError> {
@@ -594,48 +695,111 @@ async fn firmware_update_outcome_until_done<N: Node>(
             }
 
             let recover_supermicro_bmc = supermicro_bmc_task_loss_recovery_allowed(node, target);
-            let transient_error_retry_timeout = if recover_supermicro_bmc {
-                SUPERMICRO_BMC_TASK_LOSS_RECOVERY_GRACE_PERIOD
-            } else {
-                FIRMWARE_TRANSIENT_POLL_ERROR_RETRY_TIMEOUT
-            };
+            let recover_liteon_vr_pmc = liteon_vr_pmc_task_loss_recovery_allowed(node, target);
+            // Recovery may not outlive the poll loop's own task deadline.
+            let task_deadline = tokio::time::Instant::now() + poll_options.timeout;
+
+            let effective_force = effective_force_update(
+                target,
+                force_update,
+                &firmware_update_options_for_node(node, cancel),
+            );
+
             let poll_result = poll_firmware_task_until_complete_with_retry_timeout(
                 node,
                 &handle.task_id,
-                firmware_poll_timeout(node.node_type()),
-                FIRMWARE_POLL_INTERVAL,
-                transient_error_retry_timeout,
+                poll_options,
+                !effective_force,
                 cancel,
             )
             .await;
-            if let Err(poll_error) = poll_result {
-                if recover_supermicro_bmc && is_retryable_firmware_poll_error(&poll_error) {
-                    if let Some(progress) = progress.as_ref() {
-                        progress.tracker.mark_running(
-                            progress.job_id,
-                            &format!(
-                                "Firmware task {} is unavailable; verifying installed Supermicro BMC version {}",
-                                handle.task_id,
-                                target.expected_version.as_deref().unwrap_or("unknown")
-                            ),
-                        );
+            // Cleanup is deliberately outside the cancellation token. A device
+            // task may outlive RMS polling; the adapter decides whether its
+            // temporary settings can be restored and reports failures here.
+            let poll_result = finish_firmware_task(node, &handle.task_id, poll_result).await;
+
+            let poll_error = match poll_result {
+                Ok(PolledFirmwareTask::Completed(status)) => {
+                    debug_assert!(status.completed);
+                    return Ok(FirmwareTargetDisposition::Applied { summary: None });
+                }
+                Ok(PolledFirmwareTask::IdenticalImageRejected(status)) => {
+                    if cancel.is_cancelled() {
+                        return Err(FirmwareTargetUpdateError::Poll(
+                            firmware_poll_cancelled_error(&handle.task_id),
+                        ));
                     }
-                    let summary = recover_supermicro_bmc_update_after_task_loss(
-                        node,
-                        target,
-                        &handle.task_id,
-                        &poll_error,
-                        cancel,
-                    )
-                    .await
-                    .map_err(FirmwareTargetUpdateError::Poll)?;
-                    return Ok(FirmwareTargetDisposition::Applied {
-                        summary: Some(summary),
+
+                    return Ok(FirmwareTargetDisposition::Skipped {
+                        reason: status.message,
                     });
                 }
-                return Err(FirmwareTargetUpdateError::Poll(poll_error));
+                Err(error) => error,
+            };
+
+            // On this platform the exhausted transient-error window is the
+            // trigger for version verification rather than a failure, so
+            // `transient_error_timeout` doubles as the grace period before
+            // RMS concludes the task is gone. Setting it far below the
+            // flash duration verifies against pre-update firmware and
+            // reports a version mismatch instead of retrying.
+            if recover_supermicro_bmc && is_retryable_firmware_poll_error(&poll_error) {
+                if let Some(progress) = progress.as_ref() {
+                    progress.tracker.mark_running(
+                        progress.job_id,
+                        &format!(
+                            "Firmware task {} is unavailable; verifying installed Supermicro BMC version {}",
+                            handle.task_id,
+                            target.expected_version.as_deref().unwrap_or("unknown")
+                        ),
+                    );
+                }
+
+                let summary = recover_supermicro_bmc_update_after_task_loss(
+                    node,
+                    target,
+                    &handle.task_id,
+                    &poll_error,
+                    cancel,
+                )
+                .await
+                .map_err(FirmwareTargetUpdateError::Poll)?;
+
+                return Ok(FirmwareTargetDisposition::Applied {
+                    summary: Some(summary),
+                });
             }
-            Ok(FirmwareTargetDisposition::Applied { summary: None })
+
+            if recover_liteon_vr_pmc && is_retryable_firmware_poll_error(&poll_error) {
+                if let Some(progress) = progress.as_ref() {
+                    progress.tracker.mark_running(
+                        progress.job_id,
+                        &format!(
+                            "Firmware task {} is unavailable; verifying installed LiteOn PMC version {}",
+                            handle.task_id,
+                            target.expected_version.as_deref().unwrap_or("unknown")
+                        ),
+                    );
+                }
+
+                let summary = recover_liteon_vr_pmc_update_after_task_loss(
+                    node,
+                    target,
+                    &handle.task_id,
+                    &poll_error,
+                    poll_options,
+                    task_deadline,
+                    cancel,
+                )
+                .await
+                .map_err(FirmwareTargetUpdateError::Poll)?;
+
+                return Ok(FirmwareTargetDisposition::Applied {
+                    summary: Some(summary),
+                });
+            }
+
+            Err(FirmwareTargetUpdateError::Poll(poll_error))
         }
         FirmwareUpdateOutcome::Completed(summary) => Ok(FirmwareTargetDisposition::Applied {
             summary: Some(summary),
@@ -643,6 +807,33 @@ async fn firmware_update_outcome_until_done<N: Node>(
         FirmwareUpdateOutcome::Skipped { reason } => {
             Ok(FirmwareTargetDisposition::Skipped { reason })
         }
+    }
+}
+
+async fn finish_firmware_task<N: Node, T>(node: &N, task_id: &str, result: Result<T>) -> Result<T> {
+    let Some(cleanup) = node.firmware_task_cleanup() else {
+        return result;
+    };
+    match (result, cleanup.finish(task_id).await) {
+        (result, Ok(())) => result,
+        // The firmware is already applied; failing here would skip activation.
+        // The adapter keeps the pending setting and retries before its next upload.
+        (Ok(status), Err(cleanup_error)) => {
+            tracing::warn!(
+                node = node.id(),
+                task_id,
+                error = %cleanup_error.message,
+                "firmware task succeeded but cleanup failed; continuing"
+            );
+            Ok(status)
+        }
+        (Err(error), Err(cleanup_error)) => Err(RmsError::new(
+            error.code,
+            format!(
+                "{}; firmware task cleanup failed: {}",
+                error.message, cleanup_error.message
+            ),
+        )),
     }
 }
 
@@ -658,6 +849,156 @@ fn supermicro_bmc_task_loss_recovery_allowed<N: Node>(node: &N, target: &Firmwar
             .expected_version
             .as_deref()
             .is_some_and(|version| !version.trim().is_empty())
+}
+
+/// Enables VR NVL72 LiteOn PMC task-loss recovery.
+///
+/// The PMC restarts to activate its image, rejects authenticated requests for
+/// many minutes, and comes back without the Redfish task (HTTP 404). Only the
+/// PMC target carries a manifest `expected_version` for this node type, so that
+/// version is both the selector and the independent post-condition.
+fn liteon_vr_pmc_task_loss_recovery_allowed<N: Node>(node: &N, target: &FirmwareTarget) -> bool {
+    node.node_type() == NodeType::PowershelfVrnvl72Liteon
+        && target
+            .expected_version
+            .as_deref()
+            .is_some_and(|version| !version.trim().is_empty())
+}
+
+/// Completes a VR LiteOn PMC update whose task vanished across the PMC restart.
+///
+/// This is not general task-failure recovery: the update succeeds only when the
+/// PMC firmware inventory reports the manifest version. The PMC may still be
+/// restarting, so the inventory is polled until `transient_error_timeout`
+/// elapses or the poll loop's `task_deadline` passes, whichever is first, then
+/// the last completed observation is reported as a failure. No read starts at
+/// or after the deadline. A read that reaches the deadline reports a read
+/// timeout, including a matching response received at that boundary. Reads are
+/// abandoned on cancellation, which takes precedence over accepting a match.
+async fn recover_liteon_vr_pmc_update_after_task_loss<N: Node>(
+    node: &N,
+    target: &FirmwareTarget,
+    task_id: &str,
+    poll_error: &RmsError,
+    poll_options: FirmwareTaskPollOptions,
+    task_deadline: tokio::time::Instant,
+    cancel: &CancellationToken,
+) -> Result<FirmwareUpdateSummary> {
+    let Some(expected_version) = target
+        .expected_version
+        .as_deref()
+        .map(str::trim)
+        .filter(|version| !version.is_empty())
+    else {
+        return Err(RmsError::internal(
+            "LiteOn PMC task-loss recovery requires an expected firmware manifest version",
+        ));
+    };
+    tracing::warn!(
+        node = %node.id(),
+        task_id,
+        expected_version,
+        error = %poll_error.message,
+        "LiteOn PMC firmware task became unavailable; checking installed PMC version"
+    );
+
+    let deadline = std::cmp::min(
+        tokio::time::Instant::now() + poll_options.transient_error_timeout,
+        task_deadline,
+    );
+
+    let mut last_observation =
+        "firmware inventory recovery budget expired before any read".to_owned();
+
+    loop {
+        if cancel.is_cancelled() {
+            return Err(firmware_poll_cancelled_error(task_id));
+        }
+
+        // A deferred select branch must check expiry before starting a read;
+        // the timeout also bounds a read held by a rebooting PMC.
+        let read = tokio::select! {
+            _ = cancel.cancelled() => return Err(firmware_poll_cancelled_error(task_id)),
+            read = async {
+                if tokio::time::Instant::now() >= deadline {
+                    return None;
+                }
+
+                Some(tokio::time::timeout_at(deadline, node.get_firmware_inventory()).await)
+            } => read,
+        };
+
+        if cancel.is_cancelled() {
+            return Err(firmware_poll_cancelled_error(task_id));
+        }
+
+        let Some(read) = read else {
+            break;
+        };
+
+        // Tokio polls the read before its timeout, so a ready result can still
+        // arrive at an expired deadline.
+        let read_finished_at = tokio::time::Instant::now();
+
+        match read {
+            Ok(Ok(inventory)) if read_finished_at < deadline => {
+                let pmc = inventory
+                    .iter()
+                    .find(|item| item.name.to_ascii_uppercase().starts_with("FW_PMC"));
+                match pmc {
+                    Some(item) if firmware_versions_match(&item.version, expected_version) => {
+                        return Ok(FirmwareUpdateSummary {
+                            message: format!(
+                                "LiteOn PMC task disappeared across the PMC restart; installed version matches firmware manifest version {expected_version}"
+                            ),
+                            task_ids: vec![task_id.to_owned()],
+                            details: serde_json::json!({
+                                "recovery": "liteon_vr_pmc_task_loss_firmware_manifest_version_match",
+                                "task_id": task_id,
+                                "expected_version": expected_version,
+                                "installed_version": item.version.trim(),
+                                "inventory_item": item.name,
+                                "health": item.health,
+                                "poll_error": &poll_error.message,
+                            }),
+                        });
+                    }
+                    Some(item) => {
+                        last_observation =
+                            format!("{} reports version {}", item.name, item.version.trim());
+                    }
+                    None => {
+                        last_observation = "no FW_PMC entry in the firmware inventory".to_owned();
+                    }
+                }
+            }
+            Ok(Err(error)) if read_finished_at < deadline => {
+                last_observation = format!("firmware inventory read failed: {}", error.message);
+            }
+            _ => {
+                last_observation =
+                    "firmware inventory read did not finish within the recovery budget".to_owned();
+
+                break;
+            }
+        }
+
+        let now = tokio::time::Instant::now();
+
+        if now >= deadline {
+            break;
+        }
+
+        let sleep_for = std::cmp::min(poll_options.interval, deadline - now);
+
+        if !sleep_unless_cancelled(sleep_for, cancel).await {
+            return Err(firmware_poll_cancelled_error(task_id));
+        }
+    }
+
+    Err(RmsError::internal(format!(
+        "LiteOn PMC task {task_id} disappeared and the installed version could not be confirmed as firmware manifest version {expected_version}: {last_observation}"
+    )))
 }
 
 /// Handles the Supermicro GB300 BMC task-loss special case by verifying the
@@ -765,47 +1106,90 @@ fn firmware_target_result_json(
     result
 }
 
-/// Wraps `node.activate_firmware_with` with a single BMC-aux-powercycle retry
-/// for nodes when the host (i.e. NVOS) is unreachable. Relies on concrete node
-/// implementations for firmware activation and fallback powercycling.
-///
-/// The cancellation token is forwarded to nvfwupd, which (as on the update path)
-/// consumes it only as a one-shot pre-flight check at the top of
-/// `activate_firmware_with_context`: it bails before starting if the token is
-/// already cancelled, but does NOT check it again once activation is under way.
-/// The caller already checks the same token at the workflow boundary just before
-/// this call, so a cancellation is realistically only observed here if the
-/// node's `op_lock` is contended and the token flips while we wait for it.
+#[cfg(test)]
 async fn activate_firmware_for_node<N: Node>(node: &N, cancel: &CancellationToken) -> Result<()> {
+    activate_firmware_for_node_with_strategy(node, cancel, None).await
+}
+
+#[cfg(test)]
+async fn activate_firmware_for_node_with_strategy<N: Node>(
+    node: &N,
+    cancel: &CancellationToken,
+    strategy: Option<ActivationStrategy>,
+) -> Result<()> {
+    activate_firmware_with_mode(
+        node,
+        cancel,
+        activation_mode_for_node_and_strategy(node, strategy)?,
+    )
+    .await
+}
+
+/// Preserve the NVUE-to-BMC recovery fallback for GB200/GB300. VR NVL72 already
+/// activates via the BMC, so its failed recovery must not trigger a second reset.
+async fn activate_firmware_with_mode<N: Node>(
+    node: &N,
+    cancel: &CancellationToken,
+    mode: FirmwareActivationMode,
+) -> Result<()> {
     let fallback_cancellation = cancel.clone();
     let result = node
         .activate_firmware_with(FirmwareActivationRequest {
-            mode: activation_mode_for_node(node)?,
+            mode,
             cancellation: Some(cancel.clone()),
         })
         .await
         .map(|_| ());
-
     match result {
-        Err(ref e) if is_unreachable_err(e) && node.supports_bmc_aux_powercycle() => {
+        Err(ref error)
+            if node.node_type() != NodeType::SwitchVrnvl72Nvidia
+                && is_unreachable_err(error)
+                && node.supports_bmc_aux_powercycle() =>
+        {
             if fallback_cancellation.is_cancelled() {
                 return result;
             }
-            tracing::warn!(
-                node = %node.id(),
-                error = %e.message,
-                "firmware activation via host unreachable; falling back to BMC aux powercycle"
-            );
+            tracing::warn!(node = %node.id(), error = %error.message,
+                "firmware activation via host unreachable; falling back to BMC aux powercycle");
             attempt_bmc_aux_powercycle_recovery(node).await
         }
         other => other,
     }
 }
 
-fn activation_mode_for_node<N: Node>(node: &N) -> Result<FirmwareActivationMode> {
-    match node.node_type() {
+#[cfg(test)]
+fn activation_mode_for_node_and_strategy<N: Node>(
+    node: &N,
+    strategy: Option<ActivationStrategy>,
+) -> Result<FirmwareActivationMode> {
+    activation_mode_for_type_and_strategy(node.node_type(), strategy)
+}
+
+fn activation_mode_for_type_and_strategy(
+    node_type: NodeType,
+    strategy: Option<ActivationStrategy>,
+) -> Result<FirmwareActivationMode> {
+    match strategy {
+        Some(ActivationStrategy::FullComputePowerCycle)
+            if node_type.kind() == NodeKind::Compute =>
+        {
+            Ok(FirmwareActivationMode::FullGb200Compute)
+        }
+        Some(ActivationStrategy::FullComputePowerCycle) => {
+            Err(RmsError::invalid_argument(format!(
+                "activation strategy full_compute_power_cycle is not valid for {}",
+                node_type.as_str()
+            )))
+        }
+        None => activation_mode_for_type(node_type),
+    }
+}
+
+fn activation_mode_for_type(node_type: NodeType) -> Result<FirmwareActivationMode> {
+    match node_type {
         NodeType::ComputeGb200Nvidia
         | NodeType::ComputeGb200Wiwynn
+        | NodeType::ComputeGb200Dell
         | NodeType::ComputeGb300Nvidia
         | NodeType::ComputeGb300Lenovo
         | NodeType::ComputeGb300Supermicro
@@ -816,7 +1200,9 @@ fn activation_mode_for_node<N: Node>(node: &N) -> Result<FirmwareActivationMode>
         NodeType::PowershelfGb200Liteon
         | NodeType::PowershelfGb200Delta
         | NodeType::PowershelfGb300Liteon
-        | NodeType::PowershelfGb300Delta => {
+        | NodeType::PowershelfGb300Delta
+        | NodeType::PowershelfVrnvl72Liteon
+        | NodeType::PowershelfVrnvl72Delta => {
             Ok(FirmwareActivationMode::PowerShelfReset { force: false })
         }
     }
@@ -827,6 +1213,7 @@ fn node_supports_post_activation_version_check<N: Node>(node: &N) -> bool {
         node.node_type(),
         NodeType::ComputeGb200Nvidia
             | NodeType::ComputeGb200Wiwynn
+            | NodeType::ComputeGb200Dell
             | NodeType::ComputeGb300Nvidia
             | NodeType::ComputeGb300Lenovo
             | NodeType::ComputeGb300Supermicro
@@ -837,12 +1224,56 @@ fn node_supports_post_activation_version_check<N: Node>(node: &N) -> bool {
     )
 }
 
+/// Compare the selected switch PLDM payloads before flashing.
+/// Raw images have no package version metadata and retain their existing update
+/// behavior. This preflight performs no recovery or activation on read failure.
+async fn pre_update_firmware_version_check<N: Node>(
+    node: &N,
+    targets: &[FirmwareTarget],
+    force_update: bool,
+    cancel: &CancellationToken,
+) -> Result<Option<FirmwareVersionCheckSummary>> {
+    if force_update
+        || node.node_type().kind() != NodeKind::Switch
+        || targets.is_empty()
+        || targets.iter().any(|target| {
+            !Path::new(&target.firmware_file)
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("fwpkg"))
+        })
+    {
+        return Ok(None);
+    }
+
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => Err(RmsError::cancelled(
+            "pre-update firmware version check cancelled",
+        )),
+        result = node.verify_firmware_package_versions(targets) => result.map(Some),
+    }
+}
+
 async fn post_activation_version_check<N: Node>(
     node: &N,
     targets: &[FirmwareTarget],
     cancel: &CancellationToken,
 ) -> Result<Option<FirmwareVersionCheckSummary>> {
-    if !node_supports_post_activation_version_check(node) {
+    post_activation_version_check_with_policy(node, targets, cancel, None).await
+}
+
+async fn post_activation_version_check_with_policy<N: Node>(
+    node: &N,
+    targets: &[FirmwareTarget],
+    cancel: &CancellationToken,
+    verification: Option<VerificationPolicy>,
+) -> Result<Option<FirmwareVersionCheckSummary>> {
+    if verification.is_none() && !node_supports_post_activation_version_check(node) {
+        return Ok(None);
+    }
+
+    if verification.is_some_and(|policy| !policy.enabled()) {
         return Ok(None);
     }
 
@@ -853,67 +1284,83 @@ async fn post_activation_version_check<N: Node>(
     // Cancel-aware initial reboot/settle grace period: a cancellation after
     // activation (e.g. graceful shutdown) stops the verification here instead
     // of waiting out the delay.
-    if !sleep_unless_cancelled(POST_ACTIVATION_VERSION_CHECK_INITIAL_DELAY, cancel).await {
+    let settle_delay = verification.map_or(POST_ACTIVATION_VERSION_CHECK_INITIAL_DELAY, |policy| {
+        policy.settle_delay()
+    });
+    if !sleep_unless_cancelled(settle_delay, cancel).await {
         return Err(post_activation_version_check_cancelled_error());
     }
 
-    let summary = verify_firmware_package_versions_after_activation(node, targets, cancel).await?;
-    if summary.matched {
-        Ok(Some(summary))
-    } else {
-        Err(RmsError::internal(format!(
+    let summary =
+        verify_firmware_package_versions_after_activation(node, targets, cancel, verification)
+            .await?;
+    if !summary.matched {
+        return Err(RmsError::internal(format!(
             "post-activation firmware version check failed: {}",
             version_check_mismatch_summary(&summary.details)
-        )))
+        )));
     }
+
+    wait_for_management_api(|| node.verify_management_api_reachable(), cancel).await?;
+    wait_for_system_ready(|| node.verify_system_ready(), cancel, verification).await?;
+
+    Ok(Some(summary))
+}
+
+/// Attempt count and retry interval of a post-activation poll: the stage's
+/// policy when it has one, the built-in constants otherwise.
+fn post_activation_poll_budget(verification: Option<VerificationPolicy>) -> (usize, Duration) {
+    verification.map_or(
+        (
+            POST_ACTIVATION_VERSION_CHECK_ATTEMPTS,
+            POST_ACTIVATION_VERSION_CHECK_RETRY_INTERVAL,
+        ),
+        |policy| (policy.attempts().get() as usize, policy.retry_interval()),
+    )
 }
 
 async fn verify_firmware_package_versions_after_activation<N: Node>(
     node: &N,
     targets: &[FirmwareTarget],
     cancel: &CancellationToken,
+    verification: Option<VerificationPolicy>,
 ) -> Result<FirmwareVersionCheckSummary> {
+    let (attempts, retry_interval) = post_activation_poll_budget(verification);
     let mut last_error = None;
     let mut last_mismatched_summary = None;
-    for attempt in 1..=POST_ACTIVATION_VERSION_CHECK_ATTEMPTS {
+    for attempt in 1..=attempts {
         if cancel.is_cancelled() {
             return Err(post_activation_version_check_cancelled_error());
         }
         match node.verify_firmware_package_versions(targets).await {
             Ok(summary) if summary.matched => return Ok(summary),
             Ok(summary) => {
-                let will_retry = attempt < POST_ACTIVATION_VERSION_CHECK_ATTEMPTS;
+                let will_retry = attempt < attempts;
                 tracing::warn!(
                     node = %node.id(),
                     attempt,
-                    attempts = POST_ACTIVATION_VERSION_CHECK_ATTEMPTS,
+                    attempts,
                     will_retry,
                     summary = %version_check_mismatch_summary(&summary.details),
                     "post-activation firmware versions do not match"
                 );
                 last_mismatched_summary = Some(summary);
-                if will_retry
-                    && !sleep_unless_cancelled(POST_ACTIVATION_VERSION_CHECK_RETRY_INTERVAL, cancel)
-                        .await
-                {
+                if will_retry && !sleep_unless_cancelled(retry_interval, cancel).await {
                     return Err(post_activation_version_check_cancelled_error());
                 }
             }
             Err(error) if is_retryable_post_activation_version_check_error(&error) => {
-                let will_retry = attempt < POST_ACTIVATION_VERSION_CHECK_ATTEMPTS;
+                let will_retry = attempt < attempts;
                 tracing::warn!(
                     node = %node.id(),
                     attempt,
-                    attempts = POST_ACTIVATION_VERSION_CHECK_ATTEMPTS,
+                    attempts,
                     will_retry,
                     error = %error.message,
                     "post-activation firmware version check failed"
                 );
                 last_error = Some(error);
-                if will_retry
-                    && !sleep_unless_cancelled(POST_ACTIVATION_VERSION_CHECK_RETRY_INTERVAL, cancel)
-                        .await
-                {
+                if will_retry && !sleep_unless_cancelled(retry_interval, cancel).await {
                     return Err(post_activation_version_check_cancelled_error());
                 }
             }
@@ -938,6 +1385,111 @@ fn is_retryable_post_activation_version_check_error(error: &RmsError) -> bool {
             | ErrorCode::ConnectionRefused
             | ErrorCode::DnsResolutionFailed
     )
+}
+
+/// Polls `probe` until the node's management API answers, on the budget the
+/// GB200 power cycle gives NVUE to return (45 probes, 15 s apart). On a
+/// switch activated through its BMC, the version check reads the BMC and can
+/// pass while the OS still boots, so the readiness poll runs after this.
+/// On a node whose API already answers, or has none, the first probe returns.
+pub(super) async fn wait_for_management_api<Fut>(
+    probe: impl Fn() -> Fut,
+    cancel: &CancellationToken,
+) -> Result<()>
+where
+    Fut: Future<Output = Result<()>>,
+{
+    poll_after_activation(
+        probe,
+        cancel,
+        POST_ACTIVATION_REACHABILITY_ATTEMPTS,
+        POST_ACTIVATION_REACHABILITY_INTERVAL,
+        "management API reachability",
+    )
+    .await
+}
+
+/// Polls `probe` until the node reports ready, on the same budget as
+/// `verify_firmware_package_versions_after_activation`: the attempt count and
+/// interval of `verification` when the stage has a policy, the post-activation
+/// constants otherwise. No initial delay, because callers reach this after
+/// `wait_for_management_api`.
+///
+/// `probe` is one readiness call: `Ok(())` when the node reports ready, or
+/// has no such signal, `FailedPrecondition` while it reports not ready, and
+/// `Aborted` when it reports a state that waiting will not change. A
+/// closure, because the two update jobs hold different types (a `Node`, a
+/// `SwitchSystemImageNode`) and both answer the same question.
+pub(super) async fn wait_for_system_ready<Fut>(
+    probe: impl Fn() -> Fut,
+    cancel: &CancellationToken,
+    verification: Option<VerificationPolicy>,
+) -> Result<()>
+where
+    Fut: Future<Output = Result<()>>,
+{
+    let (attempts, retry_interval) = post_activation_poll_budget(verification);
+    poll_after_activation(probe, cancel, attempts, retry_interval, "system readiness").await
+}
+
+/// The post-activation poll loop. Retries the errors
+/// `is_retryable_after_activation` accepts, `attempts` times with
+/// `retry_interval` between them. Any other error ends the wait at once, and
+/// so does cancellation. When the budget runs out, the
+/// last error is returned. `what` names the check in the log and the
+/// messages.
+async fn poll_after_activation<Fut>(
+    probe: impl Fn() -> Fut,
+    cancel: &CancellationToken,
+    attempts: usize,
+    retry_interval: Duration,
+    what: &str,
+) -> Result<()>
+where
+    Fut: Future<Output = Result<()>>,
+{
+    let cancelled = || RmsError::cancelled(format!("{what} check cancelled before completion"));
+    let mut last_error = None;
+
+    for attempt in 1..=attempts {
+        if cancel.is_cancelled() {
+            return Err(cancelled());
+        }
+
+        match probe().await {
+            Ok(()) => return Ok(()),
+            Err(error) if is_retryable_after_activation(&error) => {
+                let will_retry = attempt < attempts;
+                tracing::warn!(
+                    attempt,
+                    attempts,
+                    will_retry,
+                    error = %error.message,
+                    "{what} check not satisfied after activation"
+                );
+                last_error = Some(error);
+                if will_retry && !sleep_unless_cancelled(retry_interval, cancel).await {
+                    return Err(cancelled());
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| {
+        RmsError::internal(format!(
+            "{what} check ran out of attempts without a probe result"
+        ))
+    }))
+}
+
+/// While NVOS boots, NVUE can answer with any error before it answers ready:
+/// a proxy 502, an auth 401, a 500, or a body this client cannot decode, such
+/// as a health word a later NVOS adds. Two errors end the wait: `Aborted`, a
+/// state that waiting will not change, and `InvalidArgument`, a node without
+/// a management API endpoint.
+fn is_retryable_after_activation(error: &RmsError) -> bool {
+    !matches!(error.code, ErrorCode::Aborted | ErrorCode::InvalidArgument)
 }
 
 fn version_check_mismatch_summary(details: &serde_json::Value) -> String {
@@ -1359,6 +1911,8 @@ fn build_firmware_targets(
                 component: firmware_target_component_for_node_type(node_type, &ft.target),
                 firmware_file: path.to_string_lossy().into_owned(),
                 expected_version: None,
+                resolution: None,
+                linkx_policy: None,
             });
         }
     } else if !r.filename.is_empty() {
@@ -1367,6 +1921,8 @@ fn build_firmware_targets(
             component: firmware_target_component_for_node_type(node_type, &r.target),
             firmware_file: path.to_string_lossy().into_owned(),
             expected_version: None,
+            resolution: None,
+            linkx_policy: None,
         });
     }
 
@@ -1406,6 +1962,8 @@ pub(crate) fn build_firmware_targets_from_list_with_expected_versions(
             expected_version: expected_versions
                 .and_then(|versions| versions.get(&ft.filename))
                 .cloned(),
+            resolution: None,
+            linkx_policy: None,
         });
     }
     Ok(targets)
@@ -1428,28 +1986,41 @@ fn validate_firmware_target_entry(target: &rm::FirmwareTarget) -> std::result::R
 
 // Construct an ephemeral node instance for firmware-by-node-list. Credentials
 // and target host come directly from the request; the caller has already
-// validated that username/password are non-empty.
+// validated that credentials required by the node type are non-empty.
 pub(crate) fn build_ephemeral_node(
     node_info: &rm::NodeInfo,
     node_type: NodeType,
     expected_inventory: Option<ExpectedInventoryPolicy>,
+    recovery: Option<RecoveryProfile>,
+    insecure_bmc: bool,
+) -> Result<Arc<NodeInstance>> {
+    build_ephemeral_node_with_profiles(
+        node_info,
+        node_type,
+        expected_inventory,
+        recovery,
+        &HardwareProfileCatalog::default(),
+        insecure_bmc,
+    )
+}
+
+pub(crate) fn build_ephemeral_node_with_profiles(
+    node_info: &rm::NodeInfo,
+    node_type: NodeType,
+    expected_inventory: Option<ExpectedInventoryPolicy>,
+    recovery: Option<RecoveryProfile>,
+    profiles: &HardwareProfileCatalog,
+    insecure_bmc: bool,
 ) -> Result<Arc<NodeInstance>> {
     let flat = flatten_node_info(node_info)?;
     // Direct switch firmware is a host/NVUE workflow, so it requires
     // host_endpoint and does not force callers to provide a BMC endpoint.
     // Compute and powershelf firmware are BMC/Redfish workflows.
     let bmc_endpoint = if node_type.kind() == NodeKind::Switch {
-        flat.optional_bmc_endpoint()?
+        flat.optional_bmc_endpoint(insecure_bmc)?
     } else {
-        Some(flat.bmc_endpoint()?)
-    }
-    .map(|mut endpoint| {
-        // BMC/Redfish endpoints use HTTPS with Basic auth in current
-        // deployments, but RMS cannot validate BMC certificates. Keep this
-        // hardcoded here rather than honoring a client-supplied endpoint field.
-        endpoint.dangerously_accept_invalid_certs = true;
-        endpoint
-    });
+        Some(flat.bmc_endpoint(insecure_bmc)?)
+    };
     let host_endpoint = if node_type.kind() == NodeKind::Switch {
         Some(flat.switch_host_management_endpoint()?)
     } else if node_type.supports_flint_inband_firmware() {
@@ -1464,11 +2035,107 @@ pub(crate) fn build_ephemeral_node(
         bmc_endpoint,
         host_endpoint,
         expected_inventory,
+        recovery,
+        runtime_config: profiles.runtime_config_for_request(node_type),
     };
 
     NodeInstance::create(&config, node_info.rack_id.as_str())
 }
 
+/// Where an update job's recovery bundles come from. Decided where the
+/// update is prepared, consumed at detection, never re-derived in between.
+#[derive(Debug, Clone)]
+pub(crate) enum RecoverySource {
+    /// The two HMC files were materialized next to the update's payloads,
+    /// from the same manifest, stored or inline. The job never touches the
+    /// object store for them.
+    Prepared(RecoveryBundles),
+    /// The update's manifest carries no HMC recovery package for this node
+    /// type (or the object predates recovery packages in the catalog).
+    /// Detection that finds a component in recovery fails closed.
+    Absent,
+    /// A raw `update_firmware` has no manifest in hand: the latest
+    /// available object that carries a recovery package. Fails closed when
+    /// the candidates span several hardware types.
+    Latest,
+}
+
+/// What recovery detection needs besides the node: the bundle source, and
+/// the store plus digest policy the `Latest` source resolves through.
+pub(crate) struct RecoveryDispatch {
+    pub(crate) firmware_objects: Arc<dyn FirmwareObjectStore>,
+    pub(crate) firmware_dir: PathBuf,
+    pub(crate) artifact_require_sha256: bool,
+    pub(crate) source: RecoverySource,
+}
+
+impl RackManagerServiceImpl {
+    async fn prepare_firmware_node_for_job(
+        &self,
+        job: &RmsJobHandle,
+        node: &NodeInstance,
+    ) -> std::result::Result<(), (&'static str, JobFailure)> {
+        self.initialize_nvue_client(node.nvue_client(), None)
+            .await
+            .map_err(|error| {
+                (
+                    "nvue_setup",
+                    JobFailure::new(firmware_update_job_error(&error), error.message),
+                )
+            })?;
+
+        self.admit_firmware_node_for_job(job, node)
+            .map_err(|failure| ("scope_admission", failure))
+    }
+
+    /// Reserves configured switch identities before dispatch without device I/O.
+    /// The firmware worker adds physical identity when NVUE can report it.
+    pub(crate) fn admit_firmware_node_for_job(
+        &self,
+        job: &RmsJobHandle,
+        node: &NodeInstance,
+    ) -> std::result::Result<(), JobFailure> {
+        if node.node_type().kind() != NodeKind::Switch {
+            return Ok(());
+        }
+
+        let scopes =
+            crate::api::grpc::switch_scope::configured_switch_scopes(node, node.nvue_client())
+                .map_err(|error| JobFailure::new(JobError::Internal, error.message))?;
+
+        self.admit_known_switch_job_scopes(job, scopes)
+    }
+
+    /// The recovery inputs of one update job, taken from the service's
+    /// firmware object store, firmware directory, and digest policy.
+    pub(crate) fn recovery_dispatch(&self, source: RecoverySource) -> RecoveryDispatch {
+        RecoveryDispatch {
+            firmware_objects: self.backends.firmware_objects.clone(),
+            firmware_dir: self.firmware_dir.clone(),
+            artifact_require_sha256: self.artifact_require_sha256,
+            source,
+        }
+    }
+}
+
+/// VR NVL72 inventory and comparison need only the BMC; retain the existing
+/// host endpoint requirements for GB200/GB300 switch inventory.
+pub(crate) fn build_ephemeral_inventory_node(
+    node_info: &rm::NodeInfo,
+    node_type: NodeType,
+    profiles: &HardwareProfileCatalog,
+    insecure_bmc: bool,
+) -> Result<Arc<NodeInstance>> {
+    if node_type == NodeType::SwitchVrnvl72Nvidia {
+        super::power_handlers::build_ephemeral_power_node(node_info, profiles, insecure_bmc)
+            .map_err(RmsError::invalid_argument)
+    } else {
+        build_ephemeral_node_with_profiles(node_info, node_type, None, None, profiles, insecure_bmc)
+    }
+}
+
+#[allow(clippy::too_many_arguments)] // the update request's shape: targets, two flags, poll timing, recovery dispatch
+#[cfg(test)]
 pub(crate) fn spawn_firmware_update_job<N: Node + Send + Sync + 'static>(
     tracker: Arc<JobTracker>,
     job_handle: RmsJobHandle,
@@ -1476,6 +2143,8 @@ pub(crate) fn spawn_firmware_update_job<N: Node + Send + Sync + 'static>(
     targets: Vec<FirmwareTarget>,
     activate: bool,
     force_update: bool,
+    poll_options: FirmwareTaskPollOptions,
+    recovery: RecoveryDispatch,
 ) {
     spawn_firmware_update_job_with_policy(
         tracker,
@@ -1484,10 +2153,16 @@ pub(crate) fn spawn_firmware_update_job<N: Node + Send + Sync + 'static>(
         targets,
         activate,
         force_update,
+        poll_options,
         false,
+        recovery,
+        None,
+        None,
     );
 }
 
+#[allow(clippy::too_many_arguments)] // same shape as spawn_firmware_update_job
+#[cfg(test)]
 pub(crate) fn spawn_firmware_object_update_job<N: Node + Send + Sync + 'static>(
     tracker: Arc<JobTracker>,
     job_handle: RmsJobHandle,
@@ -1495,6 +2170,8 @@ pub(crate) fn spawn_firmware_object_update_job<N: Node + Send + Sync + 'static>(
     targets: Vec<FirmwareTarget>,
     activate: bool,
     force_update: bool,
+    poll_options: FirmwareTaskPollOptions,
+    recovery: RecoveryDispatch,
 ) {
     spawn_firmware_update_job_with_policy(
         tracker,
@@ -1503,10 +2180,95 @@ pub(crate) fn spawn_firmware_object_update_job<N: Node + Send + Sync + 'static>(
         targets,
         activate,
         force_update,
+        poll_options,
         true,
+        recovery,
+        None,
+        None,
     );
 }
 
+/// Detect through the node's recovery capability and recover before the
+/// update, inside the update job itself.
+///
+/// `Ok` means the update may proceed: recovery ran and the flow's
+/// closing confirm verified every listed component healthy, or nothing
+/// watched was in recovery. The stricter pre-flash proceed condition
+/// (every watched component Health == "OK", or no flash) is a separate
+/// change. Until it lands, non-recovery unhealthy readings enter the
+/// update path unchanged.
+async fn dispatch_compute_oob_recovery(
+    node: &dyn Node,
+    recovery: &dyn Recoverable,
+    source: RecoverySource,
+    firmware_objects: &dyn FirmwareObjectStore,
+    firmware_dir: &Path,
+    artifact_require_sha256: bool,
+    cancel: &CancellationToken,
+) -> Result<()> {
+    // An unreadable inventory maps to an empty one by policy: detection is
+    // fail-open. An empty inventory shows no recovery signature, so the
+    // update proceeds as it did before detection existed and fails on its
+    // own terms if the node is genuinely sick. Post-flash verification
+    // reads stay fail-closed, there the read is the proof of success.
+    // "Empty" stands in for "healthy" only here.
+    // TODO: propagate the error once the pre-flash health check makes an
+    // unreadable inventory blocking.
+    let inventory = match node.get_firmware_inventory().await {
+        Ok(inventory) => inventory,
+        Err(error) => {
+            tracing::warn!(
+                node = %node.id(),
+                error = %error.message,
+                "recovery detection skipped: firmware inventory read failed"
+            );
+            Vec::new()
+        }
+    };
+    // The read above is network time. A cancel that landed in it is why
+    // the job stops, whatever the read showed.
+    if cancel.is_cancelled() {
+        return Err(RmsError::cancelled(
+            "recovery flow cancelled during recovery detection",
+        ));
+    }
+    let in_recovery = recovery.detect(&inventory);
+    if in_recovery.is_empty() {
+        // Not an error: nothing watched reports the recovery signature.
+        return Ok(());
+    }
+
+    let bundles = match source {
+        RecoverySource::Prepared(bundles) => bundles,
+        RecoverySource::Absent => {
+            return Err(RmsError::failed_precondition(format!(
+                "components in recovery state ({}) but the update's manifest carries no HMC \
+                 recovery package for {}",
+                in_recovery.join(", "),
+                node.node_type()
+            )));
+        }
+        RecoverySource::Latest => {
+            let resolved = resolve_recovery_bundles_from_latest_object(
+                firmware_objects,
+                firmware_dir,
+                node.node_type(),
+                artifact_require_sha256,
+            )
+            .await;
+            // Resolution reads the object store. Same rule as the read above.
+            if cancel.is_cancelled() {
+                return Err(RmsError::cancelled(
+                    "recovery flow cancelled during bundle resolution",
+                ));
+            }
+            resolved?
+        }
+    };
+    recovery.recover(&in_recovery, bundles, cancel).await
+}
+
+#[allow(clippy::too_many_arguments)] // the three policy flags are the update request's own shape
 fn spawn_firmware_update_job_with_policy<N: Node + Send + Sync + 'static>(
     tracker: Arc<JobTracker>,
     job_handle: RmsJobHandle,
@@ -1514,8 +2276,27 @@ fn spawn_firmware_update_job_with_policy<N: Node + Send + Sync + 'static>(
     targets: Vec<FirmwareTarget>,
     activate: bool,
     force_update: bool,
+    poll_options: FirmwareTaskPollOptions,
     allow_mixed_inband_oob: bool,
+    recovery: RecoveryDispatch,
+    profile: Option<Arc<HardwareUpdatePlan>>,
+    switch_admission: Option<(RackManagerServiceImpl, nvue_client::SharedClient)>,
 ) {
+    let job_handle =
+        profile_trace::trace_firmware_job(job_handle, Some(node.node_type()), profile.as_deref());
+    let poll_options = profile
+        .as_deref()
+        .map_or(poll_options, |profile| FirmwareTaskPollOptions {
+            timeout: profile.polling().task_timeout(),
+            interval: profile.polling().interval(),
+            transient_error_timeout: profile.polling().transient_error_budget(),
+        });
+    let RecoveryDispatch {
+        firmware_objects,
+        firmware_dir,
+        artifact_require_sha256,
+        source,
+    } = recovery;
     let progress_tracker = tracker.clone();
     tracker
         .spawn_job(job_handle, move |job| async move {
@@ -1543,11 +2324,90 @@ fn spawn_firmware_update_job_with_policy<N: Node + Send + Sync + 'static>(
                 return;
             }
 
-            let stages = match firmware_update_stages_with_policy(
+            if force_update && targets.iter().any(is_linkx_target) {
+                fail_tracked_firmware_job(job, "validation", None, JobError::InvalidArgument,
+                    "LINKX does not permit force_update or health-gate bypasses");
+                return;
+            }
+
+            // Optional NVUE discovery belongs to the accepted worker so offline
+            // switches do not delay RPC acceptance or the rest of a batch.
+            if let Some((service, client)) = switch_admission {
+                let discovery = crate::api::grpc::switch_scope::discover_switch_scopes(
+                    &client, node.rack_id(), node.id(),
+                );
+
+                let Some(scopes) = cancel.run_until_cancelled(discovery).await else {
+                    fail_tracked_firmware_job(job, "cancelled", None, JobError::Other,
+                        "firmware update cancelled during switch identity discovery");
+
+                    return;
+                };
+
+                // Missing metadata permits BMC recovery; a discovered conflict
+                // must stop the worker before any device write.
+                if let Ok(scopes) = scopes
+                    && let Err(failure) = service.admit_known_switch_job_scopes(&job, scopes)
+                {
+                    fail_tracked_firmware_job(job, "scope_admission", None,
+                        job_error_of(&failure.error), &failure.message);
+
+                    return;
+                }
+            }
+
+            if let Some(recovery) = node.recovery() {
+                // A cancel already pending ends the job before the detection
+                // read and the bundle resolution. The flow's own checks start
+                // at its first stage.
+                if cancel.is_cancelled() {
+                    fail_tracked_firmware_job(
+                        job,
+                        "cancelled",
+                        None,
+                        JobError::Other,
+                        "firmware update job cancelled before recovery detection",
+                    );
+                    return;
+                }
+                if let Err(error) = dispatch_compute_oob_recovery(
+                    node.as_ref(),
+                    recovery,
+                    source,
+                    firmware_objects.as_ref(),
+                    &firmware_dir,
+                    artifact_require_sha256,
+                    &cancel,
+                )
+                .await
+                {
+                    if error.code == ErrorCode::Cancelled {
+                        fail_tracked_firmware_job(
+                            job,
+                            "cancelled",
+                            None,
+                            JobError::Other,
+                            &error.message,
+                        );
+                        return;
+                    }
+                    fail_tracked_firmware_job(
+                        job,
+                        "recovery",
+                        None,
+                        firmware_update_job_error(&error),
+                        &format!("compute OOB recovery: {}", error.message),
+                    );
+                    return;
+                }
+            }
+
+            let stages = match firmware_update_stages_with_profile_policy(
                 node.node_type(),
                 &targets,
                 activate,
                 allow_mixed_inband_oob,
+                profile.as_deref(),
             ) {
                 Ok(stages) => stages,
                 Err(error) => {
@@ -1556,6 +2416,34 @@ fn spawn_firmware_update_job_with_policy<N: Node + Send + Sync + 'static>(
                     return;
                 }
             };
+
+            let targets: Vec<_> = stages
+                .iter()
+                .flat_map(|stage| stage.targets.iter().cloned())
+                .collect();
+            let pre_update_check = match pre_update_firmware_version_check(
+                node.as_ref(),
+                &targets,
+                force_update,
+                &cancel,
+            )
+            .await
+            {
+                Ok(summary) => summary,
+                Err(error) => {
+                    fail_tracked_firmware_job(
+                        job,
+                        "pre_update_version_check",
+                        None,
+                        firmware_update_job_error(&error),
+                        &error.message,
+                    );
+                    return;
+                }
+            };
+            let already_current = pre_update_check.as_ref().is_some_and(|summary| {
+                summary.matched && summary.details["all_targets_matched"] == true
+            });
 
             let mut skipped = 0usize;
             let mut target_results = Vec::new();
@@ -1579,26 +2467,34 @@ fn spawn_firmware_update_job_with_policy<N: Node + Send + Sync + 'static>(
                     let Some(target) = group.first() else {
                         continue;
                     };
-                    job.progress(format!(
-                        "Uploading target {}/{}: {}",
-                        completed_targets + 1,
-                        targets.len(),
-                        firmware_target_label(target)
-                    ));
+                    let disposition = if already_current {
+                        Ok(FirmwareTargetDisposition::Skipped {
+                            reason: "installed firmware matches all selected package versions"
+                                .to_owned(),
+                        })
+                    } else {
+                        job.progress(format!(
+                            "Uploading target {}/{}: {}",
+                            completed_targets + 1,
+                            targets.len(),
+                            firmware_target_label(target)
+                        ));
+                        update_firmware_group_with_bmc_recovery(
+                            node.as_ref(),
+                            group,
+                            force_update,
+                            poll_options,
+                            Some(FirmwareTaskProgress {
+                                tracker: progress_tracker.as_ref(),
+                                job_id: &job_id,
+                                target,
+                            }),
+                            &cancel,
+                        )
+                        .await
+                    };
 
-                    match update_firmware_group_with_bmc_recovery(
-                        node.as_ref(),
-                        group,
-                        force_update,
-                        Some(FirmwareTaskProgress {
-                            tracker: progress_tracker.as_ref(),
-                            job_id: &job_id,
-                            target,
-                        }),
-                        &cancel,
-                    )
-                    .await
-                    {
+                    match disposition {
                         Ok(disposition) => {
                             target_results.extend(
                                 group.iter().map(|target| {
@@ -1655,7 +2551,9 @@ fn spawn_firmware_update_job_with_policy<N: Node + Send + Sync + 'static>(
                     completed_targets += group.len();
                 }
 
-                if stage.activate_after && !stage_applied_targets.is_empty() {
+                if let Some(activation_mode) = stage.activation.clone()
+                    && !stage_applied_targets.is_empty()
+                {
                     if cancel.is_cancelled() {
                         fail_tracked_firmware_job(
                             job,
@@ -1675,7 +2573,9 @@ fn spawn_firmware_update_job_with_policy<N: Node + Send + Sync + 'static>(
                             stages.len()
                         ));
                     }
-                    if let Err(e) = activate_firmware_for_node(node.as_ref(), &cancel).await {
+                    if let Err(e) =
+                        activate_firmware_with_mode(node.as_ref(), &cancel, activation_mode).await
+                    {
                         let message =
                             format!("Firmware flashed but activation failed: {}", e.message);
                         fail_tracked_firmware_job(
@@ -1689,15 +2589,16 @@ fn spawn_firmware_update_job_with_policy<N: Node + Send + Sync + 'static>(
                     }
                     activation_count += 1;
 
-                    if !node_supports_post_activation_version_check(node.as_ref()) {
+                    let Some(verification) = stage.verification else {
                         continue;
-                    }
+                    };
 
-                    job.progress("Verifying activated firmware versions");
-                    match post_activation_version_check(
+                    job.progress("Verifying activated firmware versions and system readiness");
+                    match post_activation_version_check_with_policy(
                         node.as_ref(),
                         &stage_applied_targets,
                         &cancel,
+                        Some(verification),
                     )
                     .await
                     {
@@ -1732,7 +2633,11 @@ fn spawn_firmware_update_job_with_policy<N: Node + Send + Sync + 'static>(
                 "targets_completed": targets.len() - skipped,
                 "targets_skipped": skipped,
                 "targets": target_results,
-                "activated": activation_count > 0,
+                "activated": activation_count > 0 || target_results.iter().any(|result| {
+                    result.get("component").and_then(serde_json::Value::as_str).is_some_and(|c| c.eq_ignore_ascii_case("LINKX"))
+                        && result.get("status").and_then(serde_json::Value::as_str) == Some("completed")
+                }),
+                "pre_update_version_check": pre_update_check.map(|summary| summary.details),
                 "post_activation_version_check": post_activation_check,
                 "status": if all_skipped {
                     "already_up_to_date".to_owned()
@@ -1773,11 +2678,35 @@ fn firmware_update_stages_with_policy(
     activate: bool,
     allow_mixed_inband_oob: bool,
 ) -> Result<Vec<FirmwareUpdateStage>> {
+    if targets.iter().any(is_linkx_target) {
+        validate_firmware_request_with_policy(
+            node_type,
+            targets,
+            activate,
+            allow_mixed_inband_oob,
+        )?;
+        let (linkx, out_of_band): (Vec<_>, Vec<_>) =
+            targets.iter().cloned().partition(is_linkx_target);
+        let mut stages = Vec::new();
+        if !out_of_band.is_empty() {
+            stages.push(FirmwareUpdateStage {
+                targets: out_of_band,
+                activate_after: true,
+            });
+        }
+        // LinkX performs module activation and verification inside NVFWUPD.
+        // Never follow it with the GB200/VR tray AC-cycle activation path.
+        stages.push(FirmwareUpdateStage {
+            targets: linkx,
+            activate_after: false,
+        });
+        return Ok(stages);
+    }
     if node_type.supports_flint_inband_firmware() {
         let (inband, out_of_band): (Vec<_>, Vec<_>) = targets
             .iter()
             .cloned()
-            .partition(|target| flint_device_family(&target.component).is_some());
+            .partition(|target| flint_family_for_target(target).is_some());
         if !inband.is_empty() && !out_of_band.is_empty() {
             if !allow_mixed_inband_oob {
                 return Err(RmsError::invalid_argument(
@@ -1864,6 +2793,190 @@ fn firmware_update_stages_with_policy(
     Ok(stages)
 }
 
+/// All decisions needed by execution; the executor never reinterprets a profile.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExecutableFirmwareStage {
+    targets: Vec<FirmwareTarget>,
+    activation: Option<FirmwareActivationMode>,
+    verification: Option<VerificationPolicy>,
+}
+
+impl ExecutableFirmwareStage {
+    /// Resolve activation and verification once, before the executor runs.
+    fn new(
+        node_type: NodeType,
+        targets: Vec<FirmwareTarget>,
+        activate: bool,
+        strategy: Option<ActivationStrategy>,
+        verification: VerificationPolicy,
+    ) -> Result<Self> {
+        let activation = activate
+            .then(|| activation_mode_for_type_and_strategy(node_type, strategy))
+            .transpose()?;
+        let verification = (activation.is_some()
+            && node_type.kind() != NodeKind::Powershelf
+            && verification.enabled())
+        .then_some(verification);
+        Ok(Self {
+            targets,
+            activation,
+            verification,
+        })
+    }
+}
+
+fn default_stage_verification() -> VerificationPolicy {
+    VerificationPolicy::required(
+        POST_ACTIVATION_VERSION_CHECK_INITIAL_DELAY,
+        std::num::NonZeroU32::new(POST_ACTIVATION_VERSION_CHECK_ATTEMPTS as u32)
+            .expect("verification attempts are nonzero"),
+        POST_ACTIVATION_VERSION_CHECK_RETRY_INTERVAL,
+    )
+}
+
+fn firmware_update_stages_with_profile_policy(
+    node_type: NodeType,
+    targets: &[FirmwareTarget],
+    activate: bool,
+    allow_mixed_inband_oob: bool,
+    profile: Option<&HardwareUpdatePlan>,
+) -> Result<Vec<ExecutableFirmwareStage>> {
+    validate_firmware_request_with_policy(node_type, targets, activate, allow_mixed_inband_oob)?;
+    let Some(profile) = profile else {
+        return firmware_update_stages_with_policy(
+            node_type,
+            targets,
+            activate,
+            allow_mixed_inband_oob,
+        )?
+        .into_iter()
+        .map(|stage| {
+            ExecutableFirmwareStage::new(
+                node_type,
+                stage.targets,
+                stage.activate_after,
+                None,
+                default_stage_verification(),
+            )
+        })
+        .collect();
+    };
+    if profile.node_type() != node_type {
+        return Err(RmsError::invalid_argument(format!(
+            "hardware profile {} is for {}, not {}",
+            profile.profile_id(),
+            profile.node_type().as_str(),
+            node_type.as_str()
+        )));
+    }
+    firmware_update_stages_from_profile(targets, activate, profile)
+}
+
+/// Build the NIC stage first, profile stages in order, then module-activated LinkX.
+fn firmware_update_stages_from_profile(
+    targets: &[FirmwareTarget],
+    activate: bool,
+    profile: &HardwareUpdatePlan,
+) -> Result<Vec<ExecutableFirmwareStage>> {
+    let mut remaining: Vec<_> = targets.iter().collect();
+    let mut stages = Vec::new();
+    let linkx: Vec<_> = remaining
+        .extract_if(.., |target| is_linkx_target(target))
+        .cloned()
+        .collect();
+    let inband: Vec<_> = remaining
+        .extract_if(.., |target| flint_family_for_target(target).is_some())
+        .cloned()
+        .collect();
+    if !inband.is_empty() {
+        // NIC updates retain their mandatory activation and verification boundary.
+        stages.push(ExecutableFirmwareStage::new(
+            profile.node_type(),
+            inband,
+            true,
+            None,
+            default_stage_verification(),
+        )?);
+    }
+    for configured_stage in profile.stages() {
+        let mut stage_targets = Vec::new();
+        for configured_target in configured_stage.targets() {
+            let resolved = remaining
+                .extract_if(.., |target| {
+                    profile_target_matches(configured_target, target)
+                })
+                .map(|target| configured_target.resolve(target))
+                .collect::<Result<Vec<_>>>()?;
+            // One manifest artifact can fan out to several explicit request paths.
+            // Reject duplicate uploads of the same package to the same destination.
+            let mut uploads = std::collections::HashSet::new();
+            for target in &resolved {
+                let destination = target
+                    .resolution
+                    .as_ref()
+                    .map(|resolved| &resolved.destination);
+                if !uploads.insert((&target.firmware_file, destination)) {
+                    return Err(RmsError::invalid_argument(format!(
+                        "duplicate firmware upload for hardware profile target {}",
+                        configured_target.id()
+                    )));
+                }
+            }
+            stage_targets.extend(resolved);
+        }
+        if !stage_targets.is_empty() {
+            stages.push(ExecutableFirmwareStage::new(
+                profile.node_type(),
+                stage_targets,
+                activate && configured_stage.activate_after(),
+                profile.activation(),
+                profile.verification(),
+            )?);
+        }
+    }
+
+    if !remaining.is_empty() {
+        let unmatched = remaining
+            .into_iter()
+            .map(firmware_target_label)
+            .collect::<Vec<_>>();
+        return Err(RmsError::invalid_argument(format!(
+            "firmware target(s) are not allowed by hardware profile {}: {}",
+            profile.profile_id(),
+            unmatched.join(", ")
+        )));
+    }
+
+    if !linkx.is_empty() {
+        // The LinkX workflow activates and verifies its modules itself. Keep it
+        // after every profile-defined OOB stage, without a subsequent tray cycle.
+        stages.push(ExecutableFirmwareStage::new(
+            profile.node_type(),
+            linkx,
+            false,
+            None,
+            default_stage_verification(),
+        )?);
+    }
+
+    Ok(stages)
+}
+
+fn profile_target_matches(configured: &FirmwareTargetPlan, target: &FirmwareTarget) -> bool {
+    let filename = Path::new(&target.firmware_file)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(&target.firmware_file);
+    if !configured.filename().matches(filename) {
+        return false;
+    }
+
+    target.resolution.as_ref().map_or_else(
+        || configured.matches_component(&target.component),
+        |resolved| resolved.profile_target_id == configured.id(),
+    )
+}
+
 fn fail_tracked_firmware_job(
     job: RmsJobHandle,
     phase: &str,
@@ -1887,13 +3000,13 @@ fn firmware_update_job_error(error: &RmsError) -> JobError {
     }
 }
 
+/// Uses the caller-resolved node type; descriptor-only types have no protobuf enum value.
 fn build_firmware_targets_by_type(
     r: &rm::BatchUpdateFirmwareByNodeTypeRequest,
     firmware_dir: &Path,
+    node_type: NodeType,
 ) -> std::result::Result<Vec<FirmwareTarget>, String> {
     let mut targets = Vec::new();
-    let node_type =
-        proto_node_type_to_domain(r.node_type).ok_or_else(|| "unknown node type".to_owned())?;
 
     if !r.firmware_targets.is_empty() {
         for ft in &r.firmware_targets {
@@ -1904,6 +3017,8 @@ fn build_firmware_targets_by_type(
                 component: firmware_target_component_for_node_type(node_type, &ft.target),
                 firmware_file: path.to_string_lossy().into_owned(),
                 expected_version: None,
+                resolution: None,
+                linkx_policy: None,
             });
         }
     } else if !r.filename.is_empty() {
@@ -1912,6 +3027,8 @@ fn build_firmware_targets_by_type(
             component: firmware_target_component_for_node_type(node_type, &r.target),
             firmware_file: path.to_string_lossy().into_owned(),
             expected_version: None,
+            resolution: None,
+            linkx_policy: None,
         });
     }
 
@@ -1930,6 +3047,38 @@ fn firmware_inventory_info_to_proto(info: FirmwareInfo) -> rm::FirmwareInventory
 }
 
 impl RackManagerServiceImpl {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn spawn_profiled_firmware_update_job(
+        &self,
+        pending: RmsJobHandle,
+        node: Arc<NodeInstance>,
+        targets: Vec<FirmwareTarget>,
+        activate: bool,
+        force_update: bool,
+        from_manifest: bool,
+        recovery: RecoveryDispatch,
+    ) {
+        let profile = self.hardware_profiles.shared_for_request(node.node_type());
+        let switch_admission = node
+            .nvue_client()
+            .cloned()
+            .map(|client| (self.clone(), client));
+
+        spawn_firmware_update_job_with_policy(
+            self.job_tracker.clone(),
+            pending,
+            node,
+            targets,
+            activate,
+            force_update,
+            self.workflow_timings.firmware_task_poll,
+            from_manifest,
+            recovery,
+            profile,
+            switch_admission,
+        );
+    }
+
     pub(crate) async fn handle_get_node_firmware_inventory(
         &self,
         req: tonic::Request<rm::GetNodeFirmwareInventoryRequest>,
@@ -1956,7 +3105,9 @@ impl RackManagerServiceImpl {
             }
         };
 
-        if let Err(error) = self.initialize_nvue_client(node.nvue_client(), None).await {
+        if node.node_type() != NodeType::SwitchVrnvl72Nvidia
+            && let Err(error) = self.initialize_nvue_client(node.nvue_client(), None).await
+        {
             tracing::error!(node = %r.node_id, rack = %r.rack_id, error = %error.message, "failed to configure NVUE client");
             return Ok(tonic::Response::new(resp));
         }
@@ -2023,7 +3174,12 @@ impl RackManagerServiceImpl {
                 }
             };
 
-            match build_ephemeral_node(node_info, node_type, None) {
+            match build_ephemeral_inventory_node(
+                node_info,
+                node_type,
+                &self.hardware_profiles,
+                self.insecure_bmc,
+            ) {
                 Ok(node) => ready.push((index, node_info.node_id.clone(), node)),
                 Err(error) => outcomes.push((index, node_info.node_id.clone(), Err(error.message))),
             }
@@ -2032,9 +3188,11 @@ impl RackManagerServiceImpl {
         let fetched: Vec<InventoryOutcome> =
             futures::stream::iter(ready.into_iter().map(|(index, node_id, node)| async move {
                 let inventory = async {
-                    self.initialize_nvue_client(node.nvue_client(), None)
-                        .await
-                        .map_err(|error| error.message)?;
+                    if node.node_type() != NodeType::SwitchVrnvl72Nvidia {
+                        self.initialize_nvue_client(node.nvue_client(), None)
+                            .await
+                            .map_err(|error| error.message)?;
+                    }
                     node.get_firmware_inventory()
                         .await
                         .map_err(|error| error.message)
@@ -2158,18 +3316,18 @@ impl RackManagerServiceImpl {
             }
         };
 
-        if let Err(error) = self.initialize_nvue_client(node.nvue_client(), None).await {
-            tracing::error!(node = %r.node_id, rack = %r.rack_id, error = %error.message, "failed to configure NVUE client");
+        let pending = self.trace_firmware_job(pending, Some(node.node_type()));
+
+        if let Err((phase, failure)) = self.prepare_firmware_node_for_job(&pending, &node).await {
+            let code = job_error_of(&failure.error);
+
+            tracing::error!(node = %r.node_id, rack = %r.rack_id, phase, error = %failure.message, "firmware preparation failed");
+
             resp.status = rm::ReturnCode::Failure.into();
-            resp.error_code = rm::FirmwareUpdateError::ClientFailure.into();
-            fail_tracked_firmware_job(
-                pending,
-                "nvue_setup",
-                None,
-                firmware_update_job_error(&error),
-                &error.message,
-            );
-            resp.message = error.message;
+            resp.error_code = rm::FirmwareUpdateError::from(code).into();
+            fail_tracked_firmware_job(pending, phase, None, code, &failure.message);
+
+            resp.message = failure.message;
             return Ok(tonic::Response::new(resp));
         }
 
@@ -2223,13 +3381,14 @@ impl RackManagerServiceImpl {
         resp.message = format!("Firmware update job created for {}", r.node_id);
 
         // Spawn background task: upload each target, poll until done, optionally activate
-        spawn_firmware_update_job(
-            self.job_tracker.clone(),
+        self.spawn_profiled_firmware_update_job(
             pending,
             node,
             targets,
             r.activate,
             r.force_update,
+            false,
+            self.recovery_dispatch(RecoverySource::Latest),
         );
 
         Ok(tonic::Response::new(resp))
@@ -2275,7 +3434,7 @@ impl RackManagerServiceImpl {
             }
         };
 
-        let targets = match build_firmware_targets_by_type(&r, &self.firmware_dir) {
+        let targets = match build_firmware_targets_by_type(&r, &self.firmware_dir, target_type) {
             Ok(t) if t.is_empty() => {
                 tracing::error!(rack = %r.rack_id, "no firmware targets specified");
                 batch.message = "no firmware targets specified".into();
@@ -2348,22 +3507,33 @@ impl RackManagerServiceImpl {
 
         let mut queued_jobs = Vec::with_capacity(admitted_nodes);
 
-        for (node, pending, ()) in admitted {
-            if let Err(error) = self.initialize_nvue_client(node.nvue_client(), None).await {
-                tracing::error!(node = %node.id(), rack = %r.rack_id, error = %error.message, "failed to configure NVUE client");
+        // Capture every admitted child's provenance before the first setup await.
+        let admitted = admitted
+            .into_iter()
+            .map(|(node, pending, ())| {
+                let pending = self.trace_firmware_job(pending, Some(node.node_type()));
+                (node, pending)
+            })
+            .collect::<Vec<_>>();
+
+        for (node, pending) in admitted {
+            if let Err((phase, failure)) = self.prepare_firmware_node_for_job(&pending, &node).await
+            {
+                tracing::error!(node = %node.id(), rack = %r.rack_id, phase, error = %failure.message, "firmware preparation failed");
+
                 batch.node_results.push(rm::NodeOperationResult {
                     node_id: node.id().to_owned(),
                     status: rm::ReturnCode::Failure.into(),
-                    error_message: error.message.clone(),
+                    error_message: failure.message.clone(),
                 });
                 failed_nodes += 1;
                 let child_id = JobId::from(pending.id().as_ref());
                 fail_tracked_firmware_job(
                     pending,
-                    "nvue_setup",
+                    phase,
                     None,
-                    firmware_update_job_error(&error),
-                    &error.message,
+                    job_error_of(&failure.error),
+                    &failure.message,
                 );
                 // Sealing a handle directly does not aggregate its parent, so
                 // refresh it here rather than leaving the parent `Running`
@@ -2406,13 +3576,14 @@ impl RackManagerServiceImpl {
         }
 
         for (pending, node) in queued_jobs {
-            spawn_firmware_update_job(
-                self.job_tracker.clone(),
+            self.spawn_profiled_firmware_update_job(
                 pending,
                 node,
                 targets.clone(),
                 r.activate,
                 r.force_update,
+                false,
+                self.recovery_dispatch(RecoverySource::Latest),
             );
         }
 
@@ -2639,7 +3810,7 @@ impl RackManagerServiceImpl {
                 }
             };
 
-            if flat.creds_for_node_type(node_type).is_none() {
+            if !flat.has_credentials_for_node_type(node_type) {
                 let source = if node_type.kind() == NodeKind::Switch {
                     "host"
                 } else {
@@ -2677,7 +3848,27 @@ impl RackManagerServiceImpl {
                     continue;
                 }
             };
-            let node = match build_ephemeral_node(&node_info, node_type, expected_inventory) {
+            let recovery = match self.recovery_profile_for_node(&node_info) {
+                Ok(profile) => profile,
+                Err(e) => {
+                    batch.node_results.push(rm::NodeOperationResult {
+                        node_id: node_id.clone(),
+                        status: rm::ReturnCode::Failure.into(),
+                        error_message: e.message,
+                    });
+                    skipped_nodes += 1;
+                    continue;
+                }
+            };
+            let built = build_ephemeral_node_with_profiles(
+                &node_info,
+                node_type,
+                expected_inventory,
+                recovery,
+                &self.hardware_profiles,
+                self.insecure_bmc,
+            );
+            let node = match built {
                 Ok(n) => n,
                 Err(e) => {
                     let message = e.message;
@@ -2743,6 +3934,31 @@ impl RackManagerServiceImpl {
                     continue;
                 }
             };
+
+            let pending = self.trace_firmware_job(pending, Some(node.node_type()));
+
+            if let Err(failure) = self.admit_firmware_node_for_job(&pending, &node) {
+                batch.node_results.push(rm::NodeOperationResult {
+                    node_id: node_id.clone(),
+                    status: rm::ReturnCode::Failure.into(),
+                    error_message: failure.message.clone(),
+                });
+
+                skipped_nodes += 1;
+                let child_id = JobId::from(pending.id().as_ref());
+
+                fail_tracked_firmware_job(
+                    pending,
+                    "scope_admission",
+                    None,
+                    job_error_of(&failure.error),
+                    &failure.message,
+                );
+
+                self.job_tracker.refresh_parent_for_child(&child_id);
+                continue;
+            }
+
             let job_id = pending.id().to_string();
 
             jobs.push(rm::NodeFirmwareJobInfo {
@@ -2768,13 +3984,14 @@ impl RackManagerServiceImpl {
         }
 
         for (pending, node, targets) in queued_jobs {
-            spawn_firmware_update_job(
-                self.job_tracker.clone(),
+            self.spawn_profiled_firmware_update_job(
                 pending,
                 node,
                 targets,
                 activate,
                 force_update,
+                false,
+                self.recovery_dispatch(RecoverySource::Latest),
             );
         }
 
@@ -2819,12 +4036,13 @@ impl RackManagerServiceImpl {
         let mut failed_nodes = 0usize;
 
         for node in rack.list_nodes() {
-            if let Err(error) = self.initialize_nvue_client(node.nvue_client(), None).await {
+            if node.node_type() != NodeType::SwitchVrnvl72Nvidia
+                && let Err(error) = self.initialize_nvue_client(node.nvue_client(), None).await
+            {
                 tracing::error!(node = %node.id(), rack = %r.rack_id, error = %error.message, "failed to configure NVUE client");
                 failed_nodes += 1;
                 continue;
             }
-
             let inventory = match node.get_firmware_inventory().await {
                 Ok(inv) => inv,
                 Err(e) => {
@@ -2925,10 +4143,12 @@ fn batch_update_firmware_response(
 
 #[cfg(test)]
 mod tests {
+    mod hardware_profile_startup;
+    mod hardware_profiles;
     use super::*;
     use crate::domain::node::{
-        FirmwareActivationSummary, FirmwareInfo, FirmwareTaskStatus, NodeKind, NodeType,
-        PowerState, ProductFamily,
+        FirmwareActivationSummary, FirmwareInfo, FirmwareTaskRejection, FirmwareTaskStatus,
+        NodeKind, NodeType, PowerState, ProductFamily,
     };
     use crate::domain::rack::{Endpoint, EndpointConfig, EndpointCredentials, NodeConfig};
     use async_trait::async_trait;
@@ -2946,6 +4166,24 @@ mod tests {
 
     type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
 
+    pub(super) fn poll_options(timeout: Duration, interval: Duration) -> FirmwareTaskPollOptions {
+        FirmwareTaskPollOptions {
+            timeout,
+            interval,
+            ..FirmwareTaskPollOptions::default()
+        }
+    }
+
+    /// Production bounds with a transient-error window short enough to run in a
+    /// test. The retry sleep is clamped to the remaining window, so this also
+    /// keeps the poll interval from being waited out.
+    fn task_loss_poll_options() -> FirmwareTaskPollOptions {
+        FirmwareTaskPollOptions {
+            transient_error_timeout: Duration::from_millis(10),
+            ..FirmwareTaskPollOptions::default()
+        }
+    }
+
     struct CountingPollNode {
         complete_after: usize,
         calls: AtomicUsize,
@@ -2959,6 +4197,34 @@ mod tests {
 
     struct SupermicroSequenceNode {
         events: Arc<Mutex<Vec<String>>>,
+    }
+
+    /// VR LiteOn PMC whose task vanishes across the PMC restart. Inventory reads
+    /// replay `inventory` in order and then repeat the last entry.
+    struct LiteonPmcTaskLossNode {
+        node_type: NodeType,
+        inventory: Mutex<VecDeque<Result<Vec<FirmwareInfo>>>>,
+        poll_calls: AtomicUsize,
+        inventory_calls: AtomicUsize,
+        /// Time every inventory read takes, like a PMC that is still rebooting.
+        read_delay: Duration,
+    }
+
+    impl LiteonPmcTaskLossNode {
+        fn new(inventory: Vec<Result<Vec<FirmwareInfo>>>) -> Self {
+            Self {
+                node_type: NodeType::PowershelfVrnvl72Liteon,
+                inventory: Mutex::new(inventory.into()),
+                poll_calls: AtomicUsize::new(0),
+                inventory_calls: AtomicUsize::new(0),
+                read_delay: Duration::ZERO,
+            }
+        }
+
+        fn with_read_delay(mut self, read_delay: Duration) -> Self {
+            self.read_delay = read_delay;
+            self
+        }
     }
 
     struct SupermicroTaskLossNode {
@@ -3141,6 +4407,64 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl Node for LiteonPmcTaskLossNode {
+        fn id(&self) -> &str {
+            "liteon-pmc-task-loss-node"
+        }
+
+        fn rack_id(&self) -> &str {
+            "rack-01"
+        }
+
+        fn node_type(&self) -> NodeType {
+            self.node_type
+        }
+
+        fn get_info(&self) -> HashMap<String, String> {
+            HashMap::new()
+        }
+
+        async fn update_firmware(
+            &self,
+            _target: &FirmwareTarget,
+            _force_update: bool,
+            _options: FirmwareUpdateOptions,
+        ) -> Result<FirmwareUpdateOutcome> {
+            Ok(FirmwareUpdateOutcome::Started(
+                crate::domain::node::FirmwareTaskHandle {
+                    task_id: "0".to_owned(),
+                },
+            ))
+        }
+
+        async fn poll_firmware_task(&self, task_id: &str) -> Result<FirmwareTaskStatus> {
+            assert_eq!(task_id, "0");
+            self.poll_calls.fetch_add(1, Ordering::SeqCst);
+            Err(RmsError::internal(
+                "NVFWUPD task failed for 0: failed to retrieve task status",
+            ))
+        }
+
+        async fn get_firmware_inventory(&self) -> Result<Vec<FirmwareInfo>> {
+            self.inventory_calls.fetch_add(1, Ordering::SeqCst);
+
+            if !self.read_delay.is_zero() {
+                tokio::time::sleep(self.read_delay).await;
+            }
+
+            let mut inventory = self.inventory.lock().unwrap();
+            if inventory.len() > 1 {
+                inventory.pop_front().unwrap()
+            } else {
+                match inventory.front().unwrap() {
+                    Ok(inventory) => Ok(inventory.clone()),
+                    Err(error) => Err(RmsError::unavailable(error.message.clone())),
+                }
+            }
+        }
+    }
+
     struct OutcomeNode {
         node_type: NodeType,
         outcome: Mutex<Option<FirmwareUpdateOutcome>>,
@@ -3169,6 +4493,16 @@ mod tests {
         summary: FirmwareVersionCheckSummary,
         transient_failures: usize,
         calls: AtomicUsize,
+        /// Readiness probes that answer `not_ready_error` before the first
+        /// ready one.
+        not_ready_probes: usize,
+        not_ready_error: fn() -> RmsError,
+        readiness_calls: AtomicUsize,
+        /// Reachability probes that fail before the first answer, as NVUE
+        /// does while NVOS boots, with `unreachable_error` as the answer.
+        unreachable_probes: usize,
+        unreachable_error: fn() -> RmsError,
+        reachability_calls: AtomicUsize,
     }
 
     struct StaticPollNode {
@@ -3178,10 +4512,12 @@ mod tests {
     struct SequencePollNode {
         statuses: Mutex<VecDeque<FirmwareTaskStatus>>,
         calls: AtomicUsize,
+        fail_refetch: bool,
     }
 
     struct InventoryNode {
         id: &'static str,
+        node_type: NodeType,
         result: Mutex<Option<Result<Vec<FirmwareInfo>>>>,
     }
 
@@ -3196,7 +4532,7 @@ mod tests {
         }
 
         fn node_type(&self) -> NodeType {
-            NodeType::ComputeGb200Nvidia
+            self.node_type
         }
 
         fn get_info(&self) -> HashMap<String, String> {
@@ -3219,10 +4555,23 @@ mod tests {
             firmware_download_cancellations: Arc::new(Mutex::new(HashMap::new())),
             backends: Backends::memory(),
             firmware_dir: PathBuf::from("firmware"),
+            artifact_require_sha256: false,
+            insecure_bmc: true,
+            artifact_download_policy:
+                crate::api::grpc::artifact_download::ArtifactDownloadPolicy::default(),
             switch_tls_roots: SwitchTlsRoots::default(),
-            sftp_upload_options: crate::transport::ssh::SftpUploadOptions::default(),
+            sftp_upload_options: crate::transport::ssh::SshUploadOptions::default(),
             nmx_gateway_id: crate::libnmxc::DEFAULT_NMX_C_GATEWAY_ID.to_owned(),
             expected_inventory_catalog: crate::config::ExpectedInventoryCatalog::default(),
+            workflow_timings: crate::config::WorkflowTimings::default(),
+            recovery_profiles: crate::config::RecoveryProfiles::default(),
+            fabric_layout_catalog: std::sync::Arc::new(
+                crate::config::fabric_layout::FabricLayoutCatalog::default(),
+            ),
+            hardware_profiles: Arc::new(
+                crate::config::hardware_profiles::HardwareProfileCatalog::built_in().unwrap(),
+            ),
+            fabric_operations: std::sync::Arc::new(Default::default()),
         }
     }
 
@@ -3239,6 +4588,7 @@ mod tests {
     fn inventory_node(id: &'static str, result: Result<Vec<FirmwareInfo>>) -> NodeInstance {
         NodeInstance::from_test_node(InventoryNode {
             id,
+            node_type: NodeType::ComputeGb200Nvidia,
             result: Mutex::new(Some(result)),
         })
     }
@@ -3260,6 +4610,8 @@ mod tests {
                     false,
                 )),
                 expected_inventory: None,
+                recovery: None,
+                runtime_config: None,
             },
             "rack-01",
         )
@@ -3455,6 +4807,128 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn batch_update_firmware_by_node_type_preserves_descriptor_selection() -> TestResult {
+        use crate::api::grpc::conversions::domain_node_type_to_proto;
+        use crate::api::grpc::node_type_resolver::domain_node_type_to_descriptor;
+
+        use librms::protos::rack_manager::rack_manager_server::RackManager as RackManagerRpc;
+
+        let firmware_dir = tempfile::tempdir()?;
+        std::fs::write(firmware_dir.path().join("hmc.fwpkg"), b"firmware")?;
+
+        for (node_type, other_type) in [
+            (NodeType::ComputeGb200Nvidia, NodeType::ComputeGb200Wiwynn),
+            (NodeType::ComputeGb200Wiwynn, NodeType::ComputeGb200Dell),
+            (NodeType::ComputeGb200Dell, NodeType::ComputeGb200Wiwynn),
+            (
+                NodeType::ComputeGb300Supermicro,
+                NodeType::ComputeGb300Nvidia,
+            ),
+            (
+                NodeType::PowershelfVrnvl72Liteon,
+                NodeType::PowershelfVrnvl72Delta,
+            ),
+            (
+                NodeType::PowershelfVrnvl72Delta,
+                NodeType::PowershelfVrnvl72Liteon,
+            ),
+        ] {
+            let rack_manager = Arc::new(RackManager::new());
+            rack_manager.create_rack("rack-01", node_type.product_family().rack_type())?;
+
+            let rack = rack_manager.find_rack("rack-01").ok_or("rack not found")?;
+
+            for (id, node_type) in [("selected-node", node_type), ("other-node", other_type)] {
+                rack.add_node(
+                    id,
+                    Arc::new(NodeInstance::from_test_node(InventoryNode {
+                        id,
+                        node_type,
+                        result: Mutex::new(None),
+                    })),
+                )?;
+            }
+
+            let mut service = test_service(rack_manager);
+            service.firmware_dir = firmware_dir.path().to_owned();
+
+            // Keep both nodes busy to test type selection without preparing devices.
+            let busy = service
+                .job_tracker
+                .create_job("rack-01", "selected-node", JobType::FirmwareUpdate)
+                .expect("occupy selected node");
+
+            let _other_busy = service
+                .job_tracker
+                .create_job("rack-01", "other-node", JobType::FirmwareUpdate)
+                .expect("occupy other node");
+
+            let proto_type = domain_node_type_to_proto(node_type);
+
+            let descriptor_type = if proto_type == rm::NodeType::Unspecified {
+                node_type
+            } else {
+                other_type
+            };
+
+            for multi_target in [false, true] {
+                let request = rm::BatchUpdateFirmwareByNodeTypeRequest {
+                    rack_id: "rack-01".into(),
+                    node_type: proto_type as i32,
+                    node_descriptor: Some(domain_node_type_to_descriptor(descriptor_type)),
+                    filename: "hmc.fwpkg".into(),
+                    target: "HMC".into(),
+                    firmware_targets: if multi_target {
+                        vec![rm::FirmwareTarget {
+                            filename: "hmc.fwpkg".into(),
+                            target: "HMC".into(),
+                        }]
+                    } else {
+                        Vec::new()
+                    },
+                    ..Default::default()
+                };
+
+                let response = RackManagerRpc::batch_update_firmware_by_node_type(
+                    &service,
+                    tonic::Request::new(request),
+                )
+                .await?
+                .into_inner();
+
+                let batch = response.response.ok_or("missing batch response")?;
+
+                assert_eq!(
+                    batch.node_results.len(),
+                    1,
+                    "{node_type}, multi_target={multi_target}: {batch:?}"
+                );
+
+                assert_eq!(batch.status, rm::ReturnCode::Failure as i32);
+                assert!(!batch.job_id.is_empty());
+                assert_eq!(batch.node_results[0].node_id, "selected-node");
+                assert_eq!(batch.node_results[0].status, rm::ReturnCode::Failure as i32);
+
+                assert!(
+                    batch.node_results[0]
+                        .error_message
+                        .contains(busy.id().as_ref())
+                );
+
+                assert!(response.jobs.is_empty());
+
+                let stats = batch.stats.ok_or("missing batch stats")?;
+
+                assert_eq!(stats.total_nodes, 1);
+                assert_eq!(stats.failed_nodes, 1);
+                assert_eq!(stats.successful_nodes, 0);
+            }
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn batch_update_firmware_by_node_type_refuses_busy_node_before_nvue_setup() -> TestResult
     {
         let client_root = tempfile::tempdir()?;
@@ -3604,6 +5078,7 @@ mod tests {
                     updateable: true,
                     target: "bmc".to_owned(),
                     health: "OK".to_owned(),
+                    state: "Enabled".to_owned(),
                     sku: String::new(),
                 }]),
             )),
@@ -3680,6 +5155,7 @@ mod tests {
                     state: "Completed".to_owned(),
                     status: "OK".to_owned(),
                     message: "done".to_owned(),
+                    rejection: None,
                 },
                 poll_calls: AtomicUsize::new(0),
             }
@@ -3732,6 +5208,8 @@ mod tests {
             component: "psu".to_owned(),
             firmware_file: "/tmp/psu.tar".to_owned(),
             expected_version: None,
+            resolution: None,
+            linkx_policy: None,
         };
         let raw = r#"Upload failed for target psu: NVFWUPD task failed for powerdevice0: firmware update failed with status 1: error=LiteOn PSU firmware update failed for powerdevice0: Object {"error": String("LiteOn PSU update timed out"), "task_id": String("powerdevice0"), "last_response": Object {"error": Object {"@Message.ExtendedInfo": Array [Object {"Message": String("The request failed due to an internal service error.  The service is still operational."), "MessageId": String("Base.1.11.0.InternalError"), "MessageSeverity": String("Critical"), "Resolution": String("Resubmit the request.  If the problem persists, consider resetting the service.")}]}}}; error=LiteOn PSU serial fallback failed"#;
 
@@ -3762,6 +5240,8 @@ mod tests {
             component: "psu".to_owned(),
             firmware_file: "/tmp/psu.tar".to_owned(),
             expected_version: None,
+            resolution: None,
+            linkx_policy: None,
         };
         let raw = r#"Upload failed for target psu: NVFWUPD task failed for powerdevice0: firmware update failed with status 1: error=LiteOn PSU firmware update failed for powerdevice5: Object {"error": String("LiteOn PSU update timed out"), "task_id": String("powerdevice5"), "last_response": Object {"error": Object {"@Message.ExtendedInfo": Array [Object {"Message": String("The request failed due to an internal service error.  The service is still operational."), "MessageId": String("Base.1.11.0.InternalError"), "MessageSeverity": String("Critical"), "Resolution": String("Resubmit the request.  If the problem persists, consider resetting the service.")}]}}}; error=LiteOn PSU serial fallback failed"#;
 
@@ -3843,6 +5323,7 @@ mod tests {
             let expected = match self.node_type {
                 NodeType::ComputeGb200Nvidia
                 | NodeType::ComputeGb200Wiwynn
+                | NodeType::ComputeGb200Dell
                 | NodeType::ComputeGb300Nvidia
                 | NodeType::ComputeGb300Lenovo
                 | NodeType::ComputeGb300Supermicro
@@ -3853,7 +5334,9 @@ mod tests {
                 NodeType::PowershelfGb200Liteon
                 | NodeType::PowershelfGb200Delta
                 | NodeType::PowershelfGb300Liteon
-                | NodeType::PowershelfGb300Delta => {
+                | NodeType::PowershelfGb300Delta
+                | NodeType::PowershelfVrnvl72Liteon
+                | NodeType::PowershelfVrnvl72Delta => {
                     FirmwareActivationMode::PowerShelfReset { force: false }
                 }
             };
@@ -3976,6 +5459,20 @@ mod tests {
             }
             Ok(self.summary.clone())
         }
+        async fn verify_management_api_reachable(&self) -> Result<()> {
+            let call = self.reachability_calls.fetch_add(1, Ordering::SeqCst);
+            if call < self.unreachable_probes {
+                return Err((self.unreachable_error)());
+            }
+            Ok(())
+        }
+        async fn verify_system_ready(&self) -> Result<()> {
+            let call = self.readiness_calls.fetch_add(1, Ordering::SeqCst);
+            if call < self.not_ready_probes {
+                return Err((self.not_ready_error)());
+            }
+            Ok(())
+        }
     }
 
     #[async_trait]
@@ -4011,8 +5508,14 @@ mod tests {
         fn get_info(&self) -> HashMap<String, String> {
             HashMap::new()
         }
+
         async fn poll_firmware_task(&self, _task_id: &str) -> Result<FirmwareTaskStatus> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+
+            if self.fail_refetch && call == 1 {
+                return Err(RmsError::internal("refetch failed"));
+            }
+
             let mut statuses = self.statuses.lock().unwrap();
             if statuses.len() > 1 {
                 Ok(statuses.pop_front().unwrap())
@@ -4030,6 +5533,8 @@ mod tests {
             component: "BMC".to_owned(),
             firmware_file: "/tmp/fw.fwpkg".to_owned(),
             expected_version: None,
+            resolution: None,
+            linkx_policy: None,
         }
     }
 
@@ -4038,6 +5543,8 @@ mod tests {
             component: component.to_owned(),
             firmware_file: firmware_file.to_owned(),
             expected_version: None,
+            resolution: None,
+            linkx_policy: None,
         }
     }
 
@@ -4046,6 +5553,8 @@ mod tests {
             component: String::new(),
             firmware_file: "/tmp/NvOBMC_GBNVL72_70.02.01.05.bin".to_owned(),
             expected_version: Some("70.02.01.05".to_owned()),
+            resolution: None,
+            linkx_policy: None,
         }
     }
 
@@ -4137,7 +5646,16 @@ mod tests {
             ),
         ];
 
-        spawn_firmware_update_job(tracker.clone(), pending, node, targets, true, false);
+        spawn_firmware_update_job(
+            tracker.clone(),
+            pending,
+            node,
+            targets,
+            true,
+            false,
+            FirmwareTaskPollOptions::default(),
+            recovery_disarmed(),
+        );
 
         let job = wait_for_firmware_job_terminal(tracker.as_ref(), &job_id).await;
         assert_eq!(
@@ -4173,6 +5691,413 @@ mod tests {
             component: component.to_owned(),
             firmware_file: filename.to_owned(),
             expected_version: None,
+            resolution: None,
+            linkx_policy: None,
+        }
+    }
+
+    fn linkx_target() -> FirmwareTarget {
+        FirmwareTarget {
+            component: "LINKX".to_owned(),
+            firmware_file: "/tmp/linkx.bin".to_owned(),
+            expected_version: Some("44.40.2035".to_owned()),
+            resolution: None,
+            linkx_policy: Some(nvfwupd::flint::LinkxPolicy {
+                current_version: "44.40.2019".to_owned(),
+                target_version: "44.40.2035".to_owned(),
+                sha256: "a".repeat(64),
+            }),
+        }
+    }
+
+    #[test]
+    fn linkx_is_vr_only_policy_required_and_module_activated() {
+        let target = linkx_target();
+        for kind in [
+            NodeType::ComputeGb200Nvidia,
+            NodeType::ComputeGb300Nvidia,
+            NodeType::SwitchVrnvl72Nvidia,
+        ] {
+            assert!(validate_firmware_request(kind, std::slice::from_ref(&target), true).is_err());
+        }
+        assert!(
+            validate_firmware_request(
+                NodeType::ComputeVrnvl72Nvidia,
+                std::slice::from_ref(&target),
+                false
+            )
+            .is_err()
+        );
+        let mut no_policy = target.clone();
+        no_policy.linkx_policy = None;
+        assert!(
+            validate_firmware_request(NodeType::ComputeVrnvl72Nvidia, &[no_policy], true).is_err()
+        );
+        let stages = firmware_update_stages(
+            NodeType::ComputeVrnvl72Nvidia,
+            std::slice::from_ref(&target),
+            true,
+        )
+        .unwrap();
+        assert_eq!(stages.len(), 1);
+        assert!(!stages[0].activate_after);
+        let mixed = [target.clone(), firmware_target()];
+        assert!(firmware_update_stages(NodeType::ComputeVrnvl72Nvidia, &mixed, true).is_err());
+        let stages =
+            firmware_update_stages_with_policy(NodeType::ComputeVrnvl72Nvidia, &mixed, true, true)
+                .unwrap();
+        assert_eq!(stages[0].targets, vec![firmware_target()]);
+        assert!(stages[0].activate_after);
+        assert_eq!(stages[1].targets, vec![target.clone()]);
+        assert!(!stages[1].activate_after);
+        assert!(
+            validate_firmware_request(
+                NodeType::ComputeVrnvl72Nvidia,
+                &[target.clone(), target],
+                true
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn powershelf_stages_never_request_post_activation_version_verification() {
+        // Power shelves do not implement `verify_firmware_package_versions`, so an
+        // activated shelf stage must never schedule the post-activation check.
+        for node_type in [
+            NodeType::PowershelfGb200Liteon,
+            NodeType::PowershelfGb200Delta,
+            NodeType::PowershelfGb300Liteon,
+            NodeType::PowershelfGb300Delta,
+            NodeType::PowershelfVrnvl72Liteon,
+            NodeType::PowershelfVrnvl72Delta,
+        ] {
+            let stages = firmware_update_stages_with_profile_policy(
+                node_type,
+                &[firmware_target()],
+                true,
+                false,
+                None,
+            )
+            .unwrap();
+            assert!(!stages.is_empty());
+            for stage in stages {
+                assert!(stage.activation.is_some(), "{node_type:?} activates");
+                assert_eq!(
+                    stage.verification, None,
+                    "{node_type:?} must not verify versions"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn linkx_job_completes_without_tray_activation_and_force_fails_before_io() {
+        for force in [false, true] {
+            let tracker = Arc::new(JobTracker::new());
+            let pending = tracker
+                .create_job("rack", "node", JobType::FirmwareUpdate)
+                .unwrap();
+            let job_id = pending.id().to_string();
+            // This mock does not implement activation: accidentally requesting
+            // a tray power cycle would fail the job.
+            let node = Arc::new(OutcomeNode::new_for_node_type(
+                NodeType::ComputeVrnvl72Nvidia,
+                completed_update_outcome(),
+            ));
+            spawn_firmware_update_job(
+                tracker.clone(),
+                pending,
+                node.clone(),
+                vec![linkx_target()],
+                true,
+                force,
+                FirmwareTaskPollOptions::default(),
+                recovery_disarmed(),
+            );
+            let job = wait_for_firmware_job_terminal(&tracker, &job_id).await;
+            if force {
+                assert_eq!(
+                    job.state,
+                    crate::orchestrator::job_lifecycle::JobState::Failed
+                );
+                assert!(node.update_options.lock().unwrap().is_empty());
+            } else {
+                assert_eq!(
+                    job.state,
+                    crate::orchestrator::job_lifecycle::JobState::Completed,
+                    "{}",
+                    job.error_message
+                );
+                assert_eq!(node.update_options.lock().unwrap().len(), 1);
+                let result: serde_json::Value = serde_json::from_str(&job.result_json).unwrap();
+                assert_eq!(result["activated"], true);
+            }
+        }
+    }
+
+    struct FirmwarePreflightNode {
+        node_type: NodeType,
+        first_check: Mutex<Option<Result<FirmwareVersionCheckSummary>>>,
+        events: Mutex<Vec<String>>,
+        cancel_on_check: Option<CancellationToken>,
+    }
+
+    impl FirmwarePreflightNode {
+        fn new(node_type: NodeType, summary: Result<FirmwareVersionCheckSummary>) -> Self {
+            Self {
+                node_type,
+                first_check: Mutex::new(Some(summary)),
+                events: Mutex::new(Vec::new()),
+                cancel_on_check: None,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Node for FirmwarePreflightNode {
+        fn id(&self) -> &str {
+            "preflight-switch"
+        }
+        fn rack_id(&self) -> &str {
+            "preflight-rack"
+        }
+        fn node_type(&self) -> NodeType {
+            self.node_type
+        }
+        fn get_info(&self) -> HashMap<String, String> {
+            HashMap::new()
+        }
+        async fn verify_firmware_package_versions(
+            &self,
+            targets: &[FirmwareTarget],
+        ) -> Result<FirmwareVersionCheckSummary> {
+            assert_eq!(targets, switch_preflight_targets());
+            self.events.lock().unwrap().push("compare".to_owned());
+            if let Some(cancel) = &self.cancel_on_check {
+                cancel.cancel();
+                return std::future::pending().await;
+            }
+            self.first_check
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap_or_else(|| Ok(switch_preflight_summary(true)))
+        }
+        async fn update_firmware(
+            &self,
+            target: &FirmwareTarget,
+            _force_update: bool,
+            _options: FirmwareUpdateOptions,
+        ) -> Result<FirmwareUpdateOutcome> {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("flash:{}", target.component));
+            Ok(completed_update_outcome())
+        }
+        async fn activate_firmware_with(
+            &self,
+            _request: FirmwareActivationRequest,
+        ) -> Result<FirmwareActivationSummary> {
+            self.events.lock().unwrap().push("activate".to_owned());
+            Ok(FirmwareActivationSummary {
+                message: "activated".to_owned(),
+                details: serde_json::json!({}),
+            })
+        }
+    }
+
+    fn switch_preflight_targets() -> Vec<FirmwareTarget> {
+        vec![
+            inband_target("BMC", "/tmp/switch.fwpkg"),
+            inband_target("FPGA", "/tmp/switch.fwpkg"),
+        ]
+    }
+
+    fn switch_preflight_summary(all_targets_matched: bool) -> FirmwareVersionCheckSummary {
+        FirmwareVersionCheckSummary {
+            matched: all_targets_matched,
+            details: serde_json::json!({
+                "status": if all_targets_matched { "matched" } else { "mismatch" },
+                "all_targets_matched": all_targets_matched,
+            }),
+        }
+    }
+
+    async fn run_switch_preflight_job(
+        node: Arc<FirmwarePreflightNode>,
+        activate: bool,
+        force_update: bool,
+        firmware_object: bool,
+    ) -> crate::orchestrator::job_tracker::JobInfo {
+        let tracker = Arc::new(JobTracker::new());
+        let pending = tracker
+            .create_job(node.rack_id(), node.id(), JobType::FirmwareUpdate)
+            .unwrap();
+        let job_id = pending.id().to_string();
+        spawn_firmware_update_job_with_policy(
+            tracker.clone(),
+            pending,
+            node,
+            switch_preflight_targets(),
+            activate,
+            force_update,
+            FirmwareTaskPollOptions::default(),
+            firmware_object,
+            recovery_disarmed(),
+            None,
+            None,
+        );
+        wait_for_firmware_job_terminal(&tracker, &job_id).await
+    }
+
+    #[tokio::test]
+    async fn switch_preflight_all_current_skips_flash_and_activation() {
+        for node_type in [
+            NodeType::SwitchGb200Nvidia,
+            NodeType::SwitchGb300Nvidia,
+            NodeType::SwitchVrnvl72Nvidia,
+        ] {
+            for firmware_object in [false, true] {
+                let node = Arc::new(FirmwarePreflightNode::new(
+                    node_type,
+                    Ok(switch_preflight_summary(true)),
+                ));
+                let job =
+                    run_switch_preflight_job(node.clone(), true, false, firmware_object).await;
+                assert_eq!(
+                    job.state,
+                    crate::orchestrator::job_lifecycle::JobState::Completed
+                );
+                assert_eq!(*node.events.lock().unwrap(), ["compare"]);
+                let result: serde_json::Value = serde_json::from_str(&job.result_json).unwrap();
+                assert_eq!(result["status"], "already_up_to_date");
+                assert_eq!(result["targets_skipped"], 2);
+                assert_eq!(result["targets_completed"], 0);
+                assert_eq!(result["activated"], false);
+                assert_eq!(
+                    result["pre_update_version_check"]["all_targets_matched"],
+                    true
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn switch_preflight_mismatch_or_unverified_continues_update() {
+        for summary in [
+            switch_preflight_summary(false),
+            FirmwareVersionCheckSummary {
+                matched: true,
+                details: serde_json::json!({"status": "unverified", "all_targets_matched": false}),
+            },
+            FirmwareVersionCheckSummary {
+                matched: true,
+                details: serde_json::json!({"status": "matched", "all_targets_matched": false}),
+            },
+            FirmwareVersionCheckSummary {
+                matched: true,
+                details: serde_json::json!({"status": "matched"}),
+            },
+        ] {
+            let node = Arc::new(FirmwarePreflightNode::new(
+                NodeType::SwitchGb200Nvidia,
+                Ok(summary),
+            ));
+            let job = run_switch_preflight_job(node.clone(), true, false, false).await;
+            assert_eq!(
+                job.state,
+                crate::orchestrator::job_lifecycle::JobState::Completed
+            );
+            assert_eq!(
+                *node.events.lock().unwrap(),
+                ["compare", "flash:BMC", "flash:FPGA", "activate", "compare"]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn switch_preflight_force_bypasses_comparison() {
+        let node = Arc::new(FirmwarePreflightNode::new(
+            NodeType::SwitchGb200Nvidia,
+            Ok(switch_preflight_summary(true)),
+        ));
+        let job = run_switch_preflight_job(node.clone(), false, true, false).await;
+        assert_eq!(
+            job.state,
+            crate::orchestrator::job_lifecycle::JobState::Completed
+        );
+        assert_eq!(*node.events.lock().unwrap(), ["flash:BMC", "flash:FPGA"]);
+    }
+
+    #[tokio::test]
+    async fn switch_preflight_read_failure_stops_before_flash_and_activation() {
+        let node = Arc::new(FirmwarePreflightNode::new(
+            NodeType::SwitchGb200Nvidia,
+            Err(RmsError::unavailable("firmware inventory read failed")),
+        ));
+        let job = run_switch_preflight_job(node.clone(), true, false, true).await;
+        assert_eq!(
+            job.state,
+            crate::orchestrator::job_lifecycle::JobState::Failed
+        );
+        assert_eq!(*node.events.lock().unwrap(), ["compare"]);
+        let result: serde_json::Value = serde_json::from_str(&job.result_json).unwrap();
+        assert_eq!(result["phase"], "pre_update_version_check");
+        assert!(job.error_message.contains("firmware inventory read failed"));
+    }
+
+    #[tokio::test]
+    async fn switch_preflight_cancellation_stops_inventory_read() {
+        for cancel_before_start in [true, false] {
+            let cancel = CancellationToken::new();
+            let mut node = FirmwarePreflightNode::new(
+                NodeType::SwitchGb200Nvidia,
+                Ok(switch_preflight_summary(true)),
+            );
+            node.cancel_on_check = Some(cancel.clone());
+            if cancel_before_start {
+                cancel.cancel();
+            }
+            let error = tokio::time::timeout(
+                Duration::from_secs(1),
+                pre_update_firmware_version_check(
+                    &node,
+                    &switch_preflight_targets(),
+                    false,
+                    &cancel,
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap_err();
+            assert_eq!(error.code, ErrorCode::Cancelled);
+            assert_eq!(
+                node.events.lock().unwrap().len(),
+                usize::from(!cancel_before_start)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn switch_preflight_leaves_raw_payloads_and_compute_updates_unchanged() {
+        for (node_type, filename) in [
+            (NodeType::SwitchGb200Nvidia, "/tmp/cpld.vme"),
+            (NodeType::SwitchGb200Nvidia, "/tmp/nvos.bin"),
+            (NodeType::ComputeGb200Nvidia, "/tmp/compute.fwpkg"),
+        ] {
+            let node = FirmwarePreflightNode::new(node_type, Ok(switch_preflight_summary(true)));
+            let summary = pre_update_firmware_version_check(
+                &node,
+                &[inband_target("BMC", filename)],
+                false,
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            assert!(summary.is_none());
+            assert!(node.events.lock().unwrap().is_empty());
         }
     }
 
@@ -4241,6 +6166,8 @@ mod tests {
             ],
             true,
             false,
+            FirmwareTaskPollOptions::default(),
+            recovery_disarmed(),
         );
 
         let job = wait_for_firmware_job_terminal(tracker.as_ref(), &job_id).await;
@@ -4282,6 +6209,8 @@ mod tests {
             ],
             true,
             false,
+            FirmwareTaskPollOptions::default(),
+            recovery_disarmed(),
         );
 
         let job = wait_for_firmware_job_terminal(tracker.as_ref(), &job_id).await;
@@ -4323,6 +6252,8 @@ mod tests {
             ],
             true,
             false,
+            FirmwareTaskPollOptions::default(),
+            recovery_disarmed(),
         );
 
         let job = wait_for_firmware_job_terminal(tracker.as_ref(), &job_id).await;
@@ -4375,6 +6306,8 @@ mod tests {
             ],
             true,
             false,
+            FirmwareTaskPollOptions::default(),
+            recovery_disarmed(),
         );
 
         let job = wait_for_firmware_job_terminal(tracker.as_ref(), &job_id).await;
@@ -4416,6 +6349,8 @@ mod tests {
             ],
             true,
             false,
+            FirmwareTaskPollOptions::default(),
+            recovery_disarmed(),
         );
 
         let job = wait_for_firmware_job_terminal(tracker.as_ref(), &job_id).await;
@@ -4445,6 +6380,8 @@ mod tests {
             vec![firmware_target()],
             false,
             false,
+            FirmwareTaskPollOptions::default(),
+            recovery_disarmed(),
         );
 
         let job = wait_for_firmware_job_terminal(tracker.as_ref(), &job_id).await;
@@ -4454,6 +6391,517 @@ mod tests {
         );
         let result: serde_json::Value = serde_json::from_str(&job.result_json).unwrap();
         assert_eq!(result["status"], "completed");
+    }
+
+    /// Recovery dispatch inputs for a node without a roster: an empty object store.
+    fn recovery_disarmed() -> RecoveryDispatch {
+        RecoveryDispatch {
+            firmware_objects: crate::persistence::Backends::memory().firmware_objects,
+            firmware_dir: std::path::PathBuf::from("firmware"),
+            artifact_require_sha256: false,
+            source: RecoverySource::Latest,
+        }
+    }
+
+    /// Compute node with the recovery capability: `recovery()` is `Some`, so
+    /// the job layer detects through it and hands the result to `recover`,
+    /// which this mock records.
+    struct RecoveryDetectMockNode {
+        /// Inventories returned per `get_firmware_inventory` call. The last
+        /// entry repeats, which makes the recovery flow's re-reads
+        /// scriptable.
+        inventories: Mutex<VecDeque<Vec<FirmwareInfo>>>,
+        /// Error returned by the next `get_firmware_inventory` instead of an
+        /// inventory. The real node's read can fail, and the detection's Err
+        /// arm needs a mock that can show it.
+        inventory_error: Mutex<Option<RmsError>>,
+        update_calls: AtomicUsize,
+        /// Each `recover` call as one line: the detected list and the two
+        /// bundle files it received.
+        recovery_ops: Mutex<Vec<String>>,
+        /// Error the next `recover` returns after logging the call, so a test
+        /// can show the job what the flow reports.
+        recover_error: Mutex<Option<RmsError>>,
+        /// Token fired from inside `get_firmware_inventory`, so a test can
+        /// land a cancel in the detection read.
+        cancel_in_inventory: Mutex<Option<CancellationToken>>,
+        /// The node's recovery watch set, as its roster would supply it.
+        watched: Vec<String>,
+    }
+
+    impl RecoveryDetectMockNode {
+        fn with_inventory(inventory: Vec<FirmwareInfo>) -> Self {
+            Self::with_inventories([inventory])
+        }
+
+        fn with_inventories(inventories: impl IntoIterator<Item = Vec<FirmwareInfo>>) -> Self {
+            Self {
+                inventories: Mutex::new(inventories.into_iter().collect()),
+                inventory_error: Mutex::new(None),
+                update_calls: AtomicUsize::new(0),
+                recovery_ops: Mutex::new(Vec::new()),
+                recover_error: Mutex::new(None),
+                cancel_in_inventory: Mutex::new(None),
+                watched: vec!["HGX_FW_FPGA_0".to_owned()],
+            }
+        }
+
+        fn cancelling_in_inventory(self, cancel: CancellationToken) -> Self {
+            *self.cancel_in_inventory.lock().unwrap() = Some(cancel);
+            self
+        }
+
+        fn with_recover_error(self, error: RmsError) -> Self {
+            *self.recover_error.lock().unwrap() = Some(error);
+            self
+        }
+
+        fn with_failing_inventory(error: RmsError) -> Self {
+            let node = Self::with_inventory(Vec::new());
+            *node.inventory_error.lock().unwrap() = Some(error);
+            node
+        }
+    }
+
+    #[async_trait]
+    impl Node for RecoveryDetectMockNode {
+        fn id(&self) -> &str {
+            "recovery-node"
+        }
+        fn rack_id(&self) -> &str {
+            "recovery-rack"
+        }
+        fn node_type(&self) -> NodeType {
+            NodeType::ComputeGb200Nvidia
+        }
+        fn get_info(&self) -> HashMap<String, String> {
+            HashMap::new()
+        }
+        fn recovery(&self) -> Option<&dyn Recoverable> {
+            Some(self)
+        }
+        async fn get_firmware_inventory(&self) -> Result<Vec<FirmwareInfo>> {
+            if let Some(e) = self.inventory_error.lock().unwrap().take() {
+                return Err(e);
+            }
+            if let Some(cancel) = self.cancel_in_inventory.lock().unwrap().take() {
+                cancel.cancel();
+            }
+            let mut inventories = self.inventories.lock().unwrap();
+            if inventories.len() > 1 {
+                Ok(inventories.pop_front().expect("len checked"))
+            } else {
+                Ok(inventories.front().cloned().unwrap_or_default())
+            }
+        }
+        async fn update_firmware(
+            &self,
+            _target: &FirmwareTarget,
+            _force_update: bool,
+            _options: FirmwareUpdateOptions,
+        ) -> Result<FirmwareUpdateOutcome> {
+            self.update_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(completed_update_outcome())
+        }
+    }
+
+    #[async_trait]
+    impl Recoverable for RecoveryDetectMockNode {
+        fn detect(&self, inventory: &[FirmwareInfo]) -> Vec<String> {
+            inventory
+                .iter()
+                .filter(|info| {
+                    self.watched.contains(&info.name)
+                        && info.health == "Critical"
+                        && info.state == "StandbyOffline"
+                })
+                .map(|info| info.name.clone())
+                .collect()
+        }
+
+        async fn recover(
+            &self,
+            in_recovery: &[String],
+            bundles: crate::domain::node::RecoveryBundles,
+            _cancel: &CancellationToken,
+        ) -> Result<()> {
+            self.recovery_ops.lock().unwrap().push(format!(
+                "recover {in_recovery:?} regular={} recovery={}",
+                bundles.regular, bundles.recovery
+            ));
+            match self.recover_error.lock().unwrap().take() {
+                Some(error) => Err(error),
+                None => Ok(()),
+            }
+        }
+    }
+
+    fn watched_entry(health: &str, state: &str) -> FirmwareInfo {
+        FirmwareInfo {
+            name: "HGX_FW_FPGA_0".to_owned(),
+            version: "1.0.0".to_owned(),
+            firmware_type: FirmwareType::FPGA,
+            updateable: true,
+            target: String::new(),
+            health: health.to_owned(),
+            state: state.to_owned(),
+            sku: String::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_dispatch_fails_the_job_when_no_bundles_are_resolvable() {
+        // A component in recovery dispatches the recovery flow, but with no
+        // available firmware object the bundles cannot be resolved: the job
+        // must fail before any flash or recovery push.
+        let tracker = Arc::new(JobTracker::new());
+        let pending = tracker
+            .create_job("recovery-rack", "recovery-node", JobType::FirmwareUpdate)
+            .unwrap();
+        let job_id = pending.id().to_string();
+        let node = Arc::new(RecoveryDetectMockNode::with_inventory(vec![watched_entry(
+            "Critical",
+            "StandbyOffline",
+        )]));
+        let service = test_service(Arc::new(RackManager::new()));
+
+        // Via the object entry point on purpose: detection is shared code,
+        // and this pins the object flow's wiring of the detection params.
+        spawn_firmware_object_update_job(
+            tracker.clone(),
+            pending,
+            node.clone(),
+            vec![firmware_target()],
+            false,
+            false,
+            FirmwareTaskPollOptions::default(),
+            service.recovery_dispatch(RecoverySource::Latest),
+        );
+
+        let job = wait_for_firmware_job_terminal(tracker.as_ref(), &job_id).await;
+        assert_eq!(
+            job.state,
+            crate::orchestrator::job_lifecycle::JobState::Failed
+        );
+        assert_eq!(job.error_code, JobError::FailedPrecondition);
+        assert!(
+            job.error_message.contains("compute OOB recovery")
+                && job.error_message.contains("no available firmware object"),
+            "unexpected message: {}",
+            job.error_message
+        );
+        assert_eq!(node.update_calls.load(Ordering::SeqCst), 0);
+        assert!(node.recovery_ops.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn recovery_dispatch_runs_the_flow_and_proceeds_in_the_same_job() {
+        // Automatic remediation, end to end in one job: detection trips
+        // on the recovery signature, bundles resolve from the latest firmware
+        // object, the node runs its recovery procedure, the update then
+        // proceeds.
+        let firmware_dir = tempfile::tempdir().unwrap();
+        let regular = firmware_dir.path().join("regular.fwpkg");
+        let recovery = firmware_dir.path().join("recovery.fwpkg");
+        std::fs::write(&regular, b"regular").unwrap();
+        std::fs::write(&recovery, b"recovery").unwrap();
+        let manifest: crate::domain::firmware_manifest::FirmwareManifest =
+            serde_json::from_value(serde_json::json!({
+                "ProductName": "GB200", "Milestones": [{"Name": "test", "BoardSKUs": [{
+                    "Type": "Compute Node", "Components": {"Firmware": [{
+                        "Component": "HMC", "Version": "1.0", "Type": "Prod",
+                        "Locations": [
+                            {"Location": regular, "LocationType": "file", "Type": "Firmware"},
+                            {"Location": recovery, "LocationType": "file", "Type": "Firmware-Recovery"}
+                        ]
+                    }]}
+                }]}]
+            }))
+            .unwrap();
+
+        let mut service = test_service(Arc::new(RackManager::new()));
+        service.firmware_dir = firmware_dir.path().to_owned();
+        crate::api::grpc::firmware_object_handlers::store_prepared_manifest(
+            &service,
+            "obj-1",
+            crate::persistence::RackHardwareType("gb200-nvl72".to_owned()),
+            &manifest,
+        )
+        .await;
+
+        let tracker = Arc::new(JobTracker::new());
+        let pending = tracker
+            .create_job("recovery-rack", "recovery-node", JobType::FirmwareUpdate)
+            .unwrap();
+        let job_id = pending.id().to_string();
+        // Detection read: FPGA-named component in recovery. Flow confirm:
+        // healthy. The update then runs on the healthy tray.
+        let node = Arc::new(RecoveryDetectMockNode::with_inventories([
+            vec![watched_entry("Critical", "StandbyOffline")],
+            vec![watched_entry("OK", "Enabled")],
+        ]));
+
+        spawn_firmware_update_job(
+            tracker.clone(),
+            pending,
+            node.clone(),
+            vec![firmware_target()],
+            false,
+            false,
+            FirmwareTaskPollOptions::default(),
+            service.recovery_dispatch(RecoverySource::Latest),
+        );
+
+        let job = wait_for_firmware_job_terminal(tracker.as_ref(), &job_id).await;
+        assert_eq!(
+            job.state,
+            crate::orchestrator::job_lifecycle::JobState::Completed,
+            "error: {}",
+            job.error_message
+        );
+        // The dispatch hands the node the detected list and both resolved
+        // bundle files, once, and then runs the actual update. The sequence
+        // itself is the node's, pinned in nodes/compute_gb200_nvidia/recovery.rs.
+        let ops = node.recovery_ops.lock().unwrap().clone();
+        assert_eq!(ops.len(), 1, "ops: {ops:?}");
+        assert!(
+            ops[0].starts_with("recover [\"HGX_FW_FPGA_0\"] regular="),
+            "ops: {ops:?}"
+        );
+        assert!(
+            ops[0].contains("/regular.fwpkg recovery=") && ops[0].ends_with("/recovery.fwpkg"),
+            "ops: {ops:?}"
+        );
+        assert_eq!(node.update_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn node_instance_dispatches_recovery_capabilities() {
+        // The wrapper must route the recovery capability to the wrapped node.
+        // A missing dispatch arm silently falls back to the trait default's
+        // Unimplemented error, even when the inner node implements the
+        // method (caught live against StratumSim, 2026-08-28).
+        struct NodeMock;
+        #[async_trait]
+        impl Node for NodeMock {
+            fn id(&self) -> &str {
+                "probe"
+            }
+            fn rack_id(&self) -> &str {
+                "rack"
+            }
+            fn node_type(&self) -> NodeType {
+                NodeType::ComputeGb200Nvidia
+            }
+            fn get_info(&self) -> HashMap<String, String> {
+                HashMap::new()
+            }
+            fn recovery(&self) -> Option<&dyn Recoverable> {
+                Some(self)
+            }
+        }
+        #[async_trait]
+        impl Recoverable for NodeMock {
+            fn detect(&self, _inventory: &[FirmwareInfo]) -> Vec<String> {
+                Vec::new()
+            }
+            async fn recover(
+                &self,
+                _in_recovery: &[String],
+                _bundles: crate::domain::node::RecoveryBundles,
+                _cancel: &CancellationToken,
+            ) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let instance = NodeInstance::from_test_node(NodeMock);
+        instance
+            .recovery()
+            .expect("recovery must reach the wrapped node")
+            .recover(
+                &["HGX_FW_FPGA_0".to_owned()],
+                crate::domain::node::RecoveryBundles {
+                    regular: "regular.fwpkg".to_owned(),
+                    recovery: "recovery.fwpkg".to_owned(),
+                },
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("recover must reach the wrapped node");
+    }
+
+    #[tokio::test]
+    async fn recovery_dispatch_respects_a_pre_cancelled_job() {
+        // Without the pre-dispatch cancel check the flow would power-cycle
+        // the node before the stage loop's own cancel checks run.
+        let tracker = Arc::new(JobTracker::new());
+        let pending = tracker
+            .create_job("recovery-rack", "recovery-node", JobType::FirmwareUpdate)
+            .unwrap();
+        let job_id = pending.id().to_string();
+        pending.cancellation_token().cancel();
+        let node = Arc::new(RecoveryDetectMockNode::with_inventory(vec![watched_entry(
+            "Critical",
+            "StandbyOffline",
+        )]));
+        let service = test_service(Arc::new(RackManager::new()));
+
+        spawn_firmware_update_job(
+            tracker.clone(),
+            pending,
+            node.clone(),
+            vec![firmware_target()],
+            false,
+            false,
+            FirmwareTaskPollOptions::default(),
+            service.recovery_dispatch(RecoverySource::Latest),
+        );
+
+        let job = wait_for_firmware_job_terminal(tracker.as_ref(), &job_id).await;
+        assert_eq!(
+            job.state,
+            crate::orchestrator::job_lifecycle::JobState::Failed
+        );
+        assert!(node.recovery_ops.lock().unwrap().is_empty());
+        assert_eq!(node.update_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn recovery_dispatch_reports_a_cancel_from_inside_the_flow_as_cancelled() {
+        // The flow stopped at one of its safe points. The job ends in the
+        // same phase as the job's own cancel guards, not as a recovery
+        // failure, and no flash follows.
+        let node = Arc::new(
+            RecoveryDetectMockNode::with_inventory(vec![watched_entry(
+                "Critical",
+                "StandbyOffline",
+            )])
+            .with_recover_error(RmsError::cancelled("recovery flow cancelled")),
+        );
+        let bundles = crate::domain::node::RecoveryBundles {
+            regular: "regular.fwpkg".to_owned(),
+            recovery: "recovery.fwpkg".to_owned(),
+        };
+
+        let job = run_detection_job(node.clone(), RecoverySource::Prepared(bundles)).await;
+
+        assert_eq!(
+            job.state,
+            crate::orchestrator::job_lifecycle::JobState::Failed
+        );
+        assert_eq!(job.error_code, JobError::Other);
+        let result: serde_json::Value = serde_json::from_str(&job.result_json).unwrap();
+        assert_eq!(result["phase"], "cancelled");
+        assert_eq!(node.update_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn recovery_dispatch_stops_after_a_cancel_in_the_detection_read() {
+        // The cancel lands during the inventory read. With no bundles the
+        // dispatch would otherwise end the job as a bundle failure.
+        let tracker = Arc::new(JobTracker::new());
+        let pending = tracker
+            .create_job("recovery-rack", "recovery-node", JobType::FirmwareUpdate)
+            .unwrap();
+        let job_id = pending.id().to_string();
+        let node = Arc::new(
+            RecoveryDetectMockNode::with_inventory(vec![watched_entry(
+                "Critical",
+                "StandbyOffline",
+            )])
+            .cancelling_in_inventory(pending.cancellation_token()),
+        );
+        let service = test_service(Arc::new(RackManager::new()));
+
+        spawn_firmware_update_job(
+            tracker.clone(),
+            pending,
+            node.clone(),
+            vec![firmware_target()],
+            false,
+            false,
+            FirmwareTaskPollOptions::default(),
+            service.recovery_dispatch(RecoverySource::Absent),
+        );
+
+        let job = wait_for_firmware_job_terminal(tracker.as_ref(), &job_id).await;
+        assert_eq!(job.error_code, JobError::Other);
+        let result: serde_json::Value = serde_json::from_str(&job.result_json).unwrap();
+        assert_eq!(result["phase"], "cancelled");
+        assert!(node.recovery_ops.lock().unwrap().is_empty());
+        assert_eq!(node.update_calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// Drives one update job through recovery detection and returns the terminal job.
+    async fn run_detection_job(
+        node: Arc<RecoveryDetectMockNode>,
+        source: RecoverySource,
+    ) -> crate::orchestrator::job_tracker::JobInfo {
+        let tracker = Arc::new(JobTracker::new());
+        let pending = tracker
+            .create_job("recovery-rack", "recovery-node", JobType::FirmwareUpdate)
+            .unwrap();
+        let job_id = pending.id().to_string();
+        let service = test_service(Arc::new(RackManager::new()));
+
+        spawn_firmware_update_job(
+            tracker.clone(),
+            pending,
+            node,
+            vec![firmware_target()],
+            false,
+            false,
+            FirmwareTaskPollOptions::default(),
+            service.recovery_dispatch(source),
+        );
+
+        wait_for_firmware_job_terminal(tracker.as_ref(), &job_id).await
+    }
+
+    #[tokio::test]
+    async fn recovery_detection_ignores_non_signature_readings() {
+        // Only the full recovery signature (Critical + StandbyOffline)
+        // dispatches the flow. A healthy reading, Warning health, Critical
+        // with another State, OK + StandbyOffline, and a watched component
+        // absent from inventory all enter the update path unchanged. The
+        // stricter pre-flash proceed condition (block unless everything reads
+        // OK) is a separate change.
+        for inventory in [
+            vec![watched_entry("OK", "Enabled")],
+            vec![watched_entry("Warning", "Enabled")],
+            vec![watched_entry("Critical", "Unknown")],
+            vec![watched_entry("OK", "StandbyOffline")],
+            Vec::new(),
+        ] {
+            let node = Arc::new(RecoveryDetectMockNode::with_inventory(inventory));
+            let job = run_detection_job(node.clone(), RecoverySource::Latest).await;
+
+            assert_eq!(
+                job.state,
+                crate::orchestrator::job_lifecycle::JobState::Completed
+            );
+            assert_eq!(node.update_calls.load(Ordering::SeqCst), 1);
+            assert!(node.recovery_ops.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_detection_skips_on_a_failed_inventory_read() {
+        // An unreadable inventory cannot prove recovery state. Detection is
+        // best-effort until the pre-flash health check lands. The
+        // update proceeds as it did before this change.
+        let node = Arc::new(RecoveryDetectMockNode::with_failing_inventory(
+            RmsError::new(ErrorCode::Timeout, "inventory read timed out"),
+        ));
+        let job = run_detection_job(node.clone(), RecoverySource::Latest).await;
+
+        assert_eq!(
+            job.state,
+            crate::orchestrator::job_lifecycle::JobState::Completed
+        );
+        assert_eq!(node.update_calls.load(Ordering::SeqCst), 1);
+        assert!(node.recovery_ops.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -4475,6 +6923,8 @@ mod tests {
             vec![firmware_target()],
             false,
             false,
+            FirmwareTaskPollOptions::default(),
+            recovery_disarmed(),
         );
 
         let job = wait_for_firmware_job_terminal(tracker.as_ref(), &job_id).await;
@@ -4527,6 +6977,8 @@ mod tests {
             vec![firmware_target()],
             false,
             false,
+            FirmwareTaskPollOptions::default(),
+            recovery_disarmed(),
         );
 
         // Wait until the worker is actually in-flight (polling the hung task) so
@@ -4610,9 +7062,14 @@ mod tests {
             },
         ));
 
-        let disposition = update_firmware_target_until_done(&node, &firmware_target(), false)
-            .await
-            .expect("completed outcome should succeed");
+        let disposition = update_firmware_target_until_done(
+            &node,
+            &firmware_target(),
+            false,
+            FirmwareTaskPollOptions::default(),
+        )
+        .await
+        .expect("completed outcome should succeed");
 
         assert!(matches!(
             disposition,
@@ -4622,14 +7079,111 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn started_task_cleanup_runs_after_success_failure_and_cancellation() {
+        use crate::domain::node::{FirmwareTaskCleanup, FirmwareTaskHandle};
+
+        struct CleanupNode {
+            status: FirmwareTaskStatus,
+            fail_cleanup: bool,
+            calls: AtomicUsize,
+        }
+        #[async_trait]
+        impl FirmwareTaskCleanup for CleanupNode {
+            async fn finish(&self, task_id: &str) -> Result<()> {
+                assert_eq!(task_id, "force-task");
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                if self.fail_cleanup {
+                    return Err(RmsError::failed_precondition("ForceUpdate cleanup pending"));
+                }
+                Ok(())
+            }
+        }
+        #[async_trait]
+        impl Node for CleanupNode {
+            fn id(&self) -> &str {
+                "cleanup-node"
+            }
+            fn rack_id(&self) -> &str {
+                "rack"
+            }
+            fn node_type(&self) -> NodeType {
+                NodeType::ComputeGb200Dell
+            }
+            fn get_info(&self) -> HashMap<String, String> {
+                HashMap::new()
+            }
+            fn firmware_task_cleanup(&self) -> Option<&dyn FirmwareTaskCleanup> {
+                Some(self)
+            }
+            async fn poll_firmware_task(&self, _task_id: &str) -> Result<FirmwareTaskStatus> {
+                Ok(self.status.clone())
+            }
+        }
+
+        for (state, cancelled) in [("Completed", false), ("Failed", false), ("Running", true)] {
+            for fail_cleanup in [false, true] {
+                let node = CleanupNode {
+                    status: FirmwareTaskStatus {
+                        state: state.to_owned(),
+                        status: if state == "Failed" { "Critical" } else { "OK" }.to_owned(),
+                        completed: state != "Running",
+                        ..Default::default()
+                    },
+                    fail_cleanup,
+                    calls: AtomicUsize::new(0),
+                };
+                let cancel = CancellationToken::new();
+                if cancelled {
+                    cancel.cancel();
+                }
+                let result = firmware_update_outcome_until_done(
+                    &node,
+                    &firmware_target(),
+                    FirmwareUpdateOutcome::Started(FirmwareTaskHandle {
+                        task_id: "force-task".to_owned(),
+                    }),
+                    false,
+                    poll_options(Duration::from_secs(1), Duration::ZERO),
+                    None,
+                    &cancel,
+                )
+                .await;
+                assert_eq!(node.calls.load(Ordering::SeqCst), 1);
+                if state == "Completed" {
+                    // A cleanup failure must not fail a task whose firmware was applied.
+                    assert!(result.is_ok(), "{fail_cleanup}: {result:?}");
+                } else {
+                    let FirmwareTargetUpdateError::Poll(error) = result.unwrap_err() else {
+                        panic!("expected poll/cleanup failure");
+                    };
+                    if cancelled {
+                        assert_eq!(error.code, ErrorCode::Cancelled);
+                    }
+                    if state == "Failed" {
+                        assert!(error.message.contains("ended unsuccessfully"));
+                    }
+                    if fail_cleanup {
+                        assert!(error.message.contains("ForceUpdate cleanup pending"));
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn update_target_outcome_skipped_finishes_without_polling() {
         let node = OutcomeNode::new(FirmwareUpdateOutcome::Skipped {
             reason: "already current".to_owned(),
         });
 
-        let disposition = update_firmware_target_until_done(&node, &firmware_target(), false)
-            .await
-            .expect("skipped outcome should succeed");
+        let disposition = update_firmware_target_until_done(
+            &node,
+            &firmware_target(),
+            false,
+            FirmwareTaskPollOptions::default(),
+        )
+        .await
+        .expect("skipped outcome should succeed");
 
         assert_eq!(
             disposition,
@@ -4650,6 +7204,8 @@ mod tests {
             NodeType::PowershelfGb200Delta,
             NodeType::PowershelfGb300Liteon,
             NodeType::PowershelfGb300Delta,
+            NodeType::PowershelfVrnvl72Liteon,
+            NodeType::PowershelfVrnvl72Delta,
         ] {
             let node = OutcomeNode::new_for_node_type(
                 node_type,
@@ -4660,9 +7216,14 @@ mod tests {
                 }),
             );
 
-            let disposition = update_firmware_target_until_done(&node, &firmware_target(), false)
-                .await
-                .expect("completed outcome should succeed without task polling");
+            let disposition = update_firmware_target_until_done(
+                &node,
+                &firmware_target(),
+                false,
+                FirmwareTaskPollOptions::default(),
+            )
+            .await
+            .expect("completed outcome should succeed without task polling");
 
             assert!(matches!(
                 disposition,
@@ -4679,12 +7240,19 @@ mod tests {
             NodeType::PowershelfGb200Delta,
             NodeType::PowershelfGb300Liteon,
             NodeType::PowershelfGb300Delta,
+            NodeType::PowershelfVrnvl72Liteon,
+            NodeType::PowershelfVrnvl72Delta,
         ] {
             let node = OutcomeNode::new_for_node_type(node_type, completed_update_outcome());
 
-            let disposition = update_firmware_target_until_done(&node, &firmware_target(), false)
-                .await
-                .expect("powershelf update should succeed");
+            let disposition = update_firmware_target_until_done(
+                &node,
+                &firmware_target(),
+                false,
+                FirmwareTaskPollOptions::default(),
+            )
+            .await
+            .expect("powershelf update should succeed");
 
             assert!(matches!(
                 disposition,
@@ -4708,9 +7276,14 @@ mod tests {
         ] {
             let node = OutcomeNode::new_for_node_type(node_type, completed_update_outcome());
 
-            let disposition = update_firmware_target_until_done(&node, &firmware_target(), false)
-                .await
-                .expect("non-powershelf update should succeed");
+            let disposition = update_firmware_target_until_done(
+                &node,
+                &firmware_target(),
+                false,
+                FirmwareTaskPollOptions::default(),
+            )
+            .await
+            .expect("non-powershelf update should succeed");
 
             assert!(matches!(
                 disposition,
@@ -4730,15 +7303,855 @@ mod tests {
             },
         ));
 
-        let disposition = update_firmware_target_until_done(&node, &firmware_target(), false)
-            .await
-            .expect("started outcome should poll and succeed");
+        let disposition = update_firmware_target_until_done(
+            &node,
+            &firmware_target(),
+            false,
+            FirmwareTaskPollOptions::default(),
+        )
+        .await
+        .expect("started outcome should poll and succeed");
 
         assert_eq!(
             disposition,
             FirmwareTargetDisposition::Applied { summary: None }
         );
         assert_eq!(node.poll_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn identical_image_task_skips_only_when_effective_force_is_false() {
+        let rejection = "The resource property 'FW_COMPONENT_0' has detected errors of type 'Component image is identical'.";
+
+        for message in [
+            rejection.to_owned(),
+            format!("{rejection} Resolution: Retry firmware update operation with the force flag"),
+        ] {
+            for (force_update, profile_force) in [(false, false), (true, false), (false, true)] {
+                let mut node = OutcomeNode::new(FirmwareUpdateOutcome::Started(
+                    crate::domain::node::FirmwareTaskHandle {
+                        task_id: "Task-1".to_owned(),
+                    },
+                ));
+
+                node.poll_status = FirmwareTaskStatus {
+                    completed: true,
+                    state: "Failed".to_owned(),
+                    status: "Critical".to_owned(),
+                    message: message.clone(),
+                    rejection: Some(FirmwareTaskRejection::IdenticalImage),
+                    ..Default::default()
+                };
+
+                let mut target = firmware_target();
+
+                if profile_force {
+                    target.resolution =
+                        Some(crate::domain::firmware_target::FirmwareTargetResolution {
+                            profile_target_id: "component".to_owned(),
+                            destination:
+                                crate::domain::firmware_target::FirmwareDestination::DriverDefault,
+                            update_parameters: Some(serde_json::Map::from_iter([(
+                                "ForceUpdate".to_owned(),
+                                serde_json::Value::Bool(true),
+                            )])),
+                            oem_parameters: None,
+                        });
+                }
+
+                let disposition = update_firmware_target_until_done(
+                    &node,
+                    &target,
+                    force_update,
+                    poll_options(Duration::from_secs(1), Duration::ZERO),
+                )
+                .await;
+
+                if force_update || profile_force {
+                    let error = disposition.expect_err("forced task rejection must fail");
+
+                    let FirmwareTargetUpdateError::Poll(error) = error else {
+                        panic!("forced task rejection must be a polling error");
+                    };
+
+                    assert!(error.message.contains(&message));
+                } else {
+                    let disposition = disposition.expect("unforced rejection must skip");
+                    let result = firmware_target_result_json(&target, &disposition);
+
+                    assert_eq!(
+                        disposition,
+                        FirmwareTargetDisposition::Skipped {
+                            reason: message.clone()
+                        }
+                    );
+
+                    assert_eq!(result["status"], "skipped");
+                    assert_eq!(result["reason"], message);
+                }
+
+                assert_eq!(node.poll_calls.load(Ordering::SeqCst), 2);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn identical_image_rejection_has_a_distinct_poll_outcome() {
+        let rejected = FirmwareTaskStatus {
+            completed: true,
+            state: "Failed".to_owned(),
+            status: "Critical".to_owned(),
+            message: "Component image is identical".to_owned(),
+            rejection: Some(FirmwareTaskRejection::IdenticalImage),
+            ..Default::default()
+        };
+
+        let node = SequencePollNode {
+            statuses: Mutex::new(VecDeque::from([rejected.clone(), rejected])),
+            calls: AtomicUsize::new(0),
+            fail_refetch: false,
+        };
+
+        let result = poll_firmware_task_until_complete_with_retry_timeout(
+            &node,
+            "Task-1",
+            poll_options(Duration::from_secs(1), Duration::ZERO),
+            true,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("confirmed identical-image rejection should be returned for skip handling");
+
+        assert!(matches!(
+            result,
+            PolledFirmwareTask::IdenticalImageRejected(status) if status.state == "Failed"
+        ));
+
+        assert_eq!(node.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn shorter_mixed_failure_on_refetch_is_not_skipped() {
+        let node = SequencePollNode {
+            statuses: Mutex::new(VecDeque::from([
+                FirmwareTaskStatus {
+                    completed: true,
+                    state: "Failed".to_owned(),
+                    status: "Critical".to_owned(),
+                    message: "The resource property 'FW_COMPONENT_0' has detected errors of type 'Component image is identical'. Resolution: Retry the firmware update with the force flag after reviewing all selected components".to_owned(),
+                    rejection: Some(FirmwareTaskRejection::IdenticalImage),
+                    ..Default::default()
+                },
+                FirmwareTaskStatus {
+                    completed: true,
+                    state: "Failed".to_owned(),
+                    status: "Critical".to_owned(),
+                    message: "The resource property 'FW_COMPONENT_0' has detected errors of type 'Component image is identical'.; Another component failed.".to_owned(),
+                    ..Default::default()
+                },
+            ])),
+            calls: AtomicUsize::new(0),
+            fail_refetch: false,
+        };
+
+        let error = poll_firmware_task_until_complete_with_retry_timeout(
+            &node,
+            "Task-1",
+            poll_options(Duration::from_secs(1), Duration::ZERO),
+            true,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect_err("later mixed failure must remain failed");
+
+        assert!(error.message.contains("Another component failed"));
+        assert_eq!(node.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn nonterminal_critical_refetch_does_not_confirm_identical_image_skip() {
+        for state in ["Running", "Unknown"] {
+            let node = SequencePollNode {
+                statuses: Mutex::new(VecDeque::from([
+                    FirmwareTaskStatus {
+                        completed: true,
+                        state: "Failed".to_owned(),
+                        status: "Critical".to_owned(),
+                        message: "Component image is identical".to_owned(),
+                        rejection: Some(FirmwareTaskRejection::IdenticalImage),
+                        ..Default::default()
+                    },
+                    FirmwareTaskStatus {
+                        completed: false,
+                        state: state.to_owned(),
+                        status: "Critical".to_owned(),
+                        message: "Another component failed".to_owned(),
+                        ..Default::default()
+                    },
+                ])),
+                calls: AtomicUsize::new(0),
+                fail_refetch: false,
+            };
+
+            let error = poll_firmware_task_until_complete_with_retry_timeout(
+                &node,
+                "Task-1",
+                poll_options(Duration::from_secs(1), Duration::ZERO),
+                true,
+                &CancellationToken::new(),
+            )
+            .await
+            .expect_err("a nonterminal critical refetch must not confirm a skip");
+
+            assert!(error.message.contains("Another component failed"));
+            assert_eq!(node.calls.load(Ordering::SeqCst), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn later_successful_task_response_does_not_confirm_an_identical_image_skip() {
+        let node = SequencePollNode {
+            statuses: Mutex::new(VecDeque::from([
+                FirmwareTaskStatus {
+                    completed: true,
+                    state: "Failed".to_owned(),
+                    status: "Critical".to_owned(),
+                    message: "The resource property 'FW_COMPONENT_0' has detected errors of type 'Component image is identical'.".to_owned(),
+                    rejection: Some(FirmwareTaskRejection::IdenticalImage),
+                    ..Default::default()
+                },
+                FirmwareTaskStatus {
+                    completed: true,
+                    state: "Completed".to_owned(),
+                    status: "OK".to_owned(),
+                    message: "Another component was updated.".to_owned(),
+                    ..Default::default()
+                },
+            ])),
+            calls: AtomicUsize::new(0),
+            fail_refetch: false,
+        };
+
+        let error = poll_firmware_task_until_complete_with_retry_timeout(
+            &node,
+            "Task-1",
+            poll_options(Duration::from_secs(1), Duration::ZERO),
+            true,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect_err("a later success response must not turn the initial failure into a skip");
+
+        assert!(error.message.contains("Component image is identical"));
+        assert_eq!(node.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn failed_refetch_does_not_confirm_an_identical_image_skip() {
+        let node = SequencePollNode {
+            statuses: Mutex::new(VecDeque::from([FirmwareTaskStatus {
+                completed: true,
+                state: "Failed".to_owned(),
+                status: "Critical".to_owned(),
+                message: "The resource property 'FW_COMPONENT_0' has detected errors of type 'Component image is identical'.".to_owned(),
+                rejection: Some(FirmwareTaskRejection::IdenticalImage),
+                ..Default::default()
+            }])),
+            calls: AtomicUsize::new(0),
+            fail_refetch: true,
+        };
+
+        let error = poll_firmware_task_until_complete_with_retry_timeout(
+            &node,
+            "Task-1",
+            poll_options(Duration::from_secs(1), Duration::ZERO),
+            true,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect_err("an unconfirmed rejection must remain a task failure");
+
+        assert!(error.message.contains("Component image is identical"));
+        assert_eq!(node.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancellation_during_identical_image_refetch_prevents_skip() {
+        let mut node = OutcomeNode::new(FirmwareUpdateOutcome::Started(
+            crate::domain::node::FirmwareTaskHandle {
+                task_id: "Task-1".to_owned(),
+            },
+        ));
+
+        node.poll_status = FirmwareTaskStatus {
+            completed: true,
+            state: "Failed".to_owned(),
+            status: "Critical".to_owned(),
+            message: "The resource property 'FW_COMPONENT_0' has detected errors of type 'Component image is identical'.".to_owned(),
+            rejection: Some(FirmwareTaskRejection::IdenticalImage),
+            ..Default::default()
+        };
+
+        let cancel = CancellationToken::new();
+        let target = firmware_target();
+
+        let update = firmware_update_outcome_until_done(
+            &node,
+            &target,
+            FirmwareUpdateOutcome::Started(crate::domain::node::FirmwareTaskHandle {
+                task_id: "Task-1".to_owned(),
+            }),
+            false,
+            poll_options(Duration::from_secs(60), Duration::from_secs(60)),
+            None,
+            &cancel,
+        );
+
+        tokio::pin!(update);
+
+        assert!(futures::poll!(&mut update).is_pending());
+
+        cancel.cancel();
+
+        let error = update.await.expect_err("cancellation must prevent a skip");
+
+        let FirmwareTargetUpdateError::Poll(error) = error else {
+            panic!("cancellation must be reported as a polling error");
+        };
+
+        assert_eq!(error.code, ErrorCode::Cancelled);
+        assert_eq!(node.poll_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancellation_during_non_identical_refetch_preserves_device_failure() {
+        let node = StaticPollNode {
+            status: FirmwareTaskStatus {
+                completed: true,
+                state: "Failed".to_owned(),
+                status: "Critical".to_owned(),
+                message: "Firmware image verification failed".to_owned(),
+                ..Default::default()
+            },
+        };
+
+        let cancel = CancellationToken::new();
+
+        let poll = poll_firmware_task_until_complete_with_retry_timeout(
+            &node,
+            "Task-1",
+            poll_options(Duration::from_secs(60), Duration::from_secs(60)),
+            true,
+            &cancel,
+        );
+
+        tokio::pin!(poll);
+
+        assert!(futures::poll!(&mut poll).is_pending());
+
+        cancel.cancel();
+
+        let error = poll
+            .await
+            .expect_err("terminal device failure must remain visible");
+
+        assert_eq!(error.code, ErrorCode::Internal);
+        assert!(error.message.contains("Firmware image verification failed"));
+    }
+
+    fn liteon_pmc_target() -> FirmwareTarget {
+        FirmwareTarget {
+            component: String::new(),
+            firmware_file: "/tmp/cm14mp3rd_2.3.4.fwpkg".to_owned(),
+            expected_version: Some("2.3.4".to_owned()),
+            resolution: None,
+            linkx_policy: None,
+        }
+    }
+
+    fn pmc_inventory(version: &str) -> Result<Vec<FirmwareInfo>> {
+        let item = |name: &str, version: &str| FirmwareInfo {
+            name: name.to_owned(),
+            version: version.to_owned(),
+            firmware_type: crate::domain::node::FirmwareType::Unknown,
+            updateable: false,
+            target: format!("/redfish/v1/UpdateService/FirmwareInventory/{name}"),
+            health: "OK".to_owned(),
+            state: "Enabled".to_owned(),
+            sku: String::new(),
+        };
+        Ok(vec![
+            item("FW_PSU_1", "0x6 / 0x6"),
+            item("FW_PMC_0", version),
+        ])
+    }
+
+    /// Short recovery window; the first poll loop uses the same transient budget.
+    fn pmc_task_loss_poll_options() -> FirmwareTaskPollOptions {
+        FirmwareTaskPollOptions {
+            timeout: Duration::from_secs(30),
+            interval: Duration::from_millis(5),
+            transient_error_timeout: Duration::from_millis(300),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn liteon_vr_pmc_task_loss_waits_out_the_restart_then_accepts_the_manifest_version() {
+        // Observed on hardware: the PMC rejects requests for ~13 minutes, comes
+        // back with the task gone (404), and reports the new version.
+        let node = LiteonPmcTaskLossNode::new(vec![
+            Err(RmsError::unavailable("PMC returned HTTP 401")),
+            pmc_inventory("2.3.3"),
+            pmc_inventory("2.3.4"),
+        ]);
+
+        let disposition = update_firmware_target_until_done(
+            &node,
+            &liteon_pmc_target(),
+            true,
+            pmc_task_loss_poll_options(),
+        )
+        .await
+        .expect("a matching installed PMC version should recover the lost task");
+
+        let FirmwareTargetDisposition::Applied {
+            summary: Some(summary),
+        } = disposition
+        else {
+            panic!("task-loss recovery should return an applied summary");
+        };
+        assert_eq!(summary.task_ids, ["0"]);
+        assert_eq!(
+            summary.details["recovery"],
+            "liteon_vr_pmc_task_loss_firmware_manifest_version_match"
+        );
+        assert_eq!(summary.details["installed_version"], "2.3.4");
+        assert_eq!(summary.details["inventory_item"], "FW_PMC_0");
+        assert_eq!(node.inventory_calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn liteon_vr_pmc_task_loss_matches_versions_like_compare_firmware_object() {
+        // CompareFirmwareObject trims and ignores ASCII case; so does recovery.
+        let node = LiteonPmcTaskLossNode::new(vec![pmc_inventory(" 2.3.4-rc1 ")]);
+        let mut target = liteon_pmc_target();
+        target.expected_version = Some("2.3.4-RC1".to_owned());
+
+        let disposition =
+            update_firmware_target_until_done(&node, &target, true, pmc_task_loss_poll_options())
+                .await
+                .expect("versions that differ only by case or padding should match");
+        assert!(matches!(
+            disposition,
+            FirmwareTargetDisposition::Applied { summary: Some(_) }
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn liteon_vr_pmc_task_loss_fails_when_the_pmc_never_reports_the_manifest_version() {
+        let node = LiteonPmcTaskLossNode::new(vec![pmc_inventory("2.3.3")]);
+
+        let error = update_firmware_target_until_done(
+            &node,
+            &liteon_pmc_target(),
+            true,
+            pmc_task_loss_poll_options(),
+        )
+        .await
+        .expect_err("an unchanged PMC version must not recover the lost task");
+
+        let FirmwareTargetUpdateError::Poll(error) = error else {
+            panic!("task-loss version mismatch should be a poll failure");
+        };
+        assert!(error.message.contains("FW_PMC_0 reports version 2.3.3"));
+        assert!(error.message.contains("2.3.4"));
+        assert!(node.inventory_calls.load(Ordering::SeqCst) > 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn liteon_vr_pmc_task_loss_fails_when_inventory_stays_unreadable() {
+        let node = LiteonPmcTaskLossNode::new(vec![Err(RmsError::unavailable("HTTP 401"))]);
+
+        let error = update_firmware_target_until_done(
+            &node,
+            &liteon_pmc_target(),
+            true,
+            pmc_task_loss_poll_options(),
+        )
+        .await
+        .expect_err("an unreadable inventory must not recover the lost task");
+
+        let FirmwareTargetUpdateError::Poll(error) = error else {
+            panic!("unreadable inventory should be a poll failure");
+        };
+        assert!(error.message.contains("firmware inventory read failed"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn liteon_vr_pmc_task_loss_preserves_the_last_observation_when_the_budget_expires() {
+        for (inventory, expected_observation) in [
+            (pmc_inventory("2.3.3"), "FW_PMC_0 reports version 2.3.3"),
+            (
+                Err(RmsError::unavailable("HTTP 401")),
+                "firmware inventory read failed: HTTP 401",
+            ),
+            (Ok(Vec::new()), "no FW_PMC entry in the firmware inventory"),
+        ] {
+            let node = LiteonPmcTaskLossNode::new(vec![inventory])
+                .with_read_delay(Duration::from_millis(10));
+
+            let options = FirmwareTaskPollOptions {
+                timeout: Duration::from_secs(30),
+                interval: Duration::from_secs(1),
+                transient_error_timeout: Duration::from_millis(100),
+            };
+
+            let task_deadline = tokio::time::Instant::now() + options.timeout;
+
+            let error = recover_liteon_vr_pmc_update_after_task_loss(
+                &node,
+                &liteon_pmc_target(),
+                "0",
+                &RmsError::internal("firmware task disappeared"),
+                options,
+                task_deadline,
+                &CancellationToken::new(),
+            )
+            .await
+            .expect_err("an unverified PMC version must fail recovery");
+
+            assert!(
+                error.message.contains(expected_observation),
+                "unexpected recovery diagnostic: {}",
+                error.message
+            );
+
+            assert_eq!(node.inventory_calls.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn liteon_vr_pmc_task_loss_does_not_read_inventory_with_an_expired_budget() {
+        let now = tokio::time::Instant::now();
+
+        for (recovery_budget, task_deadline) in [
+            (Duration::ZERO, now + Duration::from_secs(30)),
+            (Duration::from_millis(100), now),
+            (Duration::from_millis(100), now - Duration::from_millis(1)),
+        ] {
+            let node = LiteonPmcTaskLossNode::new(vec![pmc_inventory("2.3.4")]);
+
+            let options = FirmwareTaskPollOptions {
+                timeout: Duration::from_secs(30),
+                interval: Duration::from_millis(5),
+                transient_error_timeout: recovery_budget,
+            };
+
+            let error = recover_liteon_vr_pmc_update_after_task_loss(
+                &node,
+                &liteon_pmc_target(),
+                "0",
+                &RmsError::internal("firmware task disappeared"),
+                options,
+                task_deadline,
+                &CancellationToken::new(),
+            )
+            .await
+            .expect_err("an expired budget must not accept a matching version");
+
+            assert!(error.message.contains("budget expired before any read"));
+            assert_eq!(node.inventory_calls.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn liteon_vr_pmc_task_loss_does_not_start_a_deferred_read_after_expiry() {
+        let node = LiteonPmcTaskLossNode::new(vec![pmc_inventory("2.3.4")]);
+
+        let options = FirmwareTaskPollOptions {
+            timeout: Duration::from_secs(30),
+            interval: Duration::from_millis(5),
+            transient_error_timeout: Duration::from_millis(100),
+        };
+
+        let target = liteon_pmc_target();
+        let poll_error = RmsError::internal("firmware task disappeared");
+        let task_deadline = tokio::time::Instant::now() + options.timeout;
+        let cancel = CancellationToken::new();
+
+        let recovery = recover_liteon_vr_pmc_update_after_task_loss(
+            &node,
+            &target,
+            "0",
+            &poll_error,
+            options,
+            task_deadline,
+            &cancel,
+        );
+
+        tokio::pin!(recovery);
+
+        // Defer the selected read without starting device I/O.
+        loop {
+            let consume = tokio::task::consume_budget();
+            tokio::pin!(consume);
+
+            if futures::poll!(&mut consume).is_pending() {
+                break;
+            }
+        }
+
+        assert!(futures::poll!(&mut recovery).is_pending());
+        assert_eq!(node.inventory_calls.load(Ordering::SeqCst), 0);
+        tokio::time::advance(options.transient_error_timeout).await;
+
+        let error = recovery
+            .await
+            .expect_err("expiry must prevent a deferred read");
+
+        assert_eq!(
+            node.inventory_calls.load(Ordering::SeqCst),
+            0,
+            "deferred read started after expiry: {}",
+            error.message
+        );
+
+        assert!(error.message.contains("budget expired before any read"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn liteon_vr_pmc_task_loss_accepts_a_match_only_before_the_deadline() {
+        for (read_delay_ms, should_succeed, elapsed_ms) in
+            [(30, true, 80), (40, false, 100), (50, false, 100)]
+        {
+            let node =
+                LiteonPmcTaskLossNode::new(vec![pmc_inventory("2.3.3"), pmc_inventory("2.3.4")])
+                    .with_read_delay(Duration::from_millis(read_delay_ms));
+
+            let options = FirmwareTaskPollOptions {
+                timeout: Duration::from_secs(30),
+                interval: Duration::from_millis(20),
+                transient_error_timeout: Duration::from_millis(100),
+            };
+
+            let started = tokio::time::Instant::now();
+
+            let result = recover_liteon_vr_pmc_update_after_task_loss(
+                &node,
+                &liteon_pmc_target(),
+                "0",
+                &RmsError::internal("firmware task disappeared"),
+                options,
+                started + options.timeout,
+                &CancellationToken::new(),
+            )
+            .await;
+
+            if should_succeed {
+                let summary = result.expect("a match before expiry should succeed");
+
+                assert_eq!(summary.details["installed_version"], "2.3.4");
+                assert_eq!(summary.task_ids, ["0"]);
+            } else {
+                let error = result.expect_err("a match at or after expiry must fail");
+
+                assert!(
+                    error
+                        .message
+                        .contains("did not finish within the recovery budget")
+                );
+
+                assert!(!error.message.contains("FW_PMC_0 reports version 2.3.3"));
+            }
+
+            assert_eq!(started.elapsed(), Duration::from_millis(elapsed_ms));
+            assert_eq!(node.inventory_calls.load(Ordering::SeqCst), 2);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn liteon_vr_pmc_task_loss_cancellation_precedes_a_ready_match_and_deadline() {
+        for cancel_at_ms in [10, 100] {
+            let node = LiteonPmcTaskLossNode::new(vec![pmc_inventory("2.3.4")])
+                .with_read_delay(Duration::from_millis(10));
+
+            let options = FirmwareTaskPollOptions {
+                timeout: Duration::from_secs(30),
+                interval: Duration::from_millis(5),
+                transient_error_timeout: Duration::from_millis(100),
+            };
+
+            let target = liteon_pmc_target();
+            let poll_error = RmsError::internal("firmware task disappeared");
+            let task_deadline = tokio::time::Instant::now() + options.timeout;
+            let cancel = CancellationToken::new();
+
+            let recovery = recover_liteon_vr_pmc_update_after_task_loss(
+                &node,
+                &target,
+                "0",
+                &poll_error,
+                options,
+                task_deadline,
+                &cancel,
+            );
+
+            tokio::pin!(recovery);
+
+            assert!(futures::poll!(&mut recovery).is_pending());
+            tokio::time::advance(Duration::from_millis(cancel_at_ms)).await;
+            cancel.cancel();
+
+            let error = recovery
+                .await
+                .expect_err("cancellation must precede accepting a ready match");
+
+            assert_eq!(error.code, ErrorCode::Cancelled);
+            assert_eq!(node.inventory_calls.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    async fn run_pmc_task_loss_recovery(
+        node: &LiteonPmcTaskLossNode,
+        options: FirmwareTaskPollOptions,
+        cancel: &CancellationToken,
+    ) -> std::result::Result<FirmwareTargetDisposition, FirmwareTargetUpdateError> {
+        let outcome = FirmwareUpdateOutcome::Started(crate::domain::node::FirmwareTaskHandle {
+            task_id: "0".to_owned(),
+        });
+        firmware_update_outcome_until_done(
+            node,
+            &liteon_pmc_target(),
+            outcome,
+            false,
+            options,
+            None,
+            cancel,
+        )
+        .await
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn liteon_vr_pmc_task_loss_cancel_interrupts_a_slow_inventory_read() {
+        let node = LiteonPmcTaskLossNode::new(vec![pmc_inventory("2.3.4")])
+            .with_read_delay(Duration::from_secs(2));
+        // The poll loop gives up after 400ms; recovery then has 400ms more.
+        let options = FirmwareTaskPollOptions {
+            timeout: Duration::from_secs(30),
+            interval: Duration::from_millis(5),
+            transient_error_timeout: Duration::from_millis(400),
+        };
+        let cancel = CancellationToken::new();
+        let canceller = cancel.clone();
+
+        let cancellation = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            canceller.cancel();
+        });
+
+        let started = tokio::time::Instant::now();
+
+        let error = run_pmc_task_loss_recovery(&node, options, &cancel)
+            .await
+            .expect_err("a cancelled job must not report the PMC update as applied");
+
+        cancellation.await.expect("cancellation task should finish");
+
+        let FirmwareTargetUpdateError::Poll(error) = error else {
+            panic!("cancellation should surface as a poll error");
+        };
+
+        assert_eq!(error.code, ErrorCode::Cancelled);
+        assert_eq!(started.elapsed(), Duration::from_millis(600));
+        assert_eq!(node.inventory_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn liteon_vr_pmc_task_loss_does_not_accept_a_match_read_after_the_budget() {
+        let node = LiteonPmcTaskLossNode::new(vec![pmc_inventory("2.3.4")])
+            .with_read_delay(Duration::from_secs(2));
+        let options = FirmwareTaskPollOptions {
+            timeout: Duration::from_secs(30),
+            interval: Duration::from_millis(5),
+            transient_error_timeout: Duration::from_millis(400),
+        };
+
+        let started = tokio::time::Instant::now();
+
+        let error = run_pmc_task_loss_recovery(&node, options, &CancellationToken::new())
+            .await
+            .expect_err("a read that outlasts the budget must not report success");
+
+        let FirmwareTargetUpdateError::Poll(error) = error else {
+            panic!("an exhausted budget should be a poll failure");
+        };
+        assert!(
+            error
+                .message
+                .contains("did not finish within the recovery budget")
+        );
+
+        assert_eq!(started.elapsed(), Duration::from_millis(800));
+        assert_eq!(node.inventory_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn liteon_vr_pmc_task_loss_recovery_does_not_outlive_the_task_deadline() {
+        // The poll loop gives up because the overall task deadline passed, not
+        // because the transient budget did. Recovery must not add a new budget.
+        let node = LiteonPmcTaskLossNode::new(vec![pmc_inventory("2.3.3")]);
+        let options = FirmwareTaskPollOptions {
+            timeout: Duration::from_millis(150),
+            interval: Duration::from_millis(5),
+            transient_error_timeout: Duration::from_secs(30),
+        };
+
+        let started = tokio::time::Instant::now();
+
+        let error = run_pmc_task_loss_recovery(&node, options, &CancellationToken::new())
+            .await
+            .expect_err("an old version must not be accepted");
+
+        let FirmwareTargetUpdateError::Poll(error) = error else {
+            panic!("a missed version should be a poll failure");
+        };
+
+        assert!(error.message.contains("could not be confirmed"));
+        assert!(error.message.contains("budget expired before any read"));
+        assert_eq!(started.elapsed(), Duration::from_millis(150));
+        assert_eq!(node.inventory_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn liteon_vr_pmc_task_loss_recovery_is_limited_to_versioned_vr_targets() {
+        let vr = LiteonPmcTaskLossNode::new(vec![pmc_inventory("2.3.4")]);
+        assert!(liteon_vr_pmc_task_loss_recovery_allowed(
+            &vr,
+            &liteon_pmc_target()
+        ));
+
+        // The PSU target carries no manifest version, so it never qualifies.
+        let mut psu = liteon_pmc_target();
+        psu.expected_version = None;
+        assert!(!liteon_vr_pmc_task_loss_recovery_allowed(&vr, &psu));
+        psu.expected_version = Some("  ".to_owned());
+        assert!(!liteon_vr_pmc_task_loss_recovery_allowed(&vr, &psu));
+
+        for node_type in [
+            NodeType::PowershelfGb200Liteon,
+            NodeType::PowershelfGb300Liteon,
+            NodeType::PowershelfGb200Delta,
+            NodeType::ComputeGb300Nvidia,
+        ] {
+            let other = LiteonPmcTaskLossNode {
+                node_type,
+                ..LiteonPmcTaskLossNode::new(vec![pmc_inventory("2.3.4")])
+            };
+            assert!(
+                !liteon_vr_pmc_task_loss_recovery_allowed(&other, &liteon_pmc_target()),
+                "{node_type}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -4766,6 +8179,7 @@ mod tests {
             &node,
             &supermicro_bmc_target_with_firmware_manifest_version(),
             false,
+            task_loss_poll_options(),
         )
         .await
         .expect("matching installed firmware manifest version should recover the lost BMC task");
@@ -4809,6 +8223,7 @@ mod tests {
             &node,
             &supermicro_bmc_target_with_firmware_manifest_version(),
             false,
+            task_loss_poll_options(),
         )
         .await
         .expect_err("mismatched installed version must not recover the lost BMC task");
@@ -4847,6 +8262,7 @@ mod tests {
             &node,
             &target,
             false,
+            FirmwareTaskPollOptions::default(),
             Some(FirmwareTaskProgress {
                 tracker: &tracker,
                 job_id: &job_id,
@@ -4884,6 +8300,7 @@ mod tests {
             &node,
             &target,
             false,
+            FirmwareTaskPollOptions::default(),
             Some(FirmwareTaskProgress {
                 tracker: &tracker,
                 job_id: &job_id,
@@ -4919,6 +8336,8 @@ mod tests {
             NodeType::PowershelfGb200Delta,
             NodeType::PowershelfGb300Liteon,
             NodeType::PowershelfGb300Delta,
+            NodeType::PowershelfVrnvl72Liteon,
+            NodeType::PowershelfVrnvl72Delta,
         ] {
             let node = ActivationNode {
                 node_type,
@@ -4988,6 +8407,14 @@ mod tests {
             },
             transient_failures: 0,
             calls: AtomicUsize::new(0),
+            not_ready_probes: 0,
+            not_ready_error: || {
+                RmsError::failed_precondition("NVOS not ready: status=System is ready, health=N/A")
+            },
+            readiness_calls: AtomicUsize::new(0),
+            unreachable_probes: 0,
+            unreachable_error: || RmsError::unavailable("HTTP GET /nvue_v1/system returned 503"),
+            reachability_calls: AtomicUsize::new(0),
         };
 
         let err =
@@ -5004,6 +8431,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn post_activation_version_check_does_not_require_preflight_completeness() {
+        let node = VersionCheckNode {
+            node_type: NodeType::SwitchGb200Nvidia,
+            summary: FirmwareVersionCheckSummary {
+                matched: true,
+                details: serde_json::json!({
+                    "status": "matched",
+                    "all_targets_matched": false,
+                    "components": [{"name": "BMC", "status": "matched"}],
+                    "mismatches": []
+                }),
+            },
+            transient_failures: 0,
+            calls: AtomicUsize::new(0),
+            not_ready_probes: 0,
+            not_ready_error: || {
+                RmsError::failed_precondition("NVOS not ready: status=System is ready, health=N/A")
+            },
+            readiness_calls: AtomicUsize::new(0),
+            unreachable_probes: 0,
+            unreachable_error: || RmsError::unavailable("HTTP GET /nvue_v1/system returned 503"),
+            reachability_calls: AtomicUsize::new(0),
+        };
+        let summary =
+            post_activation_version_check(&node, &[firmware_target()], &CancellationToken::new())
+                .await
+                .expect("package completeness must not fail post-activation verification")
+                .expect("switch version check should run");
+
+        assert!(summary.matched);
+        assert_eq!(summary.details["all_targets_matched"], false);
+        assert_eq!(node.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn post_activation_version_check_retries_transient_inventory_failures() {
         let node = VersionCheckNode {
             node_type: NodeType::ComputeGb200Nvidia,
@@ -5013,6 +8475,14 @@ mod tests {
             },
             transient_failures: 2,
             calls: AtomicUsize::new(0),
+            not_ready_probes: 0,
+            not_ready_error: || {
+                RmsError::failed_precondition("NVOS not ready: status=System is ready, health=N/A")
+            },
+            readiness_calls: AtomicUsize::new(0),
+            unreachable_probes: 0,
+            unreachable_error: || RmsError::unavailable("HTTP GET /nvue_v1/system returned 503"),
+            reachability_calls: AtomicUsize::new(0),
         };
 
         let summary =
@@ -5023,6 +8493,119 @@ mod tests {
 
         assert!(summary.matched);
         assert_eq!(node.calls.load(Ordering::SeqCst), 3);
+    }
+
+    fn matched_switch_node(not_ready_probes: usize) -> VersionCheckNode {
+        VersionCheckNode {
+            node_type: NodeType::SwitchVrnvl72Nvidia,
+            summary: FirmwareVersionCheckSummary {
+                matched: true,
+                details: serde_json::json!({"status": "matched"}),
+            },
+            transient_failures: 0,
+            calls: AtomicUsize::new(0),
+            not_ready_probes,
+            not_ready_error: || {
+                RmsError::failed_precondition("NVOS not ready: status=System is ready, health=N/A")
+            },
+            readiness_calls: AtomicUsize::new(0),
+            unreachable_probes: 0,
+            unreachable_error: || RmsError::unavailable("HTTP GET /nvue_v1/system returned 503"),
+            reachability_calls: AtomicUsize::new(0),
+        }
+    }
+
+    #[tokio::test]
+    async fn post_activation_version_check_waits_for_switch_readiness() {
+        let node = matched_switch_node(1);
+
+        post_activation_version_check(&node, &[firmware_target()], &CancellationToken::new())
+            .await
+            .expect("versions match and the switch becomes ready")
+            .expect("version check should run");
+
+        assert_eq!(node.readiness_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn post_activation_version_check_waits_for_the_switch_api_before_readiness() {
+        // A BMC-activated switch: versions match while NVOS still boots.
+        let mut node = matched_switch_node(0);
+        node.unreachable_probes = 2;
+
+        post_activation_version_check(&node, &[firmware_target()], &CancellationToken::new())
+            .await
+            .expect("NVUE comes back within the budget")
+            .expect("version check should run");
+
+        assert_eq!(node.reachability_calls.load(Ordering::SeqCst), 3);
+        assert_eq!(node.readiness_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn post_activation_version_check_retries_any_http_error_while_nvue_boots() {
+        // A proxy in front of NVUE answers 502 until the service is up.
+        let mut node = matched_switch_node(0);
+        node.unreachable_probes = 1;
+        node.unreachable_error = || RmsError::internal("HTTP GET /nvue_v1/system returned 502");
+
+        post_activation_version_check(&node, &[firmware_target()], &CancellationToken::new())
+            .await
+            .expect("a 502 during boot is retried")
+            .expect("version check should run");
+
+        assert_eq!(node.reachability_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn post_activation_version_check_stops_on_a_failed_boot() {
+        // The readiness probe answers with the terminal code: no retry.
+        let mut node = matched_switch_node(0);
+        node.not_ready_probes = usize::MAX;
+        node.not_ready_error = || {
+            RmsError::aborted(
+                "NVOS reports a failed boot: status=System is not ready (failed), health=OK",
+            )
+        };
+
+        let err =
+            post_activation_version_check(&node, &[firmware_target()], &CancellationToken::new())
+                .await
+                .expect_err("a failed boot fails the job at once");
+
+        assert_eq!(err.code, ErrorCode::Aborted);
+        assert_eq!(node.readiness_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn post_activation_version_check_retries_an_http_error_from_the_readiness_read() {
+        // NVUE answered once, then a 502 arrives before the ready body.
+        let mut node = matched_switch_node(1);
+        node.not_ready_error = || RmsError::internal("HTTP GET /nvue_v1/system returned 502");
+
+        post_activation_version_check(&node, &[firmware_target()], &CancellationToken::new())
+            .await
+            .expect("a 502 on the readiness read is retried")
+            .expect("version check should run");
+
+        assert_eq!(node.readiness_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn post_activation_version_check_fails_when_the_switch_never_becomes_ready() {
+        let node = matched_switch_node(usize::MAX);
+
+        let err =
+            post_activation_version_check(&node, &[firmware_target()], &CancellationToken::new())
+                .await
+                .expect_err("versions match but the switch never reports ready");
+
+        assert_eq!(err.code, ErrorCode::FailedPrecondition);
+        assert!(err.message.contains("health=N/A"), "{}", err.message);
+        assert_eq!(
+            node.readiness_calls.load(Ordering::SeqCst),
+            POST_ACTIVATION_VERSION_CHECK_ATTEMPTS
+        );
     }
 
     struct CancelDuringVerifyNode {
@@ -5081,17 +8664,215 @@ mod tests {
 
     #[tokio::test]
     async fn post_activation_version_check_skips_powershelf_nodes() {
-        let node = OutcomeNode::new_for_node_type(
+        for node_type in [
             NodeType::PowershelfGb200Liteon,
-            completed_update_outcome(),
+            NodeType::PowershelfGb200Delta,
+            NodeType::PowershelfGb300Liteon,
+            NodeType::PowershelfGb300Delta,
+            NodeType::PowershelfVrnvl72Liteon,
+            NodeType::PowershelfVrnvl72Delta,
+        ] {
+            let node = OutcomeNode::new_for_node_type(node_type, completed_update_outcome());
+
+            let summary = post_activation_version_check(
+                &node,
+                &[firmware_target()],
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("powershelf should not run post-activation version check");
+
+            assert!(summary.is_none(), "node type {node_type}");
+        }
+    }
+
+    /// The n-th reply of a scripted readiness probe.
+    type ScriptedAnswer = fn(usize) -> Result<()>;
+
+    /// Readiness probe scripted by call number: `answer(n)` is the n-th reply.
+    struct ScriptedProbe {
+        calls: AtomicUsize,
+        answer: ScriptedAnswer,
+    }
+
+    impl ScriptedProbe {
+        fn new(answer: ScriptedAnswer) -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                answer,
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl ScriptedProbe {
+        async fn probe_system_ready(&self) -> Result<()> {
+            (self.answer)(self.calls.fetch_add(1, Ordering::SeqCst))
+        }
+    }
+
+    #[tokio::test]
+    async fn wait_for_system_ready_polls_until_the_node_reports_ready() {
+        let probe = ScriptedProbe::new(|call| {
+            if call < 2 {
+                Err(RmsError::failed_precondition(
+                    "NVOS not ready: status=System is booting, health=OK",
+                ))
+            } else {
+                Ok(())
+            }
+        });
+
+        wait_for_system_ready(
+            || probe.probe_system_ready(),
+            &CancellationToken::new(),
+            None,
+        )
+        .await
+        .expect("node became ready within the budget");
+
+        assert_eq!(probe.calls(), 3);
+    }
+
+    #[tokio::test]
+    async fn wait_for_system_ready_returns_the_last_not_ready_error_after_the_budget() {
+        let probe = ScriptedProbe::new(|_| {
+            Err(RmsError::failed_precondition(
+                "NVOS not ready: status=System is ready, health=Not OK",
+            ))
+        });
+
+        let err = wait_for_system_ready(
+            || probe.probe_system_ready(),
+            &CancellationToken::new(),
+            None,
+        )
+        .await
+        .expect_err("a node that never becomes ready fails the check");
+
+        assert_eq!(err.code, ErrorCode::FailedPrecondition);
+        assert!(err.message.contains("Not OK"));
+        assert_eq!(probe.calls(), POST_ACTIVATION_VERSION_CHECK_ATTEMPTS);
+    }
+
+    #[tokio::test]
+    async fn wait_for_system_ready_takes_its_budget_from_the_stage_policy() {
+        let probe = ScriptedProbe::new(|_| {
+            Err(RmsError::failed_precondition(
+                "NVOS not ready: status=System is ready, health=N/A",
+            ))
+        });
+        let two_quick_attempts = VerificationPolicy::required(
+            Duration::ZERO,
+            std::num::NonZeroU32::new(2).unwrap(),
+            Duration::ZERO,
         );
 
-        let summary =
-            post_activation_version_check(&node, &[firmware_target()], &CancellationToken::new())
-                .await
-                .expect("powershelf should not run post-activation version check");
+        let err = wait_for_system_ready(
+            || probe.probe_system_ready(),
+            &CancellationToken::new(),
+            Some(two_quick_attempts),
+        )
+        .await
+        .expect_err("the policy's two attempts run out");
 
-        assert!(summary.is_none());
+        assert_eq!(err.code, ErrorCode::FailedPrecondition);
+        assert_eq!(probe.calls(), 2);
+    }
+
+    #[tokio::test]
+    async fn wait_for_system_ready_retries_a_rebooting_node_until_it_answers() {
+        // What NVUE returns while NVOS initializes: HTTP 503, mapped to Unavailable.
+        let probe = ScriptedProbe::new(|call| {
+            if call == 0 {
+                Err(RmsError::unavailable(
+                    "HTTP GET /nvue_v1/system returned 503",
+                ))
+            } else {
+                Ok(())
+            }
+        });
+
+        wait_for_system_ready(
+            || probe.probe_system_ready(),
+            &CancellationToken::new(),
+            None,
+        )
+        .await
+        .expect("a transport error during the reboot is retried");
+
+        assert_eq!(probe.calls(), 2);
+    }
+
+    #[tokio::test]
+    async fn wait_for_system_ready_retries_an_answer_it_cannot_decode() {
+        // A health word outside the known set fails the decode as `Internal`.
+        let probe = ScriptedProbe::new(|_| {
+            Err(RmsError::internal(
+                "invalid NVUE system response: unknown variant `DEGRADED`",
+            ))
+        });
+
+        let err = wait_for_system_ready(
+            || probe.probe_system_ready(),
+            &CancellationToken::new(),
+            None,
+        )
+        .await
+        .expect_err("an answer that never decodes fails once the budget runs out");
+
+        assert_eq!(err.code, ErrorCode::Internal);
+        assert_eq!(probe.calls(), POST_ACTIVATION_VERSION_CHECK_ATTEMPTS);
+    }
+
+    #[tokio::test]
+    async fn wait_for_system_ready_stops_at_once_on_errors_waiting_cannot_fix() {
+        // A failed boot, and a node without a management API endpoint.
+        let terminal: [(ErrorCode, ScriptedAnswer); 2] = [
+            (ErrorCode::Aborted, |_| {
+                Err(RmsError::aborted(
+                    "NVOS reports a failed boot: status=System is not ready (failed), health=OK",
+                ))
+            }),
+            (ErrorCode::InvalidArgument, |_| {
+                Err(RmsError::invalid_argument(
+                    "node has no management API endpoint",
+                ))
+            }),
+        ];
+
+        for (code, answer) in terminal {
+            let probe = ScriptedProbe::new(answer);
+
+            let err = wait_for_system_ready(
+                || probe.probe_system_ready(),
+                &CancellationToken::new(),
+                None,
+            )
+            .await
+            .expect_err("an error waiting cannot fix is not retried");
+
+            assert_eq!(err.code, code);
+            assert_eq!(probe.calls(), 1, "{code:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn wait_for_system_ready_returns_on_the_first_ready_probe() {
+        let probe = ScriptedProbe::new(|_| Ok(()));
+
+        wait_for_system_ready(
+            || probe.probe_system_ready(),
+            &CancellationToken::new(),
+            None,
+        )
+        .await
+        .expect("a ready node passes at once");
+
+        assert_eq!(probe.calls(), 1);
     }
 
     #[test]
@@ -5150,6 +8931,83 @@ mod tests {
     }
 
     #[test]
+    fn build_firmware_targets_by_type_preserves_resolved_types() -> TestResult {
+        use crate::api::grpc::conversions::domain_node_type_to_proto;
+        use crate::api::grpc::node_type_resolver::domain_node_type_to_descriptor;
+
+        let firmware_dir = tempfile::tempdir()?;
+        std::fs::write(firmware_dir.path().join("hmc.fwpkg"), b"hmc")?;
+        std::fs::write(firmware_dir.path().join("bmc.fwpkg"), b"bmc")?;
+
+        let hmc_path = firmware_dir.path().join("hmc.fwpkg").canonicalize()?;
+        let bmc_path = firmware_dir.path().join("bmc.fwpkg").canonicalize()?;
+        let hmc_path = hmc_path.to_string_lossy();
+        let bmc_path = bmc_path.to_string_lossy();
+
+        for (node_type, components) in [
+            (NodeType::ComputeGb200Nvidia, ["HMC", "BMC"]),
+            (NodeType::ComputeGb200Wiwynn, ["HMC", "BMC"]),
+            (NodeType::ComputeGb200Dell, ["HMC", "BMC"]),
+            (NodeType::ComputeGb300Supermicro, ["HMC", "BMC"]),
+            (NodeType::PowershelfVrnvl72Liteon, ["", ""]),
+            (NodeType::PowershelfVrnvl72Delta, ["", ""]),
+        ] {
+            for multi_target in [false, true] {
+                let request = rm::BatchUpdateFirmwareByNodeTypeRequest {
+                    node_type: domain_node_type_to_proto(node_type) as i32,
+                    node_descriptor: Some(domain_node_type_to_descriptor(node_type)),
+                    filename: if multi_target {
+                        "missing.fwpkg"
+                    } else {
+                        "hmc.fwpkg"
+                    }
+                    .into(),
+                    target: "HMC".into(),
+                    firmware_targets: if multi_target {
+                        vec![
+                            rm::FirmwareTarget {
+                                filename: "hmc.fwpkg".into(),
+                                target: "HMC".into(),
+                            },
+                            rm::FirmwareTarget {
+                                filename: "bmc.fwpkg".into(),
+                                target: "BMC".into(),
+                            },
+                        ]
+                    } else {
+                        Vec::new()
+                    },
+                    ..Default::default()
+                };
+
+                let resolved =
+                    resolve_node_type(Some(request.node_type), request.node_descriptor.as_ref())?;
+
+                let expected = if multi_target {
+                    vec![
+                        (components[0], hmc_path.as_ref()),
+                        (components[1], bmc_path.as_ref()),
+                    ]
+                } else {
+                    vec![(components[0], hmc_path.as_ref())]
+                };
+
+                let targets =
+                    build_firmware_targets_by_type(&request, firmware_dir.path(), resolved)?;
+
+                let actual: Vec<_> = targets
+                    .iter()
+                    .map(|target| (target.component.as_str(), target.firmware_file.as_str()))
+                    .collect();
+
+                assert_eq!(actual, expected, "{node_type}, multi_target={multi_target}");
+            }
+        }
+
+        Ok(())
+    }
+
+    #[test]
     fn build_firmware_targets_from_list_allows_empty_targets_for_all_node_types() {
         let temp_dir = tempfile::tempdir().unwrap();
         let firmware_dir = temp_dir.path().join("firmware");
@@ -5172,6 +9030,8 @@ mod tests {
             NodeType::PowershelfGb200Delta,
             NodeType::PowershelfGb300Liteon,
             NodeType::PowershelfGb300Delta,
+            NodeType::PowershelfVrnvl72Liteon,
+            NodeType::PowershelfVrnvl72Delta,
         ] {
             let targets =
                 build_firmware_targets_from_list(node_type, &target_list, &firmware_dir).unwrap();
@@ -5276,12 +9136,12 @@ mod tests {
         let res = poll_firmware_task_until_complete(
             &node,
             "task-1",
-            Duration::from_secs(1),
-            Duration::from_millis(10),
+            poll_options(Duration::from_secs(1), Duration::from_millis(10)),
         )
         .await;
+
         assert!(res.is_ok(), "expected Ok, got {res:?}");
-        assert!(res.unwrap().completed);
+        assert!(matches!(res, Ok(PolledFirmwareTask::Completed(status)) if status.completed));
         assert_eq!(node.calls.load(Ordering::SeqCst), 1);
     }
 
@@ -5295,8 +9155,7 @@ mod tests {
         let res = poll_firmware_task_until_complete(
             &node,
             "task-1",
-            Duration::from_secs(5),
-            Duration::from_millis(1),
+            poll_options(Duration::from_secs(5), Duration::from_millis(1)),
         )
         .await;
         assert!(res.is_ok(), "expected Ok, got {res:?}");
@@ -5313,8 +9172,7 @@ mod tests {
         let res = poll_firmware_task_until_complete(
             &node,
             "task-1",
-            Duration::from_secs(1),
-            Duration::from_millis(10),
+            poll_options(Duration::from_secs(1), Duration::from_millis(10)),
         )
         .await;
         let err = res.expect_err("expected Err, got Ok");
@@ -5335,30 +9193,12 @@ mod tests {
         let res = poll_firmware_task_until_complete(
             &node,
             "1",
-            Duration::from_secs(1),
-            Duration::from_millis(1),
+            poll_options(Duration::from_secs(1), Duration::from_millis(1)),
         )
         .await;
 
         assert!(res.is_ok(), "expected Ok, got {res:?}");
         assert_eq!(node.calls.load(Ordering::SeqCst), 3);
-    }
-
-    #[test]
-    fn firmware_poll_timeout_is_keyed_by_node_kind() {
-        // Switches stay generous; compute and powershelf are bounded tighter.
-        assert_eq!(
-            firmware_poll_timeout(NodeType::SwitchGb200Nvidia),
-            Duration::from_secs(3 * 60 * 60)
-        );
-        assert_eq!(
-            firmware_poll_timeout(NodeType::ComputeGb300Supermicro),
-            Duration::from_secs(90 * 60)
-        );
-        assert_eq!(
-            firmware_poll_timeout(NodeType::PowershelfGb200Liteon),
-            Duration::from_secs(60 * 60)
-        );
     }
 
     #[tokio::test]
@@ -5375,9 +9215,8 @@ mod tests {
         let err = poll_firmware_task_until_complete_with_retry_timeout(
             &node,
             "task-cancel",
-            Duration::from_secs(3 * 60 * 60),
-            Duration::from_secs(5),
-            FIRMWARE_TRANSIENT_POLL_ERROR_RETRY_TIMEOUT,
+            poll_options(Duration::from_secs(3 * 60 * 60), Duration::from_secs(5)),
+            false,
             &cancel,
         )
         .await
@@ -5409,9 +9248,11 @@ mod tests {
             poll_firmware_task_until_complete_with_retry_timeout(
                 poll_node.as_ref(),
                 "task-cancel-wait",
-                Duration::from_secs(3 * 60 * 60),
-                Duration::from_secs(3 * 60 * 60),
-                FIRMWARE_TRANSIENT_POLL_ERROR_RETRY_TIMEOUT,
+                poll_options(
+                    Duration::from_secs(3 * 60 * 60),
+                    Duration::from_secs(3 * 60 * 60),
+                ),
+                false,
                 &poll_cancel,
             )
             .await
@@ -5444,8 +9285,7 @@ mod tests {
         let err = poll_firmware_task_until_complete(
             &node,
             "1",
-            Duration::from_millis(30),
-            Duration::from_millis(5),
+            poll_options(Duration::from_millis(30), Duration::from_millis(5)),
         )
         .await
         .expect_err("persistent transient status errors should eventually fail");
@@ -5495,6 +9335,7 @@ mod tests {
                 state: "action_error".to_owned(),
                 status: "bad image".to_owned(),
                 message: "bad image".to_owned(),
+                rejection: None,
             },
             FirmwareTaskStatus {
                 completed: true,
@@ -5502,14 +9343,14 @@ mod tests {
                 state: "Completed".to_owned(),
                 status: "Warning".to_owned(),
                 message: "The resource property Firmware Update Service has detected errors of type 'No Matching Devices'. Resolution: Verify the FW package has devices that are listed in the Redfish FW Inventory".to_owned(),
+                rejection: None,
             },
         ] {
             let node = StaticPollNode { status };
             let err = poll_firmware_task_until_complete(
                 &node,
                 "Task-Failed",
-                Duration::from_secs(1),
-                Duration::from_millis(1),
+                poll_options(Duration::from_secs(1), Duration::from_millis(1)),
             )
             .await
             .expect_err("failed terminal state should return an error");
@@ -5542,13 +9383,13 @@ mod tests {
                 },
             ])),
             calls: AtomicUsize::new(0),
+            fail_refetch: false,
         };
 
         let err = poll_firmware_task_until_complete(
             &node,
             "0",
-            Duration::from_secs(1),
-            Duration::from_millis(1),
+            poll_options(Duration::from_secs(1), Duration::from_millis(1)),
         )
         .await
         .expect_err("failed terminal state should return an error");
@@ -5561,6 +9402,45 @@ mod tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn refetch_of_failed_terminal_status_does_not_wait_a_whole_poll_interval() {
+        // A poll interval raised for quieter logs must not slow failure
+        // reporting: the confirming refetch waits the grace, not the interval.
+        let node = SequencePollNode {
+            statuses: Mutex::new(VecDeque::from([
+                FirmwareTaskStatus {
+                    completed: true,
+                    state: "Failed".to_owned(),
+                    status: "Critical".to_owned(),
+                    message: "The task with Id '0' has completed with errors.".to_owned(),
+                    ..Default::default()
+                },
+                FirmwareTaskStatus {
+                    completed: true,
+                    state: "Failed".to_owned(),
+                    status: "Critical".to_owned(),
+                    message: "The task with Id '0' has completed with errors.; ERoT is busy."
+                        .to_owned(),
+                    ..Default::default()
+                },
+            ])),
+            calls: AtomicUsize::new(0),
+            fail_refetch: false,
+        };
+
+        let started_at = tokio::time::Instant::now();
+        poll_firmware_task_until_complete(
+            &node,
+            "0",
+            poll_options(Duration::from_secs(3 * 60 * 60), Duration::from_secs(60)),
+        )
+        .await
+        .expect_err("failed terminal state should return an error");
+
+        assert_eq!(node.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(started_at.elapsed(), TERMINAL_TASK_REFETCH_GRACE);
+    }
+
     #[tokio::test]
     async fn poll_until_complete_accepts_action_error_only_at_100_percent() {
         let node = StaticPollNode {
@@ -5570,14 +9450,14 @@ mod tests {
                 state: "action_error".to_owned(),
                 status: "rebooting to install image".to_owned(),
                 message: "Installing image after reboot".to_owned(),
+                rejection: None,
             },
         };
 
         poll_firmware_task_until_complete(
             &node,
             "Task-Reboot-Handoff",
-            Duration::from_secs(1),
-            Duration::from_millis(1),
+            poll_options(Duration::from_secs(1), Duration::from_millis(1)),
         )
         .await
         .expect("action_error at 100 percent should preserve switch reboot-handoff success");
@@ -5592,14 +9472,14 @@ mod tests {
                 state: "Completed".to_owned(),
                 status: "OK".to_owned(),
                 message: "3 components updated; 2 skipped due to failed pre-checks".to_owned(),
+                rejection: None,
             },
         };
 
         poll_firmware_task_until_complete(
             &node,
             "Task-Completed-With-Diagnostics",
-            Duration::from_secs(1),
-            Duration::from_millis(1),
+            poll_options(Duration::from_secs(1), Duration::from_millis(1)),
         )
         .await
         .expect("completed OK task should not fail only because message contains failed");
@@ -5615,8 +9495,7 @@ mod tests {
         let res = poll_firmware_task_until_complete(
             &node,
             "task-1",
-            Duration::from_millis(50),
-            Duration::from_millis(5),
+            poll_options(Duration::from_millis(50), Duration::from_millis(5)),
         )
         .await;
         let err = res.expect_err("expected timeout Err, got Ok");
@@ -5626,6 +9505,38 @@ mod tests {
             err.message
         );
         assert!(node.calls.load(Ordering::SeqCst) >= 2);
+    }
+
+    #[tokio::test]
+    async fn poll_until_complete_does_not_overshoot_timeout_by_a_full_interval() {
+        // An interval far longer than the timeout: the loop must clamp its
+        // sleep to the deadline instead of waking up an interval past it.
+        let node = CountingPollNode {
+            complete_after: usize::MAX,
+            calls: AtomicUsize::new(0),
+            always_fail: false,
+        };
+
+        let started_at = std::time::Instant::now();
+
+        let err = poll_firmware_task_until_complete(
+            &node,
+            "task-1",
+            poll_options(Duration::from_millis(20), Duration::from_secs(5)),
+        )
+        .await
+        .expect_err("expected timeout Err, got Ok");
+
+        assert!(
+            err.message.to_lowercase().contains("timeout"),
+            "unexpected message: {}",
+            err.message
+        );
+        let elapsed = started_at.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "gave up after {elapsed:?}, expected roughly the 20ms timeout"
+        );
     }
 
     // ── BMC Aux Powercycle Recovery ──────────────────────────────────────────
@@ -5642,9 +9553,9 @@ mod tests {
         power_states: Mutex<VecDeque<PowerState>>,
         /// Returned by `get_power_state` once the `power_states` queue is exhausted.
         power_state_default: PowerState,
-        update_calls: AtomicUsize,
+        update_calls: Arc<AtomicUsize>,
         activation_calls: AtomicUsize,
-        powercycle_calls: AtomicUsize,
+        powercycle_calls: Arc<AtomicUsize>,
     }
 
     impl RecoveryMockNode {
@@ -5658,9 +9569,9 @@ mod tests {
                 powercycle_errors: Mutex::new(VecDeque::new()),
                 power_states: Mutex::new(VecDeque::new()),
                 power_state_default: PowerState::On,
-                update_calls: AtomicUsize::new(0),
+                update_calls: Arc::new(AtomicUsize::new(0)),
                 activation_calls: AtomicUsize::new(0),
-                powercycle_calls: AtomicUsize::new(0),
+                powercycle_calls: Arc::new(AtomicUsize::new(0)),
             }
         }
 
@@ -5692,9 +9603,11 @@ mod tests {
         fn node_type(&self) -> NodeType {
             self.node_type
         }
+
         fn get_info(&self) -> HashMap<String, String> {
-            HashMap::new()
+            HashMap::from([("host".to_owned(), "192.0.2.11".to_owned())])
         }
+
         fn supports_bmc_aux_powercycle(&self) -> bool {
             self.node_type.kind() == NodeKind::Switch
         }
@@ -5768,7 +9681,509 @@ mod tests {
             component: "bmc".to_owned(),
             firmware_file: "/tmp/fw.bin".to_owned(),
             expected_version: None,
+            resolution: None,
+            linkx_policy: None,
         }
+    }
+
+    #[tokio::test]
+    async fn firmware_admission_preserves_offline_bmc_recovery_and_invalidates_activation()
+    -> TestResult {
+        use crate::api::grpc::switch_scope::fabric_scope_keys;
+        use crate::orchestrator::fabric_operation::{ControllerIdentity, FabricOperationIntent};
+        use crate::orchestrator::job_lifecycle::{JobScope, JobState};
+
+        let firmware_dir = tempfile::tempdir()?;
+        std::fs::write(firmware_dir.path().join("bmc.bin"), b"test")?;
+        let rack_manager = Arc::new(RackManager::new());
+        rack_manager.create_rack("recovery-mock-rack", ProductFamily::Gb200.rack_type())?;
+
+        let rack = rack_manager
+            .find_rack("recovery-mock-rack")
+            .ok_or("missing rack")?;
+
+        let mock = RecoveryMockNode::switch_with_updates([
+            Err(RmsError::connection_refused("NVOS unreachable")),
+            Ok(completed_outcome()),
+        ]);
+
+        let updates = Arc::clone(&mock.update_calls);
+        let powercycles = Arc::clone(&mock.powercycle_calls);
+
+        rack.add_node(
+            "recovery-mock-node",
+            Arc::new(NodeInstance::from_test_node(mock)),
+        )?;
+
+        let mut service = test_service(rack_manager);
+        service.firmware_dir = firmware_dir.path().to_owned();
+        service.switch_tls_roots.insecure_switch = true;
+        let keys = fabric_scope_keys(&[JobScope::endpoint("192.0.2.11", 443)])?;
+
+        let controller = ControllerIdentity {
+            chassis_serial_number: "chassis-a".to_owned(),
+            tray_index: 0,
+        };
+
+        service.fabric_operations.admit(
+            FabricOperationIntent {
+                scope_keys: keys.clone(),
+                rule_id: "rule".to_owned(),
+            },
+            "completed-layout",
+            None,
+        )?;
+
+        service
+            .fabric_operations
+            .mark_pending("completed-layout", std::slice::from_ref(&controller))?;
+
+        service.fabric_operations.record_activation(
+            "completed-layout",
+            controller.clone(),
+            "config".to_owned(),
+            keys,
+        )?;
+
+        service.fabric_operations.finish("completed-layout")?;
+
+        let response = service
+            .handle_update_firmware(tonic::Request::new(rm::UpdateFirmwareRequest {
+                rack_id: "recovery-mock-rack".to_owned(),
+                node_id: "recovery-mock-node".to_owned(),
+                filename: "bmc.bin".to_owned(),
+                target: "bmc".to_owned(),
+                force_update: true,
+                ..Default::default()
+            }))
+            .await?
+            .into_inner();
+
+        assert_eq!(
+            response.status,
+            rm::ReturnCode::Success as i32,
+            "{}",
+            response.message
+        );
+
+        let completed =
+            wait_for_firmware_job_terminal(&service.job_tracker, &response.job_id).await;
+
+        assert_eq!(
+            completed.state,
+            JobState::Completed,
+            "{}",
+            completed.error_message
+        );
+
+        assert_eq!(updates.load(Ordering::SeqCst), 2);
+        assert_eq!(powercycles.load(Ordering::SeqCst), 1);
+
+        assert!(
+            !service
+                .fabric_operations
+                .has_activation_proof(&controller, "config")?
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn firmware_admission_allows_bmc_recovery_after_failed_identity_discovery() -> TestResult
+    {
+        use crate::nodes::switch_gb200_nvidia::SwitchGb200Nvidia;
+        use crate::orchestrator::job_lifecycle::JobState;
+
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        for status in [404, 200] {
+            let server = MockServer::start().await;
+
+            Mock::given(method("GET"))
+                .and(path("/nvue_v1/platform/chassis-location"))
+                .respond_with(ResponseTemplate::new(status).set_body_json(serde_json::json!({})))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let switch = SwitchGb200Nvidia::for_test(&server.uri());
+            let client = switch.optional_nvue_client().unwrap().clone();
+            let service = test_service(Arc::new(RackManager::new()));
+
+            let node = RecoveryMockNode::switch_with_updates([
+                Err(RmsError::connection_refused("NVOS unreachable")),
+                Ok(completed_outcome()),
+            ]);
+
+            let updates = Arc::clone(&node.update_calls);
+            let powercycles = Arc::clone(&node.powercycle_calls);
+
+            let job = service
+                .job_tracker
+                .create_job(node.rack_id(), node.id(), JobType::FirmwareUpdate)
+                .map_err(|failure| failure.message)?;
+
+            let job_id = job.id().to_string();
+            let recovery = service.recovery_dispatch(RecoverySource::Latest);
+
+            spawn_firmware_update_job_with_policy(
+                Arc::clone(&service.job_tracker),
+                job,
+                Arc::new(node),
+                vec![dummy_target()],
+                false,
+                true,
+                FirmwareTaskPollOptions::default(),
+                false,
+                recovery,
+                None,
+                Some((service.clone(), client)),
+            );
+
+            let completed = wait_for_firmware_job_terminal(&service.job_tracker, &job_id).await;
+
+            assert_eq!(
+                completed.state,
+                JobState::Completed,
+                "{}",
+                completed.error_message
+            );
+
+            assert_eq!(updates.load(Ordering::SeqCst), 2);
+            assert_eq!(powercycles.load(Ordering::SeqCst), 1);
+            server.verify().await;
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn firmware_admission_rejects_observed_physical_alias_conflicts() -> TestResult {
+        use crate::api::grpc::switch_scope::fabric_scope_keys;
+        use crate::nodes::switch_gb200_nvidia::SwitchGb200Nvidia;
+        use crate::orchestrator::fabric_operation::FabricOperationIntent;
+        use crate::orchestrator::job_lifecycle::{JobFailure, JobScope};
+
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        for active in [true, false] {
+            let server = MockServer::start().await;
+
+            Mock::given(method("GET"))
+                .and(path("/nvue_v1/platform/chassis-location"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "chassis-sn": "chassis-a", "tray-index": "2"
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let node = NodeInstance::SwitchGb200Nvidia(Box::new(SwitchGb200Nvidia::for_test(
+                &server.uri(),
+            )));
+
+            let service = test_service(Arc::new(RackManager::new()));
+
+            let scopes = vec![JobScope::PhysicalSwitch {
+                chassis_serial_number: "chassis-a".to_owned(),
+                tray_index: 2,
+            }];
+
+            let owner = service
+                .job_tracker
+                .create_scoped_job(
+                    "other-rack",
+                    "other-label",
+                    JobType::ConfigureScaleUpFabricManagerV2,
+                    scopes.clone(),
+                )
+                .map_err(|failure| failure.message)?;
+
+            service.fabric_operations.admit(
+                FabricOperationIntent {
+                    scope_keys: fabric_scope_keys(&scopes)?,
+                    rule_id: "rule".to_owned(),
+                },
+                owner.id().as_ref(),
+                None,
+            )?;
+
+            if !active {
+                owner.fail(JobFailure::new(
+                    JobError::Internal,
+                    "unresolved configuration",
+                ));
+            }
+
+            let job = service
+                .job_tracker
+                .create_job(node.rack_id(), node.id(), JobType::FirmwareUpdate)
+                .map_err(|failure| failure.message)?;
+
+            service
+                .admit_firmware_node_for_job(&job, &node)
+                .map_err(|failure| failure.message)?;
+
+            let job_id = job.id().to_string();
+
+            service.spawn_profiled_firmware_update_job(
+                job,
+                Arc::new(node),
+                vec![dummy_target()],
+                false,
+                true,
+                false,
+                service.recovery_dispatch(RecoverySource::Latest),
+            );
+
+            let failure = wait_for_firmware_job_terminal(&service.job_tracker, &job_id).await;
+
+            assert_eq!(
+                failure.state,
+                crate::orchestrator::job_lifecycle::JobState::Failed
+            );
+
+            assert_eq!(failure.error_code, JobError::UpdateInProgress);
+            assert!(failure.result_json.contains("scope_admission"));
+
+            assert!(
+                server
+                    .received_requests()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .all(|request| request.method == wiremock::http::Method::Get)
+            );
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn firmware_requests_dispatch_before_slow_identity_discovery() -> TestResult {
+        use crate::api::grpc::switch_handlers::tests::factory_reset_test_target;
+        use crate::orchestrator::job_lifecycle::{JobScope, JobState};
+
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        for batch in [false, true] {
+            let server = MockServer::start().await;
+            let (_proxy, node) = factory_reset_test_target(&server).await;
+            let rack_id = node.rack_id().to_owned();
+            let node_id = node.id().to_owned();
+
+            let discovery_started = Arc::new(tokio::sync::Notify::new());
+            let started = Arc::clone(&discovery_started);
+
+            Mock::given(method("GET"))
+                .and(path("/nvue_v1/platform/chassis-location"))
+                .respond_with(move |_: &wiremock::Request| {
+                    started.notify_one();
+
+                    ResponseTemplate::new(200)
+                        .set_body_json(
+                            serde_json::json!({"chassis-sn": "chassis-a", "tray-index": "2"}),
+                        )
+                        .set_delay(Duration::from_secs(30))
+                })
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let firmware_dir = tempfile::tempdir()?;
+            std::fs::write(firmware_dir.path().join("bmc.bin"), b"test")?;
+            let rack_manager = Arc::new(RackManager::new());
+            rack_manager.create_rack(&rack_id, ProductFamily::Gb200.rack_type())?;
+
+            rack_manager
+                .find_rack(&rack_id)
+                .ok_or("missing rack")?
+                .add_node(&node_id, Arc::new(node))?;
+
+            let mut service = test_service(rack_manager);
+            service.firmware_dir = firmware_dir.path().to_owned();
+            service.switch_tls_roots.insecure_switch = true;
+
+            let dispatch = async {
+                if batch {
+                    let response = service
+                        .handle_batch_update_firmware_by_node_type(tonic::Request::new(
+                            rm::BatchUpdateFirmwareByNodeTypeRequest {
+                                rack_id: rack_id.clone(),
+                                node_type: rm::NodeType::SwitchGb200Nvidia as i32,
+                                filename: "bmc.bin".into(),
+                                target: "bmc".into(),
+                                force_update: true,
+                                ..Default::default()
+                            },
+                        ))
+                        .await?
+                        .into_inner();
+
+                    Ok::<_, Box<dyn std::error::Error>>(
+                        response
+                            .jobs
+                            .into_iter()
+                            .next()
+                            .ok_or("missing job")?
+                            .job_id,
+                    )
+                } else {
+                    let response = service
+                        .handle_update_firmware(tonic::Request::new(rm::UpdateFirmwareRequest {
+                            rack_id: rack_id.clone(),
+                            node_id: node_id.clone(),
+                            filename: "bmc.bin".into(),
+                            target: "bmc".into(),
+                            force_update: true,
+                            ..Default::default()
+                        }))
+                        .await?
+                        .into_inner();
+
+                    assert_eq!(
+                        response.status,
+                        rm::ReturnCode::Success as i32,
+                        "{}",
+                        response.message
+                    );
+
+                    Ok(response.job_id)
+                }
+            };
+
+            let job_id = tokio::time::timeout(Duration::from_secs(5), dispatch).await??;
+            tokio::time::timeout(Duration::from_secs(5), discovery_started.notified()).await?;
+
+            assert!(
+                service
+                    .job_tracker
+                    .reserve_mutation(vec![JobScope::endpoint("127.0.0.1", 22)])
+                    .is_err()
+            );
+
+            service
+                .job_tracker
+                .shutdown_and_await_terminal(Duration::from_secs(2))
+                .await;
+
+            let job = service
+                .job_tracker
+                .get_job(&job_id)
+                .ok_or("missing firmware job")?;
+
+            assert_eq!(job.state, JobState::Failed);
+            assert_eq!(job.error_code, JobError::Other);
+
+            assert!(
+                job.error_message
+                    .contains("cancelled during switch identity discovery")
+            );
+
+            assert!(
+                server
+                    .received_requests()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .all(|request| request.method == wiremock::http::Method::Get)
+            );
+
+            assert!(
+                service
+                    .job_tracker
+                    .registry()
+                    .non_terminal_job_ids()
+                    .is_empty()
+            );
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn firmware_admission_rejects_active_and_unresolved_fabric_aliases() -> TestResult {
+        use crate::api::grpc::switch_scope::fabric_scope_keys;
+        use crate::orchestrator::fabric_operation::FabricOperationIntent;
+        use crate::orchestrator::job_lifecycle::{JobFailure, JobScope};
+
+        for active in [true, false] {
+            let firmware_dir = tempfile::tempdir()?;
+            std::fs::write(firmware_dir.path().join("bmc.bin"), b"test")?;
+            let rack_manager = Arc::new(RackManager::new());
+            rack_manager.create_rack("recovery-mock-rack", ProductFamily::Gb200.rack_type())?;
+
+            let rack = rack_manager
+                .find_rack("recovery-mock-rack")
+                .ok_or("missing rack")?;
+
+            let mock = RecoveryMockNode::switch_with_updates([]);
+            let updates = Arc::clone(&mock.update_calls);
+            let powercycles = Arc::clone(&mock.powercycle_calls);
+
+            rack.add_node(
+                "recovery-mock-node",
+                Arc::new(NodeInstance::from_test_node(mock)),
+            )?;
+
+            let mut service = test_service(rack_manager);
+            service.firmware_dir = firmware_dir.path().to_owned();
+            service.switch_tls_roots.insecure_switch = true;
+            let scopes = vec![JobScope::endpoint("192.0.2.11", 443)];
+
+            let owner = service
+                .job_tracker
+                .create_scoped_job(
+                    "other-rack",
+                    "other-label",
+                    JobType::ConfigureScaleUpFabricManagerV2,
+                    scopes.clone(),
+                )
+                .map_err(|failure| failure.message)?;
+
+            service.fabric_operations.admit(
+                FabricOperationIntent {
+                    scope_keys: fabric_scope_keys(&scopes)?,
+                    rule_id: "rule".to_owned(),
+                },
+                owner.id().as_ref(),
+                None,
+            )?;
+
+            if !active {
+                owner.fail(JobFailure::new(
+                    JobError::Internal,
+                    "unresolved configuration",
+                ));
+            }
+
+            let response = service
+                .handle_update_firmware(tonic::Request::new(rm::UpdateFirmwareRequest {
+                    rack_id: "recovery-mock-rack".to_owned(),
+                    node_id: "recovery-mock-node".to_owned(),
+                    filename: "bmc.bin".to_owned(),
+                    target: "bmc".to_owned(),
+                    force_update: true,
+                    ..Default::default()
+                }))
+                .await?
+                .into_inner();
+
+            assert_eq!(response.status, rm::ReturnCode::Failure as i32);
+
+            assert_eq!(
+                response.error_code,
+                rm::FirmwareUpdateError::UpdateInProgress as i32
+            );
+
+            assert_eq!(updates.load(Ordering::SeqCst), 0);
+            assert_eq!(powercycles.load(Ordering::SeqCst), 0);
+        }
+
+        Ok(())
     }
 
     // ── update_firmware_target_with_bmc_recovery ─────────────────────────────
@@ -5780,6 +10195,7 @@ mod tests {
             &node,
             &dummy_target(),
             false,
+            FirmwareTaskPollOptions::default(),
             None,
             &CancellationToken::new(),
         )
@@ -5800,14 +10216,15 @@ mod tests {
             powercycle_errors: Mutex::new(VecDeque::new()),
             power_states: Mutex::new(VecDeque::new()),
             power_state_default: PowerState::On,
-            update_calls: AtomicUsize::new(0),
+            update_calls: Arc::new(AtomicUsize::new(0)),
             activation_calls: AtomicUsize::new(0),
-            powercycle_calls: AtomicUsize::new(0),
+            powercycle_calls: Arc::new(AtomicUsize::new(0)),
         };
         let err = update_firmware_target_with_bmc_recovery(
             &node,
             &dummy_target(),
             false,
+            FirmwareTaskPollOptions::default(),
             None,
             &CancellationToken::new(),
         )
@@ -5832,6 +10249,7 @@ mod tests {
             &node,
             &dummy_target(),
             false,
+            FirmwareTaskPollOptions::default(),
             None,
             &CancellationToken::new(),
         )
@@ -5855,6 +10273,7 @@ mod tests {
             &node,
             &dummy_target(),
             false,
+            FirmwareTaskPollOptions::default(),
             None,
             &CancellationToken::new(),
         )
@@ -5881,6 +10300,7 @@ mod tests {
             &node,
             &dummy_target(),
             false,
+            FirmwareTaskPollOptions::default(),
             None,
             &CancellationToken::new(),
         )
@@ -5911,17 +10331,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn activate_firmware_for_node_falls_back_to_bmc_when_nvos_unreachable() {
+    async fn vrnvl72_activation_preserves_bmc_failure_without_another_power_cycle() {
         for code in [
             ErrorCode::ConnectionRefused,
             ErrorCode::Timeout,
             ErrorCode::Unavailable,
         ] {
-            let node = RecoveryMockNode::switch_with_updates(VecDeque::new())
-                .with_activation_error(code, "NVOS unreachable");
-            activate_firmware_for_node(&node, &CancellationToken::new())
+            let mut node = RecoveryMockNode::switch_with_updates(VecDeque::new())
+                .with_activation_error(code, "BMC recovery failed");
+            node.node_type = NodeType::SwitchVrnvl72Nvidia;
+            let error = activate_firmware_for_node(&node, &CancellationToken::new())
                 .await
-                .unwrap_or_else(|e| panic!("expected Ok for {code:?}, got Err: {}", e.message));
+                .unwrap_err();
+            assert_eq!(error.code, code);
+            assert_eq!(error.message, "BMC recovery failed");
             assert_eq!(
                 node.activation_calls.load(Ordering::SeqCst),
                 1,
@@ -5929,8 +10352,8 @@ mod tests {
             );
             assert_eq!(
                 node.powercycle_calls.load(Ordering::SeqCst),
-                1,
-                "BMC powercycle should be called as fallback for {code:?}"
+                0,
+                "BMC powercycle must not be repeated for {code:?}"
             );
         }
     }
@@ -5963,9 +10386,9 @@ mod tests {
             powercycle_errors: Mutex::new(VecDeque::new()),
             power_states: Mutex::new(VecDeque::new()),
             power_state_default: PowerState::On,
-            update_calls: AtomicUsize::new(0),
+            update_calls: Arc::new(AtomicUsize::new(0)),
             activation_calls: AtomicUsize::new(0),
-            powercycle_calls: AtomicUsize::new(0),
+            powercycle_calls: Arc::new(AtomicUsize::new(0)),
         };
         let err = activate_firmware_for_node(&node, &CancellationToken::new())
             .await
@@ -5997,5 +10420,19 @@ mod tests {
         assert!(err.message.contains("no BMC endpoint"));
         assert_eq!(node.activation_calls.load(Ordering::SeqCst), 1);
         assert_eq!(node.powercycle_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn gb_switch_activation_retains_bmc_fallback_when_nvos_is_unreachable() {
+        for node_type in [NodeType::SwitchGb200Nvidia, NodeType::SwitchGb300Nvidia] {
+            let mut node = RecoveryMockNode::switch_with_updates(VecDeque::new())
+                .with_activation_error(ErrorCode::Unavailable, "NVOS unreachable");
+            node.node_type = node_type;
+            activate_firmware_for_node(&node, &CancellationToken::new())
+                .await
+                .unwrap();
+            assert_eq!(node.activation_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(node.powercycle_calls.load(Ordering::SeqCst), 1);
+        }
     }
 }

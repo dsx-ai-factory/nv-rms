@@ -25,6 +25,7 @@ use super::error::SshError;
 use super::exec::{SSH_OUTPUT_CONTEXT_MAX_CHARS, SshExecOutput};
 use super::logging::{
     SSH_LOG_COMMAND_MAX_CHARS, scrub_password_recovery_transcript, ssh_command_log_value,
+    strip_ssh_command_text,
 };
 use super::request::{ChannelRequestEvent, channel_request_event};
 use super::{SshClient, SshEndpoint};
@@ -73,6 +74,74 @@ authentication token manipulation error";
     assert!(scrubbed.contains("password=XXXX"));
     assert!(scrubbed.contains("Retype new password:\nXXXX"));
     assert!(scrubbed.contains("Retype new password:\npassword unchanged"));
+}
+
+#[test]
+fn strip_ssh_command_text_removes_the_command_and_keeps_diagnostics() {
+    let command = "nv unset system api mtls ca-certificate";
+    let message = SshError::CommandFailed {
+        host: "sw-01".to_owned(),
+        command: ssh_command_log_value(command),
+        exit_status: 1,
+        output_context: "; stderr: Error: permission denied".to_owned(),
+    }
+    .to_string();
+
+    // The command has to actually be there, or the test proves nothing.
+    assert!(message.contains(command));
+
+    let stripped = strip_ssh_command_text(&message, command);
+
+    assert!(!stripped.contains("nv unset"), "{stripped}");
+    assert!(stripped.contains("<command>"), "{stripped}");
+
+    // Everything a caller needs in order to diagnose the failure survives.
+    assert!(stripped.contains("sw-01"), "{stripped}");
+    assert!(stripped.contains("exit status 1"), "{stripped}");
+    assert!(stripped.contains("permission denied"), "{stripped}");
+}
+
+/// The error embeds the *redacted, clipped* command, so the stripper has to
+/// match that form rather than the raw one it was handed.
+#[test]
+fn strip_ssh_command_text_matches_the_redacted_and_clipped_form() {
+    let secret = "tool --password super-secret --flag keep";
+    let redacted = SshError::CommandFailed {
+        host: "sw-01".to_owned(),
+        command: ssh_command_log_value(secret),
+        exit_status: 1,
+        output_context: String::new(),
+    }
+    .to_string();
+
+    let stripped = strip_ssh_command_text(&redacted, secret);
+    assert!(!stripped.contains("--password"), "{stripped}");
+    assert!(stripped.contains("<command>"), "{stripped}");
+
+    let long = format!("{}{}", "x".repeat(SSH_LOG_COMMAND_MAX_CHARS), "tail");
+    let clipped = SshError::CommandFailed {
+        host: "sw-01".to_owned(),
+        command: ssh_command_log_value(&long),
+        exit_status: 1,
+        output_context: String::new(),
+    }
+    .to_string();
+
+    let stripped = strip_ssh_command_text(&clipped, &long);
+    assert!(!stripped.contains("xxx"), "{stripped}");
+    assert!(stripped.contains("<command>"), "{stripped}");
+}
+
+/// A message that never named the command is returned unchanged, so the strip
+/// cannot corrupt unrelated transport errors.
+#[test]
+fn strip_ssh_command_text_leaves_unrelated_messages_alone() {
+    let message = "SSH session is not connected";
+    assert_eq!(
+        strip_ssh_command_text(message, "nv config apply --assume-yes"),
+        message
+    );
+    assert_eq!(strip_ssh_command_text(message, ""), message);
 }
 
 #[test]
@@ -416,4 +485,190 @@ async fn complete_expired_password_change_empty_password_rejected_precondition()
         .unwrap_err();
 
     assert_eq!(err.code, ErrorCode::FailedPrecondition);
+}
+
+#[derive(Clone, Copy, Debug)]
+enum RebootReply {
+    CloseBeforeConfirmation,
+    CloseAfterConfirmation,
+    Timeout,
+    SuccessfulExit,
+    Reject,
+    NonzeroExit,
+    NonzeroBeforeConfirmation,
+    NonzeroWithoutConfirmation,
+}
+
+struct RebootReplyServer(RebootReply);
+
+impl russh::server::Handler for RebootReplyServer {
+    type Error = russh::Error;
+
+    async fn auth_none(
+        &mut self,
+        _user: &str,
+    ) -> std::result::Result<russh::server::Auth, Self::Error> {
+        Ok(russh::server::Auth::Accept)
+    }
+
+    async fn channel_open_session(
+        &mut self,
+        _channel: russh::Channel<russh::server::Msg>,
+        reply: russh::server::ChannelOpenHandle,
+        _session: &mut russh::server::Session,
+    ) -> std::result::Result<(), Self::Error> {
+        reply.accept().await;
+        Ok(())
+    }
+
+    async fn exec_request(
+        &mut self,
+        channel: russh::ChannelId,
+        _data: &[u8],
+        session: &mut russh::server::Session,
+    ) -> std::result::Result<(), Self::Error> {
+        match self.0 {
+            RebootReply::CloseBeforeConfirmation => session.close(channel)?,
+            RebootReply::CloseAfterConfirmation => {
+                session.channel_success(channel)?;
+                session.close(channel)?;
+            }
+            RebootReply::SuccessfulExit => {
+                session.channel_success(channel)?;
+                session.exit_status_request(channel, 0)?;
+                session.eof(channel)?;
+                session.close(channel)?;
+            }
+            RebootReply::Timeout => session.channel_success(channel)?,
+            RebootReply::Reject => session.channel_failure(channel)?,
+            RebootReply::NonzeroWithoutConfirmation => session.exit_status_request(channel, 1)?,
+            RebootReply::NonzeroBeforeConfirmation => {
+                session.exit_status_request(channel, 1)?;
+                session.close(channel)?;
+            }
+            RebootReply::NonzeroExit => {
+                session.channel_success(channel)?;
+                session.exit_status_request(channel, 1)?;
+                session.close(channel)?;
+            }
+        }
+
+        Ok(())
+    }
+}
+
+// Shared by transport and switch dispatch tests so both exercise actual SSH
+// channel messages rather than the switch's command-execution test double.
+async fn reboot_reply_client_for_test(
+    reply: RebootReply,
+) -> (SshClient, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+
+    let config = russh::server::Config {
+        keys: vec![russh::keys::ssh_key::private::Ed25519Keypair::from_seed(&[7; 32]).into()],
+        ..Default::default()
+    };
+
+    let task = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+
+        let session = russh::server::run_stream(
+            std::sync::Arc::new(config),
+            socket,
+            RebootReplyServer(reply),
+        )
+        .await
+        .unwrap();
+
+        session.await.ok();
+    });
+
+    let mut handle = russh::client::connect(
+        std::sync::Arc::new(russh::client::Config::default()),
+        address,
+        super::client::SshHandler,
+    )
+    .await
+    .unwrap();
+
+    handle.authenticate_none("admin").await.unwrap();
+
+    (
+        SshClient {
+            host: address.ip().to_string(),
+            handle: Some(handle),
+        },
+        task,
+    )
+}
+
+#[tokio::test]
+async fn reboot_execution_allows_uncertain_replies_but_preserves_explicit_failures() {
+    for rebooting in [false, true] {
+        for reply in [
+            RebootReply::CloseBeforeConfirmation,
+            RebootReply::CloseAfterConfirmation,
+            RebootReply::Timeout,
+            RebootReply::SuccessfulExit,
+            RebootReply::Reject,
+            RebootReply::NonzeroExit,
+            RebootReply::NonzeroBeforeConfirmation,
+            RebootReply::NonzeroWithoutConfirmation,
+        ] {
+            let (client, task) = reboot_reply_client_for_test(reply).await;
+
+            let result = if rebooting {
+                client
+                    .exec_for_reboot("mock factory reset", Duration::from_millis(250))
+                    .await
+            } else {
+                client
+                    .exec("mock factory reset", Duration::from_millis(250))
+                    .await
+            };
+
+            client.close().await.unwrap();
+            task.abort();
+
+            let uncertain = matches!(
+                reply,
+                RebootReply::CloseBeforeConfirmation
+                    | RebootReply::CloseAfterConfirmation
+                    | RebootReply::Timeout
+            );
+
+            let expected = matches!(reply, RebootReply::SuccessfulExit) || rebooting && uncertain;
+
+            assert_eq!(result.is_ok(), expected, "{reply:?}: {result:?}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn switch_factory_reset_dispatch_uses_reboot_execution_only_for_the_reset_command() {
+    use crate::nodes::switch_gb200_nvidia::SwitchGb200Nvidia;
+
+    use nvswitch_cli::{NvCommand, NvConfigOperation, SwitchCommand};
+
+    for rebooting in [false, true] {
+        let (client, task) =
+            reboot_reply_client_for_test(RebootReply::CloseAfterConfirmation).await;
+
+        let switch = SwitchGb200Nvidia::for_test("http://127.0.0.1");
+        let cli = switch.nv_cli_over(client).unwrap();
+
+        let command = SwitchCommand::Nv(if rebooting {
+            NvCommand::factory_reset()
+        } else {
+            NvCommand::config(NvConfigOperation::Save)
+        });
+
+        let result = cli.run(command).await;
+
+        drop(cli);
+        task.abort();
+
+        assert_eq!(result.is_ok(), rebooting, "{result:?}");
+    }
 }

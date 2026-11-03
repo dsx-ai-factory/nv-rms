@@ -7,6 +7,21 @@ of the box.
 For the list of currently supported hardware, see
 [RMS Hardware Compatibility List](hcl.md).
 
+## Before You Start
+
+Hardware support has a higher review bar than software-only changes because maintainers and CI might not have access to the device. Before writing code:
+
+1. Open an issue through the [GitHub issue chooser](https://github.com/dsx-ai-factory/nv-rms/issues).
+   - Use a Feature/Enhancement request for a new vendor or platform, and a Bug Report for a regression on supported hardware. Include the RMS version, OEM, model or SKU, firmware, reproduction steps, and expected and observed behavior.
+
+1. Check the [Hardware Compatibility List](hcl.md) to avoid duplicating a platform already listed in the HCL.
+
+1. Capture evidence, see below testing sections. Remove credentials, addresses, serial numbers, and other site-specific data before sharing captures.
+
+1. Include additional evidence in the PR including:
+   - The commands and lifecycle paths tested, with results.
+   - Any operation that could not be tested and why.
+
 ## Overview
 
 RMS models hardware as a closed set of concrete node types. A new platform is
@@ -159,7 +174,7 @@ Expected changes in RMS:
 - Update `activation_mode_for_node()` in `src/api/grpc/firmware_handlers.rs`.
 - Update `node_supports_post_activation_version_check()` when post-activation
   version verification applies.
-- Update firmware-object lookup tables and mappings in
+- Update firmware-object node-type role keys and component mappings in
   `src/api/grpc/firmware_object_handlers.rs`.
 - Add component policy for vendor-specific firmware targets, such as BMC-only,
   HMC-only, LiteOn PSU/PMC, or Delta PSU/PMC.

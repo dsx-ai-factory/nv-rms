@@ -155,7 +155,7 @@ spec:
   renewBefore: 720h
   privateKey:
     algorithm: ECDSA
-    size: 384
+    size: 256
   dnsNames:
     - myrack.example.com
   issuerRef:

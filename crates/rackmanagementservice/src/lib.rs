@@ -25,6 +25,7 @@ pub mod libnmxc;
 pub mod logging;
 pub mod metrics;
 pub mod nodes;
+pub mod observability;
 pub mod orchestrator;
 pub mod persistence;
 pub mod racks;

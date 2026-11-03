@@ -138,6 +138,26 @@ impl SshClient {
     /// be opened, or `Internal` if the remote command fails or reports an
     /// invalid completion state.
     pub async fn exec(&self, command: &str, timeout: Duration) -> Result<String> {
+        self.exec_command(command, timeout, false).await
+    }
+
+    /// Execute a command that reboots the host, permitting a missing reply or
+    /// signal termination after the exec request is queued. Queueing does not
+    /// prove acceptance; callers must independently verify completion, even
+    /// when the request confirmation never arrives. Explicit request rejection
+    /// and nonzero exit status still fail.
+    pub(crate) async fn exec_for_reboot(&self, command: &str, timeout: Duration) -> Result<String> {
+        self.exec_command(command, timeout, true).await
+    }
+
+    // Share request confirmation and output validation with ordinary commands,
+    // whose strict completion contract remains unchanged.
+    async fn exec_command(
+        &self,
+        command: &str,
+        timeout: Duration,
+        rebooting: bool,
+    ) -> Result<String> {
         let handle = self.handle.as_ref().ok_or(SshError::NotConnected)?;
 
         let host = self.host.as_str();
@@ -151,7 +171,9 @@ impl SshClient {
             "SSH command starting"
         );
 
-        let stdout = tokio::time::timeout(timeout, async {
+        let mut request_queued = false;
+
+        let outcome = tokio::time::timeout(timeout, async {
             let mut channel = handle.channel_open_session().await.map_err(|e| {
                 let error = e.to_string();
                 tracing::warn!(
@@ -182,51 +204,94 @@ impl SshClient {
                 }
             })?;
 
+            request_queued = true;
+
             let mut output = SshExecOutput::default();
             let deferred_messages = wait_for_channel_request_confirmation(
                 &mut channel,
                 "exec request",
-                ChannelRequestFailureCode::OperationFailed,
+                if rebooting {
+                    ChannelRequestFailureCode::RebootingCommand
+                } else {
+                    ChannelRequestFailureCode::OperationFailed
+                },
             )
             .await?;
 
+            let mut finished = false;
+
             for message in deferred_messages {
-                if record_exec_channel_message(&mut output, message) {
+                finished = record_exec_channel_message(&mut output, message, rebooting);
+
+                if finished {
                     break;
                 }
             }
 
-            loop {
+            while !finished {
                 let Some(message) = channel.wait().await else {
                     break;
                 };
 
-                if record_exec_channel_message(&mut output, message) {
-                    break;
-                }
+                finished = record_exec_channel_message(&mut output, message, rebooting);
             }
 
             output.into_stdout(host, command)
         })
-        .await
-        .map_err(|_| {
-            tracing::warn!(
-                host,
-                command = &command_log,
-                timeout_secs,
-                "SSH command timed out"
-            );
-            SshError::timeout("command execution", host, timeout)
-        })??;
+        .await;
 
-        Ok(stdout)
+        match outcome {
+            Ok(Ok(stdout)) => Ok(stdout),
+            Ok(Err(SshError::CommandMissingExitStatus { .. })) if rebooting && request_queued => {
+                tracing::info!(
+                    host,
+                    "SSH reboot command connection closed; completion requires polling"
+                );
+
+                Ok(String::new())
+            }
+            Ok(Err(SshError::CommandTerminatedBySignal { signal, .. }))
+                if rebooting && request_queued =>
+            {
+                tracing::info!(
+                    host,
+                    signal,
+                    "SSH reboot command terminated by signal; completion requires polling"
+                );
+
+                Ok(String::new())
+            }
+            Err(_) if rebooting && request_queued => {
+                tracing::info!(
+                    host,
+                    "SSH reboot command reply timed out; acceptance is uncertain and completion requires polling"
+                );
+
+                Ok(String::new())
+            }
+            Ok(Err(error)) => Err(error.into()),
+            Err(_) => {
+                tracing::warn!(
+                    host,
+                    command = &command_log,
+                    timeout_secs,
+                    "SSH command timed out"
+                );
+
+                Err(SshError::timeout("command execution", host, timeout).into())
+            }
+        }
     }
 }
 
 /// Record one command channel message.
 ///
 /// Returns `true` when command output collection should stop.
-fn record_exec_channel_message(output: &mut SshExecOutput, message: ChannelMsg) -> bool {
+fn record_exec_channel_message(
+    output: &mut SshExecOutput,
+    message: ChannelMsg,
+    rebooting: bool,
+) -> bool {
     match message {
         ChannelMsg::Data { data } => {
             output.stdout.extend_from_slice(&data);
@@ -238,7 +303,7 @@ fn record_exec_channel_message(output: &mut SshExecOutput, message: ChannelMsg) 
         }
         ChannelMsg::ExitStatus { exit_status } => {
             output.exit_status = Some(exit_status);
-            false
+            rebooting && exit_status != 0
         }
         ChannelMsg::ExitSignal {
             signal_name,
@@ -246,7 +311,7 @@ fn record_exec_channel_message(output: &mut SshExecOutput, message: ChannelMsg) 
             ..
         } => {
             output.exit_signal = Some(format!("{signal_name:?}: {error_message}"));
-            false
+            rebooting
         }
         ChannelMsg::Close => true,
         _ => false,
@@ -254,7 +319,7 @@ fn record_exec_channel_message(output: &mut SshExecOutput, message: ChannelMsg) 
 }
 
 /// Build a short diagnostic suffix, preferring stderr over stdout.
-fn ssh_output_context(stdout: &[u8], stderr: &[u8]) -> String {
+pub(super) fn ssh_output_context(stdout: &[u8], stderr: &[u8]) -> String {
     let stderr = String::from_utf8_lossy(stderr);
 
     if let Some(stderr) = ssh_output_preview(&stderr) {

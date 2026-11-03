@@ -38,6 +38,29 @@ pub struct PowershelfGb300Liteon {
 }
 
 impl PowershelfGb300Liteon {
+    /// Builds a LiteOn GB300 shelf node backed by a GB200 LiteOn node.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Unimplemented` if `config.node_type` is not
+    /// `PowershelfGb300Liteon`, or any error from
+    /// [`PowershelfGb200Liteon::from_config`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rackmanagementservice::domain::node::{Node, NodeType};
+    /// use rackmanagementservice::domain::rack::NodeConfig;
+    /// use rackmanagementservice::nodes::powershelf_gb300_liteon::PowershelfGb300Liteon;
+    ///
+    /// let config = NodeConfig::new("ps-0", NodeType::PowershelfGb300Liteon, "192.0.2.10");
+    /// let shelf = PowershelfGb300Liteon::from_config(&config, "rack-1")?;
+    /// assert_eq!(shelf.node_type(), NodeType::PowershelfGb300Liteon);
+    ///
+    /// let other = NodeConfig::new("ps-1", NodeType::PowershelfGb200Liteon, "192.0.2.11");
+    /// assert!(PowershelfGb300Liteon::from_config(&other, "rack-1").is_err());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     pub fn from_config(config: &NodeConfig, rack_id: &str) -> Result<Self> {
         if config.node_type != NodeType::PowershelfGb300Liteon {
             return Err(RmsError::unimplemented(
@@ -122,10 +145,11 @@ impl Node for PowershelfGb300Liteon {
 mod tests {
     use super::*;
     use crate::domain::rack::{Endpoint, EndpointConfig, EndpointCredentials};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    #[test]
-    fn from_config_reports_gb300_type() {
-        let config = NodeConfig {
+    fn config() -> NodeConfig {
+        NodeConfig {
             id: "ps-01".into(),
             node_type: NodeType::PowershelfGb300Liteon,
             bmc_endpoint: Some(EndpointConfig::with_credentials(
@@ -140,14 +164,58 @@ mod tests {
             )),
             host_endpoint: None,
             expected_inventory: None,
-        };
+            recovery: None,
+            runtime_config: None,
+        }
+    }
 
-        let ps = PowershelfGb300Liteon::from_config(&config, "rack-01").unwrap();
+    #[test]
+    fn from_config_reports_gb300_type() {
+        let ps = PowershelfGb300Liteon::from_config(&config(), "rack-01").unwrap();
 
         assert_eq!(ps.node_type(), NodeType::PowershelfGb300Liteon);
         assert_eq!(
             ps.get_info()["type"],
             NodeType::PowershelfGb300Liteon.as_str()
         );
+    }
+
+    #[tokio::test]
+    async fn set_power_state_serves_graceful_requests_as_force_off() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/redfish/v1/Chassis"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Members": [{ "@odata.id": "/redfish/v1/Chassis/powershelf" }]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/redfish/v1/Chassis/powershelf"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Actions": {
+                    "#Chassis.ForceOff": {
+                        "target": "/redfish/v1/Chassis/powershelf/Actions/Chassis.ForceOff"
+                    }
+                }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(
+                "/redfish/v1/Chassis/powershelf/Actions/Chassis.ForceOff",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let mut ps = PowershelfGb300Liteon::from_config(&config(), "rack-01").unwrap();
+        ps.inner.replace_redfish_for_test(&server.uri());
+
+        for op in [PowerOp::Off, PowerOp::GracefulShutdown] {
+            ps.set_power_state(op, PowerTargetType::System)
+                .await
+                .unwrap_or_else(|err| panic!("{op:?}: {err}"));
+        }
     }
 }

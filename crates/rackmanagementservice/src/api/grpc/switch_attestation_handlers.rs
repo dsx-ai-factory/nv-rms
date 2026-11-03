@@ -67,6 +67,8 @@ fn prepare_attestation_target(device: &rm::NodeInfo) -> Result<Box<SwitchGb200Nv
         bmc_endpoint: None,
         host_endpoint: Some(host_endpoint),
         expected_inventory: None,
+        recovery: None,
+        runtime_config: None,
     };
 
     NodeInstance::create_switch_password(&config, &device.rack_id)

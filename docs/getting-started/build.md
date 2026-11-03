@@ -60,11 +60,16 @@ just docs-api
 
 RMS ships a multi-stage [`Dockerfile`](https://github.com/dsx-ai-factory/nv-rms/blob/main/Dockerfile):
 
-- **Stage 1 - `builder`** (`rust:1.96-bookworm`): the full build environment
-  (Rust toolchain, `protoc`, linkers). Produces the workspace release binaries
-  and pre-compiled test binaries. This stage is the base for CI lint, test, and
+- **`toolchain`** (`rust:1.96-bookworm`): the build environment, including the
+  Rust toolchain, `protoc`, and CI tools.
+- **`source`**: adds workspace source to the toolchain; used for CI lint and
   coverage jobs.
-- **Stage 2 - `release`** (`debian:bookworm-slim`): a minimal runtime image
+- **`production-build`**: compiles the workspace release binaries.
+- **`builder`**: adds pre-compiled workspace test binaries to `production-build`;
+  used for native CI tests.
+- **`benchmark-builder`**: adds the Criterion scale benchmark executable to
+  `production-build`; used by the weekly or manually dispatched benchmark workflow.
+- **`release`** (`debian:bookworm-slim`): a minimal runtime image
   containing only the `rackmanagementservice` and `nvfwupd` binaries plus
   `ca-certificates` and `ipmitool`. It excludes the Rust toolchain and is the
   artifact for production deployments. It exposes port `8801` and its entrypoint
@@ -102,19 +107,12 @@ docker build --target builder -t rms-builder .
 
 ### Standalone nvfwupd binaries
 
-The `nvfwupd` CLI can be built on its own. The workspace provides Makefile
-targets for x86_64 and arm64 Linux musl builds, as described in the
-[README](https://github.com/dsx-ai-factory/nv-rms#building-the-nvfwupd-cli):
-
-```bash
-make -C crates/rust_nvfwupd nvfwupd-x86
-make -C crates/rust_nvfwupd nvfwupd-arm64
-```
-
-The binaries are written to `target/x86_64-unknown-linux-musl/release/nvfwupd`
-and `target/aarch64-unknown-linux-musl/release/nvfwupd`, respectively. See the
+The `nvfwupd` CLI can be built on its own - convenient for distributing a
+diagnostics tool. A plain `cargo build --release -p nvfwupd` inherits the host
+sysroot glibc baseline; the `docker/nvfwupd-standalone/` Dockerfiles produce
+portable x86-64 and arm64 binaries with a glibc 2.17 baseline. See the
 [Development](../reference/development.md#building-standalone-nvfwupd) reference
-for the required toolchains and equivalent Cargo commands.
+for the full set of cross-build and verification commands.
 
 ## Next steps
 

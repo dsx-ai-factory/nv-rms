@@ -74,6 +74,7 @@ impl Util {
         "powershelf",
         "vrnvl72switch",
         "vrnvl72",
+        "lp30",
     ];
 
     /// Credential fields checked when building the sanitizer filter list.
@@ -99,6 +100,7 @@ impl Util {
         "passwd",
         "pwd",
         "pass",
+        "session_token",
         "ip",
     ];
 
@@ -335,6 +337,11 @@ pub(crate) static SANITIZE_TEST_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> 
     std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
 
 /// Serializes tests that depend on global sanitize state (`IS_SANITIZE`, `SANITIZE_CONFIG`).
+///
+/// Tests that call either state setter or run `BmcAccess::get_bmc_access`
+/// (including its synchronous wrapper) must hold this guard until the call
+/// completes. Acquire it in the test, not inside the factory: guarded callers
+/// would deadlock if the factory acquired the same non-reentrant lock.
 #[cfg(test)]
 pub(crate) struct SanitizeTestGuard {
     _lock: std::sync::MutexGuard<'static, ()>,
@@ -486,6 +493,9 @@ mod tests {
 
         let result = Util::target_platform_supported(Some("dgxrubin"), "BMCLoginAccess");
         assert!(result.is_none());
+
+        let result = Util::target_platform_supported(Some("lp30"), "BMCLoginAccess");
+        assert!(result.is_none());
     }
 
     #[test]
@@ -509,6 +519,6 @@ mod tests {
 
     #[test]
     fn test_supported_platforms_count() {
-        assert_eq!(Util::SUPPORTED_PLATFORMS.len(), 16);
+        assert_eq!(Util::SUPPORTED_PLATFORMS.len(), 17);
     }
 }

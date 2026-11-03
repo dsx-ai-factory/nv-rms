@@ -22,6 +22,11 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 use librms::protos::rack_manager as rm;
 use librms::protos::rack_manager_v2 as rm_v2;
+use rackmanagementservice::api::grpc::conversions::domain_node_type_to_proto;
+use rackmanagementservice::api::grpc::node_type_resolver::{
+    INVENTORY_PROFILE_ATTRIBUTE, domain_node_type_to_descriptor,
+};
+use rackmanagementservice::domain::node::NodeType as DomainNodeType;
 use rm::rack_manager_client::RackManagerClient;
 use rm_v2::rack_manager_v2_client::RackManagerV2Client;
 use tonic::Request;
@@ -125,8 +130,19 @@ enum Command {
 
     /// Register caller-supplied devices in RMS inventory.
     /// CSV: node_id,rack_id,ip,port,username,password,mac,type[,endpoint_role][,host_name][,bmc_ip,bmc_port,bmc_username,bmc_password[,bmc_mac]]
+    /// In every node-list CSV, type is a NodeType number, enum name, or stable
+    /// RMS node type name; descriptor-only names such as
+    /// powershelf_vrnvl72_delta are sent as a node descriptor.
     #[command(name = "add_nodes")]
-    AddNodes { devices_csv: PathBuf },
+    AddNodes {
+        devices_csv: PathBuf,
+        /// Expected-inventory profile name recorded on every node in the
+        /// CSV (node_descriptor attribute `inventory_profile`). It selects
+        /// the expected-inventory table and the recovery watch-set
+        /// server-side.
+        #[arg(long)]
+        inventory_profile: Option<String>,
+    },
 
     /// List the complete node inventory across all racks
     #[command(name = "list_node_inventory")]
@@ -211,6 +227,18 @@ enum Command {
     #[command(name = "batch_get_firmware_inventory")]
     BatchGetFirmwareInventory { nodes_csv: PathBuf },
 
+    /// Compare a firmware manifest with caller-supplied, unregistered nodes
+    #[command(name = "compare_firmware_object")]
+    CompareFirmwareObject {
+        nodes_csv: PathBuf,
+        config_json: PathBuf,
+        firmware_type: String,
+        #[arg(long = "component-filter", value_name = "NODE_TYPE:COMPONENT")]
+        component_filters: Vec<String>,
+        #[arg(long = "target-filter", value_name = "NODE_TYPE:TARGET")]
+        target_filters: Vec<String>,
+    },
+
     /// Get firmware inventory for all nodes in a rack
     #[command(name = "firmware_inventory_rack")]
     FirmwareInventoryRack { rack_id: String },
@@ -219,11 +247,19 @@ enum Command {
     /// CSV: node_id,rack_id,ip,port,username,password[,mac_address][,host_name][,node_type]
     /// Also accepts the longer node-list layout used by add_nodes
     /// (type/endpoint_role/host_name/BMC columns); BMC columns are ignored here.
+    /// With --allow-onie-recovery, append
+    /// onie_ip,onie_port,onie_username,onie_password after node_type in the
+    /// short layout or after bmc_mac in the node-list layout.
+    /// The short recovery layout requires an explicit node_type.
     #[command(name = "update_switch_system_image")]
     UpdateSwitchSystemImage {
         targets_csv: PathBuf,
         image_filename: String,
         local_file_path: String,
+
+        /// Permit ONIE recovery; requires TLS for the RMS gRPC connection.
+        #[arg(long)]
+        allow_onie_recovery: bool,
     },
 
     /// Get async switch system image job status
@@ -298,6 +334,12 @@ enum FirmwareObjectCommand {
         component_filters: Vec<String>,
         #[arg(long = "target-filter", value_name = "NODE_TYPE:TARGET")]
         target_filters: Vec<String>,
+        /// Expected-inventory profile name recorded on every node in the
+        /// CSV (node_descriptor attribute `inventory_profile`), as for
+        /// `add_nodes`: it selects the expected-inventory table and the
+        /// recovery watch-set server-side.
+        #[arg(long)]
+        inventory_profile: Option<String>,
     },
 
     /// Parse/download/apply firmware object targets from a JSON firmware manifest without persisting it
@@ -315,9 +357,19 @@ enum FirmwareObjectCommand {
         component_filters: Vec<String>,
         #[arg(long = "target-filter", value_name = "NODE_TYPE:TARGET")]
         target_filters: Vec<String>,
+        /// Expected-inventory profile name recorded on every node in the
+        /// CSV (node_descriptor attribute `inventory_profile`), as for
+        /// `add_nodes`: it selects the expected-inventory table and the
+        /// recovery watch-set server-side.
+        #[arg(long)]
+        inventory_profile: Option<String>,
     },
 
     /// Apply a firmware-object switch system image to caller-supplied switches
+    /// With --allow-onie-recovery, append
+    /// onie_ip,onie_port,onie_username,onie_password after node_type in the
+    /// short CSV layout or after bmc_mac in the node-list layout.
+    /// The short recovery layout requires an explicit node_type.
     #[command(name = "apply_stored_switch_system_image")]
     ApplyStoredSwitchSystemImage {
         rack_id: String,
@@ -326,9 +378,17 @@ enum FirmwareObjectCommand {
         hardware_type: String,
         #[arg(long)]
         object_id: Option<String>,
+
+        /// Permit ONIE recovery; requires TLS for the RMS gRPC connection.
+        #[arg(long)]
+        allow_onie_recovery: bool,
     },
 
     /// Parse/download/apply a switch system image from a JSON firmware manifest without persisting it
+    /// With --allow-onie-recovery, append
+    /// onie_ip,onie_port,onie_username,onie_password after node_type in the
+    /// short CSV layout or after bmc_mac in the node-list layout.
+    /// The short recovery layout requires an explicit node_type.
     #[command(name = "apply_switch_system_image")]
     ApplySwitchSystemImage {
         rack_id: String,
@@ -337,6 +397,10 @@ enum FirmwareObjectCommand {
         access_token: String,
         software_type: String,
         hardware_type: String,
+
+        /// Permit ONIE recovery; requires TLS for the RMS gRPC connection.
+        #[arg(long)]
+        allow_onie_recovery: bool,
     },
 
     /// List firmware-object apply history
@@ -488,6 +552,15 @@ struct SwitchTarget {
     host_name: String,
     /// Switch NodeType; defaults to SwitchGb200Nvidia for backward compatibility.
     node_type: i32,
+    onie_endpoint: Option<SwitchTargetOnieEndpoint>,
+}
+
+#[derive(Clone, Debug)]
+struct SwitchTargetOnieEndpoint {
+    ip_address: String,
+    port: u32,
+    username: String,
+    password: String,
 }
 
 #[derive(Clone, Debug)]
@@ -508,7 +581,9 @@ struct NodeListEntry {
     username: String,
     password: String,
     mac_address: String,
+    /// `NODE_TYPE_UNSPECIFIED` when the node is selected by `node_descriptor`.
     node_type: i32,
+    node_descriptor: Option<rm::NodeDescriptor>,
     endpoint_role: Option<NodeListEndpointRole>,
     /// TLS hostname for switch host_endpoint; defaults to `ip_address` when empty.
     host_name: String,
@@ -530,6 +605,30 @@ enum NodeListEndpointRole {
 impl Cli {
     fn uses_tls(&self) -> bool {
         !self.insecure && (self.cert.is_some() || self.key.is_some() || self.ca.is_some())
+    }
+
+    fn validate_transport_security(&self) -> ClientResult<()> {
+        let onie_recovery_requested = matches!(
+            &self.command,
+            Command::UpdateSwitchSystemImage {
+                allow_onie_recovery: true,
+                ..
+            } | Command::FirmwareObject {
+                command: FirmwareObjectCommand::ApplyStoredSwitchSystemImage {
+                    allow_onie_recovery: true,
+                    ..
+                } | FirmwareObjectCommand::ApplySwitchSystemImage {
+                    allow_onie_recovery: true,
+                    ..
+                },
+            }
+        );
+
+        if onie_recovery_requested && !self.uses_tls() {
+            return Err("--allow-onie-recovery requires TLS for the RMS gRPC connection".into());
+        }
+
+        Ok(())
     }
 
     fn endpoint_uri(&self) -> String {
@@ -582,6 +681,8 @@ fn build_tls_config(cli: &Cli) -> ClientResult<ClientTlsConfig> {
 }
 
 async fn run(cli: Cli) -> ClientResult<()> {
+    cli.validate_transport_security()?;
+
     let mut client = build_client(&cli).await?;
 
     match cli.command {
@@ -598,7 +699,10 @@ async fn run(cli: Cli) -> ClientResult<()> {
             operation,
         } => power(&mut client, rack_id, node_id, operation).await?,
         Command::Status { rack_id, node_id } => status(&mut client, rack_id, node_id).await?,
-        Command::AddNodes { devices_csv } => add_nodes(&mut client, &devices_csv).await?,
+        Command::AddNodes {
+            devices_csv,
+            inventory_profile,
+        } => add_nodes(&mut client, &devices_csv, inventory_profile.as_deref()).await?,
         Command::ListNodeInventory => list_node_inventory(&mut client).await?,
         Command::ListRacks => list_racks(&mut client).await?,
         Command::BatchSetPowerState {
@@ -649,6 +753,23 @@ async fn run(cli: Cli) -> ClientResult<()> {
         Command::BatchGetFirmwareInventory { nodes_csv } => {
             batch_get_firmware_inventory(&mut client, &nodes_csv).await?
         }
+        Command::CompareFirmwareObject {
+            nodes_csv,
+            config_json,
+            firmware_type,
+            component_filters,
+            target_filters,
+        } => {
+            compare_firmware_object(
+                &mut client,
+                &nodes_csv,
+                &config_json,
+                firmware_type,
+                component_filters,
+                target_filters,
+            )
+            .await?
+        }
         Command::FirmwareInventoryRack { rack_id } => {
             firmware_inventory_rack(&mut client, rack_id).await?
         }
@@ -656,9 +777,16 @@ async fn run(cli: Cli) -> ClientResult<()> {
             targets_csv,
             image_filename,
             local_file_path,
+            allow_onie_recovery,
         } => {
-            update_switch_system_image(&mut client, &targets_csv, image_filename, local_file_path)
-                .await?
+            update_switch_system_image(
+                &mut client,
+                &targets_csv,
+                image_filename,
+                local_file_path,
+                allow_onie_recovery,
+            )
+            .await?
         }
         Command::SwitchSystemImageJobStatus { job_id } => {
             switch_system_image_job_status(&mut client, job_id).await?
@@ -718,6 +846,7 @@ async fn firmware_object_command(
             components,
             component_filters,
             target_filters,
+            inventory_profile,
         } => {
             apply_stored_firmware_object(
                 client,
@@ -730,6 +859,7 @@ async fn firmware_object_command(
                 components,
                 component_filters,
                 target_filters,
+                inventory_profile.as_deref(),
             )
             .await
         }
@@ -743,6 +873,7 @@ async fn firmware_object_command(
             force,
             component_filters,
             target_filters,
+            inventory_profile,
         } => {
             apply_firmware_object(
                 client,
@@ -755,6 +886,7 @@ async fn firmware_object_command(
                 force,
                 component_filters,
                 target_filters,
+                inventory_profile.as_deref(),
             )
             .await
         }
@@ -764,6 +896,7 @@ async fn firmware_object_command(
             software_type,
             hardware_type,
             object_id,
+            allow_onie_recovery,
         } => {
             apply_stored_switch_system_image(
                 client,
@@ -772,6 +905,7 @@ async fn firmware_object_command(
                 software_type,
                 hardware_type,
                 object_id,
+                allow_onie_recovery,
             )
             .await
         }
@@ -782,6 +916,7 @@ async fn firmware_object_command(
             access_token,
             software_type,
             hardware_type,
+            allow_onie_recovery,
         } => {
             apply_switch_system_image(
                 client,
@@ -792,6 +927,7 @@ async fn firmware_object_command(
                     access_token,
                     software_type,
                     hardware_type,
+                    allow_onie_recovery,
                 },
             )
             .await
@@ -909,10 +1045,31 @@ async fn status(client: &mut Client, rack_id: String, node_id: String) -> Client
     ensure_success(response.status, "status command failed")
 }
 
-async fn add_nodes(client: &mut Client, devices_csv: &Path) -> ClientResult<()> {
+/// Bind `profile` to a node through its descriptor: the expected-inventory
+/// table and the recovery watch-set are selected by it server-side. Identity
+/// attributes already set from the node-list CSV are kept.
+fn apply_inventory_profile(info: &mut rm::NodeInfo, profile: Option<&str>) {
+    if let Some(profile) = profile {
+        info.node_descriptor
+            .get_or_insert_default()
+            .attributes
+            .insert(INVENTORY_PROFILE_ATTRIBUTE.to_owned(), profile.to_owned());
+    }
+}
+
+async fn add_nodes(
+    client: &mut Client,
+    devices_csv: &Path,
+    inventory_profile: Option<&str>,
+) -> ClientResult<()> {
     let nodes = parse_node_list_csv(devices_csv)?
         .into_iter()
-        .map(|node| node_list_entry_to_proto(node, NodeListEndpointMode::InventoryRegistration))
+        .map(|node| {
+            let mut info =
+                node_list_entry_to_proto(node, NodeListEndpointMode::InventoryRegistration);
+            apply_inventory_profile(&mut info, inventory_profile);
+            info
+        })
         .collect();
     let response = client
         .create_nodes(rm::CreateNodesRequest {
@@ -1154,7 +1311,8 @@ async fn batch_update_firmware(
         .into_iter()
         .map(|node| node_list_entry_to_proto(node, NodeListEndpointMode::DirectOperation))
         .collect();
-    let firmware_targets = parse_targets_by_type_csv(targets_csv)?;
+    let (firmware_targets, node_descriptor_firmware_targets) =
+        parse_targets_by_type_csv(targets_csv)?;
 
     let response = client
         .batch_update_firmware(rm::BatchUpdateFirmwareRequest {
@@ -1162,7 +1320,7 @@ async fn batch_update_firmware(
             firmware_targets,
             activate,
             force_update,
-            node_descriptor_firmware_targets: Vec::new(),
+            node_descriptor_firmware_targets,
         })
         .await?
         .into_inner();
@@ -1331,6 +1489,70 @@ async fn batch_get_firmware_inventory(client: &mut Client, nodes_csv: &Path) -> 
     ensure_success(common.status, "batch_get_firmware_inventory failed")
 }
 
+async fn compare_firmware_object(
+    client: &mut Client,
+    nodes_csv: &Path,
+    config_json_path: &Path,
+    firmware_type: String,
+    component_filter_args: Vec<String>,
+    target_filter_args: Vec<String>,
+) -> ClientResult<()> {
+    let nodes = parse_node_list_csv(nodes_csv)?
+        .into_iter()
+        .map(|node| node_list_entry_to_proto(node, NodeListEndpointMode::DirectOperation))
+        .collect();
+    let config_json = std::fs::read_to_string(config_json_path)?;
+    let (component_filters, node_descriptor_component_filters) =
+        parse_component_filters(&component_filter_args, &target_filter_args)?;
+    let response = client
+        .compare_firmware_object(rm::CompareFirmwareObjectRequest {
+            config_json,
+            firmware_type,
+            nodes: Some(rm::NodeSet { nodes }),
+            component_filters,
+            node_descriptor_component_filters,
+        })
+        .await?
+        .into_inner();
+
+    let common = response
+        .response
+        .ok_or("compare_firmware_object response missing common response")?;
+    print_status(common.status);
+    println!("Message: {}", common.message);
+    println!("Object ID: {}", response.object_id);
+    println!("Matches manifest: {}", response.matches_manifest);
+    print_node_operation_stats(&common.stats);
+    print_common_node_results(&common.node_results);
+    for node in response.nodes {
+        println!(
+            "Node: {} (matches manifest: {})",
+            node.node_id, node.matches_manifest
+        );
+        for component in node.components {
+            let status = rm::FirmwareComparisonStatus::try_from(component.status)
+                .map(|status| status.as_str_name())
+                .unwrap_or("UNKNOWN");
+            println!(
+                "  {}: {} -> {} ({status}){}",
+                component.component,
+                if component.installed_version.is_empty() {
+                    "<not reported>"
+                } else {
+                    &component.installed_version
+                },
+                component.proposed_version,
+                if component.reason.is_empty() {
+                    String::new()
+                } else {
+                    format!(" - {}", component.reason)
+                }
+            );
+        }
+    }
+    ensure_success(common.status, "compare_firmware_object failed")
+}
+
 async fn firmware_inventory_rack(client: &mut Client, rack_id: String) -> ClientResult<()> {
     let response = client
         .get_rack_firmware_inventory(rm::GetRackFirmwareInventoryRequest { rack_id })
@@ -1353,16 +1575,18 @@ async fn update_switch_system_image(
     targets_csv: &Path,
     image_filename: String,
     local_file_path: String,
+    allow_onie_recovery: bool,
 ) -> ClientResult<()> {
     let nodes = parse_switch_targets_csv(targets_csv)?
         .into_iter()
-        .map(switch_target_to_node)
+        .map(|target| switch_target_to_node_with_recovery(target, allow_onie_recovery))
         .collect();
     let response = client
         .update_switch_system_image(rm::UpdateSwitchSystemImageRequest {
             nodes: Some(rm::NodeSet { nodes }),
             image_filename,
             local_file_path,
+            allow_onie_recovery,
         })
         .await?
         .into_inner();
@@ -1538,12 +1762,18 @@ async fn apply_stored_firmware_object(
     components: Vec<String>,
     component_filter_args: Vec<String>,
     target_filter_args: Vec<String>,
+    inventory_profile: Option<&str>,
 ) -> ClientResult<()> {
     let nodes = parse_node_list_csv(nodes_csv)?
         .into_iter()
-        .map(|node| node_list_entry_to_proto(node, NodeListEndpointMode::DirectOperation))
+        .map(|node| {
+            let mut info = node_list_entry_to_proto(node, NodeListEndpointMode::DirectOperation);
+            apply_inventory_profile(&mut info, inventory_profile);
+            info
+        })
         .collect();
-    let component_filters = parse_component_filters(&component_filter_args, &target_filter_args)?;
+    let (component_filters, node_descriptor_component_filters) =
+        parse_component_filters(&component_filter_args, &target_filter_args)?;
     let response = client
         .apply_stored_firmware_object(rm::ApplyStoredFirmwareObjectRequest {
             rack_id,
@@ -1554,7 +1784,7 @@ async fn apply_stored_firmware_object(
             nodes: Some(rm::NodeSet { nodes }),
             force_update,
             component_filters,
-            node_descriptor_component_filters: Vec::new(),
+            node_descriptor_component_filters,
         })
         .await?
         .into_inner();
@@ -1584,13 +1814,19 @@ async fn apply_firmware_object(
     force_update: bool,
     component_filter_args: Vec<String>,
     target_filter_args: Vec<String>,
+    inventory_profile: Option<&str>,
 ) -> ClientResult<()> {
     let config_json = std::fs::read_to_string(config_json_path)?;
     let nodes = parse_node_list_csv(nodes_csv)?
         .into_iter()
-        .map(|node| node_list_entry_to_proto(node, NodeListEndpointMode::DirectOperation))
+        .map(|node| {
+            let mut info = node_list_entry_to_proto(node, NodeListEndpointMode::DirectOperation);
+            apply_inventory_profile(&mut info, inventory_profile);
+            info
+        })
         .collect();
-    let component_filters = parse_component_filters(&component_filter_args, &target_filter_args)?;
+    let (component_filters, node_descriptor_component_filters) =
+        parse_component_filters(&component_filter_args, &target_filter_args)?;
     let response = client
         .apply_firmware_object(rm::ApplyFirmwareObjectRequest {
             rack_id,
@@ -1601,7 +1837,7 @@ async fn apply_firmware_object(
             nodes: Some(rm::NodeSet { nodes }),
             force_update,
             component_filters,
-            node_descriptor_component_filters: Vec::new(),
+            node_descriptor_component_filters,
         })
         .await?
         .into_inner();
@@ -1626,10 +1862,11 @@ async fn apply_stored_switch_system_image(
     software_type: String,
     hardware_type: String,
     object_id: Option<String>,
+    allow_onie_recovery: bool,
 ) -> ClientResult<()> {
     let nodes = parse_switch_targets_csv(switches_csv)?
         .into_iter()
-        .map(switch_target_to_node)
+        .map(|target| switch_target_to_node_with_recovery(target, allow_onie_recovery))
         .collect();
     let response = client
         .apply_stored_switch_system_image(rm::ApplyStoredSwitchSystemImageRequest {
@@ -1638,6 +1875,7 @@ async fn apply_stored_switch_system_image(
             software_type,
             hardware_type,
             nodes: Some(rm::NodeSet { nodes }),
+            allow_onie_recovery,
         })
         .await?
         .into_inner();
@@ -1665,6 +1903,7 @@ struct ApplySwitchSystemImageInput {
     access_token: String,
     software_type: String,
     hardware_type: String,
+    allow_onie_recovery: bool,
 }
 
 async fn apply_switch_system_image(
@@ -1678,12 +1917,13 @@ async fn apply_switch_system_image(
         access_token,
         software_type,
         hardware_type,
+        allow_onie_recovery,
     } = input;
 
     let config_json = std::fs::read_to_string(config_json_path)?;
     let nodes = parse_switch_targets_csv(&switches_csv)?
         .into_iter()
-        .map(switch_target_to_node)
+        .map(|target| switch_target_to_node_with_recovery(target, allow_onie_recovery))
         .collect();
     let response = client
         .apply_switch_system_image(rm::ApplySwitchSystemImageRequest {
@@ -1693,6 +1933,7 @@ async fn apply_switch_system_image(
             software_type,
             hardware_type,
             nodes: Some(rm::NodeSet { nodes }),
+            allow_onie_recovery,
         })
         .await?
         .into_inner();
@@ -1925,6 +2166,7 @@ async fn nvlink_configure(
                 topology_type,
                 extra_static_configs: Vec::new(),
             }),
+            layout: None,
         })
         .await?
         .into_inner();
@@ -2256,7 +2498,7 @@ fn parse_switch_targets_csv(path: &Path) -> ClientResult<Vec<SwitchTarget>> {
     for (line_number, fields) in csv_records(path)?.into_iter().enumerate() {
         if fields.len() < 6 {
             return Err(format!(
-                "invalid CSV format on line {}. Expected node_id,rack_id,ip,port,username,password[,mac_address][,host_name][,node_type] (or the longer node-list layout with type/endpoint_role/host_name/BMC columns)",
+                "invalid CSV format on line {}. Expected node_id,rack_id,ip,port,username,password[,mac_address][,host_name][,node_type][,onie_ip,onie_port,onie_username,onie_password] (or the longer node-list layout with type/endpoint_role/host_name/BMC columns and optional ONIE columns after bmc_mac)",
                 line_number + 1
             )
             .into());
@@ -2269,43 +2511,67 @@ fn parse_switch_targets_csv(path: &Path) -> ClientResult<Vec<SwitchTarget>> {
                 .parse::<u32>()
                 .map_err(|_| format!("invalid port on line {}", line_number + 1))?
         };
+
         let ip_address = fields[2].clone();
+
         // Detect the longer add_nodes / node-list layout where field[7] is the
         // required node type (e.g. `3` or `SwitchGb200Nvidia`), followed by
         // optional endpoint_role, host_name, and BMC columns. Without this,
         // the type value is misread as TLS host_name and NVUE rejects it as
         // an invalid DNS name.
         //
-        // The short layout tops out at 9 fields (mac, host_name, and node
-        // type are all optional), so 10+ fields is an unambiguous node-list
-        // signal on its own, checked before field[7] is even parsed. With
-        // 9 or fewer fields the two layouts can't be told apart by shape
-        // alone, so this falls back to whether field[7] parses as *any*
-        // node type (switch or not -- the `is_switch_node_type` check below
-        // rejects non-switch rows) to tell a node-list type value apart
-        // from a short-layout host_name.
+        // The base short layout tops out at 9 fields (mac, host_name, and node
+        // type are all optional). Its ONIE tail adds up to four fields, so an
+        // explicit short-layout node type in field[8] distinguishes those
+        // rows from the longer node-list layout. Otherwise, 10+ fields is a
+        // node-list signal. With 9 or fewer fields, this falls back to whether
+        // field[7] parses as *any* node type (switch or not -- the
+        // `is_switch_node_type` check below rejects non-switch rows) to tell a
+        // node-list type value apart from a short-layout host_name.
         //
         // Deciding the layout this way, instead of solely from whether
         // field[7] happens to parse, means a typo'd node-list type value
         // (e.g. `SwithcGb200Nvidia`) in an otherwise unambiguous node-list
         // row is reported as an invalid node type instead of silently
         // being misread as a host_name with the type defaulted away.
-        let is_node_list_layout = fields.len() > 9
-            || fields
-                .get(7)
+        let field_7_is_node_type = fields
+            .get(7)
+            .filter(|value| !value.is_empty())
+            .is_some_and(|value| parse_node_type_field(value, "probe").is_ok());
+
+        let has_short_onie_tail = !field_7_is_node_type
+            && (10..=13).contains(&fields.len())
+            && fields
+                .get(8)
                 .filter(|value| !value.is_empty())
                 .is_some_and(|value| parse_node_type_field(value, "probe").is_ok());
+
+        let is_node_list_layout =
+            field_7_is_node_type || (!has_short_onie_tail && fields.len() > 9);
+
+        let node_list_bmc_block_start = if is_bmc_block_start(&fields, 9) {
+            9
+        } else {
+            10
+        };
+
         let (host_name, node_type, node_type_field) = if is_node_list_layout {
             let node_type_field = fields.get(7).cloned().unwrap_or_default();
             let node_type = parse_node_type_field(
                 &node_type_field,
                 &format!("line {} node-list type", line_number + 1),
             )?;
-            let host_name = fields
-                .get(9)
-                .filter(|name| !name.is_empty())
-                .cloned()
-                .unwrap_or_else(|| ip_address.clone());
+
+            let host_name = if node_list_bmc_block_start == 9 {
+                ip_address.clone()
+            } else {
+                fields
+                    .get(9)
+                    .filter(|name| !name.is_empty())
+                    .cloned()
+                    .unwrap_or_else(|| ip_address.clone())
+            };
+
             (host_name, node_type, node_type_field)
         } else {
             let host_name = fields
@@ -2333,6 +2599,27 @@ fn parse_switch_targets_csv(path: &Path) -> ClientResult<Vec<SwitchTarget>> {
             )
             .into());
         }
+
+        let onie_endpoint_start = if is_node_list_layout {
+            let without_bmc_mac = node_list_bmc_block_start + 4;
+
+            let candidate_is_onie_ip = fields
+                .get(without_bmc_mac)
+                .is_some_and(|value| value.parse::<std::net::IpAddr>().is_ok());
+
+            // ONIE may start where the optional BMC MAC would otherwise appear.
+            if fields.len() == without_bmc_mac + 4 || candidate_is_onie_ip {
+                without_bmc_mac
+            } else {
+                without_bmc_mac + 1
+            }
+        } else {
+            9
+        };
+
+        let onie_endpoint =
+            parse_optional_switch_onie_endpoint(&fields, onie_endpoint_start, line_number + 1)?;
+
         targets.push(SwitchTarget {
             node_id: fields[0].clone(),
             rack_id: fields[1].clone(),
@@ -2343,12 +2630,62 @@ fn parse_switch_targets_csv(path: &Path) -> ClientResult<Vec<SwitchTarget>> {
             mac_address: fields.get(6).cloned().unwrap_or_default(),
             host_name,
             node_type,
+            onie_endpoint,
         });
     }
     if targets.is_empty() {
         return Err(format!("no switch targets parsed from {}", path.display()).into());
     }
     Ok(targets)
+}
+
+fn parse_optional_switch_onie_endpoint(
+    fields: &[String],
+    start: usize,
+    line_number: usize,
+) -> ClientResult<Option<SwitchTargetOnieEndpoint>> {
+    let endpoint_fields = [
+        fields.get(start).map(String::as_str).unwrap_or_default(),
+        fields
+            .get(start + 1)
+            .map(String::as_str)
+            .unwrap_or_default(),
+        fields
+            .get(start + 2)
+            .map(String::as_str)
+            .unwrap_or_default(),
+        fields
+            .get(start + 3)
+            .map(String::as_str)
+            .unwrap_or_default(),
+    ];
+
+    if endpoint_fields.iter().all(|field| field.is_empty()) {
+        return Ok(None);
+    }
+
+    let [ip_address, port, username, password] = endpoint_fields;
+
+    if ip_address.is_empty() || username.is_empty() || password.is_empty() {
+        return Err(format!(
+            "incomplete ONIE endpoint on line {line_number}. Expected onie_ip,onie_port,onie_username,onie_password (onie_port may be empty for port 22)"
+        )
+        .into());
+    }
+
+    let port = if port.is_empty() {
+        22
+    } else {
+        port.parse::<u32>()
+            .map_err(|_| format!("invalid ONIE port on line {line_number}"))?
+    };
+
+    Ok(Some(SwitchTargetOnieEndpoint {
+        ip_address: ip_address.to_owned(),
+        port,
+        username: username.to_owned(),
+        password: password.to_owned(),
+    }))
 }
 
 fn parse_single_switch_target_csv(path: &Path) -> ClientResult<SwitchTarget> {
@@ -2451,7 +2788,8 @@ fn parse_node_list_csv(path: &Path) -> ClientResult<Vec<NodeListEntry>> {
         let port = fields[3]
             .parse::<u32>()
             .map_err(|_| format!("invalid port on line {}", line_number + 1))?;
-        let node_type = parse_node_type_field(&fields[7], &format!("line {}", line_number + 1))?;
+        let (node_type, node_descriptor) =
+            parse_node_list_type_field(&fields[7], &format!("line {}", line_number + 1))?;
         let endpoint_role = match fields.get(8).map(|field| field.to_ascii_lowercase()) {
             None => None,
             Some(role) if role.is_empty() || role == "default" => None,
@@ -2495,6 +2833,7 @@ fn parse_node_list_csv(path: &Path) -> ClientResult<Vec<NodeListEntry>> {
             password: fields[5].clone(),
             mac_address: fields[6].clone(),
             node_type,
+            node_descriptor,
             endpoint_role,
             host_name,
             bmc_endpoint,
@@ -2506,8 +2845,13 @@ fn parse_node_list_csv(path: &Path) -> ClientResult<Vec<NodeListEntry>> {
     Ok(nodes)
 }
 
-fn parse_targets_by_type_csv(path: &Path) -> ClientResult<HashMap<i32, rm::FirmwareTargetList>> {
-    let mut targets_by_type: HashMap<i32, Vec<rm::FirmwareTarget>> = HashMap::new();
+fn parse_targets_by_type_csv(
+    path: &Path,
+) -> ClientResult<(
+    HashMap<i32, rm::FirmwareTargetList>,
+    Vec<rm::NodeDescriptorFirmwareTargetList>,
+)> {
+    let mut targets_by_type: HashMap<SelectedNodeType, Vec<rm::FirmwareTarget>> = HashMap::new();
     for (line_number, fields) in csv_records(path)?.into_iter().enumerate() {
         if fields.len() < 3 {
             return Err(format!(
@@ -2516,7 +2860,7 @@ fn parse_targets_by_type_csv(path: &Path) -> ClientResult<HashMap<i32, rm::Firmw
             )
             .into());
         }
-        let node_type = parse_node_type_field(&fields[0], &format!("line {}", line_number + 1))?;
+        let node_type = parse_selected_node_type(&fields[0], &format!("line {}", line_number + 1))?;
         targets_by_type
             .entry(node_type)
             .or_default()
@@ -2529,21 +2873,34 @@ fn parse_targets_by_type_csv(path: &Path) -> ClientResult<HashMap<i32, rm::Firmw
         return Err(format!("no firmware targets parsed from {}", path.display()).into());
     }
 
-    let targets = targets_by_type
+    let (by_type, by_descriptor) = split_selected_node_types(targets_by_type);
+    let by_type = by_type
         .into_iter()
         .map(|(node_type, targets)| (node_type, rm::FirmwareTargetList { targets }))
         .collect();
-    Ok(targets)
+    let by_descriptor = by_descriptor
+        .into_iter()
+        .map(
+            |(node_descriptor, targets)| rm::NodeDescriptorFirmwareTargetList {
+                node_descriptor: Some(node_descriptor),
+                firmware_targets: Some(rm::FirmwareTargetList { targets }),
+            },
+        )
+        .collect();
+    Ok((by_type, by_descriptor))
 }
 
 fn parse_component_filters(
     component_args: &[String],
     target_args: &[String],
-) -> ClientResult<HashMap<i32, rm::FirmwareObjectComponentFilter>> {
-    let mut component_filters: HashMap<i32, Vec<String>> = HashMap::new();
-    let mut wildcards: HashMap<i32, bool> = HashMap::new();
+) -> ClientResult<(
+    HashMap<i32, rm::FirmwareObjectComponentFilter>,
+    Vec<rm::NodeDescriptorFirmwareObjectComponentFilter>,
+)> {
+    let mut component_filters: HashMap<SelectedNodeType, Vec<String>> = HashMap::new();
+    let mut wildcards: HashMap<SelectedNodeType, bool> = HashMap::new();
     for arg in component_args {
-        let Some((node_type, component)) = arg.split_once(':') else {
+        let Some((node_type_name, component)) = arg.split_once(':') else {
             return Err(
                 format!("invalid component filter '{arg}', expected NODE_TYPE:COMPONENT").into(),
             );
@@ -2554,16 +2911,13 @@ fn parse_component_filters(
             )
             .into());
         }
-        let node_type = node_type
-            .parse::<i32>()
-            .map_err(|_| format!("invalid node type in component filter '{arg}'"))?;
-        rm::NodeType::try_from(node_type)
+        let node_type = parse_selected_node_type(node_type_name, "component filter")
             .map_err(|_| format!("invalid node type in component filter '{arg}'"))?;
         let filter = component_filters.entry(node_type).or_default();
         if component == "*" {
             if !filter.is_empty() {
                 return Err(format!(
-                    "invalid component filter '{arg}', wildcard cannot be combined with explicit components for node type {node_type}"
+                    "invalid component filter '{arg}', wildcard cannot be combined with explicit components for node type {node_type_name}"
                 )
                 .into());
             }
@@ -2571,7 +2925,7 @@ fn parse_component_filters(
         } else {
             if wildcards.get(&node_type).copied().unwrap_or(false) {
                 return Err(format!(
-                    "invalid component filter '{arg}', explicit components cannot be combined with wildcard for node type {node_type}"
+                    "invalid component filter '{arg}', explicit components cannot be combined with wildcard for node type {node_type_name}"
                 )
                 .into());
             }
@@ -2596,7 +2950,7 @@ fn parse_component_filters(
             .map_err(|_| format!("invalid node type in target filter '{arg}'"))?;
         rm::NodeType::try_from(node_type)
             .map_err(|_| format!("invalid node type in target filter '{arg}'"))?;
-        if component_filters.contains_key(&node_type) {
+        if component_filters.contains_key(&SelectedNodeType::Proto(node_type)) {
             return Err(format!(
                 "target filter '{arg}' cannot be combined with component filters for node type {node_type}"
             )
@@ -2622,6 +2976,7 @@ fn parse_component_filters(
         }
     }
 
+    let (component_filters, descriptor_filters) = split_selected_node_types(component_filters);
     let mut filters = HashMap::new();
     filters.extend(
         component_filters
@@ -2633,7 +2988,16 @@ fn parse_component_filters(
     filters.extend(target_filters.into_iter().map(|(node_type, components)| {
         (node_type, rm::FirmwareObjectComponentFilter { components })
     }));
-    Ok(filters)
+    let descriptor_filters = descriptor_filters
+        .into_iter()
+        .map(
+            |(node_descriptor, components)| rm::NodeDescriptorFirmwareObjectComponentFilter {
+                node_descriptor: Some(node_descriptor),
+                component_filter: Some(rm::FirmwareObjectComponentFilter { components }),
+            },
+        )
+        .collect();
+    Ok((filters, descriptor_filters))
 }
 
 fn parse_firmware_object_component_target(node_type: i32, value: &str) -> ClientResult<String> {
@@ -2776,6 +3140,31 @@ fn csv_records(path: &Path) -> ClientResult<Vec<Vec<String>>> {
 }
 
 fn switch_target_to_node(target: SwitchTarget) -> rm::NodeInfo {
+    switch_target_to_node_with_recovery(target, false)
+}
+
+fn switch_target_to_node_with_recovery(
+    target: SwitchTarget,
+    allow_onie_recovery: bool,
+) -> rm::NodeInfo {
+    let additional_host_endpoints = if allow_onie_recovery {
+        target
+            .onie_endpoint
+            .map(|endpoint| rm::Endpoint {
+                interface: Some(rm::NetworkInterface {
+                    ip_address: endpoint.ip_address,
+                    mac_address: String::new(),
+                    host_name: None,
+                }),
+                port: endpoint.port,
+                credentials: Some(user_pass(endpoint.username, endpoint.password)),
+            })
+            .into_iter()
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     rm::NodeInfo {
         node_id: target.node_id,
         rack_id: target.rack_id,
@@ -2791,7 +3180,7 @@ fn switch_target_to_node(target: SwitchTarget) -> rm::NodeInfo {
             credentials: Some(user_pass(target.username, target.password)),
         }),
         node_descriptor: None,
-        additional_host_endpoints: Vec::new(),
+        additional_host_endpoints,
     }
 }
 
@@ -2843,7 +3232,7 @@ fn node_list_entry_to_proto(node: NodeListEntry, mode: NodeListEndpointMode) -> 
             r#type: Some(node.node_type),
             bmc_endpoint: Some(bmc_endpoint_proto),
             host_endpoint: Some(host_endpoint_proto),
-            node_descriptor: None,
+            node_descriptor: node.node_descriptor,
             additional_host_endpoints: Vec::new(),
         };
     }
@@ -2864,7 +3253,7 @@ fn node_list_entry_to_proto(node: NodeListEntry, mode: NodeListEndpointMode) -> 
             r#type: Some(node.node_type),
             bmc_endpoint,
             host_endpoint,
-            node_descriptor: None,
+            node_descriptor: node.node_descriptor,
             additional_host_endpoints: Vec::new(),
         }
     } else {
@@ -2879,7 +3268,7 @@ fn node_list_entry_to_proto(node: NodeListEntry, mode: NodeListEndpointMode) -> 
             r#type: Some(node.node_type),
             bmc_endpoint,
             host_endpoint,
-            node_descriptor: None,
+            node_descriptor: node.node_descriptor,
             additional_host_endpoints: Vec::new(),
         }
     }
@@ -2954,6 +3343,78 @@ fn parse_node_type_field(value: &str, context: &str) -> ClientResult<i32> {
     .into())
 }
 
+/// Node type selected by a client CSV column or command-line selector.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum SelectedNodeType {
+    /// A protobuf `NodeType` value.
+    Proto(i32),
+    /// An RMS node type without a protobuf enum value, sent by descriptor.
+    DescriptorOnly(DomainNodeType),
+}
+
+/// Parse a node type selector.
+///
+/// In addition to [`parse_node_type_field`] values, this accepts stable RMS
+/// node type names (for example `powershelf_vrnvl72_delta`).
+fn parse_selected_node_type(value: &str, context: &str) -> ClientResult<SelectedNodeType> {
+    let stable_name = value.trim().to_ascii_lowercase().replace(['-', ' '], "_");
+    let Some(node_type) = DomainNodeType::from_stable_name(&stable_name) else {
+        return parse_node_type_field(value, context)
+            .map(SelectedNodeType::Proto)
+            .map_err(|error| {
+                format!("{error}, or a stable RMS node type name such as powershelf_vrnvl72_delta")
+                    .into()
+            });
+    };
+
+    let proto_type = domain_node_type_to_proto(node_type);
+    if proto_type == rm::NodeType::Unspecified {
+        Ok(SelectedNodeType::DescriptorOnly(node_type))
+    } else {
+        Ok(SelectedNodeType::Proto(proto_type as i32))
+    }
+}
+
+/// Split selector entries into protobuf-keyed and descriptor-keyed entries.
+///
+/// Descriptor entries are ordered by stable node type name.
+fn split_selected_node_types<T>(
+    entries: HashMap<SelectedNodeType, T>,
+) -> (HashMap<i32, T>, Vec<(rm::NodeDescriptor, T)>) {
+    let mut by_type = HashMap::new();
+    let mut by_descriptor = Vec::new();
+    for (node_type, value) in entries {
+        match node_type {
+            SelectedNodeType::Proto(node_type) => {
+                by_type.insert(node_type, value);
+            }
+            SelectedNodeType::DescriptorOnly(node_type) => by_descriptor.push((node_type, value)),
+        }
+    }
+    by_descriptor.sort_by_key(|(node_type, _)| node_type.as_str());
+    let by_descriptor = by_descriptor
+        .into_iter()
+        .map(|(node_type, value)| (domain_node_type_to_descriptor(node_type), value))
+        .collect();
+    (by_type, by_descriptor)
+}
+
+/// Parse a node-list `type` column into the protobuf `type` and descriptor.
+///
+/// Names without a protobuf enum value are sent as `NODE_TYPE_UNSPECIFIED`
+/// plus the canonical node descriptor.
+fn parse_node_list_type_field(
+    value: &str,
+    context: &str,
+) -> ClientResult<(i32, Option<rm::NodeDescriptor>)> {
+    match parse_selected_node_type(value, context)? {
+        SelectedNodeType::Proto(node_type) => Ok((node_type, None)),
+        SelectedNodeType::DescriptorOnly(node_type) => Ok((
+            rm::NodeType::Unspecified as i32,
+            Some(domain_node_type_to_descriptor(node_type)),
+        )),
+    }
+}
 fn validate_component_type(component_type: i32) -> ClientResult<()> {
     if matches!(
         rm::SwitchFirmwareComponentType::try_from(component_type),
@@ -3535,6 +3996,7 @@ mod tests {
             password: "secret".to_owned(),
             mac_address: "aa:bb:cc:dd:ee:ff".to_owned(),
             node_type: rm::NodeType::SwitchGb200Nvidia as i32,
+            node_descriptor: None,
             endpoint_role: None,
             host_name: String::new(),
             bmc_endpoint: None,
@@ -3701,8 +4163,252 @@ mod tests {
     }
 
     #[test]
+    fn parse_node_list_type_field_sends_descriptor_only_types_as_descriptors() -> ClientResult<()> {
+        for node_type in [
+            DomainNodeType::PowershelfVrnvl72Delta,
+            DomainNodeType::PowershelfVrnvl72Liteon,
+            DomainNodeType::ComputeGb200Dell,
+            DomainNodeType::ComputeGb200Wiwynn,
+            DomainNodeType::ComputeGb300Supermicro,
+        ] {
+            let (proto_type, descriptor) = parse_node_list_type_field(node_type.as_str(), "test")?;
+
+            assert_eq!(proto_type, rm::NodeType::Unspecified as i32, "{node_type}");
+            assert_eq!(
+                descriptor,
+                Some(domain_node_type_to_descriptor(node_type)),
+                "{node_type}"
+            );
+            assert_eq!(
+                rackmanagementservice::api::grpc::node_type_resolver::resolve_node_type(
+                    Some(proto_type),
+                    descriptor.as_ref(),
+                )?,
+                node_type
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn node_list_stable_names_preserve_descriptor_only_platforms() -> ClientResult<()> {
+        for (stable_name, vendor, family, domain_type) in [
+            (
+                "compute_gb200_dell",
+                "dell",
+                "gb200",
+                DomainNodeType::ComputeGb200Dell,
+            ),
+            (
+                "compute_gb200_wiwynn",
+                "wiwynn",
+                "gb200",
+                DomainNodeType::ComputeGb200Wiwynn,
+            ),
+            (
+                "compute_gb300_supermicro",
+                "supermicro",
+                "gb300",
+                DomainNodeType::ComputeGb300Supermicro,
+            ),
+        ] {
+            // Cover BMC-only rows and rows carrying both host and BMC endpoints.
+            for tail in [
+                ",bmc",
+                ",host,192.0.2.4,443,bmc-user,bmc-pass,02:00:00:00:00:04",
+            ] {
+                let csv = tempfile::NamedTempFile::new()?;
+                std::fs::write(
+                    csv.path(),
+                    format!(
+                        "c-01,rack-01,192.0.2.10,443,user,secret,02:00:00:00:00:10,{stable_name}{tail}\n"
+                    ),
+                )?;
+                let entries = parse_node_list_csv(csv.path())?;
+                for mode in [
+                    NodeListEndpointMode::InventoryRegistration,
+                    NodeListEndpointMode::DirectOperation,
+                ] {
+                    let node = node_list_entry_to_proto(entries[0].clone(), mode);
+                    assert_eq!(node.r#type, Some(rm::NodeType::Unspecified as i32));
+                    let descriptor = node
+                        .node_descriptor
+                        .as_ref()
+                        .expect("descriptor must survive conversion");
+                    assert_eq!(descriptor.attributes["role"], "compute");
+                    assert_eq!(descriptor.attributes["vendor"], vendor);
+                    assert_eq!(descriptor.attributes["product_family"], family);
+                    assert_eq!(
+                        rackmanagementservice::api::grpc::node_type_resolver::resolve_node_info(
+                            &node
+                        )?,
+                        domain_type,
+                    );
+                    rackmanagementservice::api::grpc::conversions::flatten_node_info(&node)?
+                        .bmc_endpoint(true)?;
+                    let bmc = node.bmc_endpoint.expect("BMC endpoint is required");
+                    assert_eq!(bmc.port, 443);
+                    let dual_endpoint = tail.starts_with(",host");
+                    assert_eq!(node.host_endpoint.is_some(), dual_endpoint);
+                    assert_eq!(
+                        bmc.interface.expect("BMC interface").ip_address,
+                        if dual_endpoint {
+                            "192.0.2.4"
+                        } else {
+                            "192.0.2.10"
+                        },
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn parse_node_list_type_field_normalizes_stable_names() -> ClientResult<()> {
+        let (proto_type, descriptor) =
+            parse_node_list_type_field(" PowerShelf-VRNVL72-Delta ", "test")?;
+
+        assert_eq!(proto_type, rm::NodeType::Unspecified as i32);
+        assert_eq!(
+            descriptor,
+            Some(domain_node_type_to_descriptor(
+                DomainNodeType::PowershelfVrnvl72Delta
+            ))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn parse_node_list_type_field_keeps_enum_types_without_descriptor() -> ClientResult<()> {
+        assert_eq!(
+            parse_node_list_type_field("compute_gb200_nvidia", "test")?,
+            (rm::NodeType::ComputeGb200Nvidia as i32, None)
+        );
+        assert_eq!(
+            parse_node_list_type_field("PowershelfGb200Delta", "test")?,
+            (rm::NodeType::PowershelfGb200Delta as i32, None)
+        );
+        assert_eq!(
+            parse_node_list_type_field("1", "test")?,
+            (rm::NodeType::ComputeGb200Nvidia as i32, None)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn parse_node_list_type_field_rejects_unknown_names() {
+        let error = parse_node_list_type_field("powershelf_vrnvl72_acme", "line 1")
+            .expect_err("unknown name should fail");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("line 1: invalid node type 'powershelf_vrnvl72_acme'"),
+            "{message}"
+        );
+        assert!(message.contains("stable RMS node type name"), "{message}");
+    }
+
+    #[test]
+    fn parse_node_list_accepts_descriptor_only_node_type() -> ClientResult<()> {
+        let csv = tempfile::NamedTempFile::new()?;
+        std::fs::write(
+            csv.path(),
+            "ps-01,rack-01,10.0.0.50,443,root,secret,aa:bb:cc:dd:ee:ff,powershelf_vrnvl72_delta\n",
+        )?;
+
+        let mut nodes = parse_node_list_csv(csv.path())?;
+        assert_eq!(nodes.len(), 1);
+        let node =
+            node_list_entry_to_proto(nodes.remove(0), NodeListEndpointMode::InventoryRegistration);
+
+        assert_eq!(node.r#type, Some(rm::NodeType::Unspecified as i32));
+        assert_eq!(
+            node.node_descriptor,
+            Some(domain_node_type_to_descriptor(
+                DomainNodeType::PowershelfVrnvl72Delta
+            ))
+        );
+        assert_eq!(
+            node.bmc_endpoint
+                .as_ref()
+                .and_then(|endpoint| endpoint.interface.as_ref())
+                .map(|interface| interface.ip_address.as_str()),
+            Some("10.0.0.50")
+        );
+        assert!(node.host_endpoint.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn node_list_stable_switch_name_preserves_endpoint_routing() -> ClientResult<()> {
+        let csv = tempfile::NamedTempFile::new()?;
+        std::fs::write(
+            csv.path(),
+            "sw-01,rack-01,192.0.2.10,443,user,secret,,switch_gb200_nvidia,,switch.example.com\n",
+        )?;
+        let entry = parse_node_list_csv(csv.path())?.remove(0);
+        let node = node_list_entry_to_proto(entry, NodeListEndpointMode::DirectOperation);
+        assert_eq!(node.r#type, Some(rm::NodeType::SwitchGb200Nvidia as i32));
+        assert!(node.node_descriptor.is_none());
+        assert!(node.bmc_endpoint.is_none());
+        assert_eq!(
+            node.host_endpoint
+                .expect("host endpoint")
+                .interface
+                .expect("host interface")
+                .host_name
+                .as_deref(),
+            Some("switch.example.com"),
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn apply_inventory_profile_keeps_descriptor_identity() {
+        let mut node = rm::NodeInfo {
+            node_descriptor: Some(domain_node_type_to_descriptor(
+                DomainNodeType::PowershelfVrnvl72Delta,
+            )),
+            ..Default::default()
+        };
+
+        apply_inventory_profile(&mut node, Some("vr-delta-v1"));
+
+        let mut expected = domain_node_type_to_descriptor(DomainNodeType::PowershelfVrnvl72Delta);
+        expected.attributes.insert(
+            INVENTORY_PROFILE_ATTRIBUTE.to_owned(),
+            "vr-delta-v1".to_owned(),
+        );
+        assert_eq!(node.node_descriptor, Some(expected));
+    }
+
+    #[test]
+    fn apply_inventory_profile_adds_descriptor_for_enum_types() {
+        let mut node = rm::NodeInfo {
+            r#type: Some(rm::NodeType::ComputeGb200Nvidia as i32),
+            ..Default::default()
+        };
+
+        apply_inventory_profile(&mut node, Some("gb200-v1"));
+        assert_eq!(
+            node.node_descriptor,
+            Some(rm::NodeDescriptor {
+                attributes: HashMap::from([(
+                    INVENTORY_PROFILE_ATTRIBUTE.to_owned(),
+                    "gb200-v1".to_owned()
+                )]),
+            })
+        );
+
+        let mut untouched = rm::NodeInfo::default();
+        apply_inventory_profile(&mut untouched, None);
+        assert!(untouched.node_descriptor.is_none());
+    }
+
+    #[test]
     fn parse_target_filters_are_node_type_specific() -> ClientResult<()> {
-        let filters = parse_component_filters(
+        let (filters, _) = parse_component_filters(
             &[],
             &[
                 format!("{}:CPU_0", rm::NodeType::ComputeGb200Nvidia as i32),
@@ -3754,7 +4460,7 @@ mod tests {
 
     #[test]
     fn parse_target_filter_wildcard_keeps_explicit_empty_components() -> ClientResult<()> {
-        let filters = parse_component_filters(
+        let (filters, _) = parse_component_filters(
             &[],
             &[format!("{}:*", rm::NodeType::ComputeGb200Nvidia as i32)],
         )?;
@@ -3762,6 +4468,88 @@ mod tests {
         assert_eq!(
             filters[&(rm::NodeType::ComputeGb200Nvidia as i32)].components,
             Vec::<String>::new()
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn parse_component_filters_send_descriptor_only_types_by_descriptor() -> ClientResult<()> {
+        let (filters, descriptor_filters) = parse_component_filters(
+            &[
+                "powershelf_vrnvl72_delta:DeltaPSU".to_owned(),
+                format!("{}:BMC", rm::NodeType::ComputeGb200Nvidia as i32),
+            ],
+            &[],
+        )?;
+
+        assert_eq!(
+            filters.keys().copied().collect::<Vec<_>>(),
+            vec![rm::NodeType::ComputeGb200Nvidia as i32]
+        );
+        assert_eq!(
+            descriptor_filters,
+            vec![rm::NodeDescriptorFirmwareObjectComponentFilter {
+                node_descriptor: Some(domain_node_type_to_descriptor(
+                    DomainNodeType::PowershelfVrnvl72Delta
+                )),
+                component_filter: Some(rm::FirmwareObjectComponentFilter {
+                    components: vec!["DeltaPSU".to_owned()],
+                }),
+            }]
+        );
+
+        let err = parse_component_filters(
+            &[
+                "powershelf_vrnvl72_delta:*".to_owned(),
+                "PowerShelf-VRNVL72-Delta:DeltaPMC".to_owned(),
+            ],
+            &[],
+        )
+        .expect_err("wildcard and explicit components should conflict");
+        assert!(err.to_string().contains("cannot be combined"), "{err}");
+
+        Ok(())
+    }
+
+    #[test]
+    fn parse_targets_csv_sends_descriptor_only_types_by_descriptor() -> ClientResult<()> {
+        let csv = tempfile::NamedTempFile::new()?;
+        std::fs::write(
+            csv.path(),
+            format!(
+                "powershelf_vrnvl72_delta,DeltaPSU,psu.bin\n{},DeltaPMC,pmc.bin\n",
+                rm::NodeType::PowershelfGb300Delta as i32
+            ),
+        )?;
+
+        let (by_type, by_descriptor) = parse_targets_by_type_csv(csv.path())?;
+
+        assert_eq!(
+            by_type,
+            HashMap::from([(
+                rm::NodeType::PowershelfGb300Delta as i32,
+                rm::FirmwareTargetList {
+                    targets: vec![rm::FirmwareTarget {
+                        target: "DeltaPMC".to_owned(),
+                        filename: "pmc.bin".to_owned(),
+                    }],
+                },
+            )])
+        );
+        assert_eq!(
+            by_descriptor,
+            vec![rm::NodeDescriptorFirmwareTargetList {
+                node_descriptor: Some(domain_node_type_to_descriptor(
+                    DomainNodeType::PowershelfVrnvl72Delta
+                )),
+                firmware_targets: Some(rm::FirmwareTargetList {
+                    targets: vec![rm::FirmwareTarget {
+                        target: "DeltaPSU".to_owned(),
+                        filename: "psu.bin".to_owned(),
+                    }],
+                }),
+            }]
         );
 
         Ok(())
@@ -3807,21 +4595,130 @@ mod tests {
         // type at field[7], empty endpoint_role, host_name, then BMC columns.
         std::fs::write(
             csv.path(),
-            "sw100,rack-01,10.85.160.23,443,admin,secret,50:00:E6:79:A2:E0,3,,10-85-160-23.ipp6-dev1.dev.dsx.nvidia.com,10.85.160.69,443,root,bmc-secret,64:33:AA:26:D0:3E\n",
+            "sw100,rack-01,192.0.2.23,443,admin,secret,02:00:00:00:00:01,3,,switch-01.example.com,192.0.2.69,443,root,bmc-secret,02:00:00:00:00:02\n",
         )?;
 
         let targets = parse_switch_targets_csv(csv.path())?;
 
         assert_eq!(targets.len(), 1);
-        assert_eq!(
-            targets[0].host_name,
-            "10-85-160-23.ipp6-dev1.dev.dsx.nvidia.com"
-        );
+        assert_eq!(targets[0].host_name, "switch-01.example.com");
         assert_eq!(targets[0].node_type, rm::NodeType::SwitchGb200Nvidia as i32);
-        assert_eq!(targets[0].ip_address, "10.85.160.23");
-        assert_eq!(targets[0].mac_address, "50:00:E6:79:A2:E0");
+        assert_eq!(targets[0].ip_address, "192.0.2.23");
+        assert_eq!(targets[0].mac_address, "02:00:00:00:00:01");
 
         Ok(())
+    }
+
+    #[test]
+    fn parse_switch_targets_accepts_short_layout_onie_endpoint() -> ClientResult<()> {
+        let csv = tempfile::NamedTempFile::new()?;
+
+        std::fs::write(
+            csv.path(),
+            "sw-01,rack-01,10.0.1.1,443,admin,secret,,sw-01.example.com,SwitchGb200Nvidia,10.0.2.1,,root,onie-secret\n",
+        )?;
+
+        let targets = parse_switch_targets_csv(csv.path())?;
+
+        let endpoint = targets
+            .first()
+            .ok_or("expected switch target")?
+            .onie_endpoint
+            .as_ref()
+            .ok_or("expected ONIE endpoint")?;
+
+        assert_eq!(endpoint.ip_address, "10.0.2.1");
+        assert_eq!(endpoint.port, 22);
+        assert_eq!(endpoint.username, "root");
+        assert_eq!(endpoint.password, "onie-secret");
+
+        Ok(())
+    }
+
+    #[test]
+    fn parse_switch_targets_accepts_node_list_layout_onie_endpoint() -> ClientResult<()> {
+        let csv = tempfile::NamedTempFile::new()?;
+
+        std::fs::write(
+            csv.path(),
+            "sw100,rack-01,192.0.2.23,443,admin,secret,02:00:00:00:00:01,3,,switch.example.com,192.0.2.69,443,root,bmc-secret,02:00:00:00:00:02,198.51.100.23,22,root,onie-secret\n",
+        )?;
+
+        let targets = parse_switch_targets_csv(csv.path())?;
+
+        let endpoint = targets
+            .first()
+            .ok_or("expected switch target")?
+            .onie_endpoint
+            .as_ref()
+            .ok_or("expected ONIE endpoint")?;
+
+        assert_eq!(endpoint.ip_address, "198.51.100.23");
+        assert_eq!(endpoint.port, 22);
+        assert_eq!(endpoint.username, "root");
+        assert_eq!(endpoint.password, "onie-secret");
+
+        Ok(())
+    }
+
+    #[test]
+    fn parse_switch_targets_derives_node_list_onie_offset_from_optional_fields() -> ClientResult<()>
+    {
+        let csv = tempfile::NamedTempFile::new()?;
+
+        std::fs::write(
+            csv.path(),
+            concat!(
+                "sw-no-host,rack-01,10.0.1.1,443,admin,secret,02:00:00:00:00:01,3,,192.168.1.10,443,root,bmc-secret,02:00:00:00:00:02,10.0.2.1,22,root,onie-secret\n",
+                "sw-no-bmc-mac,rack-01,10.0.1.2,443,admin,secret,02:00:00:00:00:03,3,,switch.example.com,192.168.1.11,443,root,bmc-secret,10.0.2.2,22,root,onie-secret\n",
+            ),
+        )?;
+
+        let targets = parse_switch_targets_csv(csv.path())?;
+
+        assert_eq!(targets.len(), 2);
+
+        let without_host_name = targets.first().ok_or("expected first switch target")?;
+
+        let without_host_name_onie = without_host_name
+            .onie_endpoint
+            .as_ref()
+            .ok_or("expected first ONIE endpoint")?;
+
+        assert_eq!(without_host_name.host_name, "10.0.1.1");
+        assert_eq!(without_host_name_onie.ip_address, "10.0.2.1");
+
+        let without_bmc_mac = targets.get(1).ok_or("expected second switch target")?;
+
+        let without_bmc_mac_onie = without_bmc_mac
+            .onie_endpoint
+            .as_ref()
+            .ok_or("expected second ONIE endpoint")?;
+
+        assert_eq!(without_bmc_mac.host_name, "switch.example.com");
+        assert_eq!(without_bmc_mac_onie.ip_address, "10.0.2.2");
+
+        Ok(())
+    }
+
+    #[test]
+    fn parse_switch_targets_rejects_partial_onie_endpoint() {
+        for row in [
+            "sw-01,rack-01,10.0.1.1,443,admin,secret,,sw-01.example.com,SwitchGb200Nvidia,10.0.2.1,22,,onie-secret\n",
+            "sw-01,rack-01,10.0.1.1,443,admin,secret,02:00:00:00:00:01,3,,switch.example.com,192.168.1.11,443,root,bmc-secret,10.0.2.2\n",
+        ] {
+            let csv = tempfile::NamedTempFile::new().expect("temp file");
+
+            std::fs::write(csv.path(), row).expect("write csv");
+
+            let error = parse_switch_targets_csv(csv.path())
+                .expect_err("partial ONIE endpoint should be rejected");
+
+            assert!(
+                error.to_string().contains("incomplete ONIE endpoint"),
+                "unexpected error for {row}: {error}"
+            );
+        }
     }
 
     #[test]
@@ -3855,7 +4752,7 @@ mod tests {
         // host_name with the type defaulted to SwitchGb200Nvidia.
         std::fs::write(
             csv.path(),
-            "sw100,rack-01,10.85.160.23,443,admin,secret,50:00:E6:79:A2:E0,BadType,,10-85-160-23.ipp6-dev1.dev.dsx.nvidia.com,10.85.160.69,443,root,bmc-secret,64:33:AA:26:D0:3E\n",
+            "sw100,rack-01,192.0.2.23,443,admin,secret,02:00:00:00:00:01,BadType,,switch-01.example.com,192.0.2.69,443,root,bmc-secret,02:00:00:00:00:02\n",
         )
         .expect("write csv");
 
@@ -3915,6 +4812,7 @@ mod tests {
             mac_address: String::new(),
             host_name: "sw-01.switch.example.com".into(),
             node_type: rm::NodeType::SwitchVrnvl72Nvidia as i32,
+            onie_endpoint: None,
         });
 
         assert_eq!(node.r#type, Some(rm::NodeType::SwitchVrnvl72Nvidia as i32));
@@ -3925,6 +4823,54 @@ mod tests {
             .and_then(|iface| iface.host_name)
             .expect("expected host_name on switch host endpoint");
         assert_eq!(host_name, "sw-01.switch.example.com");
+    }
+
+    #[test]
+    fn switch_target_to_node_only_adds_onie_endpoint_for_recovery() -> ClientResult<()> {
+        let csv = tempfile::NamedTempFile::new()?;
+
+        std::fs::write(
+            csv.path(),
+            "sw-01,rack-01,10.0.1.1,443,admin,secret,,sw-01.example.com,SwitchGb200Nvidia,10.0.2.1,22,root,onie-secret\n",
+        )?;
+
+        let target = parse_single_switch_target_csv(csv.path())?;
+
+        let without_recovery = switch_target_to_node_with_recovery(target.clone(), false);
+
+        assert!(without_recovery.additional_host_endpoints.is_empty());
+
+        let with_recovery = switch_target_to_node_with_recovery(target, true);
+
+        assert_eq!(with_recovery.additional_host_endpoints.len(), 1);
+
+        let endpoint = with_recovery
+            .additional_host_endpoints
+            .first()
+            .ok_or("expected ONIE endpoint")?;
+
+        let interface = endpoint
+            .interface
+            .as_ref()
+            .ok_or("expected ONIE network interface")?;
+
+        assert_eq!(interface.ip_address, "10.0.2.1");
+        assert_eq!(endpoint.port, 22);
+
+        let credentials = endpoint
+            .credentials
+            .as_ref()
+            .and_then(|credentials| credentials.auth.as_ref())
+            .ok_or("expected ONIE credentials")?;
+
+        let rm::credentials::Auth::UserPass(credentials) = credentials else {
+            return Err("expected ONIE username/password credentials".into());
+        };
+
+        assert_eq!(credentials.username, "root");
+        assert_eq!(credentials.password, "onie-secret");
+
+        Ok(())
     }
 
     #[test]
@@ -4004,6 +4950,7 @@ mod tests {
             password: "secret".to_owned(),
             mac_address: "aa:bb:cc:dd:ee:ff".to_owned(),
             node_type: rm::NodeType::SwitchGb200Nvidia as i32,
+            node_descriptor: None,
             endpoint_role: None,
             host_name: "sw-01.switch.example.com".into(),
             bmc_endpoint: None,
@@ -4101,6 +5048,7 @@ mod tests {
             password: "nvue-pass".to_owned(),
             mac_address: "aa:bb:cc:dd:ee:ff".to_owned(),
             node_type: rm::NodeType::SwitchVrnvl72Nvidia as i32,
+            node_descriptor: None,
             endpoint_role: None,
             host_name: String::new(),
             bmc_endpoint: Some(NodeListBmcEndpoint {
@@ -4145,6 +5093,7 @@ mod tests {
             password: "host-pass".to_owned(),
             mac_address: "aa:bb:cc:dd:ee:ff".to_owned(),
             node_type: rm::NodeType::ComputeGb200Nvidia as i32,
+            node_descriptor: None,
             endpoint_role: None,
             host_name: String::new(),
             bmc_endpoint: Some(NodeListBmcEndpoint {
@@ -4186,6 +5135,7 @@ mod tests {
             password: "nvue-pass".to_owned(),
             mac_address: "aa:bb:cc:dd:ee:ff".to_owned(),
             node_type: rm::NodeType::SwitchGb200Nvidia as i32,
+            node_descriptor: None,
             endpoint_role: Some(NodeListEndpointRole::Bmc),
             host_name: String::new(),
             bmc_endpoint: Some(NodeListBmcEndpoint {
@@ -4244,6 +5194,37 @@ mod tests {
             panic!("expected batch_get_firmware_inventory command");
         };
         assert_eq!(nodes_csv, PathBuf::from("/tmp/nodes.csv"));
+    }
+
+    #[test]
+    fn compare_firmware_object_command_parses() {
+        let cli = Cli::try_parse_from([
+            "rack_manager_client",
+            "localhost",
+            "8801",
+            "compare_firmware_object",
+            "/tmp/nodes.csv",
+            "/tmp/manifest.json",
+            "prod",
+            "--component-filter",
+            "1:BMC",
+        ])
+        .expect("expected compare_firmware_object to parse");
+
+        let Command::CompareFirmwareObject {
+            nodes_csv,
+            config_json,
+            firmware_type,
+            component_filters,
+            ..
+        } = cli.command
+        else {
+            panic!("expected compare_firmware_object command");
+        };
+        assert_eq!(nodes_csv, PathBuf::from("/tmp/nodes.csv"));
+        assert_eq!(config_json, PathBuf::from("/tmp/manifest.json"));
+        assert_eq!(firmware_type, "prod");
+        assert_eq!(component_filters, vec!["1:BMC"]);
     }
 
     #[test]
@@ -4319,5 +5300,62 @@ mod tests {
             result.is_err(),
             "disable_mtls must require at least one --service"
         );
+    }
+
+    #[test]
+    fn onie_recovery_requires_active_tls_for_every_supported_command() {
+        let commands = [
+            Command::UpdateSwitchSystemImage {
+                targets_csv: PathBuf::new(),
+                image_filename: String::new(),
+                local_file_path: String::new(),
+                allow_onie_recovery: true,
+            },
+            Command::FirmwareObject {
+                command: FirmwareObjectCommand::ApplyStoredSwitchSystemImage {
+                    rack_id: String::new(),
+                    switches_csv: PathBuf::new(),
+                    software_type: String::new(),
+                    hardware_type: String::new(),
+                    object_id: None,
+                    allow_onie_recovery: true,
+                },
+            },
+            Command::FirmwareObject {
+                command: FirmwareObjectCommand::ApplySwitchSystemImage {
+                    rack_id: String::new(),
+                    switches_csv: PathBuf::new(),
+                    config_json: PathBuf::new(),
+                    access_token: String::new(),
+                    software_type: String::new(),
+                    hardware_type: String::new(),
+                    allow_onie_recovery: true,
+                },
+            },
+        ];
+
+        let mut cli = Cli::try_parse_from(["rack_manager_client", "localhost", "8801", "version"])
+            .expect("expected base command to parse");
+
+        for command in commands {
+            cli.command = command;
+
+            let error = cli
+                .validate_transport_security()
+                .expect_err("ONIE recovery without TLS should be rejected");
+
+            assert_eq!(
+                error.to_string(),
+                "--allow-onie-recovery requires TLS for the RMS gRPC connection"
+            );
+        }
+
+        cli.ca = Some(PathBuf::from("/tmp/ca.pem"));
+        cli.validate_transport_security()
+            .expect("ONIE recovery over TLS should be accepted");
+
+        cli.insecure = true;
+        cli.validate_transport_security()
+            .expect_err("--insecure should override configured TLS material");
     }
 }

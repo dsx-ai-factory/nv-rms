@@ -13,14 +13,19 @@ nv-redfish = { workspace = true, features = [
     "update-service",
 ] }
 reqwest = { workspace = true }
+rustls = { workspace = true }
+rustls-native-certs = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["fs", "sync"] }
 tokio-util = { workspace = true, features = ["compat"] }
 url = { workspace = true }
+webpki-roots = { workspace = true }
 
 [dev-dependencies]
+rcgen = { workspace = true }
 tempfile = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt"] }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt"] }
+tokio-rustls = { workspace = true }
 wiremock = { workspace = true }

@@ -185,3 +185,196 @@ message NmxGetStaticConfigResponse {
   NmxStaticConfig staticConfig = 2;
   NmxConfigKeyVals configKeyVals = 4;  // Compatibility with responses that return values directly
 }
+
+// Observation fields and enum values retain the NMX_Controller wire numbers.
+// Fields outside the health and membership observation subset are omitted.
+enum ControlPlaneState {
+  NMX_CONTROL_PLANE_STATE_UNDEFINED = 0;
+  NMX_CONTROL_PLANE_STATE_OFFLINE = 1;
+  NMX_CONTROL_PLANE_STATE_STANDBY = 2;
+  NMX_CONTROL_PLANE_STATE_CONFIGURED = 3;
+  NMX_CONTROL_PLANE_STATE_TIMEOUT = 4;
+  NMX_CONTROL_PLANE_STATE_ERROR = 5;
+  NMX_CONTROL_PLANE_STATE_UNCONFIGURED = 6;
+  NMX_CONTROL_PLANE_STATE_DEGRADED = 7;
+}
+
+enum NmxControllerHealth {
+  NMX_CONTROLLER_HEALTH_UNKNOWN = 0;
+  NMX_CONTROLLER_HEALTH_HEALTHY = 1;
+  NMX_CONTROLLER_HEALTH_DEGRADED = 2;
+  NMX_CONTROLLER_HEALTH_UNHEALTHY = 3;
+  NMX_CONTROLLER_HEALTH_UNHEALTHY_DB_CORRUPTED = 4;
+}
+
+enum ComputeNodeHealth {
+  NMX_COMPUTE_NODE_HEALTH_UNKNOWN = 0;
+  NMX_COMPUTE_NODE_HEALTH_HEALTHY = 1;
+  NMX_COMPUTE_NODE_HEALTH_DEGRADED = 2;
+  NMX_COMPUTE_NODE_HEALTH_UNHEALTHY = 3;
+}
+
+enum SwitchNodeHealth {
+  NMX_SWITCH_NODE_HEALTH_UNKNOWN = 0;
+  NMX_SWITCH_NODE_HEALTH_HEALTHY = 1;
+  NMX_SWITCH_NODE_HEALTH_MISSING_NVLINK = 2;
+  NMX_SWITCH_NODE_HEALTH_UNHEALTHY = 3;
+}
+
+enum SwitchHealth {
+  NMX_SWITCH_HEALTH_UNKNOWN = 0;
+  NMX_SWITCH_HEALTH_HEALTHY = 1;
+  NMX_SWITCH_HEALTH_MISSING_NVLINK = 2;
+  NMX_SWITCH_HEALTH_UNHEALTHY = 3;
+}
+
+enum GpuHealth {
+  NMX_GPU_HEALTH_UNKNOWN = 0;
+  NMX_GPU_HEALTH_HEALTHY = 1;
+  NMX_GPU_HEALTH_DEGRADED = 2;
+  NMX_GPU_HEALTH_NO_NVLINK = 3;
+  NMX_GPU_HEALTH_DEGRADED_BW = 4;
+}
+
+enum PortType {
+  NMX_PORT_TYPE_UNDEFINED = 0;
+  NMX_PORT_TYPE_GPU = 1;
+  NMX_PORT_TYPE_SWITCH_ACCESS = 2;
+  NMX_PORT_TYPE_SWITCH_TRUNK = 3;
+  NMX_PORT_TYPE_FNM = 4;
+  NMX_PORT_TYPE_HCA = 5;
+}
+
+enum LogicalLinkState {
+  NMX_LOGICAL_LINK_NO_CHANGE = 0;
+  NMX_LOGICAL_LINK_STATE_DOWN = 1;
+  NMX_LOGICAL_LINK_STATE_INIT = 2;
+  NMX_LOGICAL_LINK_STATE_ARMED = 3;
+  NMX_LOGICAL_LINK_STATE_ACTIVE = 4;
+  NMX_LOGICAL_LINK_STATE_ACT_DEFER = 5;
+}
+
+enum PhysicalPortState {
+  NMX_PORT_PHYS_STATE_NO_CHANGE = 0;
+  NMX_PORT_PHYS_STATE_SLEEP = 1;
+  NMX_PORT_PHYS_STATE_POLLING = 2;
+  NMX_PORT_PHYS_STATE_DISABLED = 3;
+  NMX_PORT_PHYS_STATE_PORTCONFTRAIN = 4;
+  NMX_PORT_PHYS_STATE_LINKUP = 5;
+  NMX_PORT_PHYS_STATE_LINKERRRECOVER = 6;
+  NMX_PORT_PHYS_STATE_PHYTEST = 7;
+}
+
+enum AdminState {
+  NMX_ADMIN_STATE_UNKNOWN = 0;
+  NMX_ADMIN_STATE_UP = 1;
+  NMX_ADMIN_STATE_DOWN = 2;
+  NMX_ADMIN_STATE_DIAG = 3;
+}
+
+message NmxGetDomainStateInfoRequest {
+  NmxContext context = 1;
+  string gateway_id = 2;
+}
+
+message NmxDomainStateInfo {
+  NmxServerHeader server_header = 1;
+  NmxContext context = 2;
+  ControlPlaneState control_plane_state = 3;
+  NmxControllerHealth nmx_controller_health = 6;
+}
+
+message NmxLocation {
+  uint64 chassis_id = 1;
+  uint64 slot_id = 2;
+  uint64 host_id = 3;
+}
+
+message NmxLocationInfo {
+  string chassis_serial_number = 2;
+  uint64 tray_index = 4;
+  NmxLocation location = 6;
+}
+
+message NmxGetSwitchNodeInfoListRequest {
+  NmxContext context = 1;
+  repeated NmxLocation loc_list = 2;
+  string gateway_id = 3;
+}
+
+message NmxSwitchNodeInfo {
+  NmxLocationInfo loc = 1;
+  uint32 num_switches = 2;
+  SwitchNodeHealth node_health = 3;
+}
+
+message NmxGetSwitchNodeInfoListResponse {
+  NmxServerHeader server_header = 1;
+  NmxContext context = 2;
+  repeated NmxSwitchNodeInfo node_info_list = 3;
+}
+
+message NmxGetComputeNodeInfoListRequest {
+  NmxContext context = 1;
+  repeated NmxLocation loc_list = 2;
+  string gateway_id = 3;
+}
+
+message NmxComputeNodeInfo {
+  NmxLocationInfo loc = 1;
+  uint32 num_gpus = 2;
+  ComputeNodeHealth node_health = 3;
+}
+
+message NmxGetComputeNodeInfoListResponse {
+  NmxServerHeader server_header = 1;
+  NmxContext context = 2;
+  repeated NmxComputeNodeInfo node_info_list = 3;
+}
+
+message NmxGetTopologyInfoRequest {
+  NmxContext context = 1;
+  string gateway_id = 3;
+}
+
+message NmxPortTopoInfo {
+  PortType port_type = 1;
+  uint64 port_uid = 2;
+  uint64 port_num = 3;
+  uint64 peer_port_device_uid = 4;
+  uint64 peer_port_num = 5;
+  PhysicalPortState physical_state = 6;
+  LogicalLinkState logical_state = 7;
+  AdminState port_admin_state = 31;
+}
+
+message NmxSwitchTopoInfo {
+  NmxLocationInfo loc = 1;
+  uint64 device_uid = 3;
+  uint64 num_ports = 5;
+  uint64 system_uid = 6;
+  SwitchHealth device_health = 11;
+  repeated NmxPortTopoInfo port_topo_info = 12;
+}
+
+message NmxGpuTopoInfo {
+  NmxLocationInfo loc = 1;
+  uint64 device_uid = 3;
+  uint64 num_ports = 5;
+  uint64 system_uid = 6;
+  GpuHealth device_health = 13;
+  repeated NmxPortTopoInfo port_topo_info = 14;
+}
+
+message NmxDeviceTopoInfo {
+  oneof device {
+    NmxSwitchTopoInfo switch_topo_info = 1;
+    NmxGpuTopoInfo gpu_topo_info = 2;
+  }
+}
+
+message NmxFmTopologyInfo {
+  NmxServerHeader server_header = 1;
+  NmxContext context = 2;
+  repeated NmxDeviceTopoInfo device_topo_info = 3;
+}

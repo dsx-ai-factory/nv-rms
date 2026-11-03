@@ -1,0 +1,22 @@
+[package]
+name = "nvdebug_cli"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+description = "Runs the nvdebug log collector as an executable found by configuration"
+
+[lib]
+name = "nvdebug_cli"
+path = "src/lib.rs"
+
+[dependencies]
+nix = { workspace = true, features = ["signal"] }
+rustls-pki-types = { workspace = true }
+secrecy = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["fs", "io-util", "macros", "process", "rt-multi-thread", "time"] }
+tokio-util = { workspace = true }
+tracing = { workspace = true }

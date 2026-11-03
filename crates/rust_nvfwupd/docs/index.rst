@@ -13,6 +13,7 @@ Firmware Update Guide
     examples/gb200NVL
     examples/gb300NVL
     examples/vrnvl72
+    examples/nvos-switch-updates
     examples/powershelf
     examples/activation
     examples/factory-reset
@@ -33,6 +34,8 @@ Firmware Update Guide
     Platform-Agnostic Firmware Updates <appendix/platform-agnostic-updates>
     Parallel Update Support <appendix/parallel-update>
     Full Rack Parallel Update <appendix/full-rack-parallel-update>
+    Update Pre-Checks <appendix/update-pre-checks>
+    Expected Inventory Checks <appendix/expected-inventory>
     JSON Options For Automation <appendix/json-options>
     SPI Staged Update Support <appendix/spi-staged>
     OEM Parameters Support <appendix/oem-parameters>
@@ -44,4 +47,3 @@ Firmware Update Guide
     :hidden:
     
     history
-

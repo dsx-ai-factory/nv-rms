@@ -138,6 +138,20 @@ impl RackManagerServiceImpl {
                     continue;
                 }
             };
+            let recovery = match self.recovery_profile_for_node(ni) {
+                Ok(profile) => profile,
+                Err(e) => {
+                    tracing::error!(
+                        node = ni.node_id,
+                        rack = ni.rack_id,
+                        error = e.message,
+                        "invalid recovery profile"
+                    );
+                    messages.push(format!("{}: {}", ni.node_id, e.message));
+                    failed += 1;
+                    continue;
+                }
+            };
 
             let rack_type = node_type.product_family().rack_type();
 
@@ -161,8 +175,8 @@ impl RackManagerServiceImpl {
             // Inventory is stateful RMS-owned configuration, so every
             // registered node needs a BMC endpoint. RMS uses it as the stable
             // management endpoint for inventory and Redfish power operations.
-            let bmc_endpoint = match flat.bmc_endpoint() {
-                Ok(endpoint) => self.bmc_endpoint_with_rms_tls_policy(endpoint),
+            let bmc_endpoint = match flat.bmc_endpoint(self.insecure_bmc) {
+                Ok(endpoint) => endpoint,
                 Err(e) => {
                     let message = e.message;
                     tracing::error!(
@@ -211,6 +225,8 @@ impl RackManagerServiceImpl {
                 bmc_endpoint: Some(bmc_endpoint),
                 host_endpoint,
                 expected_inventory,
+                recovery,
+                runtime_config: self.hardware_profiles.runtime_config_for_request(node_type),
             };
 
             // Create the node and add it to its rack as one atomic step,
@@ -619,7 +635,7 @@ impl RackManagerServiceImpl {
     /// info" rather than a failure), and `Err(message)` (bare; the caller
     /// prefixes `node_id=`) on a validation failure. Kept separate so the async
     /// device-info reads can be fanned out concurrently.
-    fn build_batch_ephemeral_node(
+    pub(super) fn build_batch_ephemeral_node(
         &self,
         node_info: &rm::NodeInfo,
     ) -> std::result::Result<Option<Arc<NodeInstance>>, String> {
@@ -638,7 +654,7 @@ impl RackManagerServiceImpl {
 
         let flat = flatten_node_info(node_info).map_err(|e| e.message)?;
 
-        if flat.creds_for_node_type(node_type).is_none() {
+        if !flat.has_credentials_for_node_type(node_type) {
             let source = if node_type.kind() == NodeKind::Switch {
                 "host"
             } else {
@@ -651,13 +667,14 @@ impl RackManagerServiceImpl {
         // host-only stateless switch reads work; compute and powershelf still
         // require BMC for Redfish.
         let is_switch = node_type.kind() == NodeKind::Switch;
+
         let bmc_endpoint = if is_switch {
-            self.optional_bmc_endpoint_with_rms_tls_policy(
-                flat.optional_bmc_endpoint().map_err(|e| e.message)?,
-            )
+            flat.optional_bmc_endpoint(self.insecure_bmc)
+                .map_err(|e| e.message)?
         } else {
-            self.optional_bmc_endpoint_with_rms_tls_policy(
-                flat.bmc_endpoint().map(Some).map_err(|e| e.message)?,
+            Some(
+                flat.bmc_endpoint(self.insecure_bmc)
+                    .map_err(|e| e.message)?,
             )
         };
 
@@ -678,6 +695,8 @@ impl RackManagerServiceImpl {
             bmc_endpoint,
             host_endpoint,
             expected_inventory: None,
+            recovery: None,
+            runtime_config: self.hardware_profiles.runtime_config_for_request(node_type),
         };
 
         NodeInstance::create(&config, node_info.rack_id.as_str())
@@ -773,10 +792,23 @@ mod tests {
             firmware_download_cancellations: Arc::new(Mutex::new(HashMap::new())),
             backends: Backends::memory(),
             firmware_dir: PathBuf::from("firmware"),
+            artifact_require_sha256: false,
+            insecure_bmc: true,
+            artifact_download_policy:
+                crate::api::grpc::artifact_download::ArtifactDownloadPolicy::default(),
             switch_tls_roots: SwitchTlsRoots::default(),
-            sftp_upload_options: crate::transport::ssh::SftpUploadOptions::default(),
+            sftp_upload_options: crate::transport::ssh::SshUploadOptions::default(),
             nmx_gateway_id: crate::libnmxc::DEFAULT_NMX_C_GATEWAY_ID.to_owned(),
             expected_inventory_catalog: crate::config::ExpectedInventoryCatalog::default(),
+            workflow_timings: crate::config::WorkflowTimings::default(),
+            recovery_profiles: crate::config::RecoveryProfiles::default(),
+            fabric_operations: std::sync::Arc::new(Default::default()),
+            fabric_layout_catalog: std::sync::Arc::new(
+                crate::config::fabric_layout::FabricLayoutCatalog::default(),
+            ),
+            hardware_profiles: Arc::new(
+                crate::config::hardware_profiles::HardwareProfileCatalog::built_in().unwrap(),
+            ),
         }
     }
 
@@ -871,6 +903,60 @@ mod tests {
 
         assert_eq!(response.stats.unwrap().successful_nodes, 1);
         assert!(service.rack_manager.find_rack("rack-1").is_some());
+    }
+
+    #[test]
+    fn recovery_profile_for_node_resolves_the_trimmed_descriptor_name() {
+        let mut service = test_service();
+        service.recovery_profiles = serde_json::from_value(json!({
+            "gb200-compute-variant-a": { "regular_bundle": ["HGX_FW_FPGA_0"] }
+        }))
+        .unwrap();
+        let node = |profile: Option<&str>| rm::NodeInfo {
+            node_id: "compute-1".to_owned(),
+            rack_id: "rack-1".to_owned(),
+            node_descriptor: profile.map(|profile| rm::NodeDescriptor {
+                attributes: HashMap::from([(
+                    INVENTORY_PROFILE_ATTRIBUTE.to_owned(),
+                    profile.to_owned(),
+                )]),
+            }),
+            ..Default::default()
+        };
+
+        // The trimmed name resolves to the table as written.
+        let bound = service
+            .recovery_profile_for_node(&node(Some(" gb200-compute-variant-a ")))
+            .unwrap()
+            .expect("the profile has a recovery table");
+        assert_eq!(
+            bound.parse::<serde_json::Value>().unwrap()["regular_bundle"],
+            json!(["HGX_FW_FPGA_0"])
+        );
+        // No descriptor, or a profile without a recovery table: detection
+        // off, not an error.
+        assert!(
+            service
+                .recovery_profile_for_node(&node(None))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            service
+                .recovery_profile_for_node(&node(Some("no-recovery-table")))
+                .unwrap()
+                .is_none()
+        );
+        // A blank name is this resolver's own error, whatever other
+        // resolvers did before it.
+        let error = service
+            .recovery_profile_for_node(&node(Some("  ")))
+            .unwrap_err();
+        assert!(
+            error
+                .message
+                .contains("inventory_profile must not be empty")
+        );
     }
 
     #[tokio::test]

@@ -15,13 +15,15 @@
  * limitations under the License.
  */
 
-//! BMC endpoint access module for nvfwupd CLI.
+//! BMC endpoint access module for nvfwupd.
 //!
 //! Provides connectivity to BMC servers via HTTPS/Redfish protocol.
-//! Supports three access modes:
+//! The CLI supports three access modes:
 //! - **Login**: Direct BMC access with IP, username, and password credentials
 //! - **PortForward**: BMC access through localhost port forwarding
 //! - **NVSwitch**: NVUE REST API access for GB200/GB300/VR switch platforms
+//!
+//! The workflow API also supports caller-supplied BMC session tokens for Redfish.
 //!
 //! The [`BmcAccess::get_bmc_access`] factory method probes the target and
 //! returns an appropriately configured instance.
@@ -36,6 +38,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
+use reqwest::header::HeaderValue;
 use reqwest::{Client, Url};
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -43,13 +46,47 @@ use tokio_util::io::ReaderStream;
 
 use crate::expected_inventory;
 use crate::nvos_image;
+use crate::powershelf_rftarget::liteon_oem_powerunits_shelf;
 use crate::ssh_options::{
     self, SSH_HOST_KEY_MODE_ARG, SSH_HOST_KEY_MODE_DISABLED, SSH_HOST_KEY_MODE_STRICT,
     SSH_HOST_KEY_MODE_TOFU, SSH_KNOWN_HOSTS_ARG,
 };
 use crate::ssh_transport;
+use crate::switch_cli::{SwitchCliHandler, SwitchCliTransport};
 use crate::util::{BailAction, TraceFlags, Util};
 use crate::utils::Util as NvUtils;
+use nvswitch_cli::{RemotePath, ShellCommand};
+
+// Redact before truncation so a boundary cannot expose a partial credential.
+fn bounded_submission_text(value: &str, limit: usize, credentials: &[&str]) -> String {
+    let mut redacted = NvUtils::redact_secret_fields(value);
+    // Responses and legacy Debug output can escape echoed credentials. Mask
+    // those forms too, before truncation and independently of global state.
+    let mut secrets: Vec<String> = credentials
+        .iter()
+        .filter(|value| !value.is_empty())
+        .flat_map(|value| {
+            let json = serde_json::to_string(value).expect("strings serialize to JSON");
+            let debug = format!("{value:?}");
+            [
+                (*value).to_string(),
+                json[1..json.len() - 1].to_string(),
+                debug[1..debug.len() - 1].to_string(),
+            ]
+        })
+        .collect();
+    secrets.sort_by_key(|value| std::cmp::Reverse(value.len()));
+    secrets.dedup();
+    for secret in secrets {
+        redacted = redacted.replace(&secret, "XXXX");
+    }
+    let sanitized = NvUtils::sanitize_log(&redacted);
+    sanitized.chars().take(limit).collect()
+}
+
+tokio::task_local! {
+    static SWITCH_SFTP_PROGRESS_LABEL: String;
+}
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -60,6 +97,7 @@ const DEFAULT_TIMEOUT_SECS: u64 = 900;
 const VERIFY_TLS_ARG: &str = "verify_tls";
 const BMC_CA_CERT_ARG: &str = "bmc_ca_cert";
 const ALLOW_HTTP_ARG: &str = "allow_http";
+const SESSION_TOKEN_ARG: &str = "session_token";
 
 /// Timeout for reachability probes (seconds).
 const REACHABILITY_TIMEOUT_SECS: u64 = 120;
@@ -67,8 +105,13 @@ const REACHABILITY_TIMEOUT_SECS: u64 = 120;
 /// Per-attempt SSH connect/auth timeout for switch firmware uploads.
 const SWITCH_SSH_CONNECT_TIMEOUT_SECS: u64 = 30;
 
-/// Per-attempt setup command and SFTP transfer timeout for switch firmware uploads.
-const SWITCH_SSH_UPLOAD_TIMEOUT_SECS: u64 = 300;
+/// Per-attempt SFTP transfer timeout for switch firmware uploads.
+const SWITCH_SSH_UPLOAD_TIMEOUT_SECS: u64 = 15 * 60;
+
+/// Per-command timeout for the quick `mkdir -p` / `rm -f` setup steps that
+/// precede the transfer. These are trivial operations, so they get a short
+/// budget of their own rather than inheriting the large upload timeout.
+const SWITCH_SSH_SETUP_TIMEOUT_SECS: u64 = 30;
 
 /// Delay between retryable switch SSH upload attempts.
 const SWITCH_SSH_UPLOAD_RETRY_INTERVAL_SECS: u64 = 10;
@@ -202,8 +245,25 @@ fn connection_error_message(url: &str, error: &dyn std::error::Error) -> String 
     connection_error_message_for_detail(url, &detail)
 }
 
+fn nvswitch_reachability_body_diagnostic(trace: TraceFlags, body: &str) -> Option<String> {
+    if trace.json_mode {
+        return None;
+    }
+
+    match serde_json::from_str::<Value>(body) {
+        Ok(parsed) => Some(pretty_4space_redacted(&parsed)),
+        Err(_) => Some(NvUtils::sanitize_log(body)),
+    }
+}
+
 #[cfg(test)]
 static LAST_TEST_DISPATCH_GET_TIMEOUT_SECS: AtomicU64 = AtomicU64::new(0);
+
+// NUL cannot come from CLI arguments, so only the validated workflow builder
+// can select session-token authentication without changing the public struct.
+// It is set only from `WorkflowTargetBuilder::build_bmc_access`, driven by
+// `TargetConfig::bmc_session_token()` (an explicit field, not a heuristic).
+pub(crate) const BMC_SESSION_TOKEN_USER: &str = "\0nvfwupd-bmc-session-token";
 
 // ---------------------------------------------------------------------------
 // AccessType
@@ -216,8 +276,33 @@ pub enum AccessType {
     Login,
     /// Port-forwarded access (connects to `localhost:<port>`).
     PortForward,
+
     /// NVUE REST API access for NVSwitch platforms.
     NVSwitch,
+}
+
+/// Outcome of an observed NVUE GET used by retry pollers.
+///
+/// These three states are mutually exclusive, and callers must distinguish
+/// them: a switch that answers is still alive, while a missing response means
+/// it stopped answering. Collapsing either into the other changes whether a
+/// reboot is treated as an outage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ObservedRead {
+    /// A success response whose body parsed as JSON.
+    Readable(Value),
+    /// The switch answered, but not with a readable body.
+    Answered(Value),
+    /// No HTTP response arrived, carrying the transport cause for diagnostics.
+    NoResponse(String),
+}
+
+impl ObservedRead {
+    /// An answer whose body could not be parsed, reported as an empty object so
+    /// every access path agrees on the placeholder.
+    pub(crate) fn answered_unparsed() -> Self {
+        Self::Answered(Value::Object(serde_json::Map::new()))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -232,17 +317,20 @@ pub enum AccessType {
 pub struct BmcAccess {
     /// BMC IP address (may include brackets for IPv6).
     pub ip: String,
-    /// Login username.
+
+    /// Username used for Basic authentication.
     pub user: String,
-    /// Login password.
+
+    /// Basic-auth password or workflow-supplied Redfish session token.
     pub password: String,
+
     /// Discovered or user-supplied model name.
     pub model: String,
     /// Part number reported by the BMC.
     pub partnumber: String,
     /// Serial number reported by the BMC.
     pub serialnumber: String,
-    /// Optional port for port-forward access.
+    /// Optional port for port-forward or direct non-default Redfish access.
     pub port: String,
     /// Server type string (e.g. "gb200switch").
     pub servertype: String,
@@ -260,6 +348,10 @@ pub struct BmcAccess {
     pub ssh_host_key_mode: String,
     /// Shared reqwest async client.
     pub client: Client,
+    /// Per-instance compute policy; absent for legacy CLI and non-compute callers.
+    pub compute_timing: Option<crate::compute_timing::ComputeFirmwareTiming>,
+    /// Request-local compute power paths; empty keeps legacy discovery.
+    pub compute_power_paths: crate::compute_power::ComputePowerPaths,
 }
 
 impl fmt::Debug for BmcAccess {
@@ -333,6 +425,63 @@ fn switch_shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
+fn format_bytes_for_progress(bytes: u64) -> String {
+    const MIB: f64 = 1024.0 * 1024.0;
+    const GIB: f64 = 1024.0 * MIB;
+    let bytes = bytes as f64;
+    if bytes >= GIB {
+        format!("{:.2} GiB", bytes / GIB)
+    } else {
+        format!("{:.1} MiB", bytes / MIB)
+    }
+}
+
+fn format_switch_sftp_upload_progress(
+    attempt: u32,
+    progress: ssh_transport::SftpUploadProgress,
+) -> String {
+    let elapsed_secs = progress.elapsed_secs.max(1);
+    let rate_mib = progress.uploaded_bytes as f64 / elapsed_secs as f64 / (1024.0 * 1024.0);
+    let uploaded = format_bytes_for_progress(progress.uploaded_bytes);
+
+    match progress.total_bytes.filter(|total| *total > 0) {
+        Some(total) => {
+            let total_display = format_bytes_for_progress(total);
+            let percent = (progress.uploaded_bytes as f64 / total as f64) * 100.0;
+            format!(
+                "SFTP upload attempt {attempt} progress: {uploaded} / {total_display} ({percent:.1}%), {rate_mib:.1} MiB/s"
+            )
+        }
+        None => format!(
+            "SFTP upload attempt {attempt} progress: {uploaded} transferred, {rate_mib:.1} MiB/s"
+        ),
+    }
+}
+
+fn clean_switch_sftp_progress_label(label: &str) -> Option<String> {
+    let sanitized = NvUtils::sanitize_log(label.trim());
+    let label = sanitized.split_whitespace().collect::<Vec<_>>().join(" ");
+    if label.is_empty() {
+        None
+    } else {
+        Some(label)
+    }
+}
+
+fn current_switch_sftp_progress_label() -> Option<String> {
+    SWITCH_SFTP_PROGRESS_LABEL
+        .try_with(|label| clean_switch_sftp_progress_label(label))
+        .ok()
+        .flatten()
+}
+
+fn format_labeled_switch_sftp_message(label: Option<&str>, message: &str) -> String {
+    match label.and_then(clean_switch_sftp_progress_label) {
+        Some(label) => format!("[{label}] {message}"),
+        None => message.to_string(),
+    }
+}
+
 /// Build and validate the owned remote path used for switch firmware uploads.
 ///
 /// Only an absolute staging directory plus a plain filename is accepted. This
@@ -385,7 +534,70 @@ fn switch_remote_cleanup_path(remote_path: &str) -> Result<&str, String> {
     Ok(remote_path)
 }
 
+/// Build a `HeaderValue` for a bearer/session token and mark it sensitive so
+/// reqwest omits it from debug output and tracing/logging integrations.
+///
+/// Callers that validate the token as a legal header value beforehand (e.g.
+/// at client construction) will never hit the fallback in practice; callers
+/// with an unvalidated token (e.g. extracted from a response header) may hit
+/// it for real.
+pub fn sensitive_header_value(token: &str) -> HeaderValue {
+    let mut value = HeaderValue::from_str(token)
+        .unwrap_or_else(|_| HeaderValue::from_static("invalid-session-token"));
+    value.set_sensitive(true);
+    value
+}
+
 impl BmcAccess {
+    /// Bound submission text after masking this target's authentication values.
+    pub(crate) fn bounded_submission_text(&self, value: &str, limit: usize) -> String {
+        bounded_submission_text(value, limit, &[&self.user, &self.password])
+    }
+
+    fn redacted_submission_response(&self, value: &Value) -> Value {
+        fn mask_echoes(access: &BmcAccess, value: &mut Value) {
+            match value {
+                Value::String(text) => {
+                    *text = access.bounded_submission_text(text, usize::MAX);
+                }
+                Value::Array(entries) => {
+                    for entry in entries {
+                        mask_echoes(access, entry);
+                    }
+                }
+                Value::Object(fields) => {
+                    *fields = std::mem::take(fields)
+                        .into_iter()
+                        .map(|(key, mut entry)| {
+                            mask_echoes(access, &mut entry);
+                            (access.bounded_submission_text(&key, usize::MAX), entry)
+                        })
+                        .collect();
+                }
+                _ => {}
+            }
+        }
+        let mut redacted = NvUtils::redact_secret_json_value(value);
+        mask_echoes(self, &mut redacted);
+        redacted
+    }
+
+    /// Run an async operation with a task-local switch SFTP progress label.
+    ///
+    /// Parallel CLI workers use this to keep interleaved upload output readable
+    /// without changing RMS/library APIs.
+    pub(crate) async fn with_switch_sftp_progress_label<F, T>(label: String, future: F) -> T
+    where
+        F: Future<Output = T>,
+    {
+        SWITCH_SFTP_PROGRESS_LABEL.scope(label, future).await
+    }
+
+    /// Prefix a switch SFTP status line with the active task-local label, if any.
+    pub(crate) fn format_switch_sftp_status_line(message: &str) -> String {
+        format_labeled_switch_sftp_message(current_switch_sftp_progress_label().as_deref(), message)
+    }
+
     fn same_url_origin(left: &Url, right: &Url) -> bool {
         left.scheme() == right.scheme()
             && left.host_str() == right.host_str()
@@ -458,6 +670,19 @@ impl BmcAccess {
             path.push_str(query);
         }
         Ok(path)
+    }
+
+    fn session_token(&self) -> Option<&str> {
+        (self.user == BMC_SESSION_TOKEN_USER && !self.password.is_empty())
+            .then_some(self.password.as_str())
+    }
+
+    pub(crate) fn apply_auth(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        if let Some(token) = self.session_token() {
+            request.header("X-Auth-Token", sensitive_header_value(token))
+        } else {
+            request.basic_auth(&self.user, Some(&self.password))
+        }
     }
 
     fn clean_redfish_str(value: Option<&str>) -> Option<String> {
@@ -633,10 +858,25 @@ impl BmcAccess {
         Ok(builder)
     }
 
+    /// Start every BMC/NVUE client builder from the same transport baseline.
+    ///
+    /// Disable reqwest's default 30-second `TCP_USER_TIMEOUT` on Linux to avoid
+    /// premature firmware-upload failures. HTTP deadlines remain unchanged.
+    pub(crate) fn client_builder(timeout_secs: u64) -> reqwest::ClientBuilder {
+        let builder = Client::builder().timeout(Duration::from_secs(timeout_secs));
+        #[cfg(target_os = "linux")]
+        let builder = builder.tcp_user_timeout(None);
+        builder
+    }
+
+    /// Redirect-following is disabled when `allow_redirects` is false.
+    /// Session-token auth must never follow a redirect with the token
+    /// attached (see `apply_auth`).
     fn build_client_from_tls_options(
         timeout_secs: u64,
         verify_arg: Option<&str>,
         ca_cert_path: Option<&str>,
+        allow_redirects: bool,
     ) -> Result<Client, String> {
         let verify_tls = Self::should_verify_bmc_tls(verify_arg, ca_cert_path)?;
         let ca_cert_path = ca_cert_path.map(str::trim).filter(|path| !path.is_empty());
@@ -647,11 +887,14 @@ impl BmcAccess {
             ));
         }
 
-        let mut builder = Client::builder().timeout(Duration::from_secs(timeout_secs));
+        let mut builder = Self::client_builder(timeout_secs);
         if verify_tls {
             builder = Self::add_bmc_ca_cert(builder, ca_cert_path)?;
         } else {
             builder = builder.danger_accept_invalid_certs(true);
+        }
+        if !allow_redirects {
+            builder = builder.redirect(reqwest::redirect::Policy::none());
         }
 
         builder
@@ -665,13 +908,17 @@ impl BmcAccess {
     /// implemented and ready for NVFWUPD, but default CLI enablement is pending
     /// customer discussions. Passing a CA certificate or explicitly enabling
     /// verification keeps the opt-in path available.
+    ///
+    /// Redirect-following is disabled when `arg_dict` carries a session token,
+    /// so the token is never replayed to a redirect target (see `apply_auth`).
     fn build_client(
         timeout_secs: u64,
         arg_dict: &HashMap<String, String>,
     ) -> Result<Client, String> {
         let verify_arg = arg_dict.get(VERIFY_TLS_ARG).map(String::as_str);
         let ca_cert_path = arg_dict.get(BMC_CA_CERT_ARG).map(String::as_str);
-        Self::build_client_from_tls_options(timeout_secs, verify_arg, ca_cert_path)
+        let allow_redirects = !arg_dict.contains_key(SESSION_TOKEN_ARG);
+        Self::build_client_from_tls_options(timeout_secs, verify_arg, ca_cert_path, allow_redirects)
     }
 
     /// Temporary bridge for sync callers while the wider target call graph is
@@ -693,12 +940,51 @@ impl BmcAccess {
         HTTP_RUNTIME.block_on(future)
     }
 
+    /// Resolve target credentials as `(user, password)` for the `BmcAccess`
+    /// fields, honoring the same sentinel convention as the RMS-facing
+    /// `WorkflowTargetBuilder::build_bmc_access`: a session token is stored
+    /// as `(BMC_SESSION_TOKEN_USER, token)`, so `session_token()` and every
+    /// existing session-token guard (HTTP-fallback skip, login-cookie skip)
+    /// apply automatically regardless of construction path.
+    ///
+    /// `session_token` is mutually exclusive with `user`/`password`: mixing
+    /// them is rejected rather than silently picking one. `TargetConfig`
+    /// avoids the same ambiguity by construction (its builder clears
+    /// username/password when a token is set); the CLI's flat key=value
+    /// input has no such builder step, so it is enforced here explicitly.
+    fn resolve_login_credentials(
+        arg_dict: &HashMap<String, String>,
+    ) -> Result<(String, String), String> {
+        let Some(token) = arg_dict.get(SESSION_TOKEN_ARG) else {
+            return Ok((
+                arg_dict.get("user").cloned().unwrap_or_default(),
+                arg_dict.get("password").cloned().unwrap_or_default(),
+            ));
+        };
+
+        if arg_dict.contains_key("user") || arg_dict.contains_key("password") {
+            return Err(format!(
+                "{SESSION_TOKEN_ARG} cannot be combined with user/password; \
+                 provide one credential form"
+            ));
+        }
+        let token = token.trim();
+        if token.is_empty() {
+            return Err(format!("{SESSION_TOKEN_ARG} must not be empty"));
+        }
+        HeaderValue::from_str(token)
+            .map_err(|error| format!("invalid {SESSION_TOKEN_ARG} header value: {error}"))?;
+
+        Ok((BMC_SESSION_TOKEN_USER.to_owned(), token.to_owned()))
+    }
+
     /// Create a `BmcAccess` configured for direct login.
     fn new_login(arg_dict: &HashMap<String, String>) -> Result<Self, String> {
         let client = Self::build_client(DEFAULT_TIMEOUT_SECS, arg_dict)?;
         let ssh_host_key_options = ssh_options::parse_ssh_options(arg_dict)?;
         let allow_http =
             Self::should_allow_http_fallback(arg_dict.get(ALLOW_HTTP_ARG).map(String::as_str))?;
+        let (user, password) = Self::resolve_login_credentials(arg_dict)?;
         let mut ip = arg_dict.get("ip").cloned().unwrap_or_default();
 
         // IPv6 addresses require brackets.
@@ -711,8 +997,8 @@ impl BmcAccess {
 
         Ok(Self {
             ip,
-            user: arg_dict.get("user").cloned().unwrap_or_default(),
-            password: arg_dict.get("password").cloned().unwrap_or_default(),
+            user,
+            password,
             model: String::new(),
             partnumber: String::new(),
             serialnumber: String::new(),
@@ -725,7 +1011,26 @@ impl BmcAccess {
             ssh_known_hosts: ssh_host_key_options.known_hosts,
             ssh_host_key_mode: ssh_host_key_options.mode,
             client,
+            compute_timing: None,
+            compute_power_paths: Default::default(),
         })
+    }
+
+    /// Create a direct Redfish login using an explicit non-default port.
+    fn new_login_with_port(arg_dict: &HashMap<String, String>) -> Result<Self, String> {
+        let mut access = Self::new_login(arg_dict)?;
+        let port = arg_dict
+            .get("port")
+            .map(|value| value.trim())
+            .unwrap_or_default();
+        if port.is_empty() {
+            return Err("invalid port: ".to_string());
+        }
+        port.parse::<u16>()
+            .map_err(|_| format!("invalid port: {}", NvUtils::sanitize_log(port)))?;
+        access.port = port.to_string();
+        access.base_url = format!("https://{}:{}", access.ip, access.port);
+        Ok(access)
     }
 
     /// Create a `BmcAccess` configured for port-forwarded access.
@@ -744,6 +1049,12 @@ impl BmcAccess {
 
     /// Create a `BmcAccess` configured for NVSwitch NVUE access.
     fn new_nvswitch(arg_dict: &HashMap<String, String>) -> Result<Self, String> {
+        if arg_dict.contains_key(SESSION_TOKEN_ARG) {
+            return Err(format!(
+                "{SESSION_TOKEN_ARG} is not supported for NVUE/NVOS switch targets; \
+                 use user/password"
+            ));
+        }
         let client = Self::build_client(1200, arg_dict)?;
         let ssh_host_key_options = ssh_options::parse_ssh_options(arg_dict)?;
         let allow_http =
@@ -777,6 +1088,8 @@ impl BmcAccess {
             ssh_known_hosts: ssh_host_key_options.known_hosts,
             ssh_host_key_mode: ssh_host_key_options.mode,
             client,
+            compute_timing: None,
+            compute_power_paths: Default::default(),
         })
     }
 
@@ -791,7 +1104,7 @@ impl BmcAccess {
     /// strategy:
     ///
     /// 1. If `servertype` is a known switch type, use [`AccessType::NVSwitch`].
-    /// 2. Otherwise try, in order: port-forward, login, NVSwitch.
+    /// 2. Otherwise try, in order: port-forward, direct-port login, login, NVSwitch.
     ///
     /// # Returns
     /// `Ok((bmc_access, Option<server_type>))` on success, or `Err(message)`
@@ -802,6 +1115,21 @@ impl BmcAccess {
         json_dict: Option<&mut Value>,
     ) -> Result<(Self, Option<String>), String> {
         Self::block_on_http(Self::get_bmc_access(target_args, trace, json_dict))
+    }
+
+    /// Whether a reachable probe with `arg_count` target keys is a complete
+    /// credential for a builder calibrated to need `expected_args` keys.
+    ///
+    /// `expected_args` is a Python-parity minimum sized for ip+user+password.
+    /// A session token makes ip+session_token (2 keys) a complete, valid
+    /// credential on its own, so it must not be discarded for looking too
+    /// short relative to that minimum.
+    fn probe_has_enough_args(
+        arg_count: usize,
+        expected_args: usize,
+        has_session_token: bool,
+    ) -> bool {
+        arg_count >= expected_args || has_session_token
     }
 
     /// Async variant of [`get_bmc_access_sync`](Self::get_bmc_access_sync).
@@ -906,7 +1234,7 @@ impl BmcAccess {
             }
         }
 
-        // General probe order: PortForward -> Login -> NVSwitch
+        // General probe order: PortForward -> DirectPort -> Login -> NVSwitch
         let mut connection_failure_message: Option<String> = None;
         if bmc_access.is_none() {
             let access_builders: Vec<(
@@ -921,6 +1249,12 @@ impl BmcAccess {
                     2,
                 ),
                 (
+                    "BMCDirectPortAccess",
+                    Self::new_login_with_port
+                        as fn(&HashMap<String, String>) -> Result<BmcAccess, String>,
+                    3,
+                ),
+                (
                     "BMCLoginAccess",
                     Self::new_login as fn(&HashMap<String, String>) -> Result<BmcAccess, String>,
                     3,
@@ -932,16 +1266,30 @@ impl BmcAccess {
                 ),
             ];
 
+            let has_session_token = arg_dict.contains_key(SESSION_TOKEN_ARG);
+
             for (name, builder, expected_args) in &access_builders {
                 // Skip port-forward if no port argument given.
                 if *name == "BMCPortForwardAccess" && !arg_dict.contains_key("port") {
+                    continue;
+                }
+                if *name == "BMCDirectPortAccess" && !arg_dict.contains_key("port") {
+                    continue;
+                }
+                // A session token is never valid for NVUE/NVOS switch access;
+                // skip this probe rather than let its rejection error
+                // overwrite a more useful failure message from an earlier
+                // probe (e.g. why the BMC login attempt was unreachable).
+                if *name == "GB200NVSwitchAccess" && has_session_token {
                     continue;
                 }
 
                 let mut access = match builder(&arg_dict) {
                     Ok(a) => a,
                     Err(e) => {
-                        connection_failure_message = Some(e);
+                        if connection_failure_message.is_none() {
+                            connection_failure_message = Some(e);
+                        }
                         break;
                     }
                 };
@@ -970,7 +1318,7 @@ impl BmcAccess {
                     continue;
                 }
 
-                if arg_dict.len() < *expected_args {
+                if !Self::probe_has_enough_args(arg_dict.len(), *expected_args, has_session_token) {
                     let target_str = display_target_str.as_str();
                     tracing::debug!(
                         cli_verbose = trace.cli_verbose,
@@ -1095,19 +1443,18 @@ impl BmcAccess {
         }
     }
 
-    /// Redfish reachability check (Login / PortForward).
+    /// Redfish reachability check.
     ///
     /// On HTTPS failure, fails closed by default. If `allow_http=true` was
     /// explicitly supplied, falls back to HTTP and persists that transport via
     /// [`update_transport_type`] so subsequent requests use `http://`.
     async fn is_reachable_redfish_async(&mut self, trace: TraceFlags) -> (bool, String) {
         let url = format!("{}/redfish/v1/Chassis", self.base_url);
+
         let result = self
-            .client
-            .get(&url)
-            .basic_auth(&self.user, Some(&self.password))
+            .apply_auth(self.client.get(&url))
             .header("Content-Type", "application/json")
-            .timeout(Duration::from_secs(REACHABILITY_TIMEOUT_SECS))
+            .timeout(Duration::from_secs(self.reachability_timeout_secs()))
             .send()
             .await;
 
@@ -1130,6 +1477,13 @@ impl BmcAccess {
                     tls_certificate_verification_message_for_detail(&url, &error_chain_message(&e));
                 if let Some(message) = https_failure_message {
                     return (false, message);
+                }
+
+                if self.session_token().is_some() {
+                    return (
+                        false,
+                        "Connection Error: Failed to connect with the system.".to_string(),
+                    );
                 }
 
                 if !self.allow_http {
@@ -1156,12 +1510,11 @@ impl BmcAccess {
 
                 // Try HTTP fallback.
                 let http_url = url.replacen("https://", "http://", 1);
+
                 let fallback = self
-                    .client
-                    .get(&http_url)
-                    .basic_auth(&self.user, Some(&self.password))
+                    .apply_auth(self.client.get(&http_url))
                     .header("Content-Type", "application/json")
-                    .timeout(Duration::from_secs(REACHABILITY_TIMEOUT_SECS))
+                    .timeout(Duration::from_secs(self.reachability_timeout_secs()))
                     .send()
                     .await;
 
@@ -1195,11 +1548,9 @@ impl BmcAccess {
     /// Mirror both behaviors here so credential / routing failures produce
     /// the same user-facing diagnostic output that Python does.
     async fn is_reachable_nvswitch_async(&self, trace: TraceFlags) -> (bool, String) {
-        let platform_url = format!("https://{}/nvue_v1/platform", self.ip);
+        let platform_url = format!("{}/nvue_v1/platform", self.base_url);
         let result = self
-            .client
-            .get(&platform_url)
-            .basic_auth(&self.user, Some(&self.password))
+            .apply_auth(self.client.get(&platform_url))
             .timeout(Duration::from_secs(1200))
             .send()
             .await;
@@ -1238,17 +1589,13 @@ impl BmcAccess {
 
                     // Python reads response.text, then either pretty-prints
                     // parsed JSON (indent=4, sort_keys=False) or prints the
-                    // raw text. Match that output shape.
+                    // raw text. Keep that legacy text-mode output, but do not
+                    // contaminate JSON-mode stdout.
                     if let Ok(body) = resp.text().await {
-                        match serde_json::from_str::<Value>(&body) {
-                            Ok(parsed) => {
-                                // `serde_json::to_string_pretty` uses 2-space
-                                // indent by default. Python uses 4-space.
-                                println!("{}", pretty_4space_redacted(&parsed));
-                            }
-                            Err(_) => {
-                                println!("{}", NvUtils::sanitize_log(&body));
-                            }
+                        if let Some(diagnostic) =
+                            nvswitch_reachability_body_diagnostic(trace, &body)
+                        {
+                            println!("{diagnostic}");
                         }
                     }
                     (false, format!("HTTP {}", status_code))
@@ -1555,6 +1902,22 @@ impl BmcAccess {
     // Request dispatch
     // -----------------------------------------------------------------
 
+    /// GET a same-origin Redfish resource without discarding its HTTP status.
+    /// Callers must distinguish a missing task from transport or JSON failures.
+    pub(crate) async fn dispatch_get_response(
+        &self,
+        url: &str,
+        timeout: Duration,
+    ) -> Result<reqwest::Response, String> {
+        let url = self.same_origin_request_url(url, "Redfish request URI")?;
+        self.apply_auth(self.client.get(url))
+            .header("Content-Type", "application/json")
+            .timeout(timeout)
+            .send()
+            .await
+            .map_err(|error| NvUtils::sanitize_log(&error_chain_message(&error)))
+    }
+
     /// Dispatch a Redfish HTTP request to the BMC.
     ///
     /// Supports `GET`, `POST`, and `PATCH` methods. The full URL is formed
@@ -1578,6 +1941,19 @@ impl BmcAccess {
         Self::block_on_http(self.dispatch_request(method, url, input_data, json_prints))
     }
 
+    fn default_request_timeout_secs(&self) -> u64 {
+        self.compute_timing.map_or(DEFAULT_TIMEOUT_SECS, |timing| {
+            timing.request_timeout.as_secs()
+        })
+    }
+
+    fn reachability_timeout_secs(&self) -> u64 {
+        self.compute_timing
+            .map_or(REACHABILITY_TIMEOUT_SECS, |timing| {
+                timing.reachability_timeout.as_secs()
+            })
+    }
+
     /// Async request dispatch using default timeout and no extra params.
     pub async fn dispatch_request(
         &self,
@@ -1591,7 +1967,7 @@ impl BmcAccess {
             url,
             input_data,
             None,
-            DEFAULT_TIMEOUT_SECS,
+            self.default_request_timeout_secs(),
             false,
             json_prints,
         )
@@ -1685,8 +2061,13 @@ impl BmcAccess {
         url: &str,
         suppress_err: bool,
     ) -> (bool, Value) {
-        self.dispatch_get_with_timeout_async(trace, url, REACHABILITY_TIMEOUT_SECS, suppress_err)
-            .await
+        self.dispatch_get_with_timeout_async(
+            trace,
+            url,
+            self.reachability_timeout_secs(),
+            suppress_err,
+        )
+        .await
     }
 
     /// Async internal GET helper with an explicit per-call timeout.
@@ -1703,10 +2084,9 @@ impl BmcAccess {
         }
 
         let empty = Value::Object(serde_json::Map::new());
+
         let result = self
-            .client
-            .get(url)
-            .basic_auth(&self.user, Some(&self.password))
+            .apply_auth(self.client.get(url))
             .header("Content-Type", "application/json")
             .timeout(Duration::from_secs(time_out))
             .send()
@@ -1757,10 +2137,9 @@ impl BmcAccess {
         json_prints: Option<&mut Value>,
     ) -> (bool, Value) {
         let empty = Value::Object(serde_json::Map::new());
+
         let result = self
-            .client
-            .get(url)
-            .basic_auth(&self.user, Some(&self.password))
+            .apply_auth(self.client.get(url))
             .header("Content-Type", "application/json")
             .timeout(Duration::from_secs(time_out))
             .send()
@@ -1840,9 +2219,7 @@ impl BmcAccess {
 
         loop {
             let mut req = self
-                .client
-                .patch(url)
-                .basic_auth(&self.user, Some(&self.password))
+                .apply_auth(self.client.patch(url))
                 .header("Content-Type", "application/json")
                 .timeout(Duration::from_secs(time_out))
                 .body(body_str.clone());
@@ -1908,12 +2285,12 @@ impl BmcAccess {
     ) -> (bool, Value) {
         let empty = Value::Object(serde_json::Map::new());
 
-        if let Some(params) = param_data {
+        let json_body = param_data.or_else(|| input_data.filter(|value| !value.is_string()));
+
+        if let Some(params) = json_body {
             // POST with JSON body.
             let result = self
-                .client
-                .post(url)
-                .basic_auth(&self.user, Some(&self.password))
+                .apply_auth(self.client.post(url))
                 .header("Content-Type", "application/json")
                 .json(params)
                 .timeout(Duration::from_secs(time_out))
@@ -1959,9 +2336,7 @@ impl BmcAccess {
         {
             // POST with no body (e.g. factory reset, power actions).
             let result = self
-                .client
-                .post(url)
-                .basic_auth(&self.user, Some(&self.password))
+                .apply_auth(self.client.post(url))
                 .timeout(Duration::from_secs(time_out))
                 .send()
                 .await;
@@ -2027,41 +2402,74 @@ impl BmcAccess {
             };
             let file_body = reqwest::Body::wrap_stream(ReaderStream::new(file));
 
-            // Acquire auth token via /login first.
-            let login_url = format!("{}/login", self.base_url);
-            let login_body = serde_json::json!({
-                "data": [self.user, self.password]
-            });
+            let login_resp = if self.session_token().is_none() {
+                let login_url = format!("{}/login", self.base_url);
 
-            let login_resp = self
-                .client
-                .post(&login_url)
-                .header("Content-Type", "application/json")
-                .json(&login_body)
-                .timeout(Duration::from_secs(30))
-                .send()
-                .await;
+                let login_body = serde_json::json!({
+                    "data": [self.user, self.password]
+                });
 
-            let mut auth_token = String::new();
-            if let Ok(resp) = login_resp {
-                if resp.status().as_u16() == 200 {
-                    if let Some(cookie) = resp.headers().get("Set-Cookie") {
-                        if let Ok(cookie_str) = cookie.to_str() {
-                            let re = regex::Regex::new(r"SESSION=(\w+);")
-                                .unwrap_or_else(|_| regex::Regex::new(r"$^").unwrap());
-                            if let Some(caps) = re.captures(cookie_str) {
-                                auth_token = caps[1].to_string();
+                Some(
+                    self.client
+                        .post(&login_url)
+                        .header("Content-Type", "application/json")
+                        .json(&login_body)
+                        .timeout(Duration::from_secs(30))
+                        .send()
+                        .await,
+                )
+            } else {
+                None
+            };
+
+            let mut auth_token = self.session_token().unwrap_or_default().to_owned();
+
+            if let Some(login_result) = login_resp {
+                match login_result {
+                    Ok(resp) if resp.status().as_u16() == 200 => {
+                        let session_cookie = resp
+                            .headers()
+                            .get_all("Set-Cookie")
+                            .iter()
+                            .filter_map(|value| value.to_str().ok())
+                            .find_map(|cookie_str| {
+                                cookie_str
+                                    .split(';')
+                                    .find_map(|part| part.trim().strip_prefix("SESSION="))
+                            })
+                            .filter(|session| !session.is_empty());
+
+                        match session_cookie {
+                            Some(session) => auth_token = session.to_string(),
+                            None => {
+                                Util::bail_nvfwupd(
+                                    1,
+                                    "Unable to get valid token for POST message",
+                                    BailAction::DoNothing,
+                                    json_prints.as_deref(),
+                                );
+                                return (false, empty);
                             }
                         }
                     }
-                } else {
-                    Util::bail_nvfwupd(
-                        1,
-                        "Unable to get valid token for POST message",
-                        BailAction::DoNothing,
-                        json_prints.as_deref(),
-                    );
-                    return (false, empty);
+                    Ok(_) => {
+                        Util::bail_nvfwupd(
+                            1,
+                            "Unable to get valid token for POST message",
+                            BailAction::DoNothing,
+                            json_prints.as_deref(),
+                        );
+                        return (false, empty);
+                    }
+                    Err(e) => {
+                        Util::bail_nvfwupd(
+                            1,
+                            &format!("Error: Error sending HTTPs request: {e}"),
+                            BailAction::DoNothing,
+                            json_prints.as_deref(),
+                        );
+                        return (false, empty);
+                    }
                 }
             }
 
@@ -2074,7 +2482,7 @@ impl BmcAccess {
                 .timeout(Duration::from_secs(time_out));
 
             if !auth_token.is_empty() {
-                req = req.header("X-Auth-Token", &auth_token);
+                req = req.header("X-Auth-Token", sensitive_header_value(&auth_token));
             }
 
             match req.send().await {
@@ -2145,6 +2553,9 @@ impl BmcAccess {
         extra_headers: Option<&HashMap<String, String>>,
     ) -> (bool, Value) {
         let empty = Value::Object(serde_json::Map::new());
+        let time_out = self
+            .compute_timing
+            .map_or(time_out, |timing| timing.upload_timeout.as_secs());
         let full_url = match self.same_origin_request_url(url, "HTTP push update URI") {
             Ok(full_url) => full_url,
             Err(message) => {
@@ -2202,9 +2613,7 @@ impl BmcAccess {
         let file_body = reqwest::Body::wrap_stream(ReaderStream::new(file));
 
         let mut req = self
-            .client
-            .post(&full_url)
-            .basic_auth(&self.user, Some(&self.password))
+            .apply_auth(self.client.post(&full_url))
             .header("Content-Type", "application/octet-stream")
             .header("Expect", "100-continue")
             .header("Content-Length", file_len.to_string())
@@ -2311,6 +2720,9 @@ impl BmcAccess {
 
     /// Perform a multipart firmware upload with default behavior.
     ///
+    /// See [`Self::multipart_file_upload_with_options`] for the HTTP/JSON
+    /// success boolean and diagnostic-history contract.
+    ///
     /// The default follows the current Python CLI behavior:
     /// `UpdateParameters` before `UpdateFile`, with failures reported through
     /// the normal nvfwupd error path.
@@ -2342,6 +2754,9 @@ impl BmcAccess {
 
     /// Perform a multipart firmware upload with caller-selected failure
     /// reporting behavior.
+    ///
+    /// See [`Self::multipart_file_upload_with_options`] for the HTTP/JSON
+    /// success boolean and diagnostic-history contract.
     #[allow(clippy::too_many_arguments)]
     pub fn multipart_file_upload_sync_with_options(
         &self,
@@ -2401,6 +2816,17 @@ impl BmcAccess {
 
     /// Async multipart firmware upload with caller-selected failure-reporting
     /// behavior.
+    ///
+    /// Returns `(http_json_success, response)`. The boolean is true only for
+    /// HTTP 200/202 with valid JSON; it does not guarantee a usable task ID.
+    /// Callers must validate the task reference before declaring an update
+    /// started. The sync/default wrappers retain this same contract.
+    ///
+    /// Failed-submission diagnostics are appended to `Output` in call order.
+    /// Reusing the output object preserves earlier failures, even after a later
+    /// upload succeeds; those historical entries do not change this call's
+    /// boolean result. Each diagnostic's body and truncation flag are computed
+    /// from the same redacted text.
     #[allow(clippy::too_many_arguments)]
     pub async fn multipart_file_upload_with_options(
         &self,
@@ -2417,6 +2843,9 @@ impl BmcAccess {
     ) -> (bool, Value) {
         let empty = Value::Null;
 
+        let time_out = self
+            .compute_timing
+            .map_or(time_out, |timing| timing.upload_timeout.as_secs());
         let full_url = match self.same_origin_request_url(url, "multipart update URI") {
             Ok(full_url) => full_url,
             Err(message) => {
@@ -2520,75 +2949,121 @@ impl BmcAccess {
         }
 
         let result = self
-            .client
-            .post(&full_url)
-            .basic_auth(&self.user, Some(&self.password))
+            .apply_auth(self.client.post(&full_url))
             .multipart(form)
             .timeout(Duration::from_secs(time_out))
             .send()
             .await;
 
-        match result {
+        let (success, response, diagnostic) = match result {
             Ok(resp) => {
-                let status_code = resp.status().as_u16();
-                let body = resp.text().await.unwrap_or_default();
-
-                let response_dict = match serde_json::from_str::<Value>(&body) {
-                    Ok(val) => val,
-                    Err(_) => {
-                        let body = NvUtils::sanitize_log(&body);
-                        tracing::debug!(
-                            "Could not decode update response body: response text: {} status: {}",
-                            body,
-                            status_code
-                        );
-                        if options.bail_on_failure {
-                            Util::bail_nvfwupd_threadsafe(
-                                1,
-                                &format!(
-                                    "Could not decode update response body: \
-                                     response text: {body} status: {status_code}"
-                                ),
-                                BailAction::DoNothing,
-                                None,
-                                parallel_update,
-                            );
-                        }
-                        return (false, empty);
-                    }
-                };
-
-                if status_code == 200 || status_code == 202 {
-                    (true, response_dict)
-                } else {
-                    if json_prints.is_none() && options.bail_on_failure {
-                        println!("{}", pretty_4space_redacted(&response_dict));
-                    }
-                    if options.bail_on_failure {
-                        Util::bail_nvfwupd_threadsafe(
-                            1,
-                            &format!("Error sending POST request: ({status_code})"),
-                            BailAction::DoNothing,
-                            None,
-                            parallel_update,
+                let status = resp.status().as_u16();
+                let mut headers = serde_json::Map::new();
+                for name in ["location", "retry-after", "content-type", "x-request-id"] {
+                    if let Some(value) = resp.headers().get(name).and_then(|v| v.to_str().ok()) {
+                        headers.insert(
+                            name.to_string(),
+                            json!(self.bounded_submission_text(value, 512)),
                         );
                     }
-                    (false, response_dict)
+                }
+                match resp.text().await {
+                    Ok(body) => {
+                        let parsed = serde_json::from_str::<Value>(&body);
+                        let accepted = matches!(status, 200 | 202);
+                        let category = match (accepted, parsed.as_ref()) {
+                            (false, _) => "http_rejection",
+                            (true, Err(_)) => "json_decode_failure",
+                            (true, Ok(value)) => {
+                                if crate::rf_target::task_id_from_update_response(value).is_some() {
+                                    "accepted"
+                                } else if ["Id", "@odata.id", "Messages"]
+                                    .iter()
+                                    .any(|key| value.get(key).is_some())
+                                {
+                                    "malformed_task_reference"
+                                } else {
+                                    "missing_task_reference"
+                                }
+                            }
+                        };
+                        let redacted = match &parsed {
+                            Ok(value) => NvUtils::redact_secret_json_value(value).to_string(),
+                            Err(_) => body,
+                        };
+                        let sanitized = self.bounded_submission_text(&redacted, usize::MAX);
+                        let body_truncated = sanitized.chars().count() > 4096;
+                        let body: String = sanitized.chars().take(4096).collect();
+                        let diagnostic = json!({
+                            "category": category,
+                            "http_status": status,
+                            "headers": headers,
+                            "body": body,
+                            "body_truncated": body_truncated,
+                        });
+                        (
+                            accepted && parsed.is_ok(),
+                            parsed.unwrap_or(Value::Null),
+                            diagnostic,
+                        )
+                    }
+                    Err(error) => (
+                        false,
+                        Value::Null,
+                        json!({
+                            "category": "response_read_failure",
+                            "http_status": status,
+                            "headers": headers,
+                            "message": self.bounded_submission_text(&error.without_url().to_string(), 512),
+                        }),
+                    ),
                 }
             }
-            Err(e) => {
-                if options.bail_on_failure {
-                    Util::bail_nvfwupd_threadsafe(
-                        1,
-                        &format!("Error: Error sending HTTPs request: {e}"),
-                        BailAction::DoNothing,
-                        None,
-                        parallel_update,
-                    );
+            Err(error) => (
+                false,
+                Value::Null,
+                json!({
+                    "category": "transport_failure",
+                    "message": self.bounded_submission_text(&error.without_url().to_string(), 512),
+                }),
+            ),
+        };
+        if let Some(output) = json_prints {
+            if let Ok(mut output) = output.lock() {
+                // Keep the CLI's Error/Error Code/Output envelope intact. Parallel
+                // workers merge Output entries, so diagnostics must travel there.
+                if let Some(entries) = output.get_mut("Output").and_then(Value::as_array_mut) {
+                    // Failed attempts form an ordered history when callers
+                    // reuse an output object. A later success must not erase it.
+                    if diagnostic["category"] != "accepted" {
+                        entries.push(json!({"SubmissionDiagnostic": diagnostic}));
+                    }
                 }
-                (false, empty)
             }
         }
+        if diagnostic["category"] != "accepted" {
+            tracing::warn!(json_mode = json_prints.is_some(), submission_diagnostic = %diagnostic, "Firmware submission did not return a usable task reference");
+            // JSON-mode callers already have the diagnostic in their output object.
+            // Passing None to the legacy bail helper would print plain text to stdout.
+            if options.bail_on_failure && json_prints.is_none() {
+                Util::bail_nvfwupd_threadsafe(
+                    1,
+                    &format!("Firmware submission failed: {diagnostic}"),
+                    BailAction::DoNothing,
+                    None,
+                    parallel_update,
+                );
+            }
+        }
+        // Legacy callers may also append the parsed failure response to their
+        // JSON output. Mask its string values before handing it back, rather
+        // than protecting only the bounded diagnostic above.
+        let response = if diagnostic["category"] == "accepted" {
+            response
+        } else {
+            self.redacted_submission_response(&response)
+        };
+        (success, response)
     }
 
     // -----------------------------------------------------------------
@@ -2659,7 +3134,7 @@ impl BmcAccess {
                     .dispatch_get_with_timeout_async(
                         trace,
                         &fw_inv_uri,
-                        DEFAULT_TIMEOUT_SECS,
+                        self.default_request_timeout_secs(),
                         false,
                     )
                     .await;
@@ -2740,7 +3215,11 @@ impl BmcAccess {
             self.base_url
         );
         let (members, collection_response) = self
-            .get_resource_members_with_response(trace, &fw_inv_uri, DEFAULT_TIMEOUT_SECS)
+            .get_resource_members_with_response(
+                trace,
+                &fw_inv_uri,
+                self.default_request_timeout_secs(),
+            )
             .await;
         let oem_inv_dict = Self::get_oem_firmware_inventory(&collection_response);
 
@@ -2798,14 +3277,11 @@ impl BmcAccess {
             }
         }
 
-        // Add LiteOn PowerUnits inventory for PowerShelf targets.
+        // Add LiteOn PowerUnits inventory from its fixed URI. PF-1114-1RD
+        // exposes this resource even though Redfish discovery omits its links.
         let model_hint = model.unwrap_or(self.model.as_str());
-        let model_lower = model_hint.to_ascii_lowercase();
-        let is_liteon_powershelf = model_lower.contains("liteon")
-            || model_lower.starts_with("pf-1333")
-            || model_lower.starts_with("pf-1114");
 
-        if is_liteon_powershelf {
+        if liteon_oem_powerunits_shelf(model_hint) {
             if let Some(powerunits) = self.get_liteon_powerunits_inventory_async(trace).await {
                 inv_dict.extend(powerunits);
             }
@@ -2850,15 +3326,14 @@ impl BmcAccess {
                                 format!("/redfish/v1/UpdateService/FirmwareInventory/{name}")
                             })
                     });
-                let has_version = device_dict
-                    .get("Version")
-                    .map(|version| !version.is_null())
-                    .unwrap_or(false);
-
                 if let Some(inv_uri) = inv_uri {
-                    if has_version {
-                        inv_dict.insert(inv_uri, firmware_device.clone());
+                    let mut firmware_device = firmware_device.clone();
+                    if let Value::Object(ref mut device) = firmware_device {
+                        if device.get("Version").map(Value::is_null).unwrap_or(true) {
+                            device.insert("Version".to_string(), Value::String(String::new()));
+                        }
                     }
+                    inv_dict.insert(inv_uri, firmware_device);
                 }
             }
         }
@@ -2919,7 +3394,7 @@ impl BmcAccess {
 
     async fn get_resource_members(&self, trace: TraceFlags, url: &str) -> Vec<String> {
         let (members, _) = self
-            .get_resource_members_with_response(trace, url, REACHABILITY_TIMEOUT_SECS)
+            .get_resource_members_with_response(trace, url, self.reachability_timeout_secs())
             .await;
         members
     }
@@ -2976,6 +3451,14 @@ impl BmcAccess {
     pub fn get_systems_members_sync(&self, trace: TraceFlags) -> Vec<String> {
         let url = format!("{}/redfish/v1/Systems", self.base_url);
         self.get_resource_members_sync(trace, &url)
+    }
+
+    /// Select the configured host resource only for compute power operations.
+    pub(crate) async fn compute_power_system_members(&self, trace: TraceFlags) -> Vec<String> {
+        match self.compute_power_paths.system_state_path.as_deref() {
+            Some(path) => vec![path.to_owned()],
+            None => self.get_systems_members(trace).await,
+        }
     }
 
     /// Async Systems members query.
@@ -3063,6 +3546,36 @@ impl BmcAccess {
             .await
     }
 
+    /// GET an NVUE path and distinguish an HTTP answer from a switch that did not respond.
+    ///
+    /// A request this method could not send counts as an answer, since the
+    /// switch was never asked and so cannot be presumed down.
+    pub(crate) async fn observe_nvue_get(&self, url: &str, time_out: u64) -> ObservedRead {
+        let transport_url = match self.same_origin_request_url(url, "NVUE REST request URI") {
+            Ok(transport_url) => transport_url,
+            Err(_) => return ObservedRead::answered_unparsed(),
+        };
+
+        let response = match self
+            .apply_auth(self.client.get(&transport_url))
+            .header("Content-Type", "application/json")
+            .timeout(Duration::from_secs(time_out))
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => return ObservedRead::NoResponse(error.to_string()),
+        };
+
+        let status = response.status().as_u16();
+        let text = response.text().await.unwrap_or_default();
+        match serde_json::from_str::<Value>(&text) {
+            Ok(value) if status == 200 => ObservedRead::Readable(value),
+            Ok(value) => ObservedRead::Answered(value),
+            Err(_) => ObservedRead::answered_unparsed(),
+        }
+    }
+
     /// Send a POST request to the NVUE REST endpoint (NVSwitch access).
     pub fn dispatch_rest_request_post_sync(
         &self,
@@ -3096,9 +3609,7 @@ impl BmcAccess {
         };
 
         let result = self
-            .client
-            .post(&transport_url)
-            .basic_auth(&self.user, Some(&self.password))
+            .apply_auth(self.client.post(&transport_url))
             .header("Content-Type", "application/json")
             .json(json_data)
             .timeout(Duration::from_secs(time_out))
@@ -3199,9 +3710,7 @@ impl BmcAccess {
 
         loop {
             let result = self
-                .client
-                .get(&transport_url)
-                .basic_auth(&self.user, Some(&self.password))
+                .apply_auth(self.client.get(&transport_url))
                 .timeout(Duration::from_secs(30))
                 .send()
                 .await;
@@ -3291,9 +3800,23 @@ impl BmcAccess {
         let ip_clean = self.ip.replace('[', "").replace(']', "");
         let remote_dir = remote_dir.trim();
         let remote_path = switch_remote_upload_path(remote_dir, remote_filename)?;
+
+        // The typed `ShellCommand`s below are rendered to strings and handed to
+        // the legacy `ssh_transport` upload path rather than `NvSwitchCliHandler`
+        // on purpose: the handler has no file-transfer primitive, and these
+        // setup commands must run in the *same* SSH session as the SFTP transfer
+        // that follows, which the handler cannot share. Constructing them as
+        // typed commands still gets the `RemotePath` validation (rejecting
+        // NUL/newline/option-shaped paths) before they are flattened to strings.
         let setup_commands = vec![
-            format!("mkdir -p {}", switch_shell_quote(remote_dir)),
-            format!("rm -f {}", switch_shell_quote(&remote_path)),
+            ShellCommand::CreateDirectoryTree {
+                path: RemotePath::new(remote_dir).map_err(|e| e.to_string())?,
+            }
+            .to_string(),
+            ShellCommand::RemoveFile {
+                path: RemotePath::new(remote_path.clone()).map_err(|e| e.to_string())?,
+            }
+            .to_string(),
         ];
         let local_path_buf = Path::new(local_path).to_path_buf();
         let started = Instant::now();
@@ -3302,26 +3825,75 @@ impl BmcAccess {
             Duration::from_secs((2 * attempt_timeout_secs) + SWITCH_SSH_UPLOAD_RETRY_INTERVAL_SECS);
         let retry_interval = Duration::from_secs(SWITCH_SSH_UPLOAD_RETRY_INTERVAL_SECS);
         let mut attempt = 0_u32;
+        let progress_label = current_switch_sftp_progress_label();
 
         loop {
             attempt += 1;
+            let start_msg = format!(
+                "Starting SFTP upload attempt {attempt} to {remote_path} (timeout: {upload_timeout_secs}s)"
+            );
+            let display_start_msg =
+                format_labeled_switch_sftp_message(progress_label.as_deref(), &start_msg);
+            tracing::info!(
+                log_only = true,
+                attempt,
+                remote_path = %remote_path,
+                progress_label = progress_label.as_deref().unwrap_or(""),
+                upload_timeout_secs,
+                "starting switch SFTP upload attempt"
+            );
+            if !print_json {
+                println!("{}", NvUtils::sanitize_log(&display_start_msg));
+            }
+
+            let progress_reporter: ssh_transport::SftpUploadProgressReporter = {
+                let progress_label = progress_label.clone();
+                std::sync::Arc::new(move |progress| {
+                    let msg = format_switch_sftp_upload_progress(attempt, progress);
+                    let display_msg =
+                        format_labeled_switch_sftp_message(progress_label.as_deref(), &msg);
+                    tracing::info!(
+                        log_only = true,
+                        attempt,
+                        progress_label = progress_label.as_deref().unwrap_or(""),
+                        uploaded_bytes = progress.uploaded_bytes,
+                        total_bytes = progress.total_bytes.unwrap_or(0),
+                        elapsed_secs = progress.elapsed_secs,
+                        summary = %display_msg,
+                        "switch SFTP upload progress"
+                    );
+                    if !print_json {
+                        println!("{}", NvUtils::sanitize_log(&display_msg));
+                    }
+                })
+            };
+
             match ssh_transport::upload_file_with_setup_async(
                 &ip_clean,
                 22,
                 &self.user,
                 &self.password,
                 SWITCH_SSH_CONNECT_TIMEOUT_SECS,
+                SWITCH_SSH_SETUP_TIMEOUT_SECS,
                 upload_timeout_secs,
                 &setup_commands,
                 local_path_buf.clone(),
                 remote_path.clone(),
                 self.ssh_host_key_policy(),
+                Some(progress_reporter),
             )
             .await
             {
                 Ok(()) => {
                     if !print_json {
-                        println!("Update file {} was uploaded successfully", local_path);
+                        let msg = format!("Update file {} was uploaded successfully", local_path);
+                        println!(
+                            "{}",
+                            NvUtils::sanitize_log(&format_labeled_switch_sftp_message(
+                                progress_label.as_deref(),
+                                &msg
+                            ))
+                        );
                     }
                     return Ok(remote_path);
                 }
@@ -3343,18 +3915,31 @@ impl BmcAccess {
                             e
                         );
                         if !print_json {
-                            println!("{}", msg);
+                            println!(
+                                "{}",
+                                NvUtils::sanitize_log(&format_labeled_switch_sftp_message(
+                                    progress_label.as_deref(),
+                                    &msg
+                                ))
+                            );
                         }
                         return Err(NvUtils::sanitize_log(&msg));
                     }
 
                     if !print_json {
-                        println!(
+                        let msg = format!(
                             "SSH setup/upload attempt {} failed after {}s: {}; retrying in {}s",
                             attempt,
                             elapsed.as_secs(),
                             e,
                             SWITCH_SSH_UPLOAD_RETRY_INTERVAL_SECS
+                        );
+                        println!(
+                            "{}",
+                            NvUtils::sanitize_log(&format_labeled_switch_sftp_message(
+                                progress_label.as_deref(),
+                                &msg
+                            ))
                         );
                     }
                     tokio::time::sleep(retry_interval).await;
@@ -3369,30 +3954,22 @@ impl BmcAccess {
         remote_path: &str,
     ) -> std::result::Result<(), String> {
         let remote_path = switch_remote_cleanup_path(remote_path)?;
-        let ip_clean = self.ip.replace('[', "").replace(']', "");
-        let command = format!("rm -f {}", switch_shell_quote(remote_path));
-        let output = ssh_transport::execute_command_async(
-            &ip_clean,
-            22,
+        let remote_path = RemotePath::new(remote_path).map_err(|e| e.to_string())?;
+
+        self.switch_cli(SWITCH_SSH_CONNECT_TIMEOUT_SECS)
+            .remove_file(&remote_path)
+            .await
+            .map_err(|e| format!("SSH cleanup command failed: {e}"))
+    }
+
+    pub(crate) fn switch_cli(&self, timeout_secs: u64) -> SwitchCliHandler {
+        SwitchCliTransport::new(
+            &self.ip,
             &self.user,
             &self.password,
-            SWITCH_SSH_CONNECT_TIMEOUT_SECS,
-            &command,
-            None,
             self.ssh_host_key_policy(),
         )
-        .await
-        .map_err(|e| NvUtils::sanitize_log(&format!("SSH cleanup command failed: {e}")))?;
-
-        if output.success {
-            Ok(())
-        } else {
-            Err(NvUtils::sanitize_log(&format!(
-                "SSH cleanup command failed: stdout='{}', stderr='{}'",
-                output.stdout.trim(),
-                output.stderr.trim()
-            )))
-        }
+        .into_handler(timeout_secs)
     }
 }
 
@@ -3419,6 +3996,8 @@ impl BmcAccess {
             access_type: AccessType::Login,
             ssh_known_hosts: None,
             ssh_host_key_mode: SSH_HOST_KEY_MODE_TOFU.to_string(),
+            compute_timing: None,
+            compute_power_paths: Default::default(),
             client: Client::builder()
                 .danger_accept_invalid_certs(true)
                 .build()
@@ -3452,6 +4031,8 @@ impl BmcAccess {
             access_type,
             ssh_known_hosts: None,
             ssh_host_key_mode: SSH_HOST_KEY_MODE_TOFU.to_string(),
+            compute_timing: None,
+            compute_power_paths: Default::default(),
             client: Client::builder()
                 .danger_accept_invalid_certs(true)
                 .build()
@@ -3467,7 +4048,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use tracing::Level;
     use tracing_subscriber::fmt::writer::MakeWriter;
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[derive(Clone, Default)]
@@ -3514,6 +4095,22 @@ mod tests {
         let body = String::from_utf8_lossy(body);
         body.find(&format!("name=\"{field_name}\""))
             .unwrap_or_else(|| panic!("missing multipart field {field_name}: {body}"))
+    }
+
+    #[test]
+    fn sensitive_header_value_marks_valid_token_sensitive() {
+        let value = sensitive_header_value("a-session-token");
+
+        assert!(value.is_sensitive());
+        assert_eq!(value.to_str().unwrap(), "a-session-token");
+    }
+
+    #[test]
+    fn sensitive_header_value_falls_back_on_invalid_token() {
+        let value = sensitive_header_value("invalid\ntoken");
+
+        assert!(value.is_sensitive());
+        assert_eq!(value.to_str().unwrap(), "invalid-session-token");
     }
 
     #[test]
@@ -3577,7 +4174,7 @@ mod tests {
     #[test]
     fn bmc_tls_verification_defaults_to_disabled_mode() {
         assert!(!BmcAccess::should_verify_bmc_tls(None, None).unwrap());
-        assert!(BmcAccess::build_client_from_tls_options(1, None, None).is_ok());
+        assert!(BmcAccess::build_client_from_tls_options(1, None, None, true).is_ok());
     }
 
     #[test]
@@ -3695,13 +4292,13 @@ mod tests {
     fn bmc_client_builder_loads_ca_only_when_verification_is_enabled() {
         let missing_path = "/tmp/nvfwupd-definitely-missing-bmc-ca.pem";
 
-        let err =
-            BmcAccess::build_client_from_tls_options(1, None, Some(missing_path)).unwrap_err();
+        let err = BmcAccess::build_client_from_tls_options(1, None, Some(missing_path), true)
+            .unwrap_err();
         assert!(err.contains(BMC_CA_CERT_ARG));
         assert!(err.contains(missing_path));
 
         assert!(
-            BmcAccess::build_client_from_tls_options(1, Some("0"), None).is_ok(),
+            BmcAccess::build_client_from_tls_options(1, Some("0"), None, true).is_ok(),
             "explicitly disabled verification should allow insecure/self-signed endpoints"
         );
     }
@@ -3709,8 +4306,8 @@ mod tests {
     #[test]
     fn bmc_ca_cert_is_rejected_when_verification_is_disabled() {
         let missing_path = "/tmp/nvfwupd-definitely-missing-bmc-ca.pem";
-        let err =
-            BmcAccess::build_client_from_tls_options(1, Some("0"), Some(missing_path)).unwrap_err();
+        let err = BmcAccess::build_client_from_tls_options(1, Some("0"), Some(missing_path), true)
+            .unwrap_err();
         assert!(
             err.contains(BMC_CA_CERT_ARG),
             "expected {BMC_CA_CERT_ARG} in error, got: {err}"
@@ -3784,6 +4381,7 @@ mod tests {
 
     #[test]
     fn get_bmc_access_surfaces_tls_option_conflicts_without_servertype() {
+        let _guard = crate::utils::SanitizeTestGuard::new();
         let trace = TraceFlags::default();
         let args = vec![
             "ip=127.0.0.1".to_string(),
@@ -3832,6 +4430,21 @@ mod tests {
         assert_eq!(
             message,
             "Connection Error: Failed to connect with the system."
+        );
+    }
+
+    #[test]
+    fn nvswitch_reachability_body_diagnostic_is_suppressed_in_json_mode() {
+        let html_401 = "<html><body>401 Authorization Required</body></html>";
+
+        assert_eq!(
+            nvswitch_reachability_body_diagnostic(TraceFlags::new(false, true), html_401),
+            None
+        );
+        assert_eq!(
+            nvswitch_reachability_body_diagnostic(TraceFlags::new(false, false), html_401)
+                .as_deref(),
+            Some(html_401)
         );
     }
 
@@ -3904,16 +4517,20 @@ mod tests {
         );
     }
 
-    #[test]
-    fn switch_shell_quote_escapes_single_quotes() {
+    #[tokio::test]
+    async fn switch_sftp_progress_label_prefixes_status_lines() {
         assert_eq!(
-            switch_shell_quote("/host/fw-images/bmc"),
-            "'/host/fw-images/bmc'"
+            BmcAccess::format_switch_sftp_status_line("Starting SFTP upload"),
+            "Starting SFTP upload"
         );
-        assert_eq!(
-            switch_shell_quote("/host/fw-images/bmc's"),
-            "'/host/fw-images/bmc'\\''s'"
-        );
+
+        let labeled =
+            BmcAccess::with_switch_sftp_progress_label("  Switch\nA  ".to_string(), async {
+                BmcAccess::format_switch_sftp_status_line("Starting SFTP upload")
+            })
+            .await;
+
+        assert_eq!(labeled, "[Switch A] Starting SFTP upload");
     }
 
     #[tokio::test]
@@ -3954,11 +4571,14 @@ mod tests {
 
     #[tokio::test]
     async fn scp_remove_remote_file_sanitizes_transport_errors() {
+        // Serialize with other tests that mutate the global sanitize state and
+        // pin `is_sanitize=true` + the default config, so the `ip=`/`password=`
+        // redaction assertions below are deterministic under parallel runs.
         let _guard = crate::utils::SanitizeTestGuard::new();
         let mock_host = "mock-switch-cleanup-transport-error";
         ssh_transport::install_mock_exec_error_for_host(
             mock_host,
-            "connect failed for ip=10.85.14.105 password=plain_secret",
+            "connect failed for ip=192.0.2.105 password=plain_secret",
         );
         let access = BmcAccess::mock_with_base_url_and_type(
             "http://127.0.0.1",
@@ -3974,7 +4594,7 @@ mod tests {
         assert!(err.contains("SSH cleanup command failed"));
         assert!(err.contains("ip=XXXX"));
         assert!(err.contains("password=XXXX"));
-        assert!(!err.contains("10.85.14.105"));
+        assert!(!err.contains("192.0.2.105"));
         assert!(!err.contains("plain_secret"));
         let _ = ssh_transport::take_mock_snapshot(mock_host);
     }
@@ -4006,6 +4626,8 @@ mod tests {
             access_type: AccessType::Login,
             ssh_known_hosts: None,
             ssh_host_key_mode: SSH_HOST_KEY_MODE_TOFU.to_string(),
+            compute_timing: None,
+            compute_power_paths: Default::default(),
             client: Client::builder()
                 .danger_accept_invalid_certs(true)
                 .build()
@@ -4031,6 +4653,8 @@ mod tests {
             access_type: AccessType::Login,
             ssh_known_hosts: None,
             ssh_host_key_mode: SSH_HOST_KEY_MODE_TOFU.to_string(),
+            compute_timing: None,
+            compute_power_paths: Default::default(),
             client: Client::builder()
                 .danger_accept_invalid_certs(true)
                 .build()
@@ -4056,6 +4680,8 @@ mod tests {
             access_type: AccessType::Login,
             ssh_known_hosts: None,
             ssh_host_key_mode: SSH_HOST_KEY_MODE_TOFU.to_string(),
+            compute_timing: None,
+            compute_power_paths: Default::default(),
             client: Client::builder()
                 .danger_accept_invalid_certs(true)
                 .build()
@@ -4080,6 +4706,139 @@ mod tests {
     }
 
     #[test]
+    fn cli_login_without_username_remains_basic_auth() {
+        let mut args = HashMap::new();
+        args.insert("ip".to_string(), "10.0.0.1".to_string());
+        args.insert("password".to_string(), "session-token".to_string());
+
+        let access = BmcAccess::new_login(&args).unwrap();
+
+        assert_eq!(access.access_type, AccessType::Login);
+        assert!(access.session_token().is_none());
+    }
+
+    #[test]
+    fn new_login_with_session_token_uses_sentinel_user() {
+        let mut args = HashMap::new();
+        args.insert("ip".to_string(), "10.0.0.1".to_string());
+        args.insert("session_token".to_string(), "a-real-token".to_string());
+
+        let access = BmcAccess::new_login(&args).unwrap();
+
+        assert_eq!(access.user, BMC_SESSION_TOKEN_USER);
+        assert_eq!(access.session_token(), Some("a-real-token"));
+    }
+
+    #[test]
+    fn new_login_trims_whitespace_padded_session_token() {
+        let mut args = HashMap::new();
+        args.insert("ip".to_string(), "10.0.0.1".to_string());
+        args.insert("session_token".to_string(), "  a-real-token  ".to_string());
+
+        let access = BmcAccess::new_login(&args).unwrap();
+
+        assert_eq!(access.session_token(), Some("a-real-token"));
+    }
+
+    #[test]
+    fn new_login_rejects_whitespace_only_session_token() {
+        let mut args = HashMap::new();
+        args.insert("ip".to_string(), "10.0.0.1".to_string());
+        args.insert("session_token".to_string(), "   ".to_string());
+
+        let err = BmcAccess::new_login(&args).unwrap_err();
+
+        assert!(err.contains("must not be empty"));
+    }
+
+    #[test]
+    fn new_login_rejects_session_token_combined_with_user() {
+        let mut args = HashMap::new();
+        args.insert("ip".to_string(), "10.0.0.1".to_string());
+        args.insert("user".to_string(), "admin".to_string());
+        args.insert("session_token".to_string(), "a-real-token".to_string());
+
+        let err = BmcAccess::new_login(&args).unwrap_err();
+
+        assert!(err.contains("cannot be combined with user/password"));
+    }
+
+    #[test]
+    fn new_login_rejects_empty_session_token() {
+        let mut args = HashMap::new();
+        args.insert("ip".to_string(), "10.0.0.1".to_string());
+        args.insert("session_token".to_string(), String::new());
+
+        let err = BmcAccess::new_login(&args).unwrap_err();
+
+        assert!(err.contains("must not be empty"));
+    }
+
+    #[test]
+    fn new_login_rejects_invalid_session_token_header_value() {
+        let mut args = HashMap::new();
+        args.insert("ip".to_string(), "10.0.0.1".to_string());
+        args.insert("session_token".to_string(), "invalid\ntoken".to_string());
+
+        let err = BmcAccess::new_login(&args).unwrap_err();
+
+        assert!(err.contains("invalid session_token header value"));
+    }
+
+    #[test]
+    fn new_nvswitch_rejects_session_token() {
+        let mut args = HashMap::new();
+        args.insert("ip".to_string(), "10.0.0.5".to_string());
+        args.insert("servertype".to_string(), "gb200switch".to_string());
+        args.insert("session_token".to_string(), "a-real-token".to_string());
+
+        let err = BmcAccess::new_nvswitch(&args).unwrap_err();
+
+        assert!(err.contains("not supported for NVUE/NVOS switch targets"));
+    }
+
+    #[tokio::test]
+    async fn new_login_with_session_token_does_not_follow_redirects() {
+        let destination = MockServer::start().await;
+        let source = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/redirect"))
+            .respond_with(
+                ResponseTemplate::new(302).insert_header("Location", destination.uri().as_str()),
+            )
+            .expect(1)
+            .mount(&source)
+            .await;
+
+        let mut args = HashMap::new();
+        args.insert("ip".to_string(), "10.0.0.1".to_string());
+        args.insert("session_token".to_string(), "a-real-token".to_string());
+
+        let access = BmcAccess::new_login(&args).unwrap();
+
+        let response = access
+            .apply_auth(access.client.get(format!("{}/redirect", source.uri())))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), reqwest::StatusCode::FOUND);
+        assert!(destination.received_requests().await.unwrap().is_empty());
+    }
+
+    #[test]
+    fn probe_has_enough_args_accepts_ip_and_session_token_shorthand() {
+        // A reachable BMCLoginAccess probe (expected_args=3, ip+user+password)
+        // must not be discarded just because ip+session_token is only 2 keys.
+        assert!(BmcAccess::probe_has_enough_args(2, 3, true));
+    }
+
+    #[test]
+    fn probe_has_enough_args_rejects_short_non_token_probe() {
+        assert!(!BmcAccess::probe_has_enough_args(2, 3, false));
+    }
+
+    #[test]
     fn test_new_login_ipv6() {
         let mut args = HashMap::new();
         args.insert("ip".to_string(), "fd00::1".to_string());
@@ -4089,6 +4848,60 @@ mod tests {
         let access = BmcAccess::new_login(&args).unwrap();
         assert_eq!(access.ip, "[fd00::1]");
         assert_eq!(access.base_url, "https://[fd00::1]");
+    }
+
+    #[test]
+    fn test_new_login_with_port() {
+        let mut args = HashMap::new();
+        args.insert("ip".to_string(), "10.0.0.5".to_string());
+        args.insert("user".to_string(), "admin".to_string());
+        args.insert("password".to_string(), "pass".to_string());
+        args.insert("port".to_string(), "2444".to_string());
+
+        let access = BmcAccess::new_login_with_port(&args).unwrap();
+        assert_eq!(access.access_type, AccessType::Login);
+        assert_eq!(access.port, "2444");
+        assert_eq!(access.base_url, "https://10.0.0.5:2444");
+    }
+
+    #[test]
+    fn test_new_login_with_port_ipv6() {
+        let mut args = HashMap::new();
+        args.insert("ip".to_string(), "fd00::1".to_string());
+        args.insert("user".to_string(), "admin".to_string());
+        args.insert("password".to_string(), "pass".to_string());
+        args.insert("port".to_string(), "2444".to_string());
+
+        let access = BmcAccess::new_login_with_port(&args).unwrap();
+        assert_eq!(access.ip, "[fd00::1]");
+        assert_eq!(access.port, "2444");
+        assert_eq!(access.base_url, "https://[fd00::1]:2444");
+    }
+
+    #[test]
+    fn test_new_login_with_port_rejects_invalid_port() {
+        let mut args = HashMap::new();
+        args.insert("ip".to_string(), "10.0.0.5".to_string());
+        args.insert("user".to_string(), "admin".to_string());
+        args.insert("password".to_string(), "pass".to_string());
+
+        args.insert("port".to_string(), " ".to_string());
+        assert_eq!(
+            BmcAccess::new_login_with_port(&args).unwrap_err(),
+            "invalid port: "
+        );
+
+        args.insert("port".to_string(), "not-a-port".to_string());
+        assert_eq!(
+            BmcAccess::new_login_with_port(&args).unwrap_err(),
+            "invalid port: not-a-port"
+        );
+
+        args.insert("port".to_string(), "70000".to_string());
+        assert_eq!(
+            BmcAccess::new_login_with_port(&args).unwrap_err(),
+            "invalid port: 70000"
+        );
     }
 
     #[test]
@@ -4128,6 +4941,23 @@ mod tests {
 
         let access = BmcAccess::new_nvswitch(&args).unwrap();
         assert_eq!(access.base_url, "https://10.0.0.5:443");
+    }
+
+    #[tokio::test]
+    async fn nvswitch_reachability_uses_configured_base_url() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/nvue_v1/platform"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"platform": "mock"})))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut access =
+            BmcAccess::mock_with_base_url_and_type(server.uri(), "mock", AccessType::NVSwitch);
+        let (reachable, message) = access.is_reachable(TraceFlags::default()).await;
+
+        assert!(reachable, "{message}");
     }
 
     #[test]
@@ -4293,6 +5123,7 @@ mod tests {
     fn test_phase_2b_public_bmc_access_methods_are_async_send() {
         fn assert_send_future<T: std::future::Future + Send>(_future: T) {}
 
+        let _guard = crate::utils::SanitizeTestGuard::new();
         let trace = TraceFlags::default();
         let target_args = vec![
             "ip=127.0.0.1".to_string(),
@@ -4351,6 +5182,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn configured_compute_request_timeout_reaches_http_transport() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/slow"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({}))
+                    .set_delay(Duration::from_secs(2)),
+            )
+            .mount(&server)
+            .await;
+        let mut access = BmcAccess::mock_with_base_url(server.uri(), "mock");
+        access.compute_timing = Some(crate::compute_timing::ComputeFirmwareTiming {
+            request_timeout: Duration::from_secs(1),
+            ..crate::compute_timing::ComputeFirmwareTiming::default()
+        });
+        let (ok, _) = access.dispatch_request("GET", "/slow", None, None).await;
+        assert!(!ok, "configured request timeout must expire");
+        assert_eq!(
+            BmcAccess::default_stub().default_request_timeout_secs(),
+            DEFAULT_TIMEOUT_SECS
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_upload_timeout_overrides_the_legacy_upload_argument() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/upload"))
+            .respond_with(
+                ResponseTemplate::new(202)
+                    .set_body_json(json!({"Id": "Task-1"}))
+                    .set_delay(Duration::from_secs(2)),
+            )
+            .mount(&server)
+            .await;
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), b"firmware").unwrap();
+        let mut access = BmcAccess::mock_with_base_url(server.uri(), "mock");
+        access.compute_timing = Some(crate::compute_timing::ComputeFirmwareTiming {
+            upload_timeout: Duration::from_secs(1),
+            ..crate::compute_timing::ComputeFirmwareTiming::default()
+        });
+        let (ok, _) = access
+            .multipart_file_upload_with_options(
+                "/upload",
+                file.path().to_str().unwrap(),
+                None,
+                30,
+                Some(r#"{"Targets":[]}"#),
+                None,
+                None,
+                None,
+                false,
+                MultipartUploadOptions {
+                    bail_on_failure: false,
+                },
+            )
+            .await;
+        assert!(
+            !ok,
+            "profile timeout must replace the legacy 30-second argument"
+        );
+    }
+
+    #[tokio::test]
     async fn multipart_upload_default_order_sends_update_parameters_first() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -4385,6 +5282,49 @@ mod tests {
         assert!(
             multipart_field_position(body, "UpdateParameters")
                 < multipart_field_position(body, "UpdateFile")
+        );
+    }
+
+    #[tokio::test]
+    async fn multipart_upload_uses_session_token_auth() {
+        // Firmware updates on session-token-authenticated targets (GB200/
+        // GB300/HGX compute) go through this multipart path, not the legacy
+        // login-cookie binary-upload path -- confirm apply_auth's session-
+        // token branch is actually reached here, not just Basic auth.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/upload"))
+            .and(header("X-Auth-Token", "session-token"))
+            .respond_with(ResponseTemplate::new(202).set_body_json(json!({"Id": "Task-1"})))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let update_file = tmp.path().join("fw.fwpkg");
+        tokio::fs::write(&update_file, b"firmware").await.unwrap();
+
+        let mut access = BmcAccess::mock_with_base_url(server.uri(), "mock");
+        access.user = BMC_SESSION_TOKEN_USER.to_owned();
+        access.password = "session-token".to_owned();
+
+        let (status, _) = access
+            .multipart_file_upload(
+                "/upload",
+                update_file.to_str().unwrap(),
+                None,
+                30,
+                None,
+                None,
+                None,
+                None,
+                false,
+            )
+            .await;
+
+        assert!(
+            status,
+            "multipart upload should succeed with a session token"
         );
     }
 
@@ -4424,6 +5364,555 @@ mod tests {
         let output = writer.contents();
         assert!(output.contains("multipart update URI must stay on the selected target origin"));
         assert!(!output.contains("Failed to read package file"));
+    }
+
+    /// Write a throwaway firmware file and dispatch it through `dispatch_post_async`.
+    async fn dispatch_test_upload(access: &BmcAccess, upload_url: &str) -> bool {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let update_file = temp_dir.path().join("fw.bin");
+        tokio::fs::write(&update_file, b"firmware").await.unwrap();
+
+        let (success, _) = access
+            .dispatch_post_async(
+                upload_url,
+                Some(&Value::String(update_file.to_string_lossy().into_owned())),
+                None,
+                30,
+                None,
+            )
+            .await;
+        success
+    }
+
+    #[tokio::test]
+    async fn binary_upload_uses_supplied_session_token_without_login() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/upload"))
+            .and(header("X-Auth-Token", "session-token"))
+            .respond_with(ResponseTemplate::new(202).set_body_json(json!({"Id": "Task-1"})))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut access = BmcAccess::mock_with_base_url(server.uri(), "mock");
+        access.user = BMC_SESSION_TOKEN_USER.to_owned();
+        access.password = "session-token".to_owned();
+
+        assert!(dispatch_test_upload(&access, &format!("{}/upload", server.uri())).await);
+
+        let requests = server.received_requests().await.unwrap();
+
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].url.path(), "/upload");
+    }
+
+    #[tokio::test]
+    async fn binary_upload_extracts_session_cookie_with_non_word_characters() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/login"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Set-Cookie", "SESSION=abc-123=xyz; Path=/; HttpOnly"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/upload"))
+            .and(header("X-Auth-Token", "abc-123=xyz"))
+            .respond_with(ResponseTemplate::new(202).set_body_json(json!({"Id": "Task-1"})))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let access = BmcAccess::mock_with_base_url(server.uri(), "mock");
+
+        assert!(
+            dispatch_test_upload(&access, &format!("{}/upload", server.uri())).await,
+            "upload should succeed with a non-word session id"
+        );
+    }
+
+    #[tokio::test]
+    async fn binary_upload_fails_closed_when_login_response_has_no_session_cookie() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/login"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // A mock that expects zero calls fails the test if /upload is ever
+        // reached, proving the upload is never sent without a session token.
+        Mock::given(method("POST"))
+            .and(path("/upload"))
+            .respond_with(ResponseTemplate::new(202))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let access = BmcAccess::mock_with_base_url(server.uri(), "mock");
+
+        assert!(
+            !dispatch_test_upload(&access, &format!("{}/upload", server.uri())).await,
+            "upload must fail closed when no session cookie is returned"
+        );
+    }
+
+    #[tokio::test]
+    async fn binary_upload_fails_closed_when_session_cookie_is_empty() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/login"))
+            .respond_with(
+                ResponseTemplate::new(200).insert_header("Set-Cookie", "SESSION=; Path=/"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/upload"))
+            .respond_with(ResponseTemplate::new(202))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let access = BmcAccess::mock_with_base_url(server.uri(), "mock");
+
+        assert!(
+            !dispatch_test_upload(&access, &format!("{}/upload", server.uri())).await,
+            "an empty SESSION cookie value must be treated as no cookie"
+        );
+    }
+
+    #[tokio::test]
+    async fn binary_upload_fails_closed_when_login_request_errors() {
+        // The upload target is a live server with a deny-mock, so the test
+        // fails if the upload is ever sent. The login target (base_url) is a
+        // bound-then-closed port, so the login POST fails at the transport
+        // layer (connection refused) rather than returning a status.
+        let upload_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/upload"))
+            .respond_with(ResponseTemplate::new(202))
+            .expect(0)
+            .mount(&upload_server)
+            .await;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let login_base_url = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+
+        let access = BmcAccess::mock_with_base_url(login_base_url, "mock");
+
+        assert!(
+            !dispatch_test_upload(&access, &format!("{}/upload", upload_server.uri())).await,
+            "a transport-level login failure must not fall through to an unauthenticated upload"
+        );
+    }
+
+    #[tokio::test]
+    async fn multipart_submission_diagnostics_preserve_failure_context() {
+        let _guard = crate::utils::SanitizeTestGuard::new();
+        for (status_code, body, category) in [
+            (
+                409,
+                r#"{"error":{"Message":"busy","password":"secret-value"}}"#,
+                "http_rejection",
+            ),
+            (503, "unavailable password=secret-value", "http_rejection"),
+            (202, "not-json password=secret-value", "json_decode_failure"),
+            (202, "{}", "missing_task_reference"),
+            (202, r#"{"Id":""}"#, "malformed_task_reference"),
+            (202, r#"{"Id":"42"}"#, "accepted"),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/upload"))
+                .respond_with(
+                    ResponseTemplate::new(status_code)
+                        .insert_header("Retry-After", "30")
+                        .insert_header("Set-Cookie", "session=private-cookie")
+                        .insert_header("Location", "https://bmc/redfish/v1/foo?token=header-secret")
+                        .set_body_string(body),
+                )
+                .mount(&server)
+                .await;
+            let tmp = tempfile::tempdir().unwrap();
+            let file = tmp.path().join("fw.fwpkg");
+            tokio::fs::write(&file, b"firmware").await.unwrap();
+            let output = Mutex::new(json!({"Error": [], "Error Code": 0, "Output": [
+                {"SubmissionDiagnostic": {"category":"http_rejection", "http_status":503, "target_index":7}}
+            ]}));
+            let access = BmcAccess::mock_with_base_url(server.uri(), "mock");
+            let (success, _) = access
+                .multipart_file_upload_with_options(
+                    "/upload",
+                    file.to_str().unwrap(),
+                    None,
+                    30,
+                    None,
+                    None,
+                    None,
+                    Some(&output),
+                    false,
+                    MultipartUploadOptions {
+                        bail_on_failure: false,
+                    },
+                )
+                .await;
+            let output = output.into_inner().unwrap();
+            assert_eq!(
+                success,
+                matches!(
+                    category,
+                    "accepted" | "missing_task_reference" | "malformed_task_reference"
+                ),
+                "HTTP/JSON success contract changed for {category}"
+            );
+            assert_eq!(
+                output["Output"][0]["SubmissionDiagnostic"],
+                json!({
+                    "category":"http_rejection", "http_status":503, "target_index":7
+                })
+            );
+            if category == "accepted" {
+                assert_eq!(output["Output"].as_array().unwrap().len(), 1);
+            } else {
+                assert_eq!(output["Output"].as_array().unwrap().len(), 2);
+                let diagnostic = &output["Output"][1]["SubmissionDiagnostic"];
+                assert_eq!(diagnostic["category"], category);
+                assert_eq!(diagnostic["http_status"], status_code);
+                assert_eq!(diagnostic["headers"]["retry-after"], "30");
+                assert_eq!(
+                    diagnostic["headers"]["location"],
+                    "https://bmc/redfish/v1/foo?token=XXXX"
+                );
+                let rendered = diagnostic.to_string();
+                assert!(!rendered.contains("secret-value"));
+                assert!(!rendered.contains("private-cookie"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn multipart_submission_history_survives_success_and_later_failure() {
+        let _guard = crate::utils::SanitizeTestGuard::new();
+        let server = MockServer::start().await;
+        for (route, status, response) in [
+            ("/first", 409, json!({"error":{"Message":"first busy"}})),
+            ("/success", 202, json!({"Id":"42"})),
+            ("/second", 503, json!({"error":{"Message":"second busy"}})),
+        ] {
+            Mock::given(method("POST"))
+                .and(path(route))
+                .respond_with(ResponseTemplate::new(status).set_body_json(response))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let package = tmp.path().join("fw.fwpkg");
+        tokio::fs::write(&package, b"firmware").await.unwrap();
+        let access = BmcAccess::mock_with_base_url(server.uri(), "mock");
+        let output = Mutex::new(json!({"Error": [], "Error Code": 0, "Output": []}));
+        for (route, expected_success, expected_count) in [
+            ("/first", false, 1),
+            ("/success", true, 1),
+            ("/second", false, 2),
+        ] {
+            let (success, response) = access
+                .multipart_file_upload_with_options(
+                    route,
+                    package.to_str().unwrap(),
+                    None,
+                    30,
+                    None,
+                    None,
+                    None,
+                    Some(&output),
+                    false,
+                    MultipartUploadOptions {
+                        bail_on_failure: false,
+                    },
+                )
+                .await;
+            assert_eq!(success, expected_success);
+            let mut output = output.lock().unwrap();
+            assert_eq!(output["Output"].as_array().unwrap().len(), expected_count);
+            if route == "/first" {
+                assert_eq!(response["error"]["Message"], "first busy");
+                output["Output"][0]["SubmissionDiagnostic"]["target_index"] = json!(7);
+            }
+            assert_eq!(
+                output["Output"][0]["SubmissionDiagnostic"]["http_status"],
+                409
+            );
+            assert_eq!(
+                output["Output"][0]["SubmissionDiagnostic"]["target_index"],
+                7
+            );
+            if route == "/second" {
+                assert_eq!(response["error"]["Message"], "second busy");
+                assert_eq!(
+                    output["Output"][1]["SubmissionDiagnostic"]["http_status"],
+                    503
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn multipart_submission_truncation_matches_the_redacted_body() {
+        let _guard = crate::utils::SanitizeTestGuard::new();
+        let server = MockServer::start().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let package = tmp.path().join("fw.fwpkg");
+        tokio::fs::write(&package, b"firmware").await.unwrap();
+        for (index, (body, password, expected_cut, expected_chars)) in [
+            ("1.1.1.1 ".repeat(520), "secret", false, 2600),
+            ("1.1.1.1 ".repeat(1200), "secret", true, 4096),
+            ("x ".repeat(1200), "x", true, 4096),
+            ("é".repeat(4096), "secret", false, 4096),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let route = format!("/upload-{index}");
+            Mock::given(method("POST"))
+                .and(path(route.as_str()))
+                .respond_with(ResponseTemplate::new(503).set_body_string(body))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let mut access = BmcAccess::mock_with_base_url(server.uri(), "mock");
+            access.password = password.to_string();
+            let output = Mutex::new(json!({"Error": [], "Error Code": 0, "Output": []}));
+            let (success, _) = access
+                .multipart_file_upload_with_options(
+                    &route,
+                    package.to_str().unwrap(),
+                    None,
+                    30,
+                    None,
+                    None,
+                    None,
+                    Some(&output),
+                    false,
+                    MultipartUploadOptions {
+                        bail_on_failure: false,
+                    },
+                )
+                .await;
+            assert!(!success);
+            let output = output.into_inner().unwrap();
+            let diagnostic = &output["Output"][0]["SubmissionDiagnostic"];
+            assert_eq!(diagnostic["body_truncated"], expected_cut, "case {index}");
+            assert_eq!(
+                diagnostic["body"].as_str().unwrap().chars().count(),
+                expected_chars,
+                "case {index}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn multipart_submission_retains_truncated_body_and_read_failures() {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+        let _guard = crate::utils::SanitizeTestGuard::new();
+        for broken_body in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut reader = BufReader::new(stream);
+                let mut content_length = None;
+                loop {
+                    let mut line = String::new();
+                    assert_ne!(reader.read_line(&mut line).await.unwrap(), 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':') {
+                        if name.eq_ignore_ascii_case("content-length") {
+                            content_length = Some(value.trim().parse::<u64>().unwrap());
+                        }
+                    }
+                }
+                // Consume the complete multipart body before closing the socket.
+                // A single read can leave unread request bytes and cause a reset.
+                let length = content_length.expect("multipart request has a known length");
+                let mut request_body = Vec::new();
+                (&mut reader)
+                    .take(length)
+                    .read_to_end(&mut request_body)
+                    .await
+                    .unwrap();
+                assert_eq!(request_body.len() as u64, length);
+                assert!(request_body.len() > 8192);
+                let mut stream = reader.into_inner();
+                let body = if broken_body {
+                    "short".to_string()
+                } else {
+                    "é".repeat(5000)
+                };
+                let length = if broken_body {
+                    body.len() + 100
+                } else {
+                    body.len()
+                };
+                let response = format!("HTTP/1.1 503 Unavailable\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n{body}");
+                stream.write_all(response.as_bytes()).await.unwrap();
+                stream.shutdown().await.unwrap();
+            });
+            let tmp = tempfile::tempdir().unwrap();
+            let file = tmp.path().join("fw.fwpkg");
+            tokio::fs::write(&file, b"firmware".repeat(4096))
+                .await
+                .unwrap();
+            let output = Mutex::new(json!({"Error": [], "Error Code": 0, "Output": []}));
+            let access = BmcAccess::mock_with_base_url(format!("http://{address}"), "mock");
+            let (success, _) = access
+                .multipart_file_upload_with_options(
+                    "/upload",
+                    file.to_str().unwrap(),
+                    None,
+                    30,
+                    None,
+                    None,
+                    None,
+                    Some(&output),
+                    false,
+                    MultipartUploadOptions {
+                        bail_on_failure: false,
+                    },
+                )
+                .await;
+            server.await.unwrap();
+            assert!(!success);
+            let output = output.into_inner().unwrap();
+            let diagnostic = &output["Output"][0]["SubmissionDiagnostic"];
+            assert_eq!(diagnostic["http_status"], 503);
+            if broken_body {
+                assert_eq!(diagnostic["category"], "response_read_failure");
+            } else {
+                assert_eq!(diagnostic["category"], "http_rejection");
+                assert_eq!(diagnostic["body_truncated"], true);
+                assert_eq!(diagnostic["body"].as_str().unwrap().chars().count(), 4096);
+            }
+        }
+    }
+
+    #[test]
+    fn submission_text_masks_target_credentials_after_global_config_changes() {
+        let _guard = crate::utils::SanitizeTestGuard::new();
+        let mut access = BmcAccess::mock_with_base_url("http://localhost".to_string(), "mock");
+        access.user = "synthetic-operator".to_string();
+        access.password = "synthetic-\"secret\\value\nend".to_string();
+        // Deterministically model another parallel worker replacing the config.
+        NvUtils::set_sanitize_config(Some(HashMap::from([
+            ("user".to_string(), "other-operator".to_string()),
+            ("password".to_string(), "other-secret".to_string()),
+        ])));
+        for sanitize in [true, false] {
+            NvUtils::set_is_sanitize(sanitize);
+            for value in [
+                format!("Echoed {} for {}", access.password, access.user),
+                json!({"Message": format!("Echoed {} for {}", access.password, access.user)})
+                    .to_string(),
+                format!("{:?}", json!({"Message": access.password})),
+            ] {
+                let bounded = access.bounded_submission_text(&value, 4096);
+                assert!(!bounded.contains("synthetic-"), "{bounded}");
+                assert!(!bounded.contains("secret"), "{bounded}");
+                assert!(bounded.contains("XXXX"), "{bounded}");
+            }
+        }
+        assert_eq!(
+            bounded_submission_text(
+                "prefix-long-secret",
+                4096,
+                &["prefix", "prefix-long-secret"]
+            ),
+            "XXXX"
+        );
+        assert_eq!(
+            bounded_submission_text("secret-boundary", 3, &["secret-boundary"]),
+            "XXX"
+        );
+    }
+
+    #[tokio::test]
+    async fn multipart_submission_masks_echoed_credentials_from_its_own_target() {
+        let _guard = crate::utils::SanitizeTestGuard::new();
+        let server = MockServer::start().await;
+        let secret = "target-alpha-\"secret\\value";
+        Mock::given(method("POST"))
+            .and(path("/upload"))
+            .respond_with(
+                ResponseTemplate::new(409)
+                    .insert_header("x-request-id", "echoed-target-alpha-operator")
+                    .set_body_json(json!({
+                        "error": {"Message": format!("Echoed {secret}")},
+                        (secret): "unlabelled key echo",
+                    })),
+            )
+            .mount(&server)
+            .await;
+        let tmp = tempfile::tempdir().unwrap();
+        let package = tmp.path().join("fw.fwpkg");
+        tokio::fs::write(&package, b"firmware").await.unwrap();
+        let mut access = BmcAccess::mock_with_base_url(server.uri(), "mock");
+        access.user = "target-alpha-operator".to_string();
+        access.password = secret.to_string();
+        NvUtils::set_sanitize_config(Some(HashMap::from([(
+            "password".to_string(),
+            "target-beta-secret".to_string(),
+        )])));
+        let output = Mutex::new(json!({"Error": [], "Error Code": 0, "Output": []}));
+        let (success, response) = access
+            .multipart_file_upload_with_options(
+                "/upload",
+                package.to_str().unwrap(),
+                None,
+                30,
+                None,
+                None,
+                None,
+                Some(&output),
+                false,
+                MultipartUploadOptions {
+                    bail_on_failure: false,
+                },
+            )
+            .await;
+        assert!(!success);
+        assert!(!response.to_string().contains("target-alpha"));
+        let output = output.into_inner().unwrap();
+        let diagnostic = &output["Output"][0]["SubmissionDiagnostic"];
+        assert_eq!(diagnostic["category"], "http_rejection");
+        assert_eq!(diagnostic["headers"]["x-request-id"], "echoed-XXXX");
+        let body = diagnostic["body"].as_str().unwrap();
+        assert!(body.contains("Echoed XXXX"), "{body}");
+        assert!(!output.to_string().contains("target-alpha"));
+    }
+
+    #[test]
+    fn submission_text_is_redacted_before_unicode_safe_truncation() {
+        let _guard = crate::utils::SanitizeTestGuard::new();
+        let value = format!("password={} end", "secret".repeat(1000));
+        let bounded = bounded_submission_text(&value, 64, &[]);
+        assert!(!bounded.contains("secret"));
+        assert!(bounded.chars().count() <= 64);
+        assert_eq!(
+            bounded_submission_text(&"é".repeat(5000), 4096, &[])
+                .chars()
+                .count(),
+            4096
+        );
     }
 
     #[tokio::test]
@@ -4469,7 +5958,7 @@ mod tests {
         assert!(!status);
         assert!(response.is_null());
         let output = writer.contents();
-        assert!(output.contains("Could not decode update response body"));
+        assert!(output.contains("json_decode_failure"));
         assert!(output.contains("not-json"));
         assert!(output.contains("202"));
     }
@@ -4759,6 +6248,47 @@ mod tests {
         assert_eq!(err_code, 0);
         assert_eq!(inventory[uri]["Name"], "HostBMC_0");
         assert_eq!(inventory[uri]["Version"], "00.00.27");
+    }
+
+    #[tokio::test]
+    async fn redfish_inventory_uses_complete_oem_embedded_inventory_with_missing_versions() {
+        let server = MockServer::start().await;
+        let uri = "/redfish/v1/UpdateService/FirmwareInventory/HGX_FW_NVSwitch_0";
+        Mock::given(method("GET"))
+            .and(path("/redfish/v1/UpdateService/FirmwareInventory"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Members": [{"@odata.id": uri}],
+                "Oem": {
+                    "Ami": {
+                        "FirmwareInventory": [{
+                            "DataSourceUri": uri,
+                            "Name": "HGX_FW_NVSwitch_0"
+                        }]
+                    }
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(uri))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Id": "HGX_FW_NVSwitch_0",
+                "Version": "should-not-fetch"
+            })))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let access = BmcAccess::mock_with_base_url(server.uri(), "mock");
+        let (status, err_code, inventory) = access
+            .get_firmware_inventory(TraceFlags::default(), None, None)
+            .await;
+
+        assert!(status);
+        assert_eq!(err_code, 0);
+        assert_eq!(inventory[uri]["Name"], "HGX_FW_NVSwitch_0");
+        assert_eq!(inventory[uri]["Version"], "");
     }
 
     #[tokio::test]
@@ -5059,6 +6589,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn redfish_inventory_adds_undiscoverable_liteon_powerunits_for_pf_1114_1rd() {
+        let server = MockServer::start().await;
+        let uri = "/redfish/v1/UpdateService/FirmwareInventory/FW_PMC_0";
+        Mock::given(method("GET"))
+            .and(path("/redfish/v1/UpdateService/FirmwareInventory"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Members": [{"@odata.id": uri}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(uri))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Id": "FW_PMC_0",
+                "Version": "1.0.0"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // FirmwareInventory does not link to PowerUnits; probe the fixed URI.
+        let powerunit_uri =
+            "/redfish/v1/Chassis/powershelf/Power/Oem/LiteOn/PowerUnits/powerdevice1";
+        Mock::given(method("GET"))
+            .and(path(
+                "/redfish/v1/Chassis/powershelf/Power/Oem/LiteOn/PowerUnits",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Members": [{"@odata.id": powerunit_uri}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(powerunit_uri))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Model": "SP-2183-1RD",
+                "Version": "0x6 / 0x6"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut access = BmcAccess::mock_with_base_url(server.uri(), "mock-vr-liteon");
+        access.servertype = "powershelf".to_string();
+        access.model = "PF-1114-1RD".to_string();
+        let (status, err_code, inventory) = access
+            .get_firmware_inventory(TraceFlags::default(), None, None)
+            .await;
+
+        assert!(status);
+        assert_eq!(err_code, 0);
+        assert_eq!(inventory[uri]["Version"], "1.0.0");
+        assert_eq!(inventory[powerunit_uri]["Version"], "0x6 / 0x6");
+    }
+
+    #[tokio::test]
     async fn redfish_inventory_adds_liteon_powerunits_for_liteon_model() {
         let server = MockServer::start().await;
         let inventory_uri = "/redfish/v1/UpdateService/FirmwareInventory/FW_PMC_0";
@@ -5115,6 +6702,7 @@ mod tests {
 
     #[test]
     fn test_get_bmc_access_invalid_args() {
+        let _guard = crate::utils::SanitizeTestGuard::new();
         let trace = TraceFlags::default();
         let args = vec!["invalid_no_equals".to_string()];
         let result = BmcAccess::get_bmc_access_sync(&args, trace, None);
@@ -5189,6 +6777,7 @@ mod tests {
 
     #[test]
     fn test_get_bmc_access_nvos_deprecated() {
+        let _guard = crate::utils::SanitizeTestGuard::new();
         let trace = TraceFlags::default();
         let args = vec![
             "ip=10.0.0.1".to_string(),
@@ -5205,6 +6794,161 @@ mod tests {
     fn test_switch_server_types() {
         for st in SWITCH_SERVER_TYPES {
             assert!(["gb200switch", "gb300switch", "vrnvl72switch"].contains(st));
+        }
+    }
+
+    /// Verifies the intentional security guard in `is_reachable_redfish_async`:
+    /// when HTTPS fails and the access uses a session token, the HTTP fallback
+    /// must NOT be attempted so the token is never sent over plaintext.
+    ///
+    /// If the guard were removed, the HTTP fallback would also fail (port 1 is
+    /// unreachable), but it would return "Failed to connect to the system"
+    /// instead of the session-token-specific "Connection Error:" message --
+    /// so the assertion pins the exact early-return branch.
+    #[tokio::test]
+    async fn session_token_skips_http_fallback_on_https_failure() {
+        // Port 1 is refused immediately by the OS -- no timeout wait.
+        let mut access = BmcAccess::mock_with_base_url("https://127.0.0.1:1", "127.0.0.1");
+        access.user = BMC_SESSION_TOKEN_USER.to_owned();
+        access.password = "test-token".to_owned();
+
+        let (ok, message) = access.is_reachable(TraceFlags::default()).await;
+
+        assert!(!ok);
+        assert!(
+            message.contains("Connection Error:") && !message.contains("TLS certificate"),
+            "session token guard should fire with connection-error message before HTTP fallback; got: {message:?}"
+        );
+    }
+
+    /// Session token must appear on every Redfish GET in the firmware-inventory
+    /// chain, including the collection fetch and each per-member fetch.  If any
+    /// request is sent with Basic auth instead of `X-Auth-Token`, the
+    /// header-matcher mocks below will not match and wiremock returns 404,
+    /// causing the inventory retrieval to fail and the assertions to trip.
+    #[tokio::test]
+    async fn session_token_propagates_through_get_firmware_inventory() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/redfish/v1/UpdateService/FirmwareInventory"))
+            .and(header("X-Auth-Token", "inv-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "Members": [
+                    {"@odata.id": "/redfish/v1/UpdateService/FirmwareInventory/FW_BMC_0"}
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/redfish/v1/UpdateService/FirmwareInventory/FW_BMC_0"))
+            .and(header("X-Auth-Token", "inv-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "Id": "FW_BMC_0",
+                "Name": "BMC Firmware",
+                "Version": "2.0.0"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut access = BmcAccess::mock_with_base_url(server.uri(), "mock");
+        access.user = BMC_SESSION_TOKEN_USER.to_owned();
+        access.password = "inv-token".to_owned();
+
+        let (ok, err_code, inventory) = access
+            .get_firmware_inventory(TraceFlags::default(), None, None)
+            .await;
+
+        assert!(
+            ok,
+            "inventory retrieval should succeed when session token is forwarded"
+        );
+        assert_eq!(err_code, 0);
+        assert!(
+            inventory.contains_key("/redfish/v1/UpdateService/FirmwareInventory/FW_BMC_0"),
+            "inventory map should contain the mocked component key"
+        );
+    }
+
+    #[tokio::test]
+    async fn observe_nvue_get_classifies_every_answered_read() {
+        let server = MockServer::start().await;
+        let cases = [
+            (
+                "/nvue_v1/readable",
+                200,
+                r#"{"state":"action_success"}"#,
+                ObservedRead::Readable(json!({"state": "action_success"})),
+            ),
+            (
+                "/nvue_v1/answered-json",
+                503,
+                r#"{"status":"error"}"#,
+                ObservedRead::Answered(json!({"status": "error"})),
+            ),
+            (
+                "/nvue_v1/unparsed-success",
+                200,
+                "not json at all",
+                ObservedRead::answered_unparsed(),
+            ),
+            (
+                "/nvue_v1/unparsed-error",
+                503,
+                "<html>503</html>",
+                ObservedRead::answered_unparsed(),
+            ),
+        ];
+
+        for (case_path, status, body, _) in &cases {
+            Mock::given(method("GET"))
+                .and(path(*case_path))
+                .respond_with(ResponseTemplate::new(*status).set_body_string(*body))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+
+        let access = BmcAccess::mock_with_base_url_and_type(
+            server.uri(),
+            "mock-switch",
+            AccessType::NVSwitch,
+        );
+
+        for (case_path, status, _, expected) in &cases {
+            let observed = access.observe_nvue_get(case_path, 5).await;
+
+            assert_eq!(
+                &observed, expected,
+                "unexpected outcome for HTTP {status} at {case_path}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn observe_nvue_get_reports_a_missing_response_with_its_cause() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/nvue_v1/no-answer"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(5)))
+            .mount(&server)
+            .await;
+
+        let access = BmcAccess::mock_with_base_url_and_type(
+            server.uri(),
+            "mock-switch",
+            AccessType::NVSwitch,
+        );
+
+        match access.observe_nvue_get("/nvue_v1/no-answer", 1).await {
+            ObservedRead::NoResponse(cause) => assert!(
+                !cause.is_empty(),
+                "a missing response must carry its transport cause"
+            ),
+            other => panic!("a read that times out must not look answered: {other:?}"),
         }
     }
 }

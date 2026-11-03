@@ -53,8 +53,7 @@ impl NvidiaGb300Compute {
     }
 
     fn nvfwupd_target_config(&self) -> nvfwupd::workflow::TargetConfig {
-        self.inner
-            .nvfwupd_target_config_for(NodeType::ComputeGb300Nvidia)
+        self.inner.nvfwupd_target_config()
     }
 
     /// Runs preparation and firmware update under the inherited operation lock.
@@ -80,13 +79,16 @@ impl NvidiaGb300Compute {
         let expected_inventory = self
             .expected_inventory_policy()
             .map(|policy| policy.ap_names.as_ref().to_vec());
-        let outcome = nvfwupd::workflow_api::update_firmware_with_expected_inventory(
-            self.nvfwupd_target_config(),
-            request,
-            expected_inventory,
-        )
-        .await
-        .map_err(nvfwupd_adapter::map_error)?;
+        let outcome = self
+            .inner
+            .firmware_workflow()
+            .update_firmware_with_expected_inventory(
+                self.nvfwupd_target_config(),
+                request,
+                expected_inventory,
+            )
+            .await
+            .map_err(nvfwupd_adapter::map_error)?;
 
         Ok(nvfwupd_adapter::map_outcome(outcome))
     }
@@ -131,7 +133,10 @@ impl Node for NvidiaGb300Compute {
         let _op_guard = self.inner.op_lock.lock().await;
 
         tracing::debug!(node = %self.id(), "get_firmware_inventory");
-        let inventory = nvfwupd::workflow_api::get_firmware_inventory(self.nvfwupd_target_config())
+        let inventory = self
+            .inner
+            .firmware_workflow()
+            .get_firmware_inventory(self.nvfwupd_target_config())
             .await
             .map_err(nvfwupd_adapter::map_error)?;
         Ok(inventory
@@ -148,12 +153,17 @@ impl Node for NvidiaGb300Compute {
 
         tracing::info!(node = %self.id(), "verify_firmware_package_versions via NVFWUPD GB300");
         let targets = nvfwupd_adapter::to_version_check_targets(targets);
-        let summary = nvfwupd::workflow_api::verify_firmware_target_versions(
-            self.nvfwupd_target_config(),
-            targets,
-        )
-        .await
-        .map_err(nvfwupd_adapter::map_error)?;
+        let summary = self
+            .inner
+            .firmware_workflow()
+            .verify_firmware_target_versions_after_activation_with_expected_inventory(
+                self.nvfwupd_target_config(),
+                targets,
+                self.expected_inventory_policy()
+                    .map(|policy| policy.ap_names.as_ref().to_vec()),
+            )
+            .await
+            .map_err(nvfwupd_adapter::map_error)?;
         Ok(nvfwupd_adapter::map_version_check_summary(summary))
     }
 
@@ -189,7 +199,10 @@ impl Node for NvidiaGb300Compute {
         let _op_guard = self.inner.op_lock.lock().await;
 
         tracing::debug!(node = %self.id(), task_id, "poll_firmware_task via NVFWUPD GB300");
-        let status = nvfwupd::workflow_api::get_task_status(self.nvfwupd_target_config(), task_id)
+        let status = self
+            .inner
+            .firmware_workflow()
+            .get_task_status(self.nvfwupd_target_config(), task_id)
             .await
             .map_err(nvfwupd_adapter::map_error)?;
         Ok(nvfwupd_adapter::to_task_status(status))
@@ -203,10 +216,12 @@ impl Node for NvidiaGb300Compute {
 
         tracing::info!(node = %self.id(), "activate_firmware via NVFWUPD GB300");
         let request = nvfwupd_adapter::to_activation_request(request);
-        let summary =
-            nvfwupd::workflow_api::activate_firmware(self.nvfwupd_target_config(), request)
-                .await
-                .map_err(nvfwupd_adapter::map_error)?;
+        let summary = self
+            .inner
+            .firmware_workflow()
+            .activate_firmware(self.nvfwupd_target_config(), request)
+            .await
+            .map_err(nvfwupd_adapter::map_error)?;
         Ok(nvfwupd_adapter::map_activation_summary(summary))
     }
 
@@ -241,6 +256,8 @@ mod tests {
             )),
             host_endpoint: None,
             expected_inventory: None,
+            recovery: None,
+            runtime_config: None,
         }
     }
 
@@ -276,6 +293,8 @@ mod tests {
             component: "BMC".to_owned(),
             firmware_file: "firmware.bin".to_owned(),
             expected_version: None,
+            resolution: None,
+            linkx_policy: None,
         };
 
         let error = compute

@@ -21,7 +21,7 @@ pub mod http_client;
 /// nv-redfish client support.
 pub mod redfish_client;
 
-/// SSH and SFTP transport client support.
+/// SSH, SCP, and SFTP transport client support.
 pub mod ssh;
 
 /// Backward-compatible SSH client module path.

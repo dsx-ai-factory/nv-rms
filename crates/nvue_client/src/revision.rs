@@ -31,6 +31,8 @@ pub const STATE_APPLY: &str = "apply";
 pub const STATE_SAVE: &str = "save";
 /// Revision state observed after successful apply.
 pub const STATE_APPLIED: &str = "applied";
+/// Revision state observed when NVUE applied and saved a revision in one step.
+pub const STATE_APPLIED_AND_SAVED: &str = "applied_and_saved";
 /// Failed revision state.
 pub const STATE_FAILED: &str = "failed";
 /// Error revision state.
@@ -207,6 +209,9 @@ pub enum RevisionApplyStatus {
     /// Revision reached the applied state.
     Applied,
 
+    /// Revision was applied and already persisted to startup config by NVUE.
+    AppliedAndSaved,
+
     /// NVUE reported an idempotent apply with no config diff.
     NoConfigDiff,
 
@@ -246,6 +251,11 @@ impl RevisionResponse {
         self.state(revision_id) == Some(STATE_APPLIED)
     }
 
+    /// Return true when NVUE applied and saved the revision itself.
+    pub fn is_applied_and_saved(&self, revision_id: &str) -> bool {
+        self.state(revision_id) == Some(STATE_APPLIED_AND_SAVED)
+    }
+
     /// Return true when the revision is failed, errored, or invalid.
     pub fn is_failed(&self, revision_id: &str) -> bool {
         matches!(
@@ -278,6 +288,12 @@ impl RevisionResponse {
 
         if self.is_applied(revision_id) {
             return RevisionApplyStatus::Applied;
+        }
+
+        // A definitive applied-and-saved state outranks the no-config-diff
+        // issue-string heuristic below.
+        if self.is_applied_and_saved(revision_id) {
+            return RevisionApplyStatus::AppliedAndSaved;
         }
 
         if self.has_no_config_diff(revision_id) {
@@ -458,6 +474,10 @@ mod tests {
     #[test]
     fn revision_response_handles_flat_and_nested_shapes() {
         let flat: RevisionResponse = serde_json::from_str(r#"{"state":"applied"}"#).unwrap();
+
+        let applied_and_saved: RevisionResponse =
+            serde_json::from_str(r#"{"state":"applied_and_saved"}"#).unwrap();
+
         let invalid: RevisionResponse = serde_json::from_str(r#"{"state":"invalid"}"#).unwrap();
         let pending: RevisionResponse = serde_json::from_str(r#"{"state":"pending"}"#).unwrap();
 
@@ -478,6 +498,7 @@ mod tests {
         .unwrap();
 
         assert!(flat.is_applied("ignored"));
+        assert!(applied_and_saved.is_applied_and_saved("ignored"));
         assert!(invalid.is_failed("ignored"));
         assert!(nested.is_failed("rev-1"));
         assert!(nested.has_no_config_diff("rev-1"));
@@ -488,6 +509,11 @@ mod tests {
         );
 
         assert_eq!(flat.apply_status("ignored"), RevisionApplyStatus::Applied);
+
+        assert_eq!(
+            applied_and_saved.apply_status("ignored"),
+            RevisionApplyStatus::AppliedAndSaved
+        );
 
         assert_eq!(
             invalid.apply_status("ignored"),
@@ -507,6 +533,53 @@ mod tests {
         assert_eq!(
             nested.apply_status("rev-1"),
             RevisionApplyStatus::NoConfigDiff
+        );
+    }
+
+    #[test]
+    fn applied_and_saved_is_a_terminal_success() {
+        let flat: RevisionResponse =
+            serde_json::from_str(r#"{"state":"applied_and_saved"}"#).unwrap();
+        let nested: RevisionResponse =
+            serde_json::from_str(r#"{"4":{"state":"applied_and_saved"}}"#).unwrap();
+
+        // NVUE reports a combined state rather than plain `applied`, which must
+        // not be mistaken for a still-pending or failed revision.
+        assert!(!flat.is_applied("ignored"));
+        assert!(!flat.is_failed("ignored"));
+        assert!(flat.is_applied_and_saved("ignored"));
+        assert!(nested.is_applied_and_saved("4"));
+
+        assert_eq!(
+            flat.apply_status("ignored"),
+            RevisionApplyStatus::AppliedAndSaved
+        );
+        assert_eq!(
+            nested.apply_status("4"),
+            RevisionApplyStatus::AppliedAndSaved
+        );
+    }
+
+    #[test]
+    fn applied_and_saved_outranks_no_config_diff_issue() {
+        let response: RevisionResponse = serde_json::from_str(
+            r#"{
+                "4": {
+                    "state": "applied_and_saved",
+                    "transition": {
+                        "issue": {
+                            "msg": "config apply executed with no config diff"
+                        }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert!(response.has_no_config_diff("4"));
+        assert_eq!(
+            response.apply_status("4"),
+            RevisionApplyStatus::AppliedAndSaved
         );
     }
 }

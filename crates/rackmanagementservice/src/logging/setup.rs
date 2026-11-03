@@ -15,12 +15,15 @@
  * limitations under the License.
  */
 
+use crate::config::RmsTracingConfig;
 use crate::logging::logfmt;
+use crate::observability::internal_logs::otlp_internal_metrics_layer;
+use crate::observability::tracing::{TracingGuard, build_tracer, should_export};
 use eyre::WrapErr;
-use tracing_subscriber::filter::{EnvFilter, LevelFilter};
+use tracing_subscriber::Layer;
+use tracing_subscriber::filter::{self, EnvFilter, FilterExt as _, LevelFilter};
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::{Layer, reload};
 
 pub fn dep_log_filter(env_filter: EnvFilter) -> EnvFilter {
     const DEPS: &str = "sqlxmq::runner=warn,sqlx::query=warn,\
@@ -52,32 +55,50 @@ pub fn dep_log_filter(env_filter: EnvFilter) -> EnvFilter {
 /// Defaults to false: assuming a logging collector adds its own timestamps,
 /// this is disabled to prevent duplicate timestamp fields. If no logging
 /// collector is being used, set it true to output timestamps natively.
+///
+/// `tracing_config` controls OpenTelemetry sampling, bounded batching, and the
+/// optional OTLP exporter. Trace sampling is independent of stdout log levels.
+/// The returned guard must be retained until after request and job shutdown.
 pub fn setup_logging(
     extra_logfmt_event_fields: Vec<String>,
     log_filter: Option<&str>,
     enable_timestamps: bool,
-) -> eyre::Result<()> {
+    tracing_config: &RmsTracingConfig,
+) -> eyre::Result<TracingGuard> {
     let log_level = LevelFilter::INFO.into();
 
-    // We set up some global filtering using `tracing`s `EnvFilter` framework
-    // The global filter will apply to all `Layer`s that are added to the
-    // `logging_subscriber` later on. This means it applies for both logging to
-    // stdout as well as for OpenTelemetry integration.
-    // We ignore a lot of spans and events from 3rd party frameworks
+    // The log filter controls stdout only. Trace volume is owned separately by
+    // the approved span catalog and OpenTelemetry sampler.
     let user_directives = log_filter.map(str::trim).filter(|f| !f.is_empty());
     let initial_log_filter = EnvFilter::builder()
         .with_default_directive(log_level)
         .parse(user_directives.unwrap_or_default())?;
     let initial_log_filter = dep_log_filter(initial_log_filter);
 
-    let (logfmt_stdout_filter, _logfmt_stdout_reload_handle) =
-        reload::Layer::new(initial_log_filter.clone());
+    let span_output_filter = initial_log_filter.clone();
+    let logfmt_stdout_filter = initial_log_filter
+        .or(filter::filter_fn(|metadata| metadata.is_span()))
+        .and(filter::filter_fn(|metadata| {
+            !metadata.target().starts_with("opentelemetry")
+        }));
     let logfmt_stdout_formatter = logfmt::layer()
         .with_event_fields(extra_logfmt_event_fields)
-        .with_event_timestamps(enable_timestamps);
+        .with_event_timestamps(enable_timestamps)
+        .with_span_output_filter(span_output_filter);
+    let (tracer, tracing_guard) = build_tracer(tracing_config)?;
+    let otlp_internal_metrics = otlp_internal_metrics_layer(tracing_guard.metrics());
+    let otel_layer = tracing_opentelemetry::layer()
+        .with_tracer(tracer)
+        .with_location(false)
+        .with_threads(false)
+        .with_target(false)
+        .with_tracked_inactivity(false)
+        .with_filter(filter::filter_fn(should_export));
 
     tracing_subscriber::registry()
         .with(logfmt_stdout_formatter.with_filter(logfmt_stdout_filter))
+        .with(otlp_internal_metrics)
+        .with(otel_layer)
         .try_init()
         .wrap_err("new tracing subscriber try_init()")?;
 
@@ -90,7 +111,11 @@ pub fn setup_logging(
     }
 
     tracing::info!("Current log level: {}", LevelFilter::current());
-    Ok(())
+    tracing::info!(
+        export_enabled = tracing_guard.export_enabled(),
+        "OpenTelemetry tracing initialized"
+    );
+    Ok(tracing_guard)
 }
 
 /// Message to emit when `RUST_LOG` is present in the environment but ignored.

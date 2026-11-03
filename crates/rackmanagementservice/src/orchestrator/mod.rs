@@ -15,6 +15,8 @@
  * limitations under the License.
  */
 
+pub(crate) mod fabric_operation;
+
 pub mod job_lifecycle;
 pub mod job_tracker;
 pub mod rack_manager;

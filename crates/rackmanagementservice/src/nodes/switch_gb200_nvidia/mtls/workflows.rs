@@ -22,70 +22,71 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use nvswitch_cli::{
+    BenignReason, ClusterApp, CommandFlow, FileMode, NvConfigOperation, RemotePath, StepStatus,
+    StepSubject,
+};
+use nvue_client::system::{GNMI_SERVER_ENDPOINT, GNMI_SERVER_MTLS_ENDPOINT, MtlsConfiguration};
 use serde::Serialize;
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use crate::libnmxc::NmxcTlsConfig;
+use crate::nodes::nvos::GnmiClientCa;
 use crate::transport::http_client::HttpClient;
 use crate::transport::ssh_client::SshClient;
 use crate::utilities::error::{Result, RmsError};
 use librms::protos::rack_manager as rm;
 
-use super::super::{SwitchGb200Nvidia, config, is_valid_identifier, shell_quote};
+#[cfg(not(test))]
+use super::super::config;
+use super::super::{SwitchGb200Nvidia, is_valid_identifier};
 
 const REMOTE_TLS_ROOT: &str = "/home/admin/certs";
-const REMOTE_RUN_ID_FORMAT: &str = "%Y-%m-%d_%H-%M-%S_%3f";
-const NVUE_CA_CERTIFICATE_COLLECTION: &str = "/nvue_v1/system/security/ca-certificate";
-const NVUE_ENTITY_CERTIFICATE_COLLECTION: &str = "/nvue_v1/system/security/certificate";
-const NVUE_SYSTEM_API_PATH: &str = "/nvue_v1/system/api";
-const NVUE_SYSTEM_API_MTLS_PATH: &str = "/nvue_v1/system/api/mtls";
-const NVUE_GNMI_SERVER_PATH: &str = "/nvue_v1/system/gnmi-server";
-const NVUE_GNMI_SERVER_MTLS_PATH: &str = "/nvue_v1/system/gnmi-server/mtls";
+pub(super) const REMOTE_RUN_ID_FORMAT: &str = "%Y-%m-%d_%H-%M-%S_%3f";
+pub(super) const NVUE_CA_CERTIFICATE_COLLECTION: &str = "/nvue_v1/system/security/ca-certificate";
+pub(super) const NVUE_ENTITY_CERTIFICATE_COLLECTION: &str = "/nvue_v1/system/security/certificate";
+pub(super) const NVUE_SYSTEM_API_PATH: &str = "/nvue_v1/system/api";
+pub(super) const NVUE_SYSTEM_API_MTLS_PATH: &str = "/nvue_v1/system/api/mtls";
 const MATERIAL_STABILITY_ATTEMPTS: usize = 3;
 #[cfg(not(test))]
 const MTLS_UNSET_COMMAND_SETTLE_DELAY: Duration = Duration::from_millis(300);
 #[cfg(test)]
 const MTLS_UNSET_COMMAND_SETTLE_DELAY: Duration = Duration::ZERO;
-const CLUSTER_NOT_ENABLED_ERROR: &str = "cluster is not enabled";
-const GNMI_MTLS_CERTIFICATE_UNSET_COMMAND: &str = "nv unset system gnmi-server mtls certificate";
-const GNMI_MTLS_CA_CERTIFICATE_UNSET_COMMAND: &str =
-    "nv unset system gnmi-server mtls ca-certificate";
-
-const GNMI_MTLS_SCHEMA_ABSENT_FRAGMENTS: [&str; 2] =
-    ["'mtls' is not one of", "\"mtls\" is not one of"];
-
 #[cfg(test)]
-type TestExecFn = Arc<dyn Fn(&str) -> Result<String> + Send + Sync>;
-
-enum MtlsUnsetCommandExecutor {
-    Ssh(SshClient),
-    #[cfg(test)]
-    Test(TestExecFn),
-}
-
-impl MtlsUnsetCommandExecutor {
-    async fn exec(&self, command: &str) -> Result<String> {
-        match self {
-            Self::Ssh(ssh) => ssh.exec(command, SshClient::DEFAULT_TIMEOUT).await,
-            #[cfg(test)]
-            Self::Test(exec) => exec(command),
-        }
-    }
-}
+const CLUSTER_MANAGER_ACTION_SETTLE_DELAY: Duration = Duration::ZERO;
+#[cfg(not(test))]
+const CLUSTER_MANAGER_ACTION_SETTLE_DELAY: Duration =
+    Duration::from_secs(config::CLUSTER_MANAGER_ACTION_SETTLE_SECONDS);
 
 /// Staging directory mode: owner rwx, group/other traverse-only (no list).
 /// NVUE `file://` import reads staged PEMs via `nvued`, which may not run as
 /// `admin`; mode 0700 blocks traversal for other users even when files are 0644.
-pub const SWITCH_CERTIFICATE_REMOTE_DIR_PERMISSIONS: u32 = 0o751;
-pub const SWITCH_CERTIFICATE_PUBLIC_FILE_PERMISSIONS: u32 = 0o644;
-pub const SWITCH_CERTIFICATE_PRIVATE_KEY_PERMISSIONS: u32 = 0o400;
+// rwxr-x--x (0o751): owner full, group read+search, other search only.
+pub const SWITCH_CERTIFICATE_REMOTE_DIR_PERMISSIONS: FileMode = FileMode::builder()
+    .owner_read()
+    .owner_write()
+    .owner_execute()
+    .group_read()
+    .group_execute()
+    .other_execute()
+    .build();
+// rw-r--r-- (0o644): owner read+write, group/other read.
+pub const SWITCH_CERTIFICATE_PUBLIC_FILE_PERMISSIONS: FileMode = FileMode::builder()
+    .owner_read()
+    .owner_write()
+    .group_read()
+    .other_read()
+    .build();
+// r-------- (0o400): owner read only (private key).
+pub const SWITCH_CERTIFICATE_PRIVATE_KEY_PERMISSIONS: FileMode =
+    FileMode::builder().owner_read().build();
 
 /// Remote TLS file copied to the switch before NVUE import.
 pub(crate) struct MtlsRemoteFileSpec<'a> {
     pub remote_name: &'static str,
     pub local_path: &'a std::path::Path,
-    pub permissions: u32,
+    pub permissions: FileMode,
 }
 
 /// Outcome of a single SFTP copy step in the switch certificate workflow.
@@ -125,18 +126,6 @@ fn readable_remote_run_id() -> String {
     Utc::now().format(REMOTE_RUN_ID_FORMAT).to_string()
 }
 
-fn shell_chmod_mode(mode: u32) -> String {
-    format!("{mode:o}")
-}
-
-fn remote_install_dir_command(path: &str) -> String {
-    format!(
-        "install -d -m {} {}",
-        shell_chmod_mode(SWITCH_CERTIFICATE_REMOTE_DIR_PERMISSIONS),
-        shell_quote(path),
-    )
-}
-
 fn nvue_ca_certificate_endpoint(cert_id: &str) -> String {
     format!("{NVUE_CA_CERTIFICATE_COLLECTION}/{cert_id}")
 }
@@ -149,7 +138,7 @@ fn nvue_cluster_app_manager_endpoint(app_name: &str) -> String {
     format!("/nvue_v1/cluster/apps/{app_name}/manager")
 }
 
-fn nvue_cluster_app_manager_sub_endpoint(app_name: &str, field: &str) -> String {
+pub(super) fn nvue_cluster_app_manager_sub_endpoint(app_name: &str, field: &str) -> String {
     format!("{}/{}", nvue_cluster_app_manager_endpoint(app_name), field)
 }
 
@@ -190,50 +179,20 @@ struct CaCertificateBinding<'a> {
     ca_certificate: &'a str,
 }
 
-fn mtls_unset_command(service: SwitchMtlsService) -> &'static str {
-    match service {
-        SwitchMtlsService::NvueApi => "nv unset system api mtls ca-certificate",
-        SwitchMtlsService::ScaleUpFabricTelemetryInterface => GNMI_MTLS_CERTIFICATE_UNSET_COMMAND,
-        SwitchMtlsService::ScaleUpFabricTelemetry => {
-            "nv action restore cluster apps nmx-telemetry manager encryption"
-        }
-        SwitchMtlsService::ScaleUpFabricManager => {
-            "nv action restore cluster apps nmx-controller manager encryption"
-        }
-    }
-}
-
-fn mtls_unset_commands(services: &[SwitchMtlsService]) -> Vec<String> {
-    services
+/// Build the ordered command flow that clears mTLS for `services`.
+///
+/// Command text, step ordering, the gNMI command-form fallback, and which
+/// failures are benign all live in [`CommandFlow::unset_mtls`].
+fn mtls_unset_flow(services: &[SwitchMtlsService]) -> Result<CommandFlow> {
+    let services: Vec<_> = services
         .iter()
-        .map(|service| mtls_unset_command(*service).to_owned())
-        .chain([
-            "nv config apply --assume-yes".to_owned(),
-            "nv config save".to_owned(),
-        ])
-        .collect()
+        .map(|service| service.cli_service())
+        .collect();
+
+    Ok(CommandFlow::unset_mtls(&services)?.with_settle_delay(MTLS_UNSET_COMMAND_SETTLE_DELAY))
 }
 
-fn is_cluster_app_manager_encryption_restore(command: &str) -> bool {
-    command.starts_with("nv action restore cluster apps ")
-        && command.ends_with(" manager encryption")
-}
-
-fn should_ignore_mtls_unset_error(command: &str, error: &RmsError) -> bool {
-    // Restoring cluster app manager encryption is unnecessary when the cluster
-    // is already disabled. NVOS reports that as an action failure, but the
-    // desired insecure-mode end state is already reached.
-    is_cluster_app_manager_encryption_restore(command)
-        && error.message.contains(CLUSTER_NOT_ENABLED_ERROR)
-}
-
-fn is_gnmi_mtls_schema_absent(error: &RmsError) -> bool {
-    GNMI_MTLS_SCHEMA_ABSENT_FRAGMENTS
-        .iter()
-        .any(|fragment| error.message.contains(fragment))
-}
-
-fn extract_string_field<'a>(response: &'a Value, field: &str) -> Option<&'a str> {
+pub(crate) fn extract_string_field<'a>(response: &'a Value, field: &str) -> Option<&'a str> {
     response
         .get(field)
         .and_then(Value::as_str)
@@ -291,7 +250,7 @@ fn verify_certificate_not_expired(response: &Value, certificate_id: &str) -> Res
     Ok(valid_to)
 }
 
-fn verify_expected_field(
+pub(crate) fn verify_expected_field(
     actual: Option<&str>,
     field: &str,
     expected: &str,
@@ -308,6 +267,16 @@ fn verify_expected_field(
     Ok(())
 }
 
+/// Completed-job value when gNMI verification read a bound client CA.
+pub(crate) const GNMI_CLIENT_AUTHENTICATION_MTLS: &str = "mtls";
+
+/// Completed-job value when the image has no gNMI client-CA resource.
+///
+/// Bind installed the server certificate on `/system/gnmi-server` and did not
+/// configure client authentication.
+pub(crate) const GNMI_CLIENT_AUTHENTICATION_SERVER_CERTIFICATE_ONLY: &str =
+    "server-certificate-only";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SwitchMtlsService {
     NvueApi,
@@ -317,6 +286,13 @@ pub enum SwitchMtlsService {
 }
 
 impl SwitchMtlsService {
+    pub(crate) const ALL: [Self; 4] = [
+        Self::NvueApi,
+        Self::ScaleUpFabricTelemetry,
+        Self::ScaleUpFabricManager,
+        Self::ScaleUpFabricTelemetryInterface,
+    ];
+
     pub fn from_proto(value: rm::SwitchService) -> Option<Self> {
         match value {
             rm::SwitchService::Unspecified => None,
@@ -340,9 +316,23 @@ impl SwitchMtlsService {
 
     pub(crate) fn cluster_app_name(self) -> Option<&'static str> {
         match self {
-            Self::ScaleUpFabricManager => Some("nmx-controller"),
-            Self::ScaleUpFabricTelemetry => Some("nmx-telemetry"),
+            Self::ScaleUpFabricManager => Some(ClusterApp::NMX_CONTROLLER),
+            Self::ScaleUpFabricTelemetry => Some(ClusterApp::NMX_TELEMETRY),
             Self::NvueApi | Self::ScaleUpFabricTelemetryInterface => None,
+        }
+    }
+
+    /// The NVOS object whose mTLS binding this service is configured through.
+    fn cli_service(self) -> nvswitch_cli::MtlsService {
+        match self {
+            Self::NvueApi => nvswitch_cli::MtlsService::NvueApi,
+            Self::ScaleUpFabricTelemetryInterface => nvswitch_cli::MtlsService::GnmiServer,
+            Self::ScaleUpFabricManager => {
+                nvswitch_cli::MtlsService::ClusterApp(ClusterApp::nmx_controller())
+            }
+            Self::ScaleUpFabricTelemetry => {
+                nvswitch_cli::MtlsService::ClusterApp(ClusterApp::nmx_telemetry())
+            }
         }
     }
 
@@ -352,6 +342,255 @@ impl SwitchMtlsService {
             Self::ScaleUpFabricTelemetryInterface => Some("gnmi-server"),
             Self::ScaleUpFabricManager | Self::ScaleUpFabricTelemetry => None,
         }
+    }
+}
+
+/// What happened to one service (or one persist operation) during an mTLS
+/// unset run.
+///
+/// Reported in place of the `nv` command lines the switch was asked to run:
+/// callers need to know which services converged, not how NVOS was driven.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MtlsUnsetStatus {
+    /// The binding was cleared.
+    Cleared,
+
+    /// The cluster is disabled, so the app could not have been running mTLS.
+    /// The desired state already held.
+    AlreadyDisabled,
+
+    /// This NVOS build has no mTLS schema for the service, so it was already
+    /// insecure. The desired state already held.
+    Unsupported,
+
+    /// The change failed and aborted the run.
+    Failed,
+
+    /// Never attempted: an earlier stage aborted the run, or the run finished
+    /// early because the remaining work became unnecessary.
+    NotAttempted,
+}
+
+impl MtlsUnsetStatus {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Cleared => "cleared",
+            Self::AlreadyDisabled => "already_disabled",
+            Self::Unsupported => "unsupported",
+            Self::Failed => "failed",
+            Self::NotAttempted => "not_attempted",
+        }
+    }
+
+    fn from_step_status(status: &StepStatus) -> Self {
+        match status {
+            StepStatus::Succeeded { .. } => Self::Cleared,
+            StepStatus::Benign {
+                reason: BenignReason::ClusterNotEnabled,
+            } => Self::AlreadyDisabled,
+            StepStatus::Benign {
+                reason: BenignReason::GnmiMtlsSchemaAbsent,
+            } => Self::Unsupported,
+            StepStatus::Failed { .. } => Self::Failed,
+            StepStatus::NotAttempted => Self::NotAttempted,
+        }
+    }
+}
+
+/// The stage of the unset run a status belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MtlsUnsetStage {
+    /// Clearing a service's mTLS binding.
+    UnsetBinding,
+
+    /// Applying the pending configuration.
+    ConfigApply,
+
+    /// Persisting the applied configuration.
+    ConfigSave,
+}
+
+impl MtlsUnsetStage {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::UnsetBinding => "unset_binding",
+            Self::ConfigApply => "config_apply",
+            Self::ConfigSave => "config_save",
+        }
+    }
+
+    fn from_persist_operation(operation: NvConfigOperation) -> Self {
+        match operation {
+            NvConfigOperation::Save => Self::ConfigSave,
+            // Detach never appears in the unset flow; treating it as an apply
+            // keeps this total without inventing a stage the flow cannot reach.
+            NvConfigOperation::Apply
+            | NvConfigOperation::ApplyAssumeYes
+            | NvConfigOperation::Detach => Self::ConfigApply,
+        }
+    }
+}
+
+/// One service's outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MtlsServiceOutcome {
+    pub service: SwitchMtlsService,
+    pub status: MtlsUnsetStatus,
+}
+
+/// One persist operation's outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MtlsPersistOutcome {
+    pub stage: MtlsUnsetStage,
+    pub status: MtlsUnsetStatus,
+}
+
+/// Where an unset run stopped.
+///
+/// `service` is `None` when a persist step failed, since apply and save are
+/// not attributable to any single service.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MtlsUnsetFailureSite {
+    pub service: Option<SwitchMtlsService>,
+    pub stage: MtlsUnsetStage,
+    pub message: String,
+}
+
+impl MtlsUnsetFailureSite {
+    /// A description of where the run stopped, used as the error's message.
+    ///
+    /// `message` is the transport's own text with the command already removed
+    /// by [`SwitchCliTransport::run`](super::super::cli::SwitchCliTransport),
+    /// so this adds the service and stage without reintroducing command text.
+    fn describe(&self) -> String {
+        match self.service {
+            Some(service) => format!(
+                "failed to unset mTLS for {} at stage {}: {}",
+                service.as_str(),
+                self.stage.as_str(),
+                self.message
+            ),
+            None => format!(
+                "failed to unset mTLS at stage {}: {}",
+                self.stage.as_str(),
+                self.message
+            ),
+        }
+    }
+}
+
+/// Per-service and per-persist outcomes for one mTLS unset run.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct MtlsUnsetReport {
+    pub services: Vec<MtlsServiceOutcome>,
+    pub persist: Vec<MtlsPersistOutcome>,
+    pub failure: Option<MtlsUnsetFailureSite>,
+
+    /// The run was cancelled part-way through. The statuses above still
+    /// describe what the switch was actually asked to do.
+    pub cancelled: bool,
+}
+
+impl MtlsUnsetReport {
+    /// A report where every requested service and both persist operations
+    /// share `status`.
+    fn uniform(services: &[SwitchMtlsService], status: MtlsUnsetStatus) -> Self {
+        Self {
+            services: services
+                .iter()
+                .map(|service| MtlsServiceOutcome {
+                    service: *service,
+                    status,
+                })
+                .collect(),
+            persist: [MtlsUnsetStage::ConfigApply, MtlsUnsetStage::ConfigSave]
+                .into_iter()
+                .map(|stage| MtlsPersistOutcome { stage, status })
+                .collect(),
+            failure: None,
+            cancelled: false,
+        }
+    }
+
+    /// A report for a run that never started, so every requested service and
+    /// both persist operations read as `not_attempted` rather than absent.
+    pub(crate) fn not_attempted(services: &[SwitchMtlsService]) -> Self {
+        Self::uniform(services, MtlsUnsetStatus::NotAttempted)
+    }
+
+    /// A fully successful run, for tests covering how a `completed` result is
+    /// rendered rather than how one is arrived at.
+    #[cfg(test)]
+    pub(crate) fn all_cleared(services: &[SwitchMtlsService]) -> Self {
+        Self::uniform(services, MtlsUnsetStatus::Cleared)
+    }
+
+    /// Translate a flow report into service-level outcomes.
+    ///
+    /// `requested` is the caller's service list; each flow step's
+    /// [`StepSubject`] is matched back through [`SwitchMtlsService::cli_service`],
+    /// which is injective over the four supported services, so the mapping is
+    /// unambiguous. A step whose subject does not resolve is skipped rather
+    /// than guessed at.
+    fn from_flow(report: &nvswitch_cli::FlowReport, requested: &[SwitchMtlsService]) -> Self {
+        let mut built = Self {
+            cancelled: report.interrupted(),
+            ..Self::default()
+        };
+
+        for step in report.steps() {
+            let status = MtlsUnsetStatus::from_step_status(step.status());
+
+            let (service, stage) = match step.subject() {
+                Some(StepSubject::Mtls(cli_service)) => {
+                    let Some(service) = requested
+                        .iter()
+                        .copied()
+                        .find(|service| service.cli_service() == *cli_service)
+                    else {
+                        continue;
+                    };
+
+                    built.services.push(MtlsServiceOutcome { service, status });
+
+                    (Some(service), MtlsUnsetStage::UnsetBinding)
+                }
+                Some(StepSubject::Persist(operation)) => {
+                    let stage = MtlsUnsetStage::from_persist_operation(*operation);
+
+                    built.persist.push(MtlsPersistOutcome { stage, status });
+
+                    (None, stage)
+                }
+                None => continue,
+            };
+
+            if let StepStatus::Failed { message } = step.status() {
+                built.failure.get_or_insert(MtlsUnsetFailureSite {
+                    service,
+                    stage,
+                    message: message.clone(),
+                });
+            }
+        }
+
+        built
+    }
+}
+
+/// A failed unset run, carrying the partial report alongside the error.
+///
+/// Keeping them together is the point: the error alone cannot say which
+/// services had already been cleared before the run stopped.
+#[derive(Debug)]
+pub(crate) struct MtlsUnsetError {
+    pub error: RmsError,
+    pub report: MtlsUnsetReport,
+}
+
+impl From<MtlsUnsetError> for RmsError {
+    fn from(error: MtlsUnsetError) -> Self {
+        error.error
     }
 }
 
@@ -542,6 +781,32 @@ impl SwitchMtlsMaterialPaths {
     pub fn entity_cert_id(&self) -> String {
         self.entity_cert_id.clone()
     }
+
+    #[cfg(test)]
+    pub(crate) fn for_test() -> Self {
+        Self::new(
+            "fabric-a".into(),
+            PathBuf::from("/tmp/ca.pem"),
+            PathBuf::from("/tmp/client.pem"),
+            PathBuf::from("/tmp/client.key"),
+        )
+    }
+
+    /// Test material whose IDs carry `imported_at`, so a run of installs gets
+    /// distinct, ordered IDs however fast it runs.
+    #[cfg(test)]
+    pub(crate) fn for_test_at(imported_at: chrono::NaiveDateTime) -> Self {
+        let remote_run_id = imported_at.format(REMOTE_RUN_ID_FORMAT).to_string();
+        let (ca_cert_id, entity_cert_id) =
+            cert_ids_for_domain_with_suffix("fabric-a", &remote_run_id);
+
+        Self {
+            remote_run_id,
+            ca_cert_id,
+            entity_cert_id,
+            ..Self::for_test()
+        }
+    }
 }
 
 impl SwitchGb200Nvidia {
@@ -636,109 +901,70 @@ impl SwitchGb200Nvidia {
         Ok(is_current)
     }
 
+    /// Clear mTLS for `services` and persist the result.
+    ///
+    /// Returns a per-service report: which bindings were cleared, which were
+    /// already in the desired state, and which were never attempted. The
+    /// `nv` command lines behind those changes stay in this node's tracing
+    /// output and never reach the report.
+    ///
+    /// `cancel` is honoured between commands, never during one, and a
+    /// cancelled run comes back as `Ok` with
+    /// [`MtlsUnsetReport::cancelled`] set. Stopping is not the same as doing
+    /// nothing: `nv action restore` takes effect on the switch immediately,
+    /// so the report describes the work already issued rather than writing
+    /// the whole run off as unattempted.
+    ///
+    /// # Errors
+    ///
+    /// A failed run returns [`MtlsUnsetError`], which carries the same report
+    /// covering the steps that did run, so a caller can still say which
+    /// services took effect before the run stopped.
     pub(crate) async fn unset_mtls_services(
         &self,
         services: &[SwitchMtlsService],
-    ) -> Result<Vec<String>> {
+        cancel: &CancellationToken,
+    ) -> std::result::Result<MtlsUnsetReport, MtlsUnsetError> {
+        let invalid = |error: RmsError| MtlsUnsetError {
+            error,
+            report: MtlsUnsetReport::not_attempted(services),
+        };
+
         if services.is_empty() {
-            return Err(RmsError::invalid_argument(
+            return Err(invalid(RmsError::invalid_argument(
                 "services must contain at least one SwitchService",
-            ));
+            )));
         }
 
-        let commands = mtls_unset_commands(services);
-        let mut executed_commands = Vec::with_capacity(commands.len() + 1);
-
-        let only_gnmi_service = services
-            .iter()
-            .all(|service| *service == SwitchMtlsService::ScaleUpFabricTelemetryInterface);
+        let flow = mtls_unset_flow(services).map_err(invalid)?;
 
         tracing::info!(
             node = %self.id(),
             ?services,
-            command_count = commands.len(),
+            command_count = flow.commands().len(),
             "unsetting switch service mTLS mode via SSH"
         );
 
-        #[cfg(test)]
-        let executor = match &self.ssh_exec_for_test {
-            Some(exec) => MtlsUnsetCommandExecutor::Test(Arc::clone(exec)),
-            None => MtlsUnsetCommandExecutor::Ssh(
-                SshClient::connect(self.ssh_endpoint()?, SshClient::DEFAULT_TIMEOUT).await?,
-            ),
-        };
+        let cli = self.nv_cli().await.map_err(invalid)?;
 
-        #[cfg(not(test))]
-        let executor = MtlsUnsetCommandExecutor::Ssh(
-            SshClient::connect(self.ssh_endpoint()?, SshClient::DEFAULT_TIMEOUT).await?,
-        );
+        match cli.run_flow_while(&flow, || !cancel.is_cancelled()).await {
+            Ok(report) => Ok(MtlsUnsetReport::from_flow(&report, services)),
+            Err(failure) => {
+                let report = MtlsUnsetReport::from_flow(&failure.report, services);
 
-        for (index, command) in commands.iter().enumerate() {
-            executed_commands.push(command.clone());
+                // Prefer the attributed description: it names the service and
+                // stage the run stopped on, which the raw transport error
+                // cannot. Either way the transport's own classification is
+                // preserved, and either way the command text was already
+                // stripped at the transport boundary.
+                let error = match &report.failure {
+                    Some(site) => RmsError::new(failure.failure.code, site.describe()),
+                    None => failure.failure,
+                };
 
-            if let Err(error) = executor.exec(command).await {
-                if command == GNMI_MTLS_CERTIFICATE_UNSET_COMMAND {
-                    tracing::info!(
-                        node = %self.id(),
-                        command,
-                        fallback_command = GNMI_MTLS_CA_CERTIFICATE_UNSET_COMMAND,
-                        error = %error.message,
-                        "gNMI mTLS certificate unset failed; retrying with CA certificate syntax"
-                    );
-
-                    executed_commands.push(GNMI_MTLS_CA_CERTIFICATE_UNSET_COMMAND.to_owned());
-
-                    if let Err(fallback_error) =
-                        executor.exec(GNMI_MTLS_CA_CERTIFICATE_UNSET_COMMAND).await
-                    {
-                        if is_gnmi_mtls_schema_absent(&error)
-                            && is_gnmi_mtls_schema_absent(&fallback_error)
-                        {
-                            tracing::info!(
-                                node = %self.id(),
-                                command,
-                                fallback_command = GNMI_MTLS_CA_CERTIFICATE_UNSET_COMMAND,
-                                "gNMI mTLS schema is unsupported; service is already disabled"
-                            );
-
-                            if only_gnmi_service {
-                                return Ok(executed_commands);
-                            }
-
-                            continue;
-                        }
-
-                        return Err(RmsError::new(
-                            fallback_error.code,
-                            format!(
-                                "failed to unset gNMI mTLS with both NVOS command forms; \
-                                 `{GNMI_MTLS_CERTIFICATE_UNSET_COMMAND}` failed: {}; \
-                                 `{GNMI_MTLS_CA_CERTIFICATE_UNSET_COMMAND}` failed: {}",
-                                error.message, fallback_error.message
-                            ),
-                        ));
-                    }
-                } else if should_ignore_mtls_unset_error(command, &error) {
-                    tracing::info!(
-                        node = %self.id(),
-                        command,
-                        error = %error.message,
-                        "ignoring mTLS unset error because cluster is already disabled"
-                    );
-                } else {
-                    return Err(error);
-                }
-            }
-
-            if index + 1 < commands.len() {
-                // NVUE applies and persists config asynchronously under the
-                // hood; keep SSH command sequencing conservative without adding
-                // material delay to the overall job.
-                tokio::time::sleep(MTLS_UNSET_COMMAND_SETTLE_DELAY).await;
+                Err(MtlsUnsetError { error, report })
             }
         }
-
-        Ok(executed_commands)
     }
 
     pub(crate) async fn prepare_mtls_remote_dirs(
@@ -764,32 +990,28 @@ impl SwitchGb200Nvidia {
             return Ok(());
         }
 
-        let ssh = SshClient::connect(self.ssh_endpoint()?, SshClient::DEFAULT_TIMEOUT).await?;
+        let cli = self.nv_cli().await?;
         tracing::debug!(
             node = %self.id(),
             remote_dir = %remote_dir,
             "SSH session established for remote TLS directory preparation"
         );
-        ssh.exec(
-            &remote_install_dir_command(REMOTE_TLS_ROOT),
-            SshClient::DEFAULT_TIMEOUT,
-        )
-        .await?;
-        tracing::debug!(
-            node = %self.id(),
-            path = REMOTE_TLS_ROOT,
-            "created remote TLS root directory"
-        );
-        ssh.exec(
-            &remote_install_dir_command(&remote_dir),
-            SshClient::DEFAULT_TIMEOUT,
-        )
-        .await?;
-        tracing::debug!(
-            node = %self.id(),
-            path = %remote_dir,
-            "created remote TLS run directory"
-        );
+
+        // Create the root explicitly before the per-run directory so it gets
+        // the restricted mode outright, rather than whatever mode the platform
+        // gives a parent it creates implicitly.
+        for str_path in [REMOTE_TLS_ROOT, remote_dir.as_str()] {
+            let path = RemotePath::new(str_path)?;
+
+            cli.create_directory(&path, SWITCH_CERTIFICATE_REMOTE_DIR_PERMISSIONS)
+                .await?;
+
+            tracing::debug!(
+                node = %self.id(),
+                path = %str_path,
+                "created remote TLS directory"
+            );
+        }
 
         tracing::info!(
             node = %self.id(),
@@ -797,6 +1019,67 @@ impl SwitchGb200Nvidia {
             "remote TLS directories prepared on switch"
         );
         Ok(())
+    }
+
+    /// Remove the per-run staging directory created by
+    /// [`Self::prepare_mtls_remote_dirs`].
+    ///
+    /// The staged files under `remote_dir` exist only to feed the NVUE
+    /// `@import` `file://` URIs in [`Self::import_mtls_material`]. Once the
+    /// switch has imported them into its own security store, the raw copies --
+    /// including the client private key -- are redundant, so this removes the
+    /// whole per-run directory. `remote_dir` is a timestamped path this code
+    /// constructs, never caller input, so recursive removal is safe here.
+    pub(crate) async fn cleanup_mtls_remote_dir(
+        &self,
+        material: &SwitchMtlsMaterialPaths,
+    ) -> Result<()> {
+        let remote_dir = material.remote_dir();
+
+        // Unlike `prepare_mtls_remote_dirs` and `sftp_copy_mtls_file` -- which
+        // open a real SSH/SFTP session and so must be skipped under the test
+        // stub -- this path issues a single command through `nv_cli`, whose test
+        // transport records it. There is deliberately no `#[cfg(test)]`
+        // short-circuit here: letting the removal run keeps the "the client key
+        // never outlives the job" guarantee exercised in tests rather than
+        // silently no-opped.
+        //
+        // `nv_cli()` opens a fresh SSH session rather than reusing an earlier
+        // one. That matches this workflow's per-stage reconnect design and is
+        // the deliberate choice on the failure path in particular: cleanup runs
+        // even when a prior stage errored, so a previously-opened session may be
+        // in an unknown state. The extra connect is immaterial next to the
+        // job's NVUE HTTP round-trips.
+        let path = RemotePath::new(remote_dir.as_str())?;
+        self.nv_cli().await?.remove_directory(&path).await?;
+
+        tracing::info!(
+            node = %self.id(),
+            remote_dir = %remote_dir,
+            "removed staged TLS material from switch"
+        );
+        Ok(())
+    }
+
+    /// Best-effort variant of [`Self::cleanup_mtls_remote_dir`]: logs and
+    /// swallows any error so it can be called on both the success and failure
+    /// paths of the certificate job without changing the job's outcome.
+    ///
+    /// Cleanup is a hygiene step -- a failure here leaves recoverable scratch
+    /// state on the switch, so it must never turn a successful install into a
+    /// failure, nor mask the original error on a failing path.
+    pub(crate) async fn cleanup_mtls_remote_dir_best_effort(
+        &self,
+        material: &SwitchMtlsMaterialPaths,
+    ) {
+        if let Err(e) = self.cleanup_mtls_remote_dir(material).await {
+            tracing::warn!(
+                node = %self.id(),
+                remote_dir = %material.remote_dir(),
+                error = %e.message,
+                "failed to remove staged TLS material; leaving it for manual cleanup"
+            );
+        }
     }
 
     pub(crate) async fn sftp_copy_mtls_file(
@@ -826,7 +1109,7 @@ impl SwitchGb200Nvidia {
             remote_file = spec.remote_name,
             local_path = %spec.local_path.display(),
             remote_path = %remote_path,
-            permissions = spec.permissions,
+            permissions = %spec.permissions,
             "sftp_copy_mtls_file stage starting"
         );
 
@@ -880,30 +1163,22 @@ impl SwitchGb200Nvidia {
             "SFTP upload completed; verifying remote file"
         );
 
-        let verify_cmd = format!("test -f {} && echo ok", shell_quote(&remote_path));
-        let verify_out = ssh.exec(&verify_cmd, SshClient::DEFAULT_TIMEOUT).await?;
-        if !verify_out.contains("ok") {
-            return Err(RmsError::internal(format!(
-                "SFTP upload verification failed for {remote_path}"
-            )));
-        }
+        let cli = self.nv_cli_over(ssh)?;
+        let verified_path = RemotePath::new(remote_path.clone())?;
+
+        cli.confirm_file(&verified_path, "SFTP upload").await?;
         tracing::debug!(
             node = %self.id(),
             remote_path = %remote_path,
-            verify_output = %verify_out.trim(),
             "remote TLS file presence verified after SFTP copy"
         );
 
-        let chmod_cmd = format!(
-            "chmod {} {}",
-            shell_chmod_mode(spec.permissions),
-            shell_quote(&remote_path),
-        );
-        ssh.exec(&chmod_cmd, SshClient::DEFAULT_TIMEOUT).await?;
+        cli.set_permissions(&verified_path, spec.permissions)
+            .await?;
         tracing::debug!(
             node = %self.id(),
             remote_path = %remote_path,
-            mode = %shell_chmod_mode(spec.permissions),
+            mode = %spec.permissions,
             "set remote TLS file permissions after SFTP copy"
         );
 
@@ -1031,31 +1306,21 @@ impl SwitchGb200Nvidia {
                 self.nvue_finish_config_revision(&revision_id).await?;
             }
             SwitchMtlsService::ScaleUpFabricTelemetryInterface => {
-                tracing::debug!(node = %self.id(), service = "gnmi-server", "binding gNMI server mTLS");
-
-                let certificate = serde_json::to_value(CertificateBinding {
-                    certificate: &cert_id,
-                })
-                .map_err(|error| {
-                    RmsError::internal(format!(
-                        "failed to serialize gNMI certificate binding: {error}"
-                    ))
-                })?;
-
-                let ca_certificate = serde_json::to_value(CaCertificateBinding {
-                    ca_certificate: &ca_id,
-                })
-                .map_err(|error| {
-                    RmsError::internal(format!(
-                        "failed to serialize gNMI CA certificate binding: {error}"
-                    ))
-                })?;
-
-                self.nvue_apply_config_patches(&[
-                    (NVUE_GNMI_SERVER_PATH, certificate),
-                    (NVUE_GNMI_SERVER_MTLS_PATH, ca_certificate),
-                ])
-                .await?;
+                let capabilities = self.initialize_nvue_capabilities().await?;
+                if capabilities.is_supported() {
+                    tracing::debug!(
+                        node = %self.id(),
+                        service = "gnmi-server",
+                        "binding gNMI server certificate and client CA"
+                    );
+                } else {
+                    tracing::debug!(
+                        node = %self.id(),
+                        service = "gnmi-server",
+                        "binding gNMI server certificate without a client CA"
+                    );
+                }
+                capabilities.bind_gnmi(self, material).await?;
             }
             SwitchMtlsService::ScaleUpFabricTelemetry => {
                 tracing::debug!(node = %self.id(), app_name = "nmx-telemetry", "binding cluster app mTLS");
@@ -1154,20 +1419,21 @@ impl SwitchGb200Nvidia {
             None
         };
 
-        let gnmi_mtls = if services.contains(&SwitchMtlsService::ScaleUpFabricTelemetryInterface) {
-            let configuration = self.get_gnmi_server_mtls_configuration().await?;
-
-            verify_expected_field(
-                configuration.ca_certificate(),
-                "ca-certificate",
-                &ca_id,
-                "gNMI server mTLS",
-            )?;
-
-            Some(configuration)
-        } else {
-            None
-        };
+        let (gnmi_server, gnmi_mtls, gnmi_client_authentication) =
+            if services.contains(&SwitchMtlsService::ScaleUpFabricTelemetryInterface) {
+                let (configuration, mtls) = self
+                    .initialize_nvue_capabilities()
+                    .await?
+                    .verify_gnmi(self, material)
+                    .await?;
+                let authentication = match &mtls {
+                    Some(_) => GNMI_CLIENT_AUTHENTICATION_MTLS,
+                    None => GNMI_CLIENT_AUTHENTICATION_SERVER_CERTIFICATE_ONLY,
+                };
+                (Some(configuration), mtls, Some(authentication))
+            } else {
+                (None, None, None)
+            };
 
         let mut cluster_apps = serde_json::Map::new();
         for service in services {
@@ -1186,7 +1452,9 @@ impl SwitchGb200Nvidia {
             "installed_services": installed_services,
             "ca_certificate": ca_certificate,
             "nvue_mtls": nvue_mtls,
+            "gnmi_server": gnmi_server,
             "gnmi_mtls": gnmi_mtls,
+            "gnmi_client_authentication": gnmi_client_authentication,
             "cluster_apps": cluster_apps,
         }))
     }
@@ -1259,6 +1527,15 @@ impl SwitchGb200Nvidia {
         self.enable_grpc_for_external_clients(app_name, true)
             .await?;
 
+        // Enabling the manager only converges its NVUE state. NVOS applies each
+        // field update below by calling back into the app itself, so a manager
+        // that is enabled while its app is still starting rejects the first
+        // update with "CallBack to nmx app manager failed". Wait for the app
+        // before the first update; the per-field settle delay further down only
+        // spaces the updates that follow it.
+        self.require_cluster_app_manager_action_ready(app_name)
+            .await?;
+
         let cert_bindings = [
             (
                 "certificate",
@@ -1283,7 +1560,6 @@ impl SwitchGb200Nvidia {
                 })?,
             ),
         ];
-        let settle_delay = Duration::from_secs(config::CLUSTER_MANAGER_ACTION_SETTLE_SECONDS);
 
         for (field, parameters) in cert_bindings {
             let endpoint = nvue_cluster_app_manager_sub_endpoint(app_name, field);
@@ -1296,7 +1572,8 @@ impl SwitchGb200Nvidia {
             );
             self.nvue_start_action(&endpoint, "@update", parameters)
                 .await?;
-            tokio::time::sleep(settle_delay).await;
+
+            tokio::time::sleep(CLUSTER_MANAGER_ACTION_SETTLE_DELAY).await;
         }
 
         // Encryption manager binding prefers the typed NVUE `@update` action
@@ -1334,6 +1611,101 @@ impl SwitchGb200Nvidia {
     }
 }
 
+impl GnmiClientCa {
+    /// Bind gNMI certificates according to the discovered impl.
+    ///
+    /// Unsupported client-CA is only the discovery probe
+    /// (`GET /system/gnmi-server/mtls` returning 404). That path commits the
+    /// entity certificate alone. When the probe says the resource exists, the
+    /// entity certificate and client CA share one revision. A CA patch failure
+    /// discards that revision before apply, so the switch does not keep a new
+    /// entity certificate beside the previous client CA.
+    pub(crate) async fn bind_gnmi(
+        self,
+        switch: &SwitchGb200Nvidia,
+        material: &SwitchMtlsMaterialPaths,
+    ) -> Result<()> {
+        let cert_id = material.entity_cert_id();
+        let ca_id = material.ca_cert_id();
+
+        let certificate = serde_json::to_value(CertificateBinding {
+            certificate: &cert_id,
+        })
+        .map_err(|error| {
+            RmsError::internal(format!(
+                "failed to serialize gNMI certificate binding: {error}"
+            ))
+        })?;
+
+        if !self.is_supported() {
+            tracing::warn!(
+                node = %switch.id(),
+                "gNMI client-CA resource is absent; binding the server certificate only"
+            );
+            return switch
+                .nvue_apply_config_patches(&[(GNMI_SERVER_ENDPOINT, certificate)])
+                .await;
+        }
+
+        let ca_certificate = serde_json::to_value(CaCertificateBinding {
+            ca_certificate: &ca_id,
+        })
+        .map_err(|error| {
+            RmsError::internal(format!(
+                "failed to serialize gNMI CA certificate binding: {error}"
+            ))
+        })?;
+
+        switch
+            .nvue_apply_config_patches(&[
+                (GNMI_SERVER_ENDPOINT, certificate),
+                (GNMI_SERVER_MTLS_ENDPOINT, ca_certificate),
+            ])
+            .await
+    }
+
+    /// Verify gNMI bind. `gnmi_mtls` is `null` when client-CA is unsupported,
+    /// and the verification object records `gnmi_client_authentication` as
+    /// `server-certificate-only`. When the probe said the resource exists, a
+    /// missing mTLS body fails verification and a bound CA records `mtls`.
+    pub(crate) async fn verify_gnmi(
+        self,
+        switch: &SwitchGb200Nvidia,
+        material: &SwitchMtlsMaterialPaths,
+    ) -> Result<(Value, Option<MtlsConfiguration>)> {
+        let cert_id = material.entity_cert_id();
+        let ca_id = material.ca_cert_id();
+        let configuration = switch.get_gnmi_server_configuration().await?;
+
+        verify_expected_field(
+            extract_string_field(&configuration, "certificate"),
+            "certificate",
+            &cert_id,
+            "gNMI server",
+        )?;
+
+        if !self.is_supported() {
+            return Ok((configuration, None));
+        }
+
+        let mtls = switch.get_gnmi_server_mtls_if_present().await?;
+        let Some(mtls_configuration) = mtls else {
+            return Err(RmsError::failed_precondition(
+                "gNMI client-CA resource disappeared before verification: GET /nvue_v1/system/gnmi-server/mtls returned 404",
+            ));
+        };
+
+        verify_expected_field(
+            mtls_configuration.ca_certificate(),
+            "ca-certificate",
+            &ca_id,
+            "gNMI server mTLS",
+        )?;
+
+        Ok((configuration, Some(mtls_configuration)))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1342,10 +1714,22 @@ mod tests {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    use super::super::super::config;
+
     const GNMI_MTLS_UNSUPPORTED_ERROR: &str =
         "Error: 'mtls' is not one of ['state', 'certificate']";
 
+    const GNMI_MTLS_CERTIFICATE_UNSET_COMMAND: &str =
+        "nv unset system gnmi-server mtls certificate";
+    const GNMI_MTLS_CA_CERTIFICATE_UNSET_COMMAND: &str =
+        "nv unset system gnmi-server mtls ca-certificate";
+
     type RecordedCommands = Arc<std::sync::Mutex<Vec<String>>>;
+
+    /// A token for tests that are not about cancellation.
+    fn no_cancel() -> CancellationToken {
+        CancellationToken::new()
+    }
 
     fn switch_for_gnmi_unset_test(
         primary_error: &'static str,
@@ -1371,18 +1755,61 @@ mod tests {
         (switch, commands)
     }
 
-    fn assert_executed_commands(
-        executed: Vec<String>,
-        recorded: &RecordedCommands,
-        expected: &[&str],
-    ) {
-        assert_eq!(executed, expected);
-        assert_recorded_commands(recorded, expected);
+    /// A switch whose SSH transport records every command and fails exactly
+    /// the ones in `failing`.
+    fn recording_switch(
+        failing: &'static [(&'static str, &'static str)],
+    ) -> (SwitchGb200Nvidia, RecordedCommands) {
+        let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&commands);
+
+        let switch = SwitchGb200Nvidia::for_test("http://127.0.0.1").with_ssh_exec_for_test(
+            move |command| {
+                recorded.lock().unwrap().push(command.to_owned());
+
+                failing
+                    .iter()
+                    .find(|(failing, _)| *failing == command)
+                    .map_or_else(
+                        || Ok(String::new()),
+                        |(_, error)| Err(RmsError::internal(*error)),
+                    )
+            },
+        );
+
+        (switch, commands)
     }
 
     fn assert_recorded_commands(recorded: &RecordedCommands, expected: &[&str]) {
         assert_eq!(*recorded.lock().unwrap(), expected);
     }
+
+    /// `(service name, status)` for each service in `report`.
+    fn service_statuses(report: &MtlsUnsetReport) -> Vec<(&'static str, &'static str)> {
+        report
+            .services
+            .iter()
+            .map(|outcome| (outcome.service.as_str(), outcome.status.as_str()))
+            .collect()
+    }
+
+    /// `(stage, status)` for each persist operation in `report`.
+    fn persist_statuses(report: &MtlsUnsetReport) -> Vec<(&'static str, &'static str)> {
+        report
+            .persist
+            .iter()
+            .map(|outcome| (outcome.stage.as_str(), outcome.status.as_str()))
+            .collect()
+    }
+
+    /// The persist pair every fully-executed flow ends with.
+    const PERSIST_COMPLETED: [(&str, &str); 2] =
+        [("config_apply", "cleared"), ("config_save", "cleared")];
+
+    const PERSIST_NOT_ATTEMPTED: [(&str, &str); 2] = [
+        ("config_apply", "not_attempted"),
+        ("config_save", "not_attempted"),
+    ];
 
     #[test]
     fn sftp_copy_stage_name_sanitizes_dots() {
@@ -1408,6 +1835,62 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(error.code, ErrorCode::Cancelled);
+    }
+
+    /// The whole point of cleanup is "the client key never outlives the job",
+    /// so pin that it actually issues the `rm -rf` of the scratch dir rather
+    /// than no-opping under the test transport.
+    #[tokio::test]
+    async fn cleanup_mtls_remote_dir_removes_the_staged_directory() {
+        let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&commands);
+        let switch = SwitchGb200Nvidia::for_test("http://127.0.0.1").with_ssh_exec_for_test(
+            move |command| {
+                recorded.lock().unwrap().push(command.to_owned());
+                Ok(String::new())
+            },
+        );
+        let material = SwitchMtlsMaterialPaths::new(
+            "fabric-a".into(),
+            PathBuf::from("/tmp/ca.pem"),
+            PathBuf::from("/tmp/client.pem"),
+            PathBuf::from("/tmp/client.key"),
+        );
+
+        switch.cleanup_mtls_remote_dir(&material).await.unwrap();
+
+        assert_eq!(
+            *commands.lock().unwrap(),
+            vec![format!("rm -rf '{}'", material.remote_dir())],
+        );
+    }
+
+    /// The best-effort variant runs on both the success and failure paths of
+    /// the certificate job, so it must still attempt the removal but must never
+    /// propagate or panic when the switch refuses it.
+    #[tokio::test]
+    async fn cleanup_mtls_remote_dir_best_effort_attempts_removal_and_swallows_errors() {
+        let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&commands);
+        let switch = SwitchGb200Nvidia::for_test("http://127.0.0.1").with_ssh_exec_for_test(
+            move |command| {
+                recorded.lock().unwrap().push(command.to_owned());
+                Err(RmsError::internal("switch refused the removal"))
+            },
+        );
+        let material = SwitchMtlsMaterialPaths::new(
+            "fabric-a".into(),
+            PathBuf::from("/tmp/ca.pem"),
+            PathBuf::from("/tmp/client.pem"),
+            PathBuf::from("/tmp/client.key"),
+        );
+
+        switch.cleanup_mtls_remote_dir_best_effort(&material).await;
+
+        assert_eq!(
+            *commands.lock().unwrap(),
+            vec![format!("rm -rf '{}'", material.remote_dir())],
+        );
     }
 
     #[test]
@@ -1532,6 +2015,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn nmx_controller_binding_is_stale_when_only_nvue_ca_was_rotated() {
+        let server = MockServer::start().await;
+        mount_nmx_controller_binding(&server, "cert-2", "ca-2", "cert-2", "ca-1", "mtls").await;
+
+        let switch = SwitchGb200Nvidia::for_test(&server.uri());
+
+        assert!(!switch.nmx_controller_binding_is_current().await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn nmx_controller_binding_is_unreadable_when_ca_leaf_returns_404() {
+        let server = MockServer::start().await;
+        mount_nmx_controller_binding(&server, "cert-2", "ca-1", "cert-2", "ca-1", "mtls").await;
+
+        Mock::given(method("GET"))
+            .and(path(
+                "/nvue_v1/cluster/apps/nmx-controller/manager/ca-certificate",
+            ))
+            .respond_with(ResponseTemplate::new(404))
+            .with_priority(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let switch = SwitchGb200Nvidia::for_test(&server.uri());
+
+        let error = switch
+            .nmx_controller_binding_is_current()
+            .await
+            .unwrap_err();
+
+        assert!(error.message.contains("404"));
+    }
+
+    #[tokio::test]
+    async fn nmx_controller_binding_is_stale_when_certificate_field_is_missing() {
+        let server = MockServer::start().await;
+        mount_nmx_controller_binding(&server, "cert-2", "ca-1", "cert-2", "ca-1", "mtls").await;
+
+        Mock::given(method("GET"))
+            .and(path(
+                "/nvue_v1/cluster/apps/nmx-controller/manager/certificate",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .with_priority(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let switch = SwitchGb200Nvidia::for_test(&server.uri());
+
+        assert!(!switch.nmx_controller_binding_is_current().await.unwrap());
+    }
+
+    #[tokio::test]
     async fn stable_material_detects_source_changes() {
         let directory = tempfile::tempdir().unwrap();
         let paths = ["ca.pem", "client.pem", "client.key"].map(|name| directory.path().join(name));
@@ -1572,10 +2110,16 @@ mod tests {
     }
 
     #[test]
-    fn remote_install_dir_command_creates_with_restricted_permissions() {
-        let cmd = remote_install_dir_command(REMOTE_TLS_ROOT);
-        assert!(cmd.contains("install -d -m 751"));
-        assert!(cmd.contains(REMOTE_TLS_ROOT));
+    fn remote_tls_directories_are_created_with_restricted_permissions() {
+        assert_eq!(SWITCH_CERTIFICATE_REMOTE_DIR_PERMISSIONS.to_string(), "751");
+        assert_eq!(
+            SWITCH_CERTIFICATE_PUBLIC_FILE_PERMISSIONS.to_string(),
+            "644"
+        );
+        assert_eq!(
+            SWITCH_CERTIFICATE_PRIVATE_KEY_PERMISSIONS.to_string(),
+            "400"
+        );
     }
 
     #[test]
@@ -1636,6 +2180,229 @@ mod tests {
         assert_eq!(material.remote_dir(), remote_dir);
     }
 
+    /// Mounts the reads that let `bind_cluster_app_mtls` reach its manager field
+    /// updates: an already-enabled cluster, so the cluster revision is skipped,
+    /// and an already-enabled manager. The manager `@update` action is mounted
+    /// separately, so a test that does not mount it also asserts that no enable
+    /// action was attempted.
+    async fn mount_enabled_cluster_and_manager(server: &MockServer) {
+        Mock::given(method("GET"))
+            .and(path("/nvue_v1/cluster"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "state": "enabled",
+                "nmxc-conn": { "state": "up" }
+            })))
+            .named("GET /nvue_v1/cluster")
+            .mount(server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/nvue_v1/cluster/apps/nmx-controller/manager"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "state": "enabled" })))
+            .named("GET /nvue_v1/cluster/apps/nmx-controller/manager")
+            .mount(server)
+            .await;
+    }
+
+    async fn request_paths(server: &MockServer) -> Vec<String> {
+        server
+            .received_requests()
+            .await
+            .expect("wiremock requests")
+            .into_iter()
+            .map(|request| request.url.path().to_owned())
+            .collect()
+    }
+
+    /// Guards the ready path: an app that reports itself ready receives every
+    /// manager field update, in order, and needs no manager enable action
+    /// because its manager state has already converged.
+    #[tokio::test]
+    async fn bind_cluster_app_mtls_submits_every_manager_field_update_for_a_ready_app() {
+        let server = MockServer::start().await;
+
+        mount_enabled_cluster_and_manager(&server).await;
+
+        Mock::given(method("GET"))
+            .and(path("/nvue_v1/cluster/apps/nmx-controller"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "status": "ok",
+                "additional-info": "CONTROL_PLANE_STATE_CONFIGURED",
+                "manager": { "state": "enabled" }
+            })))
+            .named("ready GET /nvue_v1/cluster/apps/nmx-controller")
+            .mount(&server)
+            .await;
+
+        for field in ["certificate", "ca-certificate", "encryption"] {
+            Mock::given(method("POST"))
+                .and(path(format!(
+                    "/nvue_v1/cluster/apps/nmx-controller/manager/{field}"
+                )))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+                .named("POST @update /nvue_v1/cluster/apps/nmx-controller/manager/<field>")
+                .mount(&server)
+                .await;
+        }
+
+        let switch = SwitchGb200Nvidia::for_test(&server.uri());
+
+        switch
+            .bind_cluster_app_mtls("nmx-controller", "rms-ca", "rms-cert")
+            .await
+            .unwrap();
+
+        let submitted_field_updates: Vec<_> = request_paths(&server)
+            .await
+            .into_iter()
+            .filter_map(|entry| {
+                entry
+                    .strip_prefix("/nvue_v1/cluster/apps/nmx-controller/manager/")
+                    .map(str::to_owned)
+            })
+            .collect();
+
+        assert_eq!(
+            submitted_field_updates,
+            ["certificate", "ca-certificate", "encryption"]
+        );
+    }
+
+    /// The reported scenario: the manager state converges while the app behind
+    /// it is still starting. The enable path spends its own budget and returns
+    /// anyway, so only the readiness gate keeps the first certificate update
+    /// from reaching an app that cannot yet service the callback.
+    #[tokio::test]
+    async fn bind_cluster_app_mtls_waits_for_a_starting_app_before_the_first_certificate_update() {
+        let server = MockServer::start().await;
+
+        mount_enabled_cluster_and_manager(&server).await;
+
+        Mock::given(method("POST"))
+            .and(path("/nvue_v1/cluster/apps/nmx-controller/manager"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .named("POST @update /nvue_v1/cluster/apps/nmx-controller/manager")
+            .mount(&server)
+            .await;
+
+        // `enable_grpc_for_external_clients` reads the app status once per
+        // pre-action attempt and once more while converging the manager state,
+        // so it consumes this many reads before the readiness gate runs.
+        let reads_consumed_by_enable = u64::from(config::MAX_RETRY_ATTEMPTS + 1) + 1;
+
+        Mock::given(method("GET"))
+            .and(path("/nvue_v1/cluster/apps/nmx-controller"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "status": "not ok",
+                "additional-info": "CONTROL_PLANE_STATE_UNDEFINED",
+                "manager": { "state": "enabled" }
+            })))
+            .up_to_n_times(reads_consumed_by_enable)
+            .named("starting GET /nvue_v1/cluster/apps/nmx-controller")
+            .mount(&server)
+            .await;
+
+        // Only the readiness gate reads this far. Without it the certificate
+        // update is submitted on the starting response and this never serves.
+        Mock::given(method("GET"))
+            .and(path("/nvue_v1/cluster/apps/nmx-controller"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "status": "ok",
+                "additional-info": "CONTROL_PLANE_STATE_CONFIGURED",
+                "manager": { "state": "enabled" }
+            })))
+            .expect(1)
+            .named("ready GET /nvue_v1/cluster/apps/nmx-controller")
+            .mount(&server)
+            .await;
+
+        for field in ["certificate", "ca-certificate", "encryption"] {
+            Mock::given(method("POST"))
+                .and(path(format!(
+                    "/nvue_v1/cluster/apps/nmx-controller/manager/{field}"
+                )))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+                .named("POST @update /nvue_v1/cluster/apps/nmx-controller/manager/<field>")
+                .mount(&server)
+                .await;
+        }
+
+        let switch = SwitchGb200Nvidia::for_test(&server.uri());
+
+        switch
+            .bind_cluster_app_mtls("nmx-controller", "rms-ca", "rms-cert")
+            .await
+            .unwrap();
+
+        let paths = request_paths(&server).await;
+
+        let first_certificate_update = paths
+            .iter()
+            .position(|entry| entry == "/nvue_v1/cluster/apps/nmx-controller/manager/certificate")
+            .expect("certificate update was submitted");
+
+        let app_reads_before_update = paths
+            .iter()
+            .take(first_certificate_update)
+            .filter(|entry| *entry == "/nvue_v1/cluster/apps/nmx-controller")
+            .count();
+
+        assert!(
+            u64::try_from(app_reads_before_update).unwrap() > reads_consumed_by_enable,
+            "expected the readiness gate to read app status after the enable path, \
+             saw {app_reads_before_update} read(s) before the certificate update in {paths:?}"
+        );
+    }
+
+    /// An app that never becomes ready must fail the bind on the bounded
+    /// readiness wait, without submitting a certificate update that NVOS cannot
+    /// deliver.
+    #[tokio::test]
+    async fn bind_cluster_app_mtls_submits_no_certificate_update_when_the_app_stays_unready() {
+        let server = MockServer::start().await;
+
+        mount_enabled_cluster_and_manager(&server).await;
+
+        Mock::given(method("POST"))
+            .and(path("/nvue_v1/cluster/apps/nmx-controller/manager"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .named("POST @update /nvue_v1/cluster/apps/nmx-controller/manager")
+            .mount(&server)
+            .await;
+
+        // The manager state converges while the app behind it is still starting:
+        // NVOS reports the app health check as failing and no control-plane
+        // state it recognizes, so it cannot deliver a configuration callback.
+        Mock::given(method("GET"))
+            .and(path("/nvue_v1/cluster/apps/nmx-controller"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "status": "not ok",
+                "additional-info": "CONTROL_PLANE_STATE_UNDEFINED",
+                "manager": { "state": "enabled" }
+            })))
+            .named("starting GET /nvue_v1/cluster/apps/nmx-controller")
+            .mount(&server)
+            .await;
+
+        let switch = SwitchGb200Nvidia::for_test(&server.uri());
+
+        let error = switch
+            .bind_cluster_app_mtls("nmx-controller", "rms-ca", "rms-cert")
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error.message,
+            "cluster app nmx-controller did not become ready for manager configuration"
+        );
+
+        assert!(
+            !request_paths(&server)
+                .await
+                .contains(&"/nvue_v1/cluster/apps/nmx-controller/manager/certificate".to_owned())
+        );
+    }
+
     #[test]
     fn switch_mtls_service_maps_proto_values() {
         assert_eq!(
@@ -1692,7 +2459,7 @@ mod tests {
         );
 
         assert_eq!(
-            NVUE_GNMI_SERVER_MTLS_PATH,
+            nvue_client::system::GNMI_SERVER_MTLS_ENDPOINT,
             "/nvue_v1/system/gnmi-server/mtls"
         );
 
@@ -1744,51 +2511,104 @@ mod tests {
         assert_eq!(ca["cacert-id"], "rms-example-ca");
     }
 
+    /// Guards the RMS-side mapping from the proto service enum to the NVOS
+    /// object each service's mTLS binding lives on. The commands themselves are
+    /// covered by `nvswitch_cli`.
     #[test]
-    fn mtls_unset_commands_remove_service_mtls_and_save_config() {
-        let commands = mtls_unset_commands(&[
+    fn mtls_unset_flow_maps_every_service_to_its_nvos_object() -> Result<()> {
+        let commands = mtls_unset_flow(&[
             SwitchMtlsService::NvueApi,
             SwitchMtlsService::ScaleUpFabricManager,
+            SwitchMtlsService::ScaleUpFabricTelemetry,
             SwitchMtlsService::ScaleUpFabricTelemetryInterface,
-        ]);
+        ])?
+        .commands();
 
         assert_eq!(
             commands,
             vec![
                 "nv unset system api mtls ca-certificate",
                 "nv action restore cluster apps nmx-controller manager encryption",
+                "nv action restore cluster apps nmx-telemetry manager encryption",
                 "nv unset system gnmi-server mtls certificate",
                 "nv config apply --assume-yes",
                 "nv config save",
             ]
         );
+
+        Ok(())
     }
 
+    /// Every supported service must appear in the report under its own RMS
+    /// name, so a caller can tell the two cluster apps apart even though both
+    /// go through `MtlsService::ClusterApp`.
     #[tokio::test]
-    async fn unset_mtls_services_ignores_disabled_cluster_restore_error() {
-        let switch =
-            SwitchGb200Nvidia::for_test("http://127.0.0.1").with_ssh_exec_for_test(|command| {
-                if is_cluster_app_manager_encryption_restore(command) {
-                    return Err(RmsError::internal(
-                        "Action failed with the following issue: cluster is not enabled",
-                    ));
-                }
+    async fn unset_mtls_services_reports_every_requested_service() {
+        let (switch, commands) = recording_switch(&[]);
+        let services = [
+            SwitchMtlsService::NvueApi,
+            SwitchMtlsService::ScaleUpFabricManager,
+            SwitchMtlsService::ScaleUpFabricTelemetry,
+            SwitchMtlsService::ScaleUpFabricTelemetryInterface,
+        ];
 
-                Ok(String::new())
-            });
-
-        let commands = switch
-            .unset_mtls_services(&[SwitchMtlsService::ScaleUpFabricManager])
+        let report = switch
+            .unset_mtls_services(&services, &no_cancel())
             .await
             .unwrap();
 
         assert_eq!(
-            commands,
+            service_statuses(&report),
             vec![
+                ("nvue-api", "cleared"),
+                ("scale-up-fabric-manager", "cleared"),
+                ("scale-up-fabric-telemetry", "cleared"),
+                ("scale-up-fabric-telemetry-interface", "cleared"),
+            ]
+        );
+        assert_eq!(persist_statuses(&report), PERSIST_COMPLETED);
+        assert_eq!(report.failure, None);
+
+        // The report replaces the command list, but the commands themselves
+        // must be unchanged; the transport recording is where that is pinned.
+        assert_recorded_commands(
+            &commands,
+            &[
+                "nv unset system api mtls ca-certificate",
+                "nv action restore cluster apps nmx-controller manager encryption",
+                "nv action restore cluster apps nmx-telemetry manager encryption",
+                GNMI_MTLS_CERTIFICATE_UNSET_COMMAND,
+                "nv config apply --assume-yes",
+                "nv config save",
+            ],
+        );
+    }
+
+    #[tokio::test]
+    async fn unset_mtls_services_ignores_disabled_cluster_restore_error() {
+        let (switch, commands) = recording_switch(&[(
+            "nv action restore cluster apps nmx-controller manager encryption",
+            "Action failed with the following issue: cluster is not enabled",
+        )]);
+
+        let report = switch
+            .unset_mtls_services(&[SwitchMtlsService::ScaleUpFabricManager], &no_cancel())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            service_statuses(&report),
+            vec![("scale-up-fabric-manager", "already_disabled")]
+        );
+        assert_eq!(persist_statuses(&report), PERSIST_COMPLETED);
+
+        assert_recorded_commands(
+            &commands,
+            &[
                 "nv action restore cluster apps nmx-controller manager encryption",
                 "nv config apply --assume-yes",
                 "nv config save",
-            ]
+            ],
         );
     }
 
@@ -1796,13 +2616,22 @@ mod tests {
     async fn unset_mtls_services_retries_gnmi_with_ca_certificate_syntax() {
         let (switch, commands) = switch_for_gnmi_unset_test("unknown field certificate", None);
 
-        let executed = switch
-            .unset_mtls_services(&[SwitchMtlsService::ScaleUpFabricTelemetryInterface])
+        let report = switch
+            .unset_mtls_services(
+                &[SwitchMtlsService::ScaleUpFabricTelemetryInterface],
+                &no_cancel(),
+            )
             .await
             .unwrap();
 
-        assert_executed_commands(
-            executed,
+        // The alternate spelling is an NVOS detail, so it changes which
+        // command runs but not the service's reported status.
+        assert_eq!(
+            service_statuses(&report),
+            vec![("scale-up-fabric-telemetry-interface", "cleared")]
+        );
+
+        assert_recorded_commands(
             &commands,
             &[
                 GNMI_MTLS_CERTIFICATE_UNSET_COMMAND,
@@ -1815,38 +2644,69 @@ mod tests {
 
     #[tokio::test]
     async fn unset_mtls_services_handles_unsupported_gnmi_alone_and_with_other_services() {
-        let cases: [(&[SwitchMtlsService], &[&str]); 2] = [
-            (
+        // gNMI alone: an absent schema leaves nothing to apply, so the flow
+        // completes early and both persist steps stay unattempted.
+        let (switch, commands) = switch_for_gnmi_unset_test(
+            GNMI_MTLS_UNSUPPORTED_ERROR,
+            Some(GNMI_MTLS_UNSUPPORTED_ERROR),
+        );
+
+        let report = switch
+            .unset_mtls_services(
                 &[SwitchMtlsService::ScaleUpFabricTelemetryInterface],
-                &[
-                    GNMI_MTLS_CERTIFICATE_UNSET_COMMAND,
-                    GNMI_MTLS_CA_CERTIFICATE_UNSET_COMMAND,
-                ],
-            ),
-            (
+                &no_cancel(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            service_statuses(&report),
+            vec![("scale-up-fabric-telemetry-interface", "unsupported")]
+        );
+        assert_eq!(persist_statuses(&report), PERSIST_NOT_ATTEMPTED);
+        assert_recorded_commands(
+            &commands,
+            &[
+                GNMI_MTLS_CERTIFICATE_UNSET_COMMAND,
+                GNMI_MTLS_CA_CERTIFICATE_UNSET_COMMAND,
+            ],
+        );
+
+        // Alongside another service there is still a change to persist.
+        let (switch, commands) = switch_for_gnmi_unset_test(
+            GNMI_MTLS_UNSUPPORTED_ERROR,
+            Some(GNMI_MTLS_UNSUPPORTED_ERROR),
+        );
+
+        let report = switch
+            .unset_mtls_services(
                 &[
                     SwitchMtlsService::NvueApi,
                     SwitchMtlsService::ScaleUpFabricTelemetryInterface,
                 ],
-                &[
-                    "nv unset system api mtls ca-certificate",
-                    GNMI_MTLS_CERTIFICATE_UNSET_COMMAND,
-                    GNMI_MTLS_CA_CERTIFICATE_UNSET_COMMAND,
-                    "nv config apply --assume-yes",
-                    "nv config save",
-                ],
-            ),
-        ];
+                &no_cancel(),
+            )
+            .await
+            .unwrap();
 
-        for (services, expected) in cases {
-            let (switch, commands) = switch_for_gnmi_unset_test(
-                GNMI_MTLS_UNSUPPORTED_ERROR,
-                Some(GNMI_MTLS_UNSUPPORTED_ERROR),
-            );
-
-            let executed = switch.unset_mtls_services(services).await.unwrap();
-            assert_executed_commands(executed, &commands, expected);
-        }
+        assert_eq!(
+            service_statuses(&report),
+            vec![
+                ("nvue-api", "cleared"),
+                ("scale-up-fabric-telemetry-interface", "unsupported"),
+            ]
+        );
+        assert_eq!(persist_statuses(&report), PERSIST_COMPLETED);
+        assert_recorded_commands(
+            &commands,
+            &[
+                "nv unset system api mtls ca-certificate",
+                GNMI_MTLS_CERTIFICATE_UNSET_COMMAND,
+                GNMI_MTLS_CA_CERTIFICATE_UNSET_COMMAND,
+                "nv config apply --assume-yes",
+                "nv config save",
+            ],
+        );
     }
 
     #[tokio::test]
@@ -1854,18 +2714,25 @@ mod tests {
         let (switch, commands) =
             switch_for_gnmi_unset_test(GNMI_MTLS_UNSUPPORTED_ERROR, Some("permission denied"));
 
-        let error = switch
-            .unset_mtls_services(&[SwitchMtlsService::ScaleUpFabricTelemetryInterface])
+        let failure = switch
+            .unset_mtls_services(
+                &[SwitchMtlsService::ScaleUpFabricTelemetryInterface],
+                &no_cancel(),
+            )
             .await
             .unwrap_err();
 
         for fragment in [
-            GNMI_MTLS_CERTIFICATE_UNSET_COMMAND,
-            GNMI_MTLS_CA_CERTIFICATE_UNSET_COMMAND,
+            "scale-up-fabric-telemetry-interface",
+            "unset_binding",
             "'mtls' is not one of",
             "permission denied",
         ] {
-            assert!(error.message.contains(fragment));
+            assert!(
+                failure.error.message.contains(fragment),
+                "expected {fragment:?} in {:?}",
+                failure.error.message
+            );
         }
 
         assert_recorded_commands(
@@ -1877,25 +2744,268 @@ mod tests {
         );
     }
 
-    #[test]
-    fn should_ignore_mtls_unset_error_only_for_cluster_disabled_restore() {
-        let benign = RmsError::internal("cluster is not enabled");
-        let fatal = RmsError::internal("permission denied");
+    /// Graceful shutdown cancels in-flight jobs, and the switch keeps
+    /// whatever the run already issued. `nv action restore` takes effect
+    /// immediately, so a cancelled run that had already restored a cluster
+    /// app must report it as cleared rather than as never attempted.
+    #[tokio::test]
+    async fn unset_mtls_services_reports_what_ran_when_cancelled_mid_flow() {
+        let cancel = CancellationToken::new();
+        let trigger = cancel.clone();
+        let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&commands);
 
-        assert!(should_ignore_mtls_unset_error(
-            "nv action restore cluster apps nmx-controller manager encryption",
-            &benign
-        ));
+        let switch = SwitchGb200Nvidia::for_test("http://127.0.0.1").with_ssh_exec_for_test(
+            move |command| {
+                recorded.lock().unwrap().push(command.to_owned());
+                trigger.cancel();
 
-        assert!(!should_ignore_mtls_unset_error(
-            "nv action restore cluster apps nmx-controller manager encryption",
-            &fatal
-        ));
+                Ok(String::new())
+            },
+        );
 
-        assert!(!should_ignore_mtls_unset_error(
+        let report = switch
+            .unset_mtls_services(
+                &[
+                    SwitchMtlsService::ScaleUpFabricManager,
+                    SwitchMtlsService::NvueApi,
+                ],
+                &cancel,
+            )
+            .await
+            .unwrap();
+
+        assert!(report.cancelled);
+        assert_eq!(
+            service_statuses(&report),
+            vec![
+                ("scale-up-fabric-manager", "cleared"),
+                ("nvue-api", "not_attempted"),
+            ]
+        );
+
+        // Neither persist step ran, which is how a client learns the change
+        // reached the switch but was never committed.
+        assert_eq!(persist_statuses(&report), PERSIST_NOT_ATTEMPTED);
+
+        // A cancelled run is not a failed one; there is no site to attribute.
+        assert_eq!(report.failure, None);
+
+        assert_recorded_commands(
+            &commands,
+            &["nv action restore cluster apps nmx-controller manager encryption"],
+        );
+    }
+
+    #[tokio::test]
+    async fn unset_mtls_services_cancelled_before_it_starts_issues_nothing() {
+        let (switch, commands) = recording_switch(&[]);
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let report = switch
+            .unset_mtls_services(&[SwitchMtlsService::NvueApi], &cancel)
+            .await
+            .unwrap();
+
+        assert!(report.cancelled);
+        assert_eq!(
+            service_statuses(&report),
+            vec![("nvue-api", "not_attempted")]
+        );
+        assert_recorded_commands(&commands, &[]);
+    }
+
+    /// A run nobody cancelled must not look cancelled.
+    #[tokio::test]
+    async fn unset_mtls_services_is_not_marked_cancelled_on_a_clean_run() {
+        let (switch, _commands) = recording_switch(&[]);
+
+        let report = switch
+            .unset_mtls_services(&[SwitchMtlsService::NvueApi], &no_cancel())
+            .await
+            .unwrap();
+
+        assert!(!report.cancelled);
+    }
+
+    /// A failure mid-run must still say which services had already been
+    /// cleared and which never ran: that is the whole point of carrying the
+    /// report on the error path.
+    #[tokio::test]
+    async fn unset_mtls_services_attributes_a_partial_failure_to_its_service_and_stage() {
+        let (switch, commands) = recording_switch(&[(
+            "nv action restore cluster apps nmx-telemetry manager encryption",
+            "permission denied",
+        )]);
+
+        let failure = switch
+            .unset_mtls_services(
+                &[
+                    SwitchMtlsService::NvueApi,
+                    SwitchMtlsService::ScaleUpFabricTelemetry,
+                    SwitchMtlsService::ScaleUpFabricTelemetryInterface,
+                ],
+                &no_cancel(),
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            service_statuses(&failure.report),
+            vec![
+                ("nvue-api", "cleared"),
+                ("scale-up-fabric-telemetry", "failed"),
+                ("scale-up-fabric-telemetry-interface", "not_attempted"),
+            ]
+        );
+        assert_eq!(persist_statuses(&failure.report), PERSIST_NOT_ATTEMPTED);
+
+        let site = failure.report.failure.expect("attributed failure site");
+        assert_eq!(
+            site.service,
+            Some(SwitchMtlsService::ScaleUpFabricTelemetry)
+        );
+        assert_eq!(site.stage, MtlsUnsetStage::UnsetBinding);
+        assert_eq!(site.message, "permission denied");
+
+        assert_eq!(
+            failure.error.message,
+            "failed to unset mTLS for scale-up-fabric-telemetry at stage unset_binding: \
+             permission denied"
+        );
+
+        assert_recorded_commands(
+            &commands,
+            &[
+                "nv unset system api mtls ca-certificate",
+                "nv action restore cluster apps nmx-telemetry manager encryption",
+            ],
+        );
+    }
+
+    /// A persist step is not attributable to any single service, so the
+    /// failure site names the stage and leaves `service` unset.
+    #[tokio::test]
+    async fn unset_mtls_services_attributes_a_persist_failure_to_its_stage_only() {
+        let (switch, _commands) = recording_switch(&[("nv config save", "disk full")]);
+
+        let failure = switch
+            .unset_mtls_services(&[SwitchMtlsService::NvueApi], &no_cancel())
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            service_statuses(&failure.report),
+            vec![("nvue-api", "cleared")]
+        );
+        assert_eq!(
+            persist_statuses(&failure.report),
+            [("config_apply", "cleared"), ("config_save", "failed")]
+        );
+
+        let site = failure.report.failure.expect("attributed failure site");
+        assert_eq!(site.service, None);
+        assert_eq!(site.stage, MtlsUnsetStage::ConfigSave);
+
+        assert_eq!(
+            failure.error.message,
+            "failed to unset mTLS at stage config_save: disk full"
+        );
+    }
+
+    /// The message a client sees names the service, never the `nv` command
+    /// that failed; command text belongs in tracing only.
+    #[tokio::test]
+    async fn unset_mtls_services_keeps_command_text_out_of_the_error_message() {
+        let (switch, _commands) = recording_switch(&[(
             "nv unset system api mtls ca-certificate",
-            &benign
-        ));
+            "permission denied",
+        )]);
+
+        let failure = switch
+            .unset_mtls_services(&[SwitchMtlsService::NvueApi], &no_cancel())
+            .await
+            .unwrap_err();
+
+        assert!(!failure.error.message.contains("nv unset"));
+        assert!(!failure.error.message.contains("nv config"));
+        assert!(failure.error.message.contains("nvue-api"));
+        assert!(failure.error.message.contains("permission denied"));
+    }
+
+    #[tokio::test]
+    async fn unset_mtls_services_does_not_ignore_a_real_cluster_restore_failure() {
+        let (switch, _commands) = recording_switch(&[(
+            "nv action restore cluster apps nmx-controller manager encryption",
+            "permission denied",
+        )]);
+
+        let failure = switch
+            .unset_mtls_services(&[SwitchMtlsService::ScaleUpFabricManager], &no_cancel())
+            .await
+            .unwrap_err();
+
+        assert!(failure.error.message.contains("permission denied"));
+        assert_eq!(
+            service_statuses(&failure.report),
+            vec![("scale-up-fabric-manager", "failed")]
+        );
+    }
+
+    /// The NVUE API unset carries no benign-failure policy, so a
+    /// "cluster is not enabled" message must not excuse it.
+    #[tokio::test]
+    async fn unset_mtls_services_only_tolerates_a_disabled_cluster_on_cluster_apps() {
+        let (switch, _commands) = recording_switch(&[(
+            "nv unset system api mtls ca-certificate",
+            "cluster is not enabled",
+        )]);
+
+        let failure = switch
+            .unset_mtls_services(&[SwitchMtlsService::NvueApi], &no_cancel())
+            .await
+            .unwrap_err();
+
+        assert!(failure.error.message.contains("cluster is not enabled"));
+        assert_eq!(
+            service_statuses(&failure.report),
+            vec![("nvue-api", "failed")]
+        );
+    }
+
+    #[tokio::test]
+    async fn unset_mtls_services_requires_at_least_one_service() {
+        let switch = SwitchGb200Nvidia::for_test("http://127.0.0.1")
+            .with_ssh_exec_for_test(|_| Ok(String::new()));
+
+        let failure = switch
+            .unset_mtls_services(&[], &no_cancel())
+            .await
+            .unwrap_err();
+
+        assert_eq!(failure.error.code, ErrorCode::InvalidArgument);
+        assert!(failure.report.services.is_empty());
+    }
+
+    /// `From<MtlsUnsetError>` is what lets callers that do not want the report
+    /// keep using `?`; it must preserve the attributed error verbatim.
+    #[tokio::test]
+    async fn mtls_unset_error_converts_to_its_inner_rms_error() {
+        let (switch, _commands) = recording_switch(&[(
+            "nv unset system api mtls ca-certificate",
+            "permission denied",
+        )]);
+
+        let failure = switch
+            .unset_mtls_services(&[SwitchMtlsService::NvueApi], &no_cancel())
+            .await
+            .unwrap_err();
+        let expected = failure.error.message.clone();
+        let error = RmsError::from(failure);
+
+        assert_eq!(error.message, expected);
+        assert_eq!(error.code, ErrorCode::Internal);
     }
 
     #[test]

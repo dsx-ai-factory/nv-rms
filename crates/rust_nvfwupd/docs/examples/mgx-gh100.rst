@@ -126,7 +126,7 @@ For example, to update only the BMC firmware on a target:
     TaskStatus: OK
     Firmware update successful!
     Overall Time Taken: 0:00:04
-    Refer to 'NVIDIA Firmware Update Document' on activation steps for new firmware totake effect.
+    Refer to 'NVIDIA Firmware Update Document' on activation steps for new firmware to take effect.
 
     -------------------------------------------------------------------------------------
 

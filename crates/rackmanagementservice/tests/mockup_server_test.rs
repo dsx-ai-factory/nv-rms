@@ -17,6 +17,7 @@
 
 use std::io::Write;
 
+use rackmanagementservice::config::hardware_profiles::HardwareProfileCatalog;
 use rackmanagementservice::domain::node::{
     FirmwareTarget, Node, NodeType, PowerOp, PowerState, PowerTargetType,
 };
@@ -44,17 +45,36 @@ fn https_url(port: u16, path: &str) -> String {
 }
 
 fn compute_node(port: u16) -> rackmanagementservice::utilities::error::Result<NvidiaGb200Compute> {
-    NvidiaGb200Compute::new(
-        "compute-1".to_owned(),
-        "rack-1".to_owned(),
-        "127.0.0.1".to_owned(),
-        port,
-        "admin",
-        "password",
-        "00:11:22:33:44:55".to_owned(),
-        Vec::new(),
-        Vec::new(),
-        true,
+    let catalog = HardwareProfileCatalog::built_in().map_err(|error| {
+        rackmanagementservice::utilities::error::RmsError::internal(error.to_string())
+    })?;
+    let runtime_config = catalog
+        .runtime_config_for_request(NodeType::ComputeGb200Nvidia)
+        .ok_or_else(|| {
+            rackmanagementservice::utilities::error::RmsError::failed_precondition(
+                "missing GB200 compute hardware profile",
+            )
+        })?;
+    NvidiaGb200Compute::from_config(
+        &NodeConfig {
+            id: "compute-1".to_owned(),
+            node_type: NodeType::ComputeGb200Nvidia,
+            bmc_endpoint: Some(EndpointConfig::with_credentials(
+                Endpoint {
+                    ip_address: "127.0.0.1".to_owned(),
+                    mac_address: "00:11:22:33:44:55".to_owned(),
+                    port,
+                    host_name: None,
+                },
+                Some(EndpointCredentials::new("admin", "password")),
+                true,
+            )),
+            host_endpoint: None,
+            expected_inventory: None,
+            recovery: None,
+            runtime_config: Some(runtime_config),
+        },
+        "rack-1",
     )
 }
 
@@ -77,6 +97,8 @@ fn vrnvl72_compute_node(
             )),
             host_endpoint: None,
             expected_inventory: None,
+            recovery: None,
+            runtime_config: None,
         },
         "rack-1",
     )
@@ -654,6 +676,8 @@ async fn compute_firmware_uploads_work_against_mock_server() -> TestResult {
         component: "BMC".to_owned(),
         firmware_file,
         expected_version: None,
+        resolution: None,
+        linkx_policy: None,
     };
     let compute_task_id = compute.start_firmware_upload(&compute_target, true).await?;
 

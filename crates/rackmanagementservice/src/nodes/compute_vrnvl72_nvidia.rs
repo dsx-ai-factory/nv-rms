@@ -36,6 +36,55 @@ pub struct NvidiaVrnvl72Compute {
 }
 
 impl NvidiaVrnvl72Compute {
+    async fn update_linkx(
+        &self,
+        target: &FirmwareTarget,
+        force_update: bool,
+        options: FirmwareUpdateOptions,
+    ) -> Result<FirmwareUpdateOutcome> {
+        if force_update {
+            return Err(RmsError::failed_precondition(
+                "LINKX does not permit forced flashing or health-gate bypasses",
+            ));
+        }
+        let policy = target.linkx_policy.clone().ok_or_else(|| RmsError::failed_precondition(
+            "LINKX requires ApplyFirmwareObject with an explicit LinkxRollout policy; direct firmware requests cannot supply this policy",
+        ))?;
+        let report = nvfwupd::workflow_api::update_linkx_firmware(
+            self.inner.inband_host_target_config()?,
+            nvfwupd::flint::LinkxUpdateRequest {
+                targets: vec![nvfwupd::flint::LinkxFirmwareTarget {
+                    connectors: nvfwupd::flint::LinkxConnector::ALL.to_vec(),
+                    firmware_file: target.firmware_file.clone(),
+                    policy,
+                }],
+                cancellation: options.cancellation,
+            },
+        )
+        .await
+        .map_err(nvfwupd_adapter::map_error)?;
+        let details =
+            serde_json::to_value(&report).map_err(|e| RmsError::internal(e.to_string()))?;
+        if !report.completed {
+            // Preserve partial-update evidence even when the standard RMS job
+            // error envelope carries the failure as a message.
+            return Err(RmsError::failed_precondition(format!(
+                "LinkX update incomplete (firmware may have changed): {details}"
+            )));
+        }
+        if report
+            .connectors
+            .iter()
+            .all(|c| c.status == nvfwupd::flint::LinkxDisposition::Skipped)
+        {
+            return Ok(FirmwareUpdateOutcome::Skipped { reason: "all selected LinkX connectors already report the target version on both module paths".to_owned() });
+        }
+        Ok(FirmwareUpdateOutcome::Completed(FirmwareUpdateSummary {
+            message: "LinkX firmware flashed, module-activated, and verified on both paths with eight links recovered per connector".to_owned(),
+            task_ids: vec![], details,
+        }))
+    }
+
     pub fn from_config(config: &NodeConfig, rack_id: &str) -> Result<Self> {
         if config.node_type != NodeType::ComputeVrnvl72Nvidia {
             return Err(RmsError::unimplemented(
@@ -52,8 +101,7 @@ impl NvidiaVrnvl72Compute {
     }
 
     fn nvfwupd_target_config(&self) -> nvfwupd::workflow::TargetConfig {
-        self.inner
-            .nvfwupd_target_config_for(NodeType::ComputeVrnvl72Nvidia)
+        self.inner.nvfwupd_target_config()
     }
 }
 
@@ -96,7 +144,10 @@ impl Node for NvidiaVrnvl72Compute {
         let _op_guard = self.inner.op_lock.lock().await;
 
         tracing::debug!(node = %self.id(), "get_firmware_inventory");
-        let inventory = nvfwupd::workflow_api::get_firmware_inventory(self.nvfwupd_target_config())
+        let inventory = self
+            .inner
+            .firmware_workflow()
+            .get_firmware_inventory(self.nvfwupd_target_config())
             .await
             .map_err(nvfwupd_adapter::map_error)?;
         Ok(inventory
@@ -111,14 +162,54 @@ impl Node for NvidiaVrnvl72Compute {
     ) -> Result<FirmwareVersionCheckSummary> {
         let _op_guard = self.inner.op_lock.lock().await;
 
+        if targets
+            .iter()
+            .any(|t| t.component.trim().eq_ignore_ascii_case("LINKX"))
+        {
+            let [target] = targets else {
+                return Err(RmsError::invalid_argument(
+                    "verify LINKX separately from out-of-band targets",
+                ));
+            };
+            let version = target
+                .linkx_policy
+                .as_ref()
+                .map(|p| p.target_version.as_str())
+                .ok_or_else(|| {
+                    RmsError::failed_precondition(
+                        "LINKX version verification requires its manifest rollout policy",
+                    )
+                })?;
+            let evidence = nvfwupd::flint::inspect_linkx_firmware(
+                self.inner.inband_host_target_config()?,
+                &nvfwupd::flint::LinkxConnector::ALL,
+                version,
+            )
+            .await
+            .map_err(nvfwupd_adapter::map_error)?;
+            return Ok(FirmwareVersionCheckSummary {
+                matched: evidence.iter().all(|(_, e)| {
+                    !e.inspection_timed_out
+                        && e.query_errors.is_empty()
+                        && e.version_state == nvfwupd::flint::LinkxVersionState::Target
+                }),
+                details: serde_json::json!({ "connectors": evidence }),
+            });
+        }
+
         tracing::info!(node = %self.id(), "verify_firmware_package_versions via NVFWUPD VRNVL72");
         let targets = nvfwupd_adapter::to_version_check_targets(targets);
-        let summary = nvfwupd::workflow_api::verify_firmware_target_versions(
-            self.nvfwupd_target_config(),
-            targets,
-        )
-        .await
-        .map_err(nvfwupd_adapter::map_error)?;
+        let summary = self
+            .inner
+            .firmware_workflow()
+            .verify_firmware_target_versions_after_activation_with_expected_inventory(
+                self.nvfwupd_target_config(),
+                targets,
+                self.expected_inventory_policy()
+                    .map(|policy| policy.ap_names.as_ref().to_vec()),
+            )
+            .await
+            .map_err(nvfwupd_adapter::map_error)?;
         Ok(nvfwupd_adapter::map_version_check_summary(summary))
     }
 
@@ -130,6 +221,10 @@ impl Node for NvidiaVrnvl72Compute {
     ) -> Result<FirmwareUpdateOutcome> {
         let _op_guard = self.inner.op_lock.lock().await;
 
+        if target.component.trim().eq_ignore_ascii_case("LINKX") {
+            return self.update_linkx(target, force_update, options).await;
+        }
+
         tracing::info!(
             node = %self.id(),
             component = %target.component,
@@ -140,13 +235,16 @@ impl Node for NvidiaVrnvl72Compute {
         let expected_inventory = self
             .expected_inventory_policy()
             .map(|policy| policy.ap_names.as_ref().to_vec());
-        let outcome = nvfwupd::workflow_api::update_firmware_with_expected_inventory(
-            self.nvfwupd_target_config(),
-            request,
-            expected_inventory,
-        )
-        .await
-        .map_err(nvfwupd_adapter::map_error)?;
+        let outcome = self
+            .inner
+            .firmware_workflow()
+            .update_firmware_with_expected_inventory(
+                self.nvfwupd_target_config(),
+                request,
+                expected_inventory,
+            )
+            .await
+            .map_err(nvfwupd_adapter::map_error)?;
         Ok(nvfwupd_adapter::map_outcome(outcome))
     }
 
@@ -155,6 +253,12 @@ impl Node for NvidiaVrnvl72Compute {
         target: &FirmwareTarget,
         force_update: bool,
     ) -> Result<String> {
+        if target.component.trim().eq_ignore_ascii_case("LINKX") {
+            return Err(RmsError::unimplemented(
+                "task-id-only upload for LINKX; use ApplyFirmwareObject",
+                self.node_type(),
+            ));
+        }
         match self
             .update_firmware(target, force_update, FirmwareUpdateOptions::default())
             .await?
@@ -172,7 +276,10 @@ impl Node for NvidiaVrnvl72Compute {
         let _op_guard = self.inner.op_lock.lock().await;
 
         tracing::debug!(node = %self.id(), task_id, "poll_firmware_task via NVFWUPD VRNVL72");
-        let status = nvfwupd::workflow_api::get_task_status(self.nvfwupd_target_config(), task_id)
+        let status = self
+            .inner
+            .firmware_workflow()
+            .get_task_status(self.nvfwupd_target_config(), task_id)
             .await
             .map_err(nvfwupd_adapter::map_error)?;
         Ok(nvfwupd_adapter::to_task_status(status))
@@ -186,10 +293,12 @@ impl Node for NvidiaVrnvl72Compute {
 
         tracing::info!(node = %self.id(), "activate_firmware via NVFWUPD VRNVL72");
         let request = nvfwupd_adapter::to_activation_request(request);
-        let summary =
-            nvfwupd::workflow_api::activate_firmware(self.nvfwupd_target_config(), request)
-                .await
-                .map_err(nvfwupd_adapter::map_error)?;
+        let summary = self
+            .inner
+            .firmware_workflow()
+            .activate_firmware(self.nvfwupd_target_config(), request)
+            .await
+            .map_err(nvfwupd_adapter::map_error)?;
         Ok(nvfwupd_adapter::map_activation_summary(summary))
     }
 
@@ -224,6 +333,8 @@ mod tests {
             )),
             host_endpoint: None,
             expected_inventory: None,
+            recovery: None,
+            runtime_config: None,
         }
     }
 

@@ -100,6 +100,7 @@ mod tests {
                 state: "action_error".to_owned(),
                 status: "bad image".to_owned(),
                 message: "bad image".to_owned(),
+                rejection: None,
             },
         ] {
             let err = terminal_firmware_task_error("firmware task", "Task-Failed", &status)
@@ -121,6 +122,7 @@ mod tests {
             state: "action_error".to_owned(),
             status: "rebooting to install image".to_owned(),
             message: "Installing image after reboot".to_owned(),
+            rejection: None,
         };
 
         assert!(
@@ -137,6 +139,7 @@ mod tests {
             state: "Completed".to_owned(),
             status: "OK".to_owned(),
             message: "3 components updated; 2 skipped due to failed pre-checks".to_owned(),
+            rejection: None,
         };
 
         assert!(
@@ -153,6 +156,7 @@ mod tests {
             state: "Completed".to_owned(),
             status: "Warning".to_owned(),
             message: "The resource property Firmware Update Service has detected errors of type 'No Matching Devices'. Resolution: Verify the FW package has devices that are listed in the Redfish FW Inventory".to_owned(),
+            rejection: None,
         };
 
         let err = terminal_firmware_task_error("firmware task", "0", &status)
@@ -173,6 +177,7 @@ mod tests {
             state: "Completed".to_owned(),
             status: "Warning".to_owned(),
             message: "Completed with advisory warning only".to_owned(),
+            rejection: None,
         };
 
         assert!(

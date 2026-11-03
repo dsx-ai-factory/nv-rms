@@ -19,7 +19,6 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use secrecy::ExposeSecret;
 use serde_json::{Value, json};
 
 use crate::domain::node::{
@@ -104,19 +103,11 @@ fn lenovo_bmc_http_from_config(config: &NodeConfig) -> Result<HttpClient> {
             "bmc_endpoint is required for Lenovo GB300 compute nodes",
         ));
     };
-    let credentials = bmc_endpoint.credentials.as_ref();
-    let username = credentials
-        .map(|credentials| credentials.username.as_str())
-        .unwrap_or_default();
-    let password = credentials
-        .map(|credentials| credentials.password.expose_secret())
-        .unwrap_or_default();
 
-    Ok(HttpClient::new(
+    Ok(HttpClient::new_with_endpoint_credentials(
         &bmc_endpoint.endpoint.ip_address,
         bmc_endpoint.endpoint.port,
-        username,
-        password,
+        bmc_endpoint.credentials.clone(),
         bmc_endpoint.dangerously_accept_invalid_certs,
         true,
     )?
@@ -222,31 +213,19 @@ fn lenovo_bmc_preserve_config_mismatch(update_service: &Value) -> Option<String>
     None
 }
 
-fn lenovo_hgx_update_options(mut options: FirmwareUpdateOptions) -> FirmwareUpdateOptions {
-    options.special_json = Some(json!({"Targets": []}));
-    options.oem_parameters = Some(json!({"ImageType": "PLDM", "Platform": "HGX"}));
-    options
-}
-
-fn lenovo_bmc_update_options(
-    target: &FirmwareTarget,
-    mut options: FirmwareUpdateOptions,
-) -> FirmwareUpdateOptions {
-    options.special_json = Some(json!({"Targets": [LENOVO_BMC_INVENTORY_TARGET]}));
-    options.oem_parameters = Some(json!({"ImageType": lenovo_bmc_image_type(target)}));
-    options
-}
-
+/// Apply embedded multipart defaults only when planning did not select a profile.
 fn lenovo_update_options_for_target(
     target: &FirmwareTarget,
     options: FirmwareUpdateOptions,
-) -> FirmwareUpdateOptions {
-    if is_lenovo_hgx_target(target) {
-        lenovo_hgx_update_options(options)
+) -> Result<FirmwareUpdateOptions> {
+    if target.resolution.is_some() {
+        Ok(options)
+    } else if is_lenovo_hgx_target(target) {
+        super::nvfwupd_adapter::default_update_options(NodeType::ComputeGb300Lenovo, "HMC", options)
     } else if is_lenovo_bmc_target(target) {
-        lenovo_bmc_update_options(target, options)
+        super::nvfwupd_adapter::default_update_options(NodeType::ComputeGb300Lenovo, "BMC", options)
     } else {
-        options
+        Ok(options)
     }
 }
 
@@ -255,10 +234,15 @@ fn lenovo_version_check_targets(targets: &[FirmwareTarget]) -> Vec<FirmwareTarge
         .iter()
         .cloned()
         .map(|mut target| {
+            if target.resolution.is_some() {
+                return target;
+            }
             if is_lenovo_bmc_target(&target) {
                 target.component = LENOVO_BMC_INVENTORY_TARGET.to_owned();
+                target.resolution = None;
             } else if is_lenovo_hgx_target(&target) {
                 target.component.clear();
+                target.resolution = None;
             }
             target
         })
@@ -283,14 +267,6 @@ fn is_lenovo_bmc_target(target: &FirmwareTarget) -> bool {
 fn firmware_file_is_bmc_image(firmware_file: &str) -> bool {
     let lower = firmware_file.to_ascii_lowercase();
     lower.ends_with(".ima") || lower.ends_with(".hpm")
-}
-
-fn lenovo_bmc_image_type(target: &FirmwareTarget) -> &'static str {
-    if target.firmware_file.to_ascii_lowercase().ends_with(".hpm") {
-        "HPM"
-    } else {
-        "BMC"
-    }
 }
 
 #[async_trait]
@@ -347,7 +323,7 @@ impl Node for LenovoGb300Compute {
         options: FirmwareUpdateOptions,
     ) -> Result<FirmwareUpdateOutcome> {
         let should_preserve_bmc_config = is_lenovo_bmc_target(target);
-        let options = lenovo_update_options_for_target(target, options);
+        let options = lenovo_update_options_for_target(target, options)?;
 
         if should_preserve_bmc_config {
             return self
@@ -441,6 +417,103 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn resolved_renamed_bmc_keeps_preservation_and_oem_parameters() {
+        let catalog = crate::config::hardware_profiles::HardwareProfileCatalog::built_in().unwrap();
+        let profile = catalog
+            .resolve_request(NodeType::ComputeGb300Lenovo)
+            .unwrap();
+        let bmc = profile
+            .stages()
+            .iter()
+            .flat_map(|stage| stage.targets())
+            .find(|target| target.component_key() == "BMC")
+            .unwrap();
+        for selector in ["BMC", "bmc"] {
+            let server = MockServer::start().await;
+            let retained: serde_json::Map<String, Value> = LENOVO_BMC_FULL_RETAIN_CONFIG
+                .iter()
+                .map(|(key, value)| ((*key).to_owned(), json!(value)))
+                .collect();
+            let readback = json!({"Oem":{"AMIUpdateService":{"PreserveConfiguration":retained}}});
+            Mock::given(method("GET"))
+                .and(path(LENOVO_UPDATE_SERVICE_ENDPOINT))
+                .respond_with(SequentialResponder::json(
+                    Arc::new(AtomicUsize::new(0)),
+                    vec![json!({}), readback],
+                ))
+                .expect(2)
+                .mount(&server)
+                .await;
+            Mock::given(method("PATCH"))
+                .and(path(LENOVO_UPDATE_SERVICE_ENDPOINT))
+                .and(header("If-Match", "*"))
+                .and(body_json(json!({"Oem":{"AMIUpdateService":{
+                    "@odata.type":LENOVO_AMI_UPDATE_SERVICE_TYPE, "PreserveConfiguration":retained
+                }}})))
+                .respond_with(ResponseTemplate::new(204))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let directory = tempfile::tempdir().unwrap();
+            // Test only preparation against local mocks. Bound the subsequent
+            // NVFWUPD setup; the deliberately missing package cannot be uploaded.
+            let target = bmc
+                .resolve(&FirmwareTarget {
+                    component: selector.into(),
+                    firmware_file: directory
+                        .path()
+                        .join("renamed-bmc.bin")
+                        .to_string_lossy()
+                        .into_owned(),
+                    ..FirmwareTarget::default()
+                })
+                .unwrap();
+            assert_eq!(target.component, "BMC");
+            assert!(is_lenovo_bmc_target(&target));
+            let options =
+                lenovo_update_options_for_target(&target, FirmwareUpdateOptions::default())
+                    .unwrap();
+            let request = crate::nodes::nvfwupd_adapter::to_update_request(&target, true, options);
+            assert_eq!(request.component, LENOVO_BMC_INVENTORY_TARGET);
+            assert_eq!(
+                request.options.special_json,
+                Some(json!({"Targets":[LENOVO_BMC_INVENTORY_TARGET]}))
+            );
+            assert_eq!(
+                request.options.oem_parameters,
+                Some(json!({"ImageType":"BMC"}))
+            );
+            let config = NodeConfig {
+                recovery: None,
+                id: "lenovo-test".into(),
+                node_type: NodeType::ComputeGb300Lenovo,
+                bmc_endpoint: Some(EndpointConfig::with_credentials(
+                    Endpoint {
+                        ip_address: "127.0.0.1".into(),
+                        host_name: None,
+                        port: server.address().port(),
+                        mac_address: String::new(),
+                    },
+                    Some(EndpointCredentials::new("test", "test")),
+                    true,
+                )),
+                host_endpoint: None,
+                expected_inventory: None,
+                runtime_config: None,
+            };
+            let mut node = LenovoGb300Compute::from_config(&config, "rack").unwrap();
+            node.bmc_http = HttpClient::for_test(&server.uri());
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(2),
+                node.update_firmware(&target, true, FirmwareUpdateOptions::default()),
+            )
+            .await;
+            assert!(!matches!(outcome, Ok(Ok(_))));
+            server.verify().await;
+        }
+    }
+
     #[test]
     fn from_config_reports_lenovo_type() {
         let config = NodeConfig {
@@ -458,6 +531,8 @@ mod tests {
             )),
             host_endpoint: None,
             expected_inventory: None,
+            recovery: None,
+            runtime_config: None,
         };
 
         let compute = LenovoGb300Compute::from_config(&config, "rack-01").unwrap();
@@ -475,8 +550,11 @@ mod tests {
             component: "/redfish/v1/Chassis/HGX_Chassis_0".to_owned(),
             firmware_file: "nosbios.fwpkg".to_owned(),
             expected_version: None,
+            resolution: None,
+            linkx_policy: None,
         };
-        let options = lenovo_update_options_for_target(&target, FirmwareUpdateOptions::default());
+        let options =
+            lenovo_update_options_for_target(&target, FirmwareUpdateOptions::default()).unwrap();
 
         assert_eq!(options.special_json, Some(json!({"Targets": []})));
         assert_eq!(
@@ -491,8 +569,11 @@ mod tests {
             component: "BMC".to_owned(),
             firmware_file: "bmc.ima".to_owned(),
             expected_version: None,
+            resolution: None,
+            linkx_policy: None,
         };
-        let options = lenovo_update_options_for_target(&target, FirmwareUpdateOptions::default());
+        let options =
+            lenovo_update_options_for_target(&target, FirmwareUpdateOptions::default()).unwrap();
 
         assert_eq!(
             options.special_json,
@@ -502,19 +583,22 @@ mod tests {
     }
 
     #[test]
-    fn lenovo_bmc_hpm_target_uses_hpm_oem_parameters() {
+    fn lenovo_bmc_hpm_target_uses_configured_default_image_type() {
         let target = FirmwareTarget {
             component: "BMC".to_owned(),
             firmware_file: "bmc.hpm".to_owned(),
             expected_version: None,
+            resolution: None,
+            linkx_policy: None,
         };
-        let options = lenovo_update_options_for_target(&target, FirmwareUpdateOptions::default());
+        let options =
+            lenovo_update_options_for_target(&target, FirmwareUpdateOptions::default()).unwrap();
 
         assert_eq!(
             options.special_json,
             Some(json!({"Targets": [LENOVO_BMC_INVENTORY_TARGET]}))
         );
-        assert_eq!(options.oem_parameters, Some(json!({"ImageType": "HPM"})));
+        assert_eq!(options.oem_parameters, Some(json!({"ImageType": "BMC"})));
     }
 
     #[test]
@@ -523,8 +607,11 @@ mod tests {
             component: String::new(),
             firmware_file: "/tmp/Lenovo_NapaC_BMC_v03.03.0_signed.ima".to_owned(),
             expected_version: None,
+            resolution: None,
+            linkx_policy: None,
         };
-        let options = lenovo_update_options_for_target(&target, FirmwareUpdateOptions::default());
+        let options =
+            lenovo_update_options_for_target(&target, FirmwareUpdateOptions::default()).unwrap();
 
         assert_eq!(
             options.special_json,
@@ -539,8 +626,11 @@ mod tests {
             component: String::new(),
             firmware_file: "/tmp/platform.bin".to_owned(),
             expected_version: None,
+            resolution: None,
+            linkx_policy: None,
         };
-        let options = lenovo_update_options_for_target(&target, FirmwareUpdateOptions::default());
+        let options =
+            lenovo_update_options_for_target(&target, FirmwareUpdateOptions::default()).unwrap();
 
         assert_eq!(options.special_json, None);
         assert_eq!(options.oem_parameters, None);
@@ -553,11 +643,15 @@ mod tests {
                 component: "BMC".to_owned(),
                 firmware_file: "bmc.ima".to_owned(),
                 expected_version: None,
+                resolution: None,
+                linkx_policy: None,
             },
             FirmwareTarget {
                 component: "HMC".to_owned(),
                 firmware_file: "hgx.fwpkg".to_owned(),
                 expected_version: None,
+                resolution: None,
+                linkx_policy: None,
             },
         ];
 

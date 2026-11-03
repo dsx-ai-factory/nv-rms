@@ -78,6 +78,10 @@ use crate::workflow::{
     FlintFirmwareUpdateRequest, HostTargetConfig, SshHostKeyMode,
 };
 
+const DEFAULT_UPDATE_TIMEOUT_SECS: u64 = 900;
+const PARALLEL_UPDATE_SINGLE_PACKAGE_ERROR: &str =
+    "Only one package per system is supported in parallel update.";
+
 fn redfish_fallback_for_ipmi_command(command: &str) -> &str {
     match command {
         "PWR_STATUS" => "RF_PWR_STATUS",
@@ -94,6 +98,7 @@ fn target_input_option_supported(key: &str) -> bool {
         "ip" | "port"
             | "user"
             | "password"
+            | "session_token"
             | "servertype"
             | "verify_tls"
             | "allow_http"
@@ -536,6 +541,11 @@ pub fn validate_global_options(schema: &CLISchema, opts: &[String]) {
 // FwUpdCmdBase -- shared state for all command implementations
 // ---------------------------------------------------------------------------
 
+struct ValidatedTarget {
+    input_index: usize,
+    args: Vec<String>,
+}
+
 /// Base struct holding state shared by all firmware update commands.
 pub struct FwUpdCmdBase<'a> {
     pub schema: &'a CLISchema,
@@ -725,10 +735,7 @@ impl<'a> FwUpdCmdBase<'a> {
         if recipes.is_none() && !has_cli_target {
             if let Some(ref cp) = self.config_parser {
                 if let Some(ref config) = cp.config_dict {
-                    let parallel = config
-                        .get("ParallelUpdate")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false);
+                    let parallel = self.config_parallel_update_or_exit(json_dict);
                     if parallel {
                         let mut pkgs = Vec::new();
                         if let Some(targets) = config.get("Targets").and_then(|v| v.as_array()) {
@@ -797,6 +804,18 @@ impl<'a> FwUpdCmdBase<'a> {
         global_args: &HashMap<String, Vec<String>>,
         json_dict: Option<&Value>,
     ) -> Vec<Vec<String>> {
+        self.validate_indexed_target_json(global_args, json_dict)
+            .await
+            .into_iter()
+            .map(|target| target.args)
+            .collect()
+    }
+
+    async fn validate_indexed_target_json(
+        &self,
+        global_args: &HashMap<String, Vec<String>>,
+        json_dict: Option<&Value>,
+    ) -> Vec<ValidatedTarget> {
         let target_args = global_args.get("target");
 
         // If no BMC targets are provided, check for config or error
@@ -876,13 +895,29 @@ impl<'a> FwUpdCmdBase<'a> {
                     return Vec::new();
                 }
 
+                let has_user = given_opts.contains(&"user".to_string());
+                let has_password = given_opts.contains(&"password".to_string());
+                let has_session_token = given_opts.contains(&"session_token".to_string());
+
+                if has_session_token && (has_user || has_password) {
+                    Util::bail_nvfwupd(
+                        1,
+                        "Error: session_token cannot be combined with user/password in \
+                         command input",
+                        BailAction::Exit,
+                        json_dict,
+                    );
+                    return Vec::new();
+                }
+
                 if !given_opts.contains(&"port".to_string())
-                    && (!given_opts.contains(&"user".to_string())
-                        || !given_opts.contains(&"password".to_string()))
+                    && !has_session_token
+                    && (!has_user || !has_password)
                 {
                     Util::bail_nvfwupd(
                         1,
-                        "Error: Missing target credentials user/password in command input",
+                        "Error: Missing target credentials: provide user/password or \
+                         session_token in command input",
                         BailAction::Exit,
                         json_dict,
                     );
@@ -900,7 +935,10 @@ impl<'a> FwUpdCmdBase<'a> {
                     }
                 }
 
-                return vec![resolved_args];
+                return vec![ValidatedTarget {
+                    input_index: 0,
+                    args: resolved_args,
+                }];
             }
 
             // Check for deprecated targets=file.json
@@ -1003,12 +1041,157 @@ impl<'a> FwUpdCmdBase<'a> {
         }
     }
 
+    /// Parse an optional boolean config field, rejecting non-boolean values.
+    fn config_bool(
+        config: &Value,
+        key: &str,
+        invalid_message: &str,
+    ) -> Result<Option<bool>, String> {
+        match config.get(key) {
+            Some(Value::Bool(value)) => Ok(Some(*value)),
+            Some(_) => Err(invalid_message.to_string()),
+            None => Ok(None),
+        }
+    }
+
+    /// Return the config `ParallelUpdate` setting or exit on malformed input.
+    fn config_parallel_update_or_exit(&self, json_dict: Option<&Value>) -> bool {
+        let Some(config) = self
+            .config_parser
+            .as_ref()
+            .and_then(|cp| cp.config_dict.as_ref())
+        else {
+            return false;
+        };
+
+        match Self::config_bool(
+            config,
+            "ParallelUpdate",
+            "Error: Improper format for ParallelUpdate parameter",
+        ) {
+            Ok(value) => value.unwrap_or(false),
+            Err(message) => {
+                Util::bail_nvfwupd(1, &message, BailAction::Exit, json_dict);
+                false
+            }
+        }
+    }
+
+    /// Return a non-empty YAML/JSON scalar as a string.
+    ///
+    /// Python stringified integer port values while validating config targets.
+    /// Accept strings and integer numbers here so `TUNNEL_TCP_PORT: 2444` and
+    /// `OS_PORT: 2222` behave like their quoted equivalents.
+    fn config_string_or_integer(value: &Value) -> Option<String> {
+        match value {
+            Value::String(value) if !value.trim().is_empty() => Some(value.clone()),
+            Value::Number(value) if value.is_i64() || value.is_u64() => Some(value.to_string()),
+            _ => None,
+        }
+    }
+
+    /// Build the multipart UpdateParameters JSON implied by a config file.
+    ///
+    /// Config-driven single-target updates instantiate the concrete platform
+    /// target directly, so the command layer must carry `MultipartOptions` and
+    /// `UpdateParametersTargets` through `cmd_args.special` before the platform
+    /// target builds the multipart request body.
+    fn config_multipart_update_parameters(config: &Value) -> Result<Option<Value>, String> {
+        if config.get("FwUpdateMethod").and_then(Value::as_str) != Some("MultipartHttpPushUri") {
+            return Ok(None);
+        }
+
+        let mut has_update_parameters = false;
+        let mut update_parameters = match config.get("MultipartOptions") {
+            Some(value) => {
+                has_update_parameters = true;
+                value
+                    .as_object()
+                    .cloned()
+                    .map(Value::Object)
+                    .ok_or_else(|| {
+                        "Missing/Invalid configuration for MultipartOptions. Expected dict."
+                            .to_string()
+                    })?
+            }
+            None => json!({}),
+        };
+
+        if let Some(targets) = config.get("UpdateParametersTargets") {
+            has_update_parameters = true;
+            if !targets.is_array() {
+                return Err(
+                    "Missing/Invalid configuration for UpdateParametersTargets. Expected list."
+                        .to_string(),
+                );
+            }
+            update_parameters["Targets"] = targets.clone();
+        }
+
+        Ok(has_update_parameters.then_some(update_parameters))
+    }
+
+    /// Materialize config UpdateParameters into the internal `special` shape.
+    fn config_multipart_update_parameters_special(
+        config: &Value,
+    ) -> Result<Option<Vec<String>>, String> {
+        let Some(update_parameters) = Self::config_multipart_update_parameters(config)? else {
+            return Ok(None);
+        };
+        let serialized = serde_json::to_string(&update_parameters)
+            .map_err(|error| format!("Failed to serialize config UpdateParameters: {error}"))?;
+        Ok(Some(vec![serialized]))
+    }
+
+    /// Materialize top-level config `OemParameters` into the internal argument shape.
+    fn config_oem_parameters(config: &Value) -> Option<Vec<String>> {
+        let oem_parameters = config.get("OemParameters")?;
+        if oem_parameters.is_null() {
+            return None;
+        }
+
+        if let Some(path_or_json) = oem_parameters.as_str() {
+            if path_or_json.trim().is_empty() {
+                return None;
+            }
+            return Some(vec![path_or_json.to_string()]);
+        }
+
+        serde_json::to_string(oem_parameters)
+            .ok()
+            .map(|serialized| vec![serialized])
+    }
+
+    /// Return config-provided `BMCResetParameters` for `perform_factory_reset`.
+    fn config_bmc_reset_parameters(config: &Value) -> Result<Option<Value>, String> {
+        match config.get("BMCResetParameters") {
+            Some(params) if params.is_object() => Ok(Some(params.clone())),
+            Some(_) => Err(
+                "Missing/Invalid configuration for BMCResetParameters. Expected reset dict."
+                    .to_string(),
+            ),
+            None => Ok(None),
+        }
+    }
+
+    /// Return the config-provided `FlintDeviceType`, if present.
+    fn config_flint_device_type(&self) -> Option<String> {
+        self.config_parser
+            .as_ref()
+            .and_then(|cp| cp.config_dict.as_ref())
+            .and_then(|config| config.get("FlintDeviceType"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    }
+
     /// Build target list from config parser targets.
     async fn make_target_list(
         &self,
         targets: &[Value],
         json_dict: Option<&Value>,
-    ) -> Vec<Vec<String>> {
+    ) -> Vec<ValidatedTarget> {
         let mut targets_list = Vec::new();
 
         let is_config = self.config_parser.is_some();
@@ -1037,7 +1220,7 @@ impl<'a> FwUpdCmdBase<'a> {
             return targets_list;
         }
 
-        for target in targets {
+        for (input_index, target) in targets.iter().enumerate() {
             let obj = match target.as_object() {
                 Some(o) => o,
                 None => {
@@ -1057,19 +1240,33 @@ impl<'a> FwUpdCmdBase<'a> {
             let ip_addr = obj.get(ip_key).and_then(|v| v.as_str()).unwrap_or("");
             let user = obj.get(user_key).and_then(|v| v.as_str()).unwrap_or("");
             let password = obj.get(pass_key).and_then(|v| v.as_str()).unwrap_or("");
-            let port = obj.get(port_key).and_then(|v| v.as_str()).unwrap_or("");
+            let port = match obj.get(port_key) {
+                Some(value) => match Self::config_string_or_integer(value) {
+                    Some(port) => port,
+                    None => {
+                        Util::bail_nvfwupd(
+                            1,
+                            &format!(
+                                "Error: {} object has invalid {} value. \
+                                      {} must be a non-empty string or integer",
+                                NvUtils::sanitize_log(&Self::format_value_python_repr(target)),
+                                port_key,
+                                port_key
+                            ),
+                            BailAction::DoNothing,
+                            json_dict,
+                        );
+                        continue;
+                    }
+                },
+                None => String::new(),
+            };
             let platform_type = obj.get(type_key).and_then(|v| v.as_str());
 
             // Validate required keys
             let is_parallel_update = is_config
                 && self.cmd_name == "update_fw"
-                && self
-                    .config_parser
-                    .as_ref()
-                    .and_then(|cp| cp.config_dict.as_ref())
-                    .and_then(|d| d.get("ParallelUpdate"))
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
+                && self.config_parallel_update_or_exit(json_dict);
 
             if is_parallel_update {
                 if ip_addr.is_empty()
@@ -1101,6 +1298,33 @@ impl<'a> FwUpdCmdBase<'a> {
                 continue;
             }
 
+            let package_paths = obj
+                .get("PACKAGE")
+                .map(|pkg| Self::config_package_paths(pkg));
+            if let Some(packages) = package_paths.as_ref() {
+                if packages.is_empty() {
+                    Util::bail_nvfwupd(
+                        1,
+                        &format!(
+                            "Error: {} object has missing/invalid PACKAGE  ",
+                            NvUtils::sanitize_log(&Self::format_value_python_repr(target))
+                        ),
+                        BailAction::DoNothing,
+                        json_dict,
+                    );
+                    continue;
+                }
+                if is_parallel_update && packages.len() > 1 {
+                    Util::bail_nvfwupd(
+                        1,
+                        PARALLEL_UPDATE_SINGLE_PACKAGE_ERROR,
+                        BailAction::Exit,
+                        json_dict,
+                    );
+                    return Vec::new();
+                }
+            }
+
             // Resolve DNS
             let resolved_ip = resolve_ip(ip_addr).await;
 
@@ -1117,20 +1341,7 @@ impl<'a> FwUpdCmdBase<'a> {
             }
 
             // Handle package
-            if let Some(pkg) = obj.get("PACKAGE") {
-                let packages = Self::config_package_paths(pkg);
-                if packages.is_empty() {
-                    Util::bail_nvfwupd(
-                        1,
-                        &format!(
-                            "Error: {} object has missing/invalid PACKAGE  ",
-                            NvUtils::sanitize_log(&Self::format_value_python_repr(target))
-                        ),
-                        BailAction::DoNothing,
-                        json_dict,
-                    );
-                    continue;
-                }
+            if let Some(packages) = package_paths {
                 let encoded = serde_json::to_string(&packages).unwrap_or_else(|_| "[]".into());
                 ns.push(format!("package={encoded}"));
             }
@@ -1283,7 +1494,10 @@ impl<'a> FwUpdCmdBase<'a> {
                 }
             }
 
-            targets_list.push(ns);
+            targets_list.push(ValidatedTarget {
+                input_index,
+                args: ns,
+            });
         }
 
         // If every target in the config was rejected by the per-target
@@ -1316,10 +1530,21 @@ impl<'a> FwUpdCmdBase<'a> {
                     let os_ip = config.get("OS_IP").and_then(|v| v.as_str());
                     let os_user = config.get("OS_USERNAME").and_then(|v| v.as_str());
                     let os_pass = config.get("OS_PASSWORD").and_then(|v| v.as_str());
-                    let os_port = config
-                        .get("OS_PORT")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("22");
+                    let os_port = match config.get("OS_PORT") {
+                        Some(value) => match Self::config_string_or_integer(value) {
+                            Some(port) => port,
+                            None => {
+                                Util::bail_nvfwupd(
+                                    1,
+                                    "Error: OS_PORT must be a non-empty string or integer",
+                                    BailAction::Exit,
+                                    json_dict,
+                                );
+                                return Vec::new();
+                            }
+                        },
+                        None => "22".to_string(),
+                    };
 
                     if let (Some(ip), Some(user), Some(pass)) = (os_ip, os_user, os_pass) {
                         let mut os_target = vec![
@@ -1956,13 +2181,49 @@ async fn path_is_file(path: &str) -> bool {
 }
 
 fn recipe_supported_for_target(access_type: AccessType, recipe: &str) -> bool {
+    let recipe = recipe.to_ascii_lowercase();
     recipe.ends_with("fwpkg")
         || recipe.ends_with("tar")
-        || (access_type == AccessType::NVSwitch && nvos_image::is_nvos_image_path(recipe))
+        || recipe.ends_with("bin")
+        || (access_type == AccessType::NVSwitch && nvos_image::is_nvos_image_path(&recipe))
 }
 
 fn recipe_should_parse_as_package(recipe: &str) -> bool {
     !nvos_image::is_nvos_image_path(recipe)
+}
+
+fn update_timeout_secs(timeout_arg: Option<&str>, recipe_list: &[String]) -> u64 {
+    let timeout_override = timeout_arg
+        .and_then(|s| s.parse().ok())
+        .filter(|&t: &u64| t != 0);
+    let default_timeout = if recipe_list
+        .iter()
+        .any(|recipe| nvos_image::is_nvos_image_path(recipe))
+    {
+        GB200SwitchRFTarget::default_nvos_sftp_upload_timeout_secs()
+    } else {
+        DEFAULT_UPDATE_TIMEOUT_SECS
+    };
+
+    timeout_override.unwrap_or(default_timeout)
+}
+
+fn clean_parallel_worker_label(label: &str) -> Option<String> {
+    let sanitized = NvUtils::sanitize_log(label.trim());
+    let label = sanitized.split_whitespace().collect::<Vec<_>>().join(" ");
+    if label.is_empty() {
+        None
+    } else {
+        Some(label)
+    }
+}
+
+fn parallel_worker_progress_label(params: &InputParams, worker_index: usize) -> String {
+    params
+        .system_name
+        .as_deref()
+        .and_then(clean_parallel_worker_label)
+        .unwrap_or_else(|| format!("Target #{}", worker_index + 1))
 }
 
 /// Parse target arg list into a HashMap of key=value pairs.
@@ -1988,6 +2249,81 @@ fn append_json_error_lines(json_dict: &mut Value, message: &str) {
             errors.push(Value::String(line.to_string()));
         }
     }
+}
+
+fn package_display_name(package_path: &str) -> String {
+    Path::new(package_path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or(package_path)
+        .to_string()
+}
+
+fn package_metadata_warning_for_version_comparison(
+    package_path: &str,
+    detail: Option<&str>,
+) -> String {
+    let package_name = NvUtils::sanitize_log(&package_display_name(package_path));
+    let detail = detail.map(str::trim).filter(|detail| !detail.is_empty());
+    match detail {
+        Some(detail) => format!(
+            "Unable to parse package metadata for version comparison: {} ({})",
+            package_name,
+            NvUtils::sanitize_log(detail)
+        ),
+        None => format!(
+            "Unable to parse package metadata for version comparison: {}",
+            package_name
+        ),
+    }
+}
+
+fn push_unique_warning(warnings: &mut Vec<String>, warning: String) {
+    if !warnings.iter().any(|existing| existing == &warning) {
+        warnings.push(warning);
+    }
+}
+
+fn collect_parser_metadata_warnings(
+    warnings: &mut Vec<String>,
+    parser: &dyn FirmwarePkg,
+    package_path: &str,
+) {
+    for detail in parser.parse_warnings() {
+        push_unique_warning(
+            warnings,
+            package_metadata_warning_for_version_comparison(package_path, Some(&detail)),
+        );
+    }
+}
+
+fn package_version_is_meaningful(version: &str) -> bool {
+    let version = version.trim();
+    !version.is_empty()
+        && !version.eq_ignore_ascii_case("N/A")
+        && !version.eq_ignore_ascii_case("unknown")
+}
+
+fn parser_has_package_version_metadata(parser: &dyn FirmwarePkg) -> bool {
+    parser.apname_version_dict().values().any(|components| {
+        components.values().any(|metadata| {
+            metadata
+                .first()
+                .map(|version| package_version_is_meaningful(version))
+                .unwrap_or(false)
+        })
+    })
+}
+
+fn show_version_package_comparison_available(
+    pkg_parser: Option<&Box<dyn FirmwarePkg>>,
+    recipe_list: Option<&Vec<String>>,
+) -> bool {
+    pkg_parser
+        .map(|parser| parser_has_package_version_metadata(parser.as_ref()))
+        .unwrap_or(false)
+        || nvos_image::package_version_from_recipes(recipe_list).is_some()
 }
 
 async fn validate_expected_inventory_for_cli(
@@ -2043,6 +2379,7 @@ struct UpdateWorkerContext {
 async fn update_fw_worker(
     context: UpdateWorkerContext,
     params: InputParams,
+    worker_index: usize,
     cmd_args_template: RFCmdArgs,
     json_mode: bool,
     time_out: u64,
@@ -2226,8 +2563,10 @@ async fn update_fw_worker(
     let mut adapter = FirmwarePkgAdapter {
         inner: pkg_parser.as_mut(),
     };
-    let (status, task_id_list_raw) = rf_target
-        .start_update_monitor(
+    let progress_label = parallel_worker_progress_label(&params, worker_index);
+    let (status, task_id_list_raw) = BmcAccess::with_switch_sftp_progress_label(
+        progress_label,
+        rf_target.start_update_monitor(
             &params.package_list,
             &mut adapter,
             &worker_cmd_args,
@@ -2237,9 +2576,13 @@ async fn update_fw_worker(
             params.update_delay,
             skip_pre_flight_checks,
             Some(UpdatePreconditionMode::SingleShot),
-        )
-        .await;
+        ),
+    )
+    .await;
 
+    if let Some(output) = json_dict.as_mut() {
+        annotate_submission_target(output, worker_index);
+    }
     err_status |= status;
     pkg_parser.remove_files().await;
 
@@ -2269,6 +2612,23 @@ async fn update_fw_worker(
         json_dict,
         err_status,
         is_powershelf,
+    }
+}
+
+// The index refers to the CLI input order, so sanitized addresses remain
+// distinguishable after serial or parallel target output is merged.
+fn annotate_submission_target(output: &mut Value, target_index: usize) {
+    if let Some(entries) = output.get_mut("Output").and_then(Value::as_array_mut) {
+        for entry in entries {
+            if let Some(diagnostic) = entry
+                .get_mut("SubmissionDiagnostic")
+                .and_then(Value::as_object_mut)
+            {
+                diagnostic
+                    .entry("target_index")
+                    .or_insert(json!(target_index));
+            }
+        }
     }
 }
 
@@ -2351,9 +2711,9 @@ impl<'a> FwUpdCmdHelp<'a> {
     }
 
     fn print_target_option_notes() {
-        const SERVER_TYPES: &str = "DGX, DGXRUBIN, HGX, MGX, GH200, HGXB100, HGXB300, HGXRUBIN, GB200, GB300, VRNVL72, GB200Switch, GB300Switch, VRNVL72Switch, Powershelf";
+        const SERVER_TYPES: &str = "DGX, DGXRUBIN, HGX, MGX, GH200, HGXB100, HGXB300, HGXRUBIN, GB200, GB300, VRNVL72, LP30, GB200Switch, GB300Switch, VRNVL72Switch, Powershelf";
         const NOTES: &[&str] = &[
-            "Target options: port=<port num for port forwarding>, servertype=<Type of server>, allow_http=<true|false>.",
+            "Target options: port=<port num for port forwarding>, session_token=<BMC Redfish session token, alternative to user/password; not supported for switch targets>, servertype=<Type of server>, allow_http=<true|false>.",
             "OS target options: port=<SSH port>, servertype=<Type of server>.",
             "Cleartext HTTP fallback is disabled by default. Use allow_http=true only for trusted HTTP-only Redfish targets or port-forwarding cases.",
         ];
@@ -2773,14 +3133,10 @@ impl<'a> FwUpdCmdShowVersion<'a> {
         // Determine if parallel update is set
         let parallel_update = self
             .base
-            .config_parser
-            .as_ref()
-            .and_then(|cp| cp.config_dict.as_ref())
-            .and_then(|d| d.get("ParallelUpdate"))
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+            .config_parallel_update_or_exit(json_error_return.as_ref());
 
         let mut pkg_parser: Option<Box<dyn FirmwarePkg>> = None;
+        let mut package_warnings: Vec<String> = Vec::new();
 
         // For non-parallel, create a single parser from the first package
         if let Some(ref rl) = recipe_list {
@@ -2800,21 +3156,33 @@ impl<'a> FwUpdCmdShowVersion<'a> {
                         if !recipe_should_parse_as_package(pkg_file) {
                             continue;
                         }
-                        let (status, msg) = parser.parse_pkg(pkg_file, None).await;
+                        let (status, _msg) = parser.parse_pkg(pkg_file, None).await;
                         if !status {
-                            Util::bail_nvfwupd(
-                                1,
-                                &format!(
-                                    "WARN: {} is not a valid package. Ignoring, {}",
-                                    pkg_file, msg
-                                ),
-                                BailAction::PrintDivider,
-                                json_error_return.as_ref(),
+                            push_unique_warning(
+                                &mut package_warnings,
+                                package_metadata_warning_for_version_comparison(pkg_file, None),
                             );
                             continue;
                         }
+                        collect_parser_metadata_warnings(
+                            &mut package_warnings,
+                            parser.as_ref(),
+                            pkg_file,
+                        );
                     }
                     parser.remove_files().await;
+                    if !parser_has_package_version_metadata(parser.as_ref())
+                        && nvos_image::package_version_from_recipes(recipe_list.as_ref()).is_none()
+                    {
+                        for pkg_file in rl {
+                            if recipe_should_parse_as_package(pkg_file) {
+                                push_unique_warning(
+                                    &mut package_warnings,
+                                    package_metadata_warning_for_version_comparison(pkg_file, None),
+                                );
+                            }
+                        }
+                    }
                     pkg_parser = Some(parser);
                 }
             }
@@ -2879,6 +3247,7 @@ impl<'a> FwUpdCmdShowVersion<'a> {
                         };
 
                         let mut target_pkg_parser: Option<Box<dyn FirmwarePkg>> = None;
+                        let mut package_warnings: Vec<String> = Vec::new();
                         if let Some(first_parseable) = params
                             .package_list
                             .iter()
@@ -2895,21 +3264,40 @@ impl<'a> FwUpdCmdShowVersion<'a> {
                                 if !recipe_should_parse_as_package(pkg_file) {
                                     continue;
                                 }
-                                let (status, msg) = parser.parse_pkg(pkg_file, None).await;
+                                let (status, _msg) = parser.parse_pkg(pkg_file, None).await;
                                 if !status {
-                                    Util::bail_nvfwupd_threadsafe(
-                                        1,
-                                        &format!(
-                                            "WARN: {} is not a valid package. {}",
-                                            pkg_file, msg
+                                    push_unique_warning(
+                                        &mut package_warnings,
+                                        package_metadata_warning_for_version_comparison(
+                                            pkg_file, None,
                                         ),
-                                        BailAction::PrintDivider,
-                                        worker_json_dict.as_ref(),
-                                        true,
                                     );
+                                    continue;
                                 }
+                                collect_parser_metadata_warnings(
+                                    &mut package_warnings,
+                                    parser.as_ref(),
+                                    pkg_file,
+                                );
                             }
                             parser.remove_files().await;
+                            if !parser_has_package_version_metadata(parser.as_ref())
+                                && nvos_image::package_version_from_recipes(Some(
+                                    &params.package_list,
+                                ))
+                                .is_none()
+                            {
+                                for pkg_file in &params.package_list {
+                                    if recipe_should_parse_as_package(pkg_file) {
+                                        push_unique_warning(
+                                            &mut package_warnings,
+                                            package_metadata_warning_for_version_comparison(
+                                                pkg_file, None,
+                                            ),
+                                        );
+                                    }
+                                }
+                            }
                             target_pkg_parser = Some(parser);
                         }
 
@@ -2922,6 +3310,7 @@ impl<'a> FwUpdCmdShowVersion<'a> {
                             } else {
                                 Some(&params.package_list)
                             },
+                            &package_warnings,
                             show_staged,
                             show_software_inventory,
                             worker_json_dict.as_ref(),
@@ -2977,6 +3366,9 @@ impl<'a> FwUpdCmdShowVersion<'a> {
                     let effective_output = if (is_empty || !has_model) && worker_json_dict.is_some()
                     {
                         let mut wjd = worker_json_dict.unwrap();
+                        if let Some(warnings) = json_output.get("Warnings") {
+                            wjd["Warnings"] = warnings.clone();
+                        }
                         if let Some(ref sn) = system_name {
                             wjd["System Name"] = json!(sn);
                         }
@@ -3036,6 +3428,7 @@ impl<'a> FwUpdCmdShowVersion<'a> {
                         target_args,
                         pkg_parser.as_ref(),
                         recipe_list.as_ref(),
+                        &package_warnings,
                         show_staged,
                         show_software_inventory,
                         json_error_return.as_ref(),
@@ -3075,12 +3468,16 @@ impl<'a> FwUpdCmdShowVersion<'a> {
         target_args: &[String],
         pkg_parser: Option<&Box<dyn FirmwarePkg>>,
         recipe_list: Option<&Vec<String>>,
+        package_warnings: &[String],
         show_staged: bool,
         show_software_inventory: bool,
         json_dict: Option<&Value>,
         parallel_operation: bool,
     ) -> (i32, Value) {
         let mut json_output = json!({});
+        if !package_warnings.is_empty() {
+            json_output["Warnings"] = json!(package_warnings);
+        }
         let bmc_ip_raw = target_args
             .first()
             .map(|s| s.as_str())
@@ -3151,9 +3548,17 @@ impl<'a> FwUpdCmdShowVersion<'a> {
             inv_dict.extend(sw_inv);
         }
 
+        let parsed_package_version_metadata_available = pkg_parser
+            .map(|parser| parser_has_package_version_metadata(parser.as_ref()))
+            .unwrap_or(false);
+        let package_comparison_available =
+            show_version_package_comparison_available(pkg_parser, recipe_list);
+
         let mut package_names = Vec::new();
         if let Some(ref parser) = pkg_parser {
-            package_names.extend(parser.apname_version_dict().keys().cloned());
+            if parsed_package_version_metadata_available {
+                package_names.extend(parser.apname_version_dict().keys().cloned());
+            }
         }
         package_names.extend(nvos_image::package_versions_from_recipes(recipe_list));
         package_names.sort();
@@ -3221,49 +3626,55 @@ impl<'a> FwUpdCmdShowVersion<'a> {
             if let Some(ref rl) = recipe_list {
                 if !rl.is_empty() {
                     let mut pkg_version = "N/A".to_string();
-                    let mut up_to_date = "Yes".to_string();
-                    let mut compare_pkg_version = true;
+                    let mut up_to_date = "N/A".to_string();
 
-                    if nvos_image::is_nvos_ap_name(&ap_inv_name) {
-                        pkg_version = nvos_image::package_version_from_recipes(recipe_list)
-                            .unwrap_or_else(|| "N/A".to_string());
-                    } else if let Some(ref parser) = pkg_parser {
-                        if Self::skip_hgx_matching_for_dgx_only_package(
-                            rf_target.as_ref(),
-                            &ap_name,
-                            parser.as_ref(),
-                        ) {
-                            up_to_date = "N/A".to_string();
-                            compare_pkg_version = false;
-                        } else if rf_target.is_fungible_component(&ap_name) {
-                            pkg_version = "unknown".to_string();
-                            if let Some(identifier) =
-                                rf_target.get_identifier_from_chassis(dev_url).await
-                            {
-                                pkg_version = rf_target
-                                    .get_version_sku(
-                                        &identifier.to_lowercase(),
-                                        &json!(parser.apname_version_dict()),
-                                        &ap_name,
-                                    )
-                                    .unwrap_or_else(|| "N/A".to_string());
-                            }
-                        } else {
-                            pkg_version = rf_target
-                                .get_component_version(
-                                    &json!(parser.apname_version_dict()),
-                                    &ap_name,
-                                    None,
-                                )
-                                .await
+                    if package_comparison_available {
+                        up_to_date = "Yes".to_string();
+                        let mut compare_pkg_version = true;
+
+                        if nvos_image::is_nvos_ap_name(&ap_inv_name) {
+                            pkg_version = nvos_image::package_version_from_recipes(recipe_list)
                                 .unwrap_or_else(|| "N/A".to_string());
+                        } else if let Some(ref parser) = pkg_parser {
+                            if parsed_package_version_metadata_available {
+                                if Self::skip_hgx_matching_for_dgx_only_package(
+                                    rf_target.as_ref(),
+                                    &ap_name,
+                                    parser.as_ref(),
+                                ) {
+                                    up_to_date = "N/A".to_string();
+                                    compare_pkg_version = false;
+                                } else if rf_target.is_fungible_component(&ap_name) {
+                                    pkg_version = "unknown".to_string();
+                                    if let Some(identifier) =
+                                        rf_target.get_identifier_from_chassis(dev_url).await
+                                    {
+                                        pkg_version = rf_target
+                                            .get_version_sku(
+                                                &identifier.to_lowercase(),
+                                                &json!(parser.apname_version_dict()),
+                                                &ap_name,
+                                            )
+                                            .unwrap_or_else(|| "N/A".to_string());
+                                    }
+                                } else {
+                                    pkg_version = rf_target
+                                        .get_component_version(
+                                            &json!(parser.apname_version_dict()),
+                                            &ap_name,
+                                            None,
+                                        )
+                                        .await
+                                        .unwrap_or_else(|| "N/A".to_string());
+                                }
+                            }
                         }
-                    }
 
-                    if compare_pkg_version
-                        && !rf_target.firmware_version_up_to_date(&pkg_version, &sys_version)
-                    {
-                        up_to_date = "No".to_string();
+                        if compare_pkg_version
+                            && !rf_target.firmware_version_up_to_date(&pkg_version, &sys_version)
+                        {
+                            up_to_date = "No".to_string();
+                        }
                     }
                     firmware_dev["Pkg Version"] = json!(pkg_version);
                     firmware_dev["Up-To-Date"] = json!(up_to_date);
@@ -3283,6 +3694,7 @@ impl<'a> FwUpdCmdShowVersion<'a> {
         target_args: &[String],
         pkg_parser: Option<&Box<dyn FirmwarePkg>>,
         recipe_list: Option<&Vec<String>>,
+        package_warnings: &[String],
         show_staged: bool,
         show_software_inventory: bool,
         json_dict: Option<&Value>,
@@ -3293,6 +3705,7 @@ impl<'a> FwUpdCmdShowVersion<'a> {
             target_args,
             pkg_parser,
             recipe_list,
+            package_warnings,
             show_staged,
             show_software_inventory,
             json_dict,
@@ -3387,6 +3800,13 @@ impl<'a> FwUpdCmdShowVersion<'a> {
                     .and_then(|v| v.as_str())
                     .unwrap_or("Failed")
             );
+            if let Some(warnings) = json_output.get("Warnings").and_then(|v| v.as_array()) {
+                for warning in warnings {
+                    if let Some(message) = warning.as_str() {
+                        println!("Warning: {}", message);
+                    }
+                }
+            }
             println!();
 
             let fw_devices = json_output
@@ -3697,18 +4117,18 @@ impl<'a> FwUpdCmdUpdateFirmware<'a> {
         if !skip_pre_flight_checks {
             if let Some(ref cp) = self.base.config_parser {
                 if let Some(ref config) = cp.config_dict {
-                    match config.get("SkipPreFlightChecks") {
-                        Some(Value::Bool(b)) => skip_pre_flight_checks = *b,
-                        Some(_) => {
-                            Util::bail_nvfwupd(
-                                1,
-                                "Error: Improper format for SkipPreFlightChecks parameter. \
-                                 Expected boolean (true/false).",
-                                BailAction::DoNothing,
-                                json_output.as_ref(),
-                            );
+                    match FwUpdCmdBase::config_bool(
+                        config,
+                        "SkipPreFlightChecks",
+                        "Error: Improper format for SkipPreFlightChecks parameter. \
+                         Expected boolean (true/false).",
+                    ) {
+                        Ok(Some(value)) => skip_pre_flight_checks = value,
+                        Ok(None) => {}
+                        Err(message) => {
+                            Util::bail_nvfwupd(1, &message, BailAction::Exit, json_output.as_ref());
+                            return;
                         }
-                        None => {}
                     }
                 }
             }
@@ -3769,20 +4189,19 @@ impl<'a> FwUpdCmdUpdateFirmware<'a> {
             return;
         }
 
-        let list_of_target_ips = self
+        let targets = self
             .base
-            .validate_target_json(&global_args, json_output.as_ref())
+            .validate_indexed_target_json(&global_args, json_output.as_ref())
             .await;
+        let (target_indexes, list_of_target_ips): (Vec<_>, Vec<_>) = targets
+            .into_iter()
+            .map(|target| (target.input_index, target.args))
+            .unzip();
 
         // Determine parallel update
         let parallel_update = self
             .base
-            .config_parser
-            .as_ref()
-            .and_then(|cp| cp.config_dict.as_ref())
-            .and_then(|d| d.get("ParallelUpdate"))
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+            .config_parallel_update_or_exit(json_output.as_ref());
 
         // Validate background with multiple targets
         if background && list_of_target_ips.len() > 1 && !parallel_update {
@@ -3887,12 +4306,9 @@ impl<'a> FwUpdCmdUpdateFirmware<'a> {
         let mut all_update_status: i32 = 0;
 
         // Timeout
-        let time_out: u64 = timeout_str
-            .and_then(|s| s.parse().ok())
-            .filter(|&t: &u64| t != 0)
-            .unwrap_or(900);
+        let time_out = update_timeout_secs(timeout_str, &recipe_list);
 
-        let rf_cmd_args = RFCmdArgs {
+        let mut rf_cmd_args = RFCmdArgs {
             cmd: String::new(),
             background,
             details,
@@ -3902,6 +4318,27 @@ impl<'a> FwUpdCmdUpdateFirmware<'a> {
             special: special.clone(),
             oem_parameters: oem_parameters.clone(),
         };
+
+        if !parallel_update && rf_cmd_args.special.is_none() {
+            if let Some(ref cp) = self.base.config_parser {
+                if let Some(ref config) = cp.config_dict {
+                    match FwUpdCmdBase::config_multipart_update_parameters_special(config) {
+                        Ok(special) => rf_cmd_args.special = special,
+                        Err(message) => {
+                            Util::bail_nvfwupd(1, &message, BailAction::Exit, json_output.as_ref());
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+        if !parallel_update && rf_cmd_args.oem_parameters.is_none() {
+            if let Some(ref cp) = self.base.config_parser {
+                if let Some(ref config) = cp.config_dict {
+                    rf_cmd_args.oem_parameters = FwUpdCmdBase::config_oem_parameters(config);
+                }
+            }
+        }
 
         if parallel_update {
             // =============================================================
@@ -3919,8 +4356,21 @@ impl<'a> FwUpdCmdUpdateFirmware<'a> {
                 );
                 return;
             }
+            if input_params_list
+                .iter()
+                .any(|params| params.package_list.len() > 1)
+            {
+                Util::bail_nvfwupd(
+                    1,
+                    PARALLEL_UPDATE_SINGLE_PACKAGE_ERROR,
+                    BailAction::Exit,
+                    json_output.as_ref(),
+                );
+                return;
+            }
 
             let max_workers = self.base.get_parallel_max_workers(json_output.as_ref());
+            let timeout_arg = timeout_str.map(str::to_string);
 
             // Spawn worker tasks and process in batches to cap concurrency.
             let mut indexed_worker_results: Vec<(usize, WorkerResult)> = Vec::new();
@@ -3939,18 +4389,23 @@ impl<'a> FwUpdCmdUpdateFirmware<'a> {
 
                 for (offset, params) in chunk.iter().cloned().enumerate() {
                     let result_index = chunk_index * max_workers + offset;
+                    let target_index = target_indexes[result_index];
                     let worker_context = worker_context.clone();
                     let rf_cmd_args = rf_cmd_args.clone();
                     let expected_inventory = expected_inventory.clone();
+                    let timeout_arg = timeout_arg.clone();
                     join_set.spawn(async move {
+                        let worker_time_out =
+                            update_timeout_secs(timeout_arg.as_deref(), &params.package_list);
                         (
                             result_index,
                             update_fw_worker(
                                 worker_context,
                                 params,
+                                target_index,
                                 rf_cmd_args,
                                 json_mode,
-                                time_out,
+                                worker_time_out,
                                 skip_pre_flight_checks,
                                 expected_inventory,
                             )
@@ -4215,9 +4670,9 @@ impl<'a> FwUpdCmdUpdateFirmware<'a> {
             );
         } else {
             // =============================================================
-            // Serial (single-target) update path
+            // Serial update path
             // =============================================================
-            for target_args in &list_of_target_ips {
+            for (target_args, &target_index) in list_of_target_ips.iter().zip(&target_indexes) {
                 let bmc_ip = NvUtils::sanitize_log(
                     target_args.first().map(|s| s.as_str()).unwrap_or("unknown"),
                 );
@@ -4358,6 +4813,9 @@ impl<'a> FwUpdCmdUpdateFirmware<'a> {
                     )
                     .await;
 
+                if let Some(output) = json_output.as_mut() {
+                    annotate_submission_target(output, target_index);
+                }
                 all_update_status |= status;
                 pkg_parser.remove_files().await;
                 if !json_mode {
@@ -4627,6 +5085,18 @@ impl<'a> FwUpdCmdPerformFactoryReset<'a> {
     pub async fn run_command(&mut self) {
         let (global_args, _cmd_args) = self.base.validate_cmd(None);
         let list_of_target_ips = self.base.validate_target_json(&global_args, None).await;
+        let reset_params = self
+            .base
+            .config_parser
+            .as_ref()
+            .and_then(|cp| cp.config_dict.as_ref())
+            .map(FwUpdCmdBase::config_bmc_reset_parameters)
+            .transpose()
+            .unwrap_or_else(|message| {
+                Util::bail_nvfwupd(1, &message, BailAction::Exit, None);
+                unreachable!("bail_nvfwupd with Exit terminates");
+            })
+            .flatten();
 
         for target_args in &list_of_target_ips {
             let bmc_ip =
@@ -4658,7 +5128,7 @@ impl<'a> FwUpdCmdPerformFactoryReset<'a> {
                     None => continue,
                 };
 
-            let (status, response_dict) = rf_target.factory_reset(None).await;
+            let (status, response_dict) = rf_target.factory_reset(reset_params.as_ref()).await;
             if !status {
                 Util::bail_nvfwupd(
                     1,
@@ -5296,7 +5766,10 @@ impl<'a> FwUpdCmdFlintUpdate<'a> {
             return;
         }
 
-        let device_type = cmd_args.get_string("device_type").map(|s| s.to_string());
+        let device_type = cmd_args
+            .get_string("device_type")
+            .map(|s| s.to_string())
+            .or_else(|| self.base.config_flint_device_type());
 
         // Version query workflow
         if version_query {
@@ -6097,6 +6570,25 @@ mod tests {
     use super::*;
     use indexmap::IndexMap;
 
+    #[test]
+    fn submission_target_annotation_preserves_previous_targets_and_other_entries() {
+        let mut output = json!({"Output": [
+            {"SubmissionDiagnostic": {"category": "http_rejection", "target_index": 0}},
+            {"SubmissionDiagnostic": {"category": "missing_task_reference"}},
+            {"Id": "task-1"}
+        ]});
+        annotate_submission_target(&mut output, 1);
+        assert_eq!(
+            output["Output"][0]["SubmissionDiagnostic"]["target_index"],
+            0
+        );
+        assert_eq!(
+            output["Output"][1]["SubmissionDiagnostic"]["target_index"],
+            1
+        );
+        assert_eq!(output["Output"][2], json!({"Id": "task-1"}));
+    }
+
     struct MockFirmwarePkg {
         apname_version_dict: HashMap<String, IndexMap<String, Vec<String>>>,
     }
@@ -6111,6 +6603,44 @@ mod tests {
                 apname_version_dict,
             }
         }
+
+        fn with_component_version(package_name: &str, ap_name: &str, version: &str) -> Self {
+            let mut components = IndexMap::new();
+            components.insert(
+                ap_name.to_string(),
+                vec![
+                    version.to_string(),
+                    "GenericModel".to_string(),
+                    "unknown".to_string(),
+                ],
+            );
+            let apname_version_dict = HashMap::from([(package_name.to_string(), components)]);
+            Self {
+                apname_version_dict,
+            }
+        }
+    }
+
+    async fn test_base(cmd_name: &str, args: Vec<String>) -> FwUpdCmdBase<'static> {
+        let mut schema = CLISchema::new();
+        schema
+            .load_embedded_schema()
+            .expect("embedded CLI schema should parse");
+        let schema = Box::leak(Box::new(schema));
+        let command = schema
+            .get_command_schema(cmd_name)
+            .expect("command schema should exist")
+            .clone();
+
+        FwUpdCmdBase::new(
+            schema,
+            "nvfwupd".to_string(),
+            cmd_name.to_string(),
+            command,
+            Vec::new(),
+            args,
+        )
+        .await
     }
 
     #[async_trait::async_trait]
@@ -6136,6 +6666,11 @@ mod tests {
     fn test_match_platform_known() {
         let result = FwUpdCmdBase::match_platform("dgx");
         assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_match_platform_lp30() {
+        assert_eq!(FwUpdCmdBase::match_platform("lp30"), Some("GB200RFTarget"));
     }
 
     #[test]
@@ -6475,6 +7010,86 @@ mod tests {
         assert!(rendered.contains("password=XXXX"));
     }
 
+    #[test]
+    fn update_timeout_uses_nvos_default_and_respects_override() {
+        let nvos_recipe = vec!["nvos-amd64-25.02.4440.bin".to_string()];
+        let firmware_recipe = vec!["bundle.fwpkg".to_string()];
+
+        assert_eq!(
+            update_timeout_secs(None, &firmware_recipe),
+            DEFAULT_UPDATE_TIMEOUT_SECS
+        );
+        assert_eq!(
+            update_timeout_secs(None, &nvos_recipe),
+            GB200SwitchRFTarget::default_nvos_sftp_upload_timeout_secs()
+        );
+        assert_eq!(
+            update_timeout_secs(None, &[nvos_recipe[0].clone(), nvos_recipe[0].clone()]),
+            GB200SwitchRFTarget::default_nvos_sftp_upload_timeout_secs()
+        );
+        assert_eq!(update_timeout_secs(Some("1200"), &nvos_recipe), 1200);
+    }
+
+    #[test]
+    fn bin_recipes_are_not_rejected_by_the_cli_extension_gate() {
+        assert!(recipe_supported_for_target(
+            AccessType::Login,
+            "firmware-image.bin"
+        ));
+        assert!(recipe_supported_for_target(
+            AccessType::Login,
+            "firmware-image.BIN"
+        ));
+        assert!(recipe_supported_for_target(
+            AccessType::NVSwitch,
+            "nvos-amd64-25.02.4440.bin"
+        ));
+    }
+
+    #[test]
+    fn package_metadata_warning_uses_basename_and_optional_detail() {
+        assert_eq!(
+            package_metadata_warning_for_version_comparison("/tmp/work/invalid-package.tar", None),
+            "Unable to parse package metadata for version comparison: invalid-package.tar"
+        );
+        assert_eq!(
+            package_metadata_warning_for_version_comparison(
+                "/tmp/work/invalid-package.tar",
+                Some("tar archive did not contain a MANIFEST; using default tar metadata"),
+            ),
+            "Unable to parse package metadata for version comparison: invalid-package.tar (tar archive did not contain a MANIFEST; using default tar metadata)"
+        );
+    }
+
+    #[test]
+    fn show_version_package_comparison_requires_meaningful_metadata() {
+        let empty_pkg = MockFirmwarePkg::with_packages(&["GenericPackage"]);
+        let default_tar_pkg =
+            MockFirmwarePkg::with_component_version("generic.tar", "psu_firmware", "N/A");
+        let real_pkg =
+            MockFirmwarePkg::with_component_version("GenericPackage", "FW_BMC_0", "1.2.3");
+        let nvos_recipe = vec!["nvos-amd64-25.02.4440.bin".to_string()];
+
+        assert!(!parser_has_package_version_metadata(&empty_pkg));
+        assert!(!parser_has_package_version_metadata(&default_tar_pkg));
+        assert!(parser_has_package_version_metadata(&real_pkg));
+
+        let empty_pkg: Box<dyn FirmwarePkg> = Box::new(empty_pkg);
+        let real_pkg: Box<dyn FirmwarePkg> = Box::new(real_pkg);
+        assert!(!show_version_package_comparison_available(
+            Some(&empty_pkg),
+            None,
+        ));
+        assert!(show_version_package_comparison_available(
+            Some(&real_pkg),
+            None,
+        ));
+        assert!(show_version_package_comparison_available(
+            None,
+            Some(&nvos_recipe),
+        ));
+    }
+
     #[tokio::test]
     async fn config_package_paths_with_spaces_survive_worker_materialization() {
         let mut schema = CLISchema::new();
@@ -6495,36 +7110,44 @@ mod tests {
         )
         .await;
 
-        let targets = vec![json!({
+        let valid_target = json!({
             "BMC_IP": "192.0.2.10",
             "RF_USERNAME": "admin",
             "RF_PASSWORD": "secret",
             "ALLOW_HTTP": true,
-            "PACKAGE": [
-                "/tmp/fw bundle/update one.fwpkg",
-                "/tmp/second package.fwpkg"
-            ]
-        })];
+            "PACKAGE": ["/tmp/fw bundle/update one.fwpkg"]
+        });
+        let targets = vec![
+            Value::Null,
+            valid_target.clone(),
+            json!({"BMC_IP":"192.0.2.11"}),
+            valid_target,
+        ];
         base.config_parser = Some(ConfigParser {
             config_dict: Some(json!({"ParallelUpdate": true, "Targets": targets.clone()})),
             targets: targets.clone(),
             config_file_path: "in-memory.yaml".to_string(),
         });
 
-        let target_args = base.make_target_list(&targets, None).await;
+        let validated = base.make_target_list(&targets, None).await;
+        assert_eq!(
+            validated
+                .iter()
+                .map(|target| target.input_index)
+                .collect::<Vec<_>>(),
+            vec![1, 3]
+        );
+        let target_args: Vec<_> = validated.into_iter().map(|target| target.args).collect();
         let params = FwUpdCmdBase::create_input_params_list(&target_args, &[]);
 
-        assert_eq!(params.len(), 1);
+        assert_eq!(params.len(), 2);
         assert!(
             target_args[0].contains(&"allow_http=true".to_string()),
             "ALLOW_HTTP should materialize as allow_http=true"
         );
         assert_eq!(
             params[0].package_list,
-            vec![
-                "/tmp/fw bundle/update one.fwpkg".to_string(),
-                "/tmp/second package.fwpkg".to_string()
-            ]
+            vec!["/tmp/fw bundle/update one.fwpkg".to_string()]
         );
     }
 
@@ -6577,6 +7200,248 @@ mod tests {
         let params = FwUpdCmdBase::create_input_params_list(&target_args, &[]);
 
         assert!(params[0].package_list.is_empty());
+    }
+
+    #[test]
+    fn single_target_config_multipart_options_materialize_as_special_update_parameters() {
+        let config = json!({
+            "FwUpdateMethod": "MultipartHttpPushUri",
+            "MultipartOptions": {
+                "ForceUpdate": true
+            },
+            "UpdateParametersTargets": [
+                "/redfish/v1/Chassis/HGX_Chassis_0"
+            ]
+        });
+
+        let special = FwUpdCmdBase::config_multipart_update_parameters_special(&config)
+            .expect("config parser should succeed")
+            .expect("config should materialize UpdateParameters");
+        let update_parameters: Value =
+            serde_json::from_str(&special[0]).expect("special should be valid JSON");
+
+        assert_eq!(update_parameters["ForceUpdate"], true);
+        assert_eq!(
+            update_parameters["Targets"],
+            json!(["/redfish/v1/Chassis/HGX_Chassis_0"])
+        );
+    }
+
+    #[test]
+    fn config_multipart_update_parameters_rejects_malformed_multipart_options() {
+        let config = json!({
+            "FwUpdateMethod": "MultipartHttpPushUri",
+            "MultipartOptions": "ForceUpdate: true"
+        });
+
+        assert_eq!(
+            FwUpdCmdBase::config_multipart_update_parameters_special(&config),
+            Err("Missing/Invalid configuration for MultipartOptions. Expected dict.".to_string())
+        );
+    }
+
+    #[test]
+    fn config_multipart_update_parameters_rejects_malformed_targets() {
+        let config = json!({
+            "FwUpdateMethod": "MultipartHttpPushUri",
+            "MultipartOptions": {
+                "ForceUpdate": true
+            },
+            "UpdateParametersTargets": {
+                "Target": "/redfish/v1/Chassis/HGX_Chassis_0"
+            }
+        });
+
+        assert_eq!(
+            FwUpdCmdBase::config_multipart_update_parameters_special(&config),
+            Err(
+                "Missing/Invalid configuration for UpdateParametersTargets. Expected list."
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn config_bool_rejects_non_boolean_values() {
+        let config = json!({
+            "ParallelUpdate": "true",
+            "SkipPreFlightChecks": 1
+        });
+
+        assert_eq!(
+            FwUpdCmdBase::config_bool(
+                &config,
+                "ParallelUpdate",
+                "Error: Improper format for ParallelUpdate parameter"
+            ),
+            Err("Error: Improper format for ParallelUpdate parameter".to_string())
+        );
+        assert_eq!(
+            FwUpdCmdBase::config_bool(
+                &config,
+                "SkipPreFlightChecks",
+                "Error: Improper format for SkipPreFlightChecks parameter. Expected boolean (true/false)."
+            ),
+            Err(
+                "Error: Improper format for SkipPreFlightChecks parameter. Expected boolean (true/false)."
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn top_level_config_oem_parameters_materialize_as_inline_json() {
+        let config = json!({
+            "OemParameters": {
+                "ImageType": "PLDM",
+                "Platform": "HGX"
+            }
+        });
+
+        let oem_parameters = FwUpdCmdBase::config_oem_parameters(&config)
+            .expect("config should materialize OemParameters");
+        let parsed: Value =
+            serde_json::from_str(&oem_parameters[0]).expect("OemParameters should be valid JSON");
+
+        assert_eq!(parsed["ImageType"], "PLDM");
+        assert_eq!(parsed["Platform"], "HGX");
+    }
+
+    #[test]
+    fn top_level_config_oem_parameters_preserve_string_path() {
+        let config = json!({
+            "OemParameters": "/tmp/oem parameters.json"
+        });
+
+        assert_eq!(
+            FwUpdCmdBase::config_oem_parameters(&config),
+            Some(vec!["/tmp/oem parameters.json".to_string()])
+        );
+    }
+
+    #[test]
+    fn top_level_config_oem_parameters_omits_null() {
+        let config = json!({
+            "OemParameters": null
+        });
+
+        assert_eq!(FwUpdCmdBase::config_oem_parameters(&config), None);
+    }
+
+    #[test]
+    fn config_bmc_reset_parameters_accepts_object_body() {
+        let config = json!({
+            "BMCResetParameters": {
+                "ResetToDefaultsType": "ResetAll"
+            }
+        });
+
+        let reset_params = FwUpdCmdBase::config_bmc_reset_parameters(&config)
+            .expect("object reset parameters should parse")
+            .expect("object reset parameters should be present");
+
+        assert_eq!(reset_params["ResetToDefaultsType"], "ResetAll");
+    }
+
+    #[test]
+    fn config_bmc_reset_parameters_rejects_non_object_body() {
+        let config = json!({
+            "BMCResetParameters": "ResetAll"
+        });
+
+        assert_eq!(
+            FwUpdCmdBase::config_bmc_reset_parameters(&config),
+            Err(
+                "Missing/Invalid configuration for BMCResetParameters. Expected reset dict."
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn config_multipart_update_parameters_are_not_materialized_for_other_methods() {
+        let config = json!({
+            "FwUpdateMethod": "HttpPushUri",
+            "MultipartOptions": {
+                "ForceUpdate": true
+            },
+            "UpdateParametersTargets": [
+                "/redfish/v1/Chassis/HGX_Chassis_0"
+            ]
+        });
+
+        assert!(
+            FwUpdCmdBase::config_multipart_update_parameters_special(&config)
+                .expect("non-multipart method should parse successfully")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn numeric_tunnel_tcp_port_materializes_from_config() {
+        let mut base = test_base("update_fw", Vec::new()).await;
+        let targets = vec![json!({
+            "BMC_IP": "192.0.2.10",
+            "RF_USERNAME": "admin",
+            "RF_PASSWORD": "secret",
+            "TUNNEL_TCP_PORT": 2444,
+            "PACKAGE": ["/tmp/update.fwpkg"]
+        })];
+        base.config_parser = Some(ConfigParser {
+            config_dict: Some(json!({"Targets": targets.clone()})),
+            targets: targets.clone(),
+            config_file_path: "in-memory.yaml".to_string(),
+        });
+
+        let target_args: Vec<_> = base
+            .make_target_list(&targets, None)
+            .await
+            .into_iter()
+            .map(|target| target.args)
+            .collect();
+
+        assert_eq!(target_args.len(), 1);
+        assert!(
+            target_args[0].contains(&"port=2444".to_string()),
+            "numeric TUNNEL_TCP_PORT should be stringified"
+        );
+    }
+
+    #[tokio::test]
+    async fn numeric_os_port_materializes_from_config() {
+        let mut base = test_base("flint_update", Vec::new()).await;
+        base.config_parser = Some(ConfigParser {
+            config_dict: Some(json!({
+                "OS_IP": "192.0.2.20",
+                "OS_USERNAME": "admin",
+                "OS_PASSWORD": "secret",
+                "OS_PORT": 2222
+            })),
+            targets: Vec::new(),
+            config_file_path: "in-memory.yaml".to_string(),
+        });
+
+        let os_target = base.validate_os_target_json(&HashMap::new(), None);
+
+        assert!(
+            os_target.contains(&"port=2222".to_string()),
+            "numeric OS_PORT should be stringified"
+        );
+    }
+
+    #[tokio::test]
+    async fn config_flint_device_type_is_available_to_query_and_flash_paths() {
+        let mut base = test_base("flint_update", Vec::new()).await;
+        base.config_parser = Some(ConfigParser {
+            config_dict: Some(json!({"FlintDeviceType": "ConnectX"})),
+            targets: Vec::new(),
+            config_file_path: "in-memory.yaml".to_string(),
+        });
+
+        assert_eq!(
+            base.config_flint_device_type(),
+            Some("ConnectX".to_string())
+        );
     }
 
     #[test]

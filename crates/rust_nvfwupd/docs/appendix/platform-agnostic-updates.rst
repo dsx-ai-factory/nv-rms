@@ -34,7 +34,7 @@ The tool supports various configuration parameters and ``BMC_IP``, ``RF_USERNAME
    # from –i input in show_update_progress 
    TaskServiceUri: '/redfish/v1/TaskService/Tasks/'
 
-   # Define differnt update methods. 
+   # Define different update methods. 
    # Valid values {'MultipartHttpPushUri', 'HttpPushUri', 'NVOSRest'}
    FwUpdateMethod: "MultipartHttpPushUri"
 

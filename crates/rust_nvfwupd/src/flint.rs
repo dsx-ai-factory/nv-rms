@@ -17,15 +17,24 @@
 
 //! Structured host-side Flint firmware workflows.
 //!
-//! The process CLI and hosted callers share this implementation. The workflow
-//! validates the complete device/image PSID plan before it starts flashing.
+//! The process CLI and hosted callers share the NIC workflow, which validates
+//! the complete device/image PSID plan before it starts flashing.
+//!
+//! The LinkX workflow uses the same Flint/SSH transport to update VRNVL72 compute
+//! OSFP modules. It validates connector health and flashes sequentially with
+//! immediate module activation, without a tray reset. The wiring and commands
+//! follow cobalt-spods' guarded compute LinkX workflow
+//! (`network_validation/manage_compute_linkx_firmware.py`, 5cdb173).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use tokio::io::AsyncReadExt;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
@@ -34,7 +43,8 @@ use crate::ssh_options::{SSH_HOST_KEY_MODE_ARG, SSH_KNOWN_HOSTS_ARG};
 use crate::workflow::{
     FirmwareUpdateOutcome, FirmwareVersionCheckSummary, FlintDeviceFamily,
     FlintExpectedDeviceCounts, FlintFirmwareTarget, FlintFirmwareUpdateRequest,
-    FlintFirmwareVersionCheckRequest, HostTargetConfig, NvFwUpdError, Result, UpdateSummary,
+    FlintFirmwareVersionCheckRequest, HostTargetConfig, NvFwUpdError, Result, SshHostKeyMode,
+    UpdateSummary,
 };
 
 const QUERY_TIMEOUT_SECS: u64 = 60;
@@ -1039,8 +1049,13 @@ fn command_error(
     tool_precondition: bool,
     timeout_secs: u64,
 ) -> NvFwUpdError {
+    let raw_message = if output.stderr.trim().is_empty() {
+        output.stdout.trim()
+    } else {
+        output.stderr.trim()
+    };
+    let lower = raw_message.to_ascii_lowercase();
     let message = sanitized_command_message(&output);
-    let lower = message.to_ascii_lowercase();
     if lower.contains("authentication")
         || lower.contains("permission denied") && lower.contains("password")
     {
@@ -1172,8 +1187,1497 @@ pub(crate) fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
+const LINKX_RECOVERY_TIMEOUT: Duration = Duration::from_secs(300);
+#[cfg(not(test))]
+const LINKX_POLL_INTERVAL: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const LINKX_POLL_INTERVAL: Duration = Duration::from_millis(1);
+
+/// Physical connector selection for the supported VR CX9 wiring layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum LinkxConnector {
+    C1,
+    C3,
+    C5,
+    C7,
+}
+
+impl LinkxConnector {
+    pub const ALL: [Self; 4] = [Self::C1, Self::C3, Self::C5, Self::C7];
+
+    /// Exact physical programming device; C5/C7 ordering is intentional.
+    fn device(self) -> String {
+        let index = match self {
+            Self::C1 => 1,
+            Self::C3 => 3,
+            Self::C5 => 7,
+            Self::C7 => 5,
+        };
+        format!("/dev/mst/mt4133_pciconf{index}")
+    }
+
+    fn module_paths(self) -> [String; 2] {
+        let index = match self {
+            Self::C1 => 0,
+            Self::C3 => 2,
+            Self::C5 => 6,
+            Self::C7 => 4,
+        };
+        [index, index + 1].map(|i| format!("/dev/mst/mt4133_pciconf{i}.3"))
+    }
+
+    fn interfaces(self) -> Vec<String> {
+        let (rails, start) = match self {
+            Self::C1 => ([0, 1], 0),
+            Self::C3 => ([1, 0], 4),
+            Self::C5 => ([2, 3], 0),
+            Self::C7 => ([3, 2], 4),
+        };
+        rails
+            .into_iter()
+            .flat_map(|rail| (start..start + 4).map(move |port| format!("eth_r{rail}_p{port}")))
+            .collect()
+    }
+}
+
+/// Release-specific safety policy, supplied with the proposed firmware image.
+/// There is deliberately no default approved starting version or bypass mode.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LinkxPolicy {
+    pub current_version: String,
+    pub target_version: String,
+    /// SHA-256 of the exact firmware payload, verified locally and after transfer.
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct LinkxFirmwareTarget {
+    pub connectors: Vec<LinkxConnector>,
+    pub firmware_file: String,
+    pub policy: LinkxPolicy,
+}
+
+#[derive(Debug, Clone)]
+pub struct LinkxUpdateRequest {
+    pub targets: Vec<LinkxFirmwareTarget>,
+    pub cancellation: Option<CancellationToken>,
+}
+
+/// Firmware state is separate from link health: TARGET does not imply links up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum LinkxVersionState {
+    Target,
+    NotTarget,
+    MixedVersion,
+    PartialRead,
+    Unreadable,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LinkxEvidence {
+    /// Last observed values; a timed-out inspection can retain earlier observations.
+    pub versions: [Option<String>; 2],
+    pub version_state: LinkxVersionState,
+    pub links_up: usize,
+    pub module_health_ok: bool,
+    pub query_errors: Vec<LinkxQueryError>,
+    /// Partial or retained observations must not be used to declare recovery complete.
+    pub inspection_timed_out: bool,
+}
+
+/// A failed inspection command, including its device/interface path and sanitized cause.
+#[derive(Debug, Clone, Serialize)]
+pub struct LinkxQueryError {
+    pub command: String,
+    pub error: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LinkxDisposition {
+    NotAttempted,
+    Skipped,
+    Completed,
+    FlashFailed,
+    PostcheckFailed,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LinkxConnectorResult {
+    pub connector: LinkxConnector,
+    pub status: LinkxDisposition,
+    pub before: LinkxEvidence,
+    pub after: Option<LinkxEvidence>,
+    pub error: Option<String>,
+}
+
+/// Once a flash starts, return evidence rather than a bare cancellation error.
+/// A failed command may have changed firmware; it must never be blindly retried.
+#[derive(Debug, Clone, Serialize)]
+pub struct LinkxUpdateReport {
+    pub completed: bool,
+    pub cancellation_requested: bool,
+    pub connectors: Vec<LinkxConnectorResult>,
+}
+
+fn linkx_invalid(message: impl Into<String>) -> NvFwUpdError {
+    NvFwUpdError::IncompatibleFirmware {
+        component: "LINKX".to_owned(),
+        message: message.into(),
+    }
+}
+
+impl LinkxPolicy {
+    pub fn validate(&self) -> Result<()> {
+        let version_ok = |v: &str| {
+            !v.is_empty()
+                && v != "00.00.0000"
+                && v.split('.').count() >= 3
+                && v.split('.')
+                    .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+        };
+        if !version_ok(&self.current_version) || !version_ok(&self.target_version) {
+            return Err(linkx_invalid(
+                "LinkX policy requires explicit numeric current_version and target_version",
+            ));
+        }
+        if self.sha256.len() != 64 || !self.sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(linkx_invalid("LinkX policy requires a 64-digit sha256"));
+        }
+        Ok(())
+    }
+}
+
+/// Audit both module paths without flashing, starting MST, or cycling power.
+/// Unreadable firmware and link health are reported independently in the evidence.
+pub async fn inspect_linkx_firmware(
+    host: HostTargetConfig,
+    connectors: &[LinkxConnector],
+    target_version: &str,
+) -> Result<Vec<(LinkxConnector, LinkxEvidence)>> {
+    if host.ssh_host_key_mode == SshHostKeyMode::Disabled {
+        return Err(linkx_invalid(
+            "LinkX requires SSH host-key verification (TOFU or Strict)",
+        ));
+    }
+    let access = os_access_from_config(&host)?;
+    run_linkx_query(&access, "command -v mlxlink", false).await?;
+    let mut evidence = Vec::new();
+    for &connector in connectors {
+        let result = inspect_linkx_connector(&access, connector, target_version).await;
+        evidence.push((connector, result));
+    }
+    Ok(evidence)
+}
+
+/// Update selected VRNVL72 connectors sequentially after whole-request preflight.
+///
+/// # Errors
+/// Fails before flashing on invalid policy, missing tools, inaccessible SSH,
+/// checksum/type/version mismatch, or an unhealthy selected connector.
+/// After the first flash starts, inspect the returned report's `completed` flag.
+pub async fn update_linkx_firmware(
+    host: HostTargetConfig,
+    request: LinkxUpdateRequest,
+) -> Result<LinkxUpdateReport> {
+    if host.ssh_host_key_mode == SshHostKeyMode::Disabled {
+        return Err(linkx_invalid(
+            "LinkX requires SSH host-key verification (TOFU or Strict)",
+        ));
+    }
+    let access = os_access_from_config(&host)?;
+    update_linkx_with_access(&access, request, LINKX_RECOVERY_TIMEOUT).await
+}
+
+async fn run_linkx_query<A: FlintHostAccess>(
+    access: &A,
+    command: &str,
+    sudo: bool,
+) -> Result<String> {
+    let output = access.execute(command, QUERY_TIMEOUT_SECS, sudo).await;
+    if !output.success {
+        return Err(command_error(
+            access.target(),
+            "LinkX query",
+            output,
+            false,
+            QUERY_TIMEOUT_SECS,
+        ));
+    }
+    Ok(output.stdout)
+}
+
+async fn verify_local_linkx_image(target: &LinkxFirmwareTarget) -> Result<()> {
+    target.policy.validate()?;
+    let mut file = tokio::fs::File::open(&target.firmware_file)
+        .await
+        .map_err(|e| linkx_invalid(format!("cannot open LinkX image: {e}")))?;
+    let mut hash = Sha256::new();
+    let mut buf = [0_u8; 65536];
+    loop {
+        let size = file
+            .read(&mut buf)
+            .await
+            .map_err(|e| linkx_invalid(format!("cannot read LinkX image: {e}")))?;
+        if size == 0 {
+            break;
+        }
+        hash.update(&buf[..size]);
+    }
+    if !format!("{:x}", hash.finalize()).eq_ignore_ascii_case(&target.policy.sha256) {
+        return Err(linkx_invalid(
+            "local LinkX image sha256 does not match the rollout policy",
+        ));
+    }
+    Ok(())
+}
+
+async fn update_linkx_with_access<A: FlintHostAccess>(
+    access: &A,
+    request: LinkxUpdateRequest,
+    recovery_timeout: Duration,
+) -> Result<LinkxUpdateReport> {
+    check_cancelled(request.cancellation.as_ref(), "LinkX preflight")?;
+    let mut selected = BTreeSet::new();
+    if request.targets.is_empty() {
+        return Err(linkx_invalid("select at least one LinkX connector"));
+    }
+    for target in &request.targets {
+        if target.connectors.is_empty() {
+            return Err(linkx_invalid(
+                "select at least one LinkX connector per image",
+            ));
+        }
+        for connector in &target.connectors {
+            if !selected.insert(*connector) {
+                return Err(linkx_invalid("overlapping LinkX connector selections"));
+            }
+        }
+        verify_local_linkx_image(target).await?;
+    }
+    check_cancelled(request.cancellation.as_ref(), "LinkX host preparation")?;
+    // An earlier OOB stage may have just powered the tray on. PowerState=On
+    // does not mean SSH/the OS is ready; only wait here, never cycle the tray.
+    wait_for_host_os_ready_with_access(access, request.cancellation.as_ref())
+        .await
+        .map_err(|error| match error {
+            // Keep the existing workflow's diagnostics unchanged; only LinkX
+            // needs a host label that does not name GB200.
+            NvFwUpdError::Timeout {
+                operation: "wait for GB200 host OS boot",
+                seconds,
+            } => NvFwUpdError::Timeout {
+                operation: "wait for host OS boot",
+                seconds,
+            },
+            NvFwUpdError::Cancelled {
+                operation: "wait for GB200 host OS boot",
+            } => NvFwUpdError::Cancelled {
+                operation: "wait for host OS boot",
+            },
+            other => other,
+        })?;
+    check_cancelled(request.cancellation.as_ref(), "LinkX host preparation")?;
+    let tools = access
+        .execute(
+            "command -v mst && command -v flint && command -v mlxlink && command -v sha256sum",
+            QUERY_TIMEOUT_SECS,
+            false,
+        )
+        .await;
+    if !tools.success {
+        return Err(command_error(
+            access.target(),
+            "mst/flint/mlxlink/sha256sum",
+            tools,
+            true,
+            QUERY_TIMEOUT_SECS,
+        ));
+    }
+    run_linkx_query(access, "mst start", true).await?;
+    let remote_dir = create_remote_temp_dir(access, QUERY_TIMEOUT_SECS).await?;
+    // This stricter staging policy is LinkX-only. Do not change the shared
+    // helper's path acceptance for existing Flint CLI/library callers.
+    if !remote_dir[REMOTE_TEMP_PREFIX.len()..]
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric())
+    {
+        return Err(NvFwUpdError::InvalidResponse {
+            context: "remote temporary directory",
+            message: "mktemp returned an unexpected path".to_owned(),
+        });
+    }
+    let result = staged_linkx_update(access, &request, &remote_dir, recovery_timeout).await;
+    // Always clean on success, preflight failure, cancellation, or partial update.
+    cleanup_remote_temp_dir(access, &remote_dir, QUERY_TIMEOUT_SECS).await;
+    result
+}
+
+struct PlannedLinkxConnector {
+    connector: LinkxConnector,
+    remote_image: String,
+    target_version: String,
+    before: LinkxEvidence,
+}
+
+async fn staged_linkx_update<A: FlintHostAccess>(
+    access: &A,
+    request: &LinkxUpdateRequest,
+    remote_dir: &str,
+    recovery_timeout: Duration,
+) -> Result<LinkxUpdateReport> {
+    let mut plan = Vec::new();
+    for (index, target) in request.targets.iter().enumerate() {
+        check_cancelled(request.cancellation.as_ref(), "LinkX image preflight")?;
+        let remote_image = format!("{remote_dir}/image-{index}.bin");
+        let upload = access.upload(&target.firmware_file, &remote_image).await;
+        if !upload.success {
+            return Err(command_error(
+                access.target(),
+                "LinkX image upload",
+                upload,
+                false,
+                300,
+            ));
+        }
+        let digest = run_linkx_query(
+            access,
+            &format!("sha256sum -- {}", shell_quote(&remote_image)),
+            false,
+        )
+        .await?;
+        if !digest
+            .split_whitespace()
+            .next()
+            .is_some_and(|hash| hash.eq_ignore_ascii_case(&target.policy.sha256))
+        {
+            return Err(linkx_invalid(
+                "remote LinkX image sha256 does not match the rollout policy",
+            ));
+        }
+        let image = run_linkx_query(
+            access,
+            &format!("flint -i {} q", shell_quote(&remote_image)),
+            true,
+        )
+        .await?;
+        if linkx_field(&image, "Image type").as_deref() != Some("LINKX")
+            || linkx_field(&image, "FW Version").as_deref()
+                != Some(target.policy.target_version.as_str())
+        {
+            return Err(linkx_invalid(
+                "Flint image type/version must match LINKX and the approved target version",
+            ));
+        }
+        for &connector in &target.connectors {
+            check_cancelled(request.cancellation.as_ref(), "LinkX connector preflight")?;
+            for path in [connector.device()]
+                .into_iter()
+                .chain(connector.module_paths())
+            {
+                run_linkx_query(access, &format!("test -e {}", shell_quote(&path)), false).await?;
+            }
+            let before =
+                inspect_linkx_connector(access, connector, &target.policy.target_version).await;
+            if before.inspection_timed_out || !before.query_errors.is_empty() {
+                return Err(NvFwUpdError::TaskFailed {
+                    task_id: None,
+                    message: format!(
+                        "LinkX {connector:?} preflight inspection failed: {}",
+                        json!(before)
+                    ),
+                });
+            }
+            if before.version_state != LinkxVersionState::Target {
+                let component = run_linkx_query(
+                    access,
+                    &format!(
+                        "flint -d {} --linkx --downstream_device_ids 1 q",
+                        shell_quote(&connector.device())
+                    ),
+                    true,
+                )
+                .await?;
+                validate_linkx_preflight(&component, &before, &target.policy)?;
+            }
+            plan.push(PlannedLinkxConnector {
+                connector,
+                remote_image: remote_image.clone(),
+                target_version: target.policy.target_version.clone(),
+                before,
+            });
+        }
+    }
+    plan.sort_by_key(|p| p.connector);
+    check_cancelled(request.cancellation.as_ref(), "LinkX before flashing")?;
+    let mut report = LinkxUpdateReport {
+        completed: false,
+        cancellation_requested: false,
+        connectors: plan
+            .iter()
+            .map(|p| LinkxConnectorResult {
+                connector: p.connector,
+                status: if p.before.version_state == LinkxVersionState::Target {
+                    LinkxDisposition::Skipped
+                } else {
+                    LinkxDisposition::NotAttempted
+                },
+                before: p.before.clone(),
+                after: None,
+                error: None,
+            })
+            .collect(),
+    };
+    let mut flash_started = false;
+    for (p, result) in plan.iter().zip(&mut report.connectors) {
+        if result.status == LinkxDisposition::Skipped {
+            continue;
+        }
+        if request
+            .cancellation
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            if !flash_started {
+                return Err(NvFwUpdError::Cancelled {
+                    operation: "LinkX before flashing",
+                });
+            }
+            break;
+        }
+        flash_started = true;
+        // Deliberately no cancellation select or automatic retry around a flash.
+        let command = format!("flint -d {} --linkx --downstream_device_id_start_index 1 --num_of_downstream_devices 1 --download_transfer --activate -i {} b", shell_quote(&p.connector.device()), shell_quote(&p.remote_image));
+        let output = access.execute(&command, FLASH_TIMEOUT_SECS, true).await;
+        if !output.success {
+            result.status = LinkxDisposition::FlashFailed;
+            result.error = Some(
+                command_error(
+                    access.target(),
+                    "LinkX flash (firmware may have changed)",
+                    output,
+                    false,
+                    FLASH_TIMEOUT_SECS,
+                )
+                .to_string(),
+            );
+            result.after =
+                Some(inspect_linkx_connector(access, p.connector, &p.target_version).await);
+            break;
+        }
+        let after =
+            wait_for_linkx_recovery(access, p.connector, &p.target_version, recovery_timeout).await;
+        let healthy = !after.inspection_timed_out
+            && after.query_errors.is_empty()
+            && after.version_state == LinkxVersionState::Target
+            && after.links_up == 8
+            && after.module_health_ok;
+        result.after = Some(after);
+        result.status = if healthy {
+            LinkxDisposition::Completed
+        } else {
+            LinkxDisposition::PostcheckFailed
+        };
+        if !healthy {
+            result.error = Some("LinkX flash finished but dual-path version/module health/8-link recovery was not confirmed; no further connectors flashed".to_owned());
+            break;
+        }
+    }
+    report.completed = report.connectors.iter().all(|r| {
+        matches!(
+            r.status,
+            LinkxDisposition::Completed | LinkxDisposition::Skipped
+        )
+    });
+    report.cancellation_requested = request
+        .cancellation
+        .as_ref()
+        .is_some_and(CancellationToken::is_cancelled);
+    Ok(report)
+}
+
+/// Read a unique key; duplicated/missing fields fail closed. Strip MFT ANSI colors.
+fn linkx_field(text: &str, key: &str) -> Option<String> {
+    let ansi = regex::Regex::new(r"\x1b\[[0-9;]*m").expect("static ANSI pattern");
+    let plain = ansi.replace_all(text, "");
+    let mut values = plain.lines().filter_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        (name.trim() == key).then(|| value.trim().to_owned())
+    });
+    let value = values.next()?;
+    values.next().is_none().then_some(value)
+}
+
+fn validate_linkx_preflight(
+    component: &str,
+    evidence: &LinkxEvidence,
+    policy: &LinkxPolicy,
+) -> Result<()> {
+    let approved = ["FW A Version", "FW B Version"]
+        .iter()
+        .any(|key| linkx_field(component, key).as_deref() == Some(policy.current_version.as_str()));
+    let idle = component.lines().any(|line| {
+        line.replace(':', " ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            == ["Component", "Update", "State", "IDLE"]
+    });
+    if !approved
+        || !idle
+        || !evidence.module_health_ok
+        || evidence.links_up != 8
+        || matches!(
+            evidence.version_state,
+            LinkxVersionState::PartialRead | LinkxVersionState::Unreadable
+        )
+    {
+        return Err(linkx_invalid("LinkX preflight requires approved current firmware, IDLE component, two readable healthy Ready module paths, and all eight links up"));
+    }
+    Ok(())
+}
+
+fn linkx_version_state(versions: &[Option<String>; 2], target: &str) -> LinkxVersionState {
+    match (&versions[0], &versions[1]) {
+        (Some(a), Some(b)) if a == target && b == target => LinkxVersionState::Target,
+        (Some(a), Some(b)) if a == b => LinkxVersionState::NotTarget,
+        (Some(_), Some(_)) => LinkxVersionState::MixedVersion,
+        (None, None) => LinkxVersionState::Unreadable,
+        _ => LinkxVersionState::PartialRead,
+    }
+}
+
+async fn inspect_linkx_connector<A: FlintHostAccess>(
+    access: &A,
+    connector: LinkxConnector,
+    target: &str,
+) -> LinkxEvidence {
+    inspect_linkx_connector_with_deadline(
+        access,
+        connector,
+        target,
+        tokio::time::Instant::now() + LINKX_RECOVERY_TIMEOUT,
+        &mut LinkxInspection::default(),
+    )
+    .await
+}
+
+/// Updated after each query, outside the timed future, so a deadline never
+/// erases observations from completed queries or the preceding recovery probe.
+#[derive(Default)]
+struct LinkxInspection {
+    versions: [Option<String>; 2],
+    module_health: [bool; 2],
+    links: [bool; 8],
+    query_errors: Vec<LinkxQueryError>,
+    pending_command: Option<String>,
+}
+
+impl LinkxInspection {
+    fn record_error(&mut self, command: String, error: String) {
+        tracing::warn!(command, error, "LinkX inspection query failed");
+        self.query_errors.push(LinkxQueryError { command, error });
+    }
+
+    async fn query<A: FlintHostAccess>(
+        &mut self,
+        access: &A,
+        command: String,
+        sudo: bool,
+    ) -> Option<String> {
+        self.pending_command = Some(command.clone());
+        let result = run_linkx_query(access, &command, sudo).await;
+        self.pending_command = None;
+        match result {
+            Ok(text) => Some(text),
+            Err(error) => {
+                self.record_error(command, error.to_string());
+                None
+            }
+        }
+    }
+}
+
+async fn collect_linkx_connector_evidence<A: FlintHostAccess>(
+    access: &A,
+    connector: LinkxConnector,
+    inspection: &mut LinkxInspection,
+) {
+    for (index, path) in connector.module_paths().iter().enumerate() {
+        let text = inspection
+            .query(access, format!("mlxlink -d {} -m", shell_quote(path)), true)
+            .await;
+        inspection.versions[index] = text
+            .as_deref()
+            .and_then(|text| linkx_field(text, "FW Version"))
+            .filter(|v| v != "N/A" && !v.is_empty() && v != "00.00.0000");
+        inspection.module_health[index] = text.as_deref().is_some_and(|text| {
+            linkx_field(text, "Module FW Fault").as_deref() == Some("0")
+                && linkx_field(text, "DataPath FW Fault").as_deref() == Some("0")
+                && linkx_field(text, "Module State").as_deref() == Some("Ready state")
+        });
+    }
+    for (index, interface) in connector.interfaces().iter().enumerate() {
+        inspection.links[index] = inspection
+            .query(
+                access,
+                format!("cat /sys/class/net/{interface}/operstate"),
+                false,
+            )
+            .await
+            .is_some_and(|state| state.trim() == "up");
+    }
+}
+
+async fn inspect_linkx_connector_with_deadline<A: FlintHostAccess>(
+    access: &A,
+    connector: LinkxConnector,
+    target: &str,
+    deadline: tokio::time::Instant,
+    inspection: &mut LinkxInspection,
+) -> LinkxEvidence {
+    inspection.query_errors.clear();
+    let inspection_timed_out = tokio::time::timeout_at(
+        deadline,
+        collect_linkx_connector_evidence(access, connector, inspection),
+    )
+    .await
+    .is_err();
+    if inspection_timed_out {
+        let command = inspection.pending_command.take().unwrap_or_default();
+        inspection.record_error(
+            command,
+            "LinkX inspection deadline exceeded; completed observations retained".to_owned(),
+        );
+    }
+    LinkxEvidence {
+        version_state: linkx_version_state(&inspection.versions, target),
+        versions: inspection.versions.clone(),
+        links_up: inspection.links.iter().filter(|&&up| up).count(),
+        module_health_ok: inspection.module_health.iter().all(|&healthy| healthy),
+        query_errors: inspection.query_errors.clone(),
+        inspection_timed_out,
+    }
+}
+
+async fn wait_for_linkx_recovery<A: FlintHostAccess>(
+    access: &A,
+    connector: LinkxConnector,
+    target: &str,
+    timeout: Duration,
+) -> LinkxEvidence {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut inspection = LinkxInspection::default();
+    loop {
+        // Bound the whole inspection too: ten sequential SSH queries must not
+        // extend the advertised recovery window by ten command timeouts.
+        let evidence = inspect_linkx_connector_with_deadline(
+            access,
+            connector,
+            target,
+            deadline,
+            &mut inspection,
+        )
+        .await;
+        if evidence.inspection_timed_out
+            || (evidence.query_errors.is_empty()
+                && evidence.version_state == LinkxVersionState::Target
+                && evidence.links_up == 8
+                && evidence.module_health_ok)
+            || tokio::time::Instant::now() + LINKX_POLL_INTERVAL >= deadline
+        {
+            return evidence;
+        }
+        tokio::time::sleep(LINKX_POLL_INTERVAL).await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    mod linkx {
+        use super::*;
+        use async_trait::async_trait;
+        use std::collections::VecDeque;
+        use std::sync::{Arc, Mutex};
+
+        const OLD: &str = "44.40.2019";
+        const NEW: &str = "44.40.2035";
+        const IMAGE: &[u8] = b"test LinkX payload";
+
+        #[derive(Default)]
+        struct State {
+            commands: Vec<String>,
+            flashed: BTreeSet<usize>,
+            fault_device: Option<usize>,
+            flash_failure: bool,
+            degraded_after_flash: bool,
+            current: bool,
+            wrong_image: bool,
+            missing_tools: bool,
+            wrong_hash: bool,
+            temp_dir_output: Option<String>,
+            cancel_on_flash: Option<CancellationToken>,
+            boot_probes: VecDeque<CommandOutput>,
+            cancel_on_boot_probe: Option<CancellationToken>,
+            query_failures: Vec<(String, String)>,
+            query_failures_after_flash: bool,
+            stalled_query_after_flash: Option<String>,
+            successful_queries_before_stall: usize,
+        }
+
+        #[derive(Clone, Default)]
+        struct Mock(Arc<Mutex<State>>);
+
+        fn ok(stdout: impl Into<String>) -> CommandOutput {
+            CommandOutput {
+                success: true,
+                stdout: stdout.into(),
+                stderr: String::new(),
+            }
+        }
+
+        fn digest() -> String {
+            format!("{:x}", Sha256::digest(IMAGE))
+        }
+
+        #[async_trait]
+        impl FlintHostAccess for Mock {
+            fn target(&self) -> &str {
+                "test-host"
+            }
+
+            async fn execute(&self, command: &str, _timeout: u64, _sudo: bool) -> CommandOutput {
+                let stall = {
+                    let mut state = self.0.lock().unwrap();
+                    state.commands.push(command.to_owned());
+                    if !state.flashed.is_empty()
+                        && state.stalled_query_after_flash.as_deref() == Some(command)
+                    {
+                        if state.successful_queries_before_stall == 0 {
+                            true
+                        } else {
+                            state.successful_queries_before_stall -= 1;
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                };
+                if stall {
+                    return std::future::pending().await;
+                }
+                let mut state = self.0.lock().unwrap();
+                if command == HOST_OS_READY_COMMAND {
+                    if let Some(cancel) = &state.cancel_on_boot_probe {
+                        cancel.cancel();
+                    }
+                    return state.boot_probes.pop_front().unwrap_or_else(|| ok(""));
+                }
+                if !state.query_failures_after_flash || !state.flashed.is_empty() {
+                    if let Some((_, error)) = state
+                        .query_failures
+                        .iter()
+                        .find(|(query, _)| query == command)
+                    {
+                        return failure(error);
+                    }
+                }
+                if command.starts_with("command -v") && state.missing_tools {
+                    return CommandOutput {
+                        success: false,
+                        stdout: String::new(),
+                        stderr: "flint not found".to_owned(),
+                    };
+                }
+                if command.starts_with("mktemp") {
+                    return ok(state
+                        .temp_dir_output
+                        .as_deref()
+                        .unwrap_or("/tmp/nvfwupd-flint.ABC123\n"));
+                }
+                if command.starts_with("sha256sum") {
+                    return ok(if state.wrong_hash {
+                        "0".repeat(64)
+                    } else {
+                        digest()
+                    });
+                }
+                if command.starts_with("flint -i") {
+                    return ok(format!(
+                        "Image type: {}\nFW Version: {NEW}\n",
+                        if state.wrong_image { "FS4" } else { "LINKX" }
+                    ));
+                }
+                let index = command
+                    .split("pciconf")
+                    .nth(1)
+                    .and_then(|s| s.chars().next())
+                    .and_then(|c| c.to_digit(10))
+                    .map(|i| i as usize);
+                if command.contains("--download_transfer") {
+                    assert!(command.contains("--activate"));
+                    assert!(command.contains(
+                        "--downstream_device_id_start_index 1 --num_of_downstream_devices 1"
+                    ));
+                    state.flashed.insert(index.unwrap());
+                    if let Some(cancel) = &state.cancel_on_flash {
+                        cancel.cancel();
+                    }
+                    return CommandOutput {
+                        success: !state.flash_failure,
+                        stdout: String::new(),
+                        stderr: if state.flash_failure {
+                            "flash failed".to_owned()
+                        } else {
+                            String::new()
+                        },
+                    };
+                }
+                if command.contains("--downstream_device_ids 1 q") {
+                    return ok(format!("FW A Version : {OLD}\nFW B Version : 00.00.0000\nComponent Update State IDLE\n"));
+                }
+                if command.starts_with("mlxlink") {
+                    let index = index.unwrap();
+                    let programmed = state.current || state.flashed.contains(&(index | 1));
+                    let fault = state.fault_device == Some(index);
+                    return ok(format!("FW Version : {}\nModule FW Fault : {}\nDataPath FW Fault : 0\nModule State : Ready state\n", if programmed { NEW } else { OLD }, if fault { 1 } else { 0 }));
+                }
+                if command.starts_with("cat /sys") {
+                    return ok(if state.degraded_after_flash && !state.flashed.is_empty() {
+                        "down"
+                    } else {
+                        "up"
+                    });
+                }
+                ok("")
+            }
+
+            async fn upload(&self, _: &str, remote: &str) -> CommandOutput {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .commands
+                    .push(format!("upload {remote}"));
+                ok("")
+            }
+        }
+
+        fn request(
+            file: &tempfile::NamedTempFile,
+            connectors: Vec<LinkxConnector>,
+        ) -> LinkxUpdateRequest {
+            LinkxUpdateRequest {
+                targets: vec![LinkxFirmwareTarget {
+                    connectors,
+                    firmware_file: file.path().to_str().unwrap().to_owned(),
+                    policy: LinkxPolicy {
+                        current_version: OLD.to_owned(),
+                        target_version: NEW.to_owned(),
+                        sha256: digest(),
+                    },
+                }],
+                cancellation: None,
+            }
+        }
+
+        fn image() -> tempfile::NamedTempFile {
+            use std::io::Write;
+            let mut file = tempfile::NamedTempFile::new().unwrap();
+            file.write_all(IMAGE).unwrap();
+            file
+        }
+
+        #[tokio::test]
+        async fn linkx_rejects_unexpected_temp_paths_before_upload_or_flash() {
+            let file = image();
+            for path in [
+                "/tmp/nvfwupd-flint.ABC-123",
+                "/tmp/nvfwupd-flint.ABC_123",
+                "/tmp/nvfwupd-flint.ABC/../other",
+                "/tmp/nvfwupd-flint.ABC 123",
+                "/tmp/nvfwupd-flint.",
+                "/tmp/other.ABC123",
+            ] {
+                let mock = Mock::default();
+                mock.0.lock().unwrap().temp_dir_output = Some(path.to_owned());
+                let error = update_linkx_with_access(
+                    &mock,
+                    request(&file, vec![LinkxConnector::C1]),
+                    Duration::ZERO,
+                )
+                .await
+                .unwrap_err();
+                assert!(matches!(
+                    error,
+                    NvFwUpdError::InvalidResponse {
+                        context: "remote temporary directory",
+                        ..
+                    }
+                ));
+                let state = mock.0.lock().unwrap();
+                assert!(state.flashed.is_empty());
+                assert!(!state.commands.iter().any(|command| {
+                    command.starts_with("upload ") || command.starts_with("rm ")
+                }));
+            }
+        }
+
+        #[test]
+        fn connector_mapping_matches_reference_and_covers_32_links_once() {
+            let mut interfaces = BTreeSet::new();
+            for (connector, device) in LinkxConnector::ALL.into_iter().zip([1, 3, 7, 5]) {
+                assert_eq!(
+                    connector.device(),
+                    format!("/dev/mst/mt4133_pciconf{device}")
+                );
+                assert_eq!(
+                    connector.module_paths(),
+                    [
+                        format!("/dev/mst/mt4133_pciconf{}.3", device - 1),
+                        format!("/dev/mst/mt4133_pciconf{device}.3")
+                    ]
+                );
+                assert_eq!(connector.interfaces().len(), 8);
+                interfaces.extend(connector.interfaces());
+            }
+            assert_eq!(interfaces.len(), 32);
+            assert_eq!(LinkxConnector::C5.interfaces()[0], "eth_r2_p0");
+            assert_eq!(LinkxConnector::C7.interfaces()[0], "eth_r3_p4");
+        }
+
+        #[test]
+        fn versions_require_two_independent_reads() {
+            assert_eq!(
+                linkx_version_state(&[Some(NEW.into()), Some(NEW.into())], NEW),
+                LinkxVersionState::Target
+            );
+            assert_eq!(
+                linkx_version_state(&[Some(OLD.into()), Some(OLD.into())], NEW),
+                LinkxVersionState::NotTarget
+            );
+            assert_eq!(
+                linkx_version_state(&[Some(OLD.into()), Some(NEW.into())], NEW),
+                LinkxVersionState::MixedVersion
+            );
+            assert_eq!(
+                linkx_version_state(&[Some(NEW.into()), None], NEW),
+                LinkxVersionState::PartialRead
+            );
+            assert_eq!(
+                linkx_version_state(&[None, None], NEW),
+                LinkxVersionState::Unreadable
+            );
+            assert_eq!(
+                linkx_field("\x1b[32mFW Version : 1.2.3\x1b[0m", "FW Version"),
+                Some("1.2.3".into())
+            );
+            assert_eq!(
+                linkx_field("FW Version : 1.2.3\nFW Version : 1.2.3", "FW Version"),
+                None
+            );
+        }
+
+        #[test]
+        fn preflight_rejects_unapproved_version_busy_faulted_and_unreadable_modules() {
+            let policy = LinkxPolicy {
+                current_version: OLD.into(),
+                target_version: NEW.into(),
+                sha256: digest(),
+            };
+            let component = format!(
+                "FW A Version : {OLD}\nFW B Version : 00.00.0000\nComponent Update State IDLE"
+            );
+            let healthy = LinkxEvidence {
+                versions: [Some(OLD.into()), Some(OLD.into())],
+                version_state: LinkxVersionState::NotTarget,
+                links_up: 8,
+                module_health_ok: true,
+                query_errors: Vec::new(),
+                inspection_timed_out: false,
+            };
+            assert!(validate_linkx_preflight(&component, &healthy, &policy).is_ok());
+            assert!(validate_linkx_preflight(
+                &component.replace(OLD, "44.39.1000"),
+                &healthy,
+                &policy
+            )
+            .is_err());
+            assert!(validate_linkx_preflight(
+                &component.replace("IDLE", "BUSY"),
+                &healthy,
+                &policy
+            )
+            .is_err());
+            assert!(validate_linkx_preflight(
+                &component,
+                &LinkxEvidence {
+                    module_health_ok: false,
+                    ..healthy.clone()
+                },
+                &policy
+            )
+            .is_err());
+            assert!(validate_linkx_preflight(
+                &component,
+                &LinkxEvidence {
+                    links_up: 7,
+                    ..healthy.clone()
+                },
+                &policy
+            )
+            .is_err());
+            assert!(validate_linkx_preflight(
+                &component,
+                &LinkxEvidence {
+                    version_state: LinkxVersionState::PartialRead,
+                    ..healthy
+                },
+                &policy
+            )
+            .is_err());
+        }
+
+        #[tokio::test]
+        async fn overlapping_connectors_and_invalid_policy_fail_before_remote_io() {
+            let file = image();
+            let mock = Mock::default();
+            let req = request(&file, vec![LinkxConnector::C1, LinkxConnector::C1]);
+            assert!(update_linkx_with_access(&mock, req, Duration::ZERO)
+                .await
+                .is_err());
+            let mut req = request(&file, vec![LinkxConnector::C1]);
+            req.targets[0].policy.current_version.clear();
+            assert!(update_linkx_with_access(&mock, req, Duration::ZERO)
+                .await
+                .is_err());
+            assert!(mock.0.lock().unwrap().commands.is_empty());
+        }
+
+        #[tokio::test]
+        async fn flashes_sequentially_after_all_preflight_and_cleans() {
+            let file = image();
+            let mock = Mock::default();
+            let report = update_linkx_with_access(
+                &mock,
+                request(&file, LinkxConnector::ALL.to_vec()),
+                Duration::from_millis(10),
+            )
+            .await
+            .unwrap();
+            assert!(report.completed);
+            assert!(report
+                .connectors
+                .iter()
+                .all(|r| r.status == LinkxDisposition::Completed));
+            let state = mock.0.lock().unwrap();
+            let flash_start = state
+                .commands
+                .iter()
+                .position(|c| c.contains("--download_transfer"))
+                .unwrap();
+            assert_eq!(
+                state.commands[..flash_start]
+                    .iter()
+                    .filter(|c| c.contains("--downstream_device_ids 1 q"))
+                    .count(),
+                4
+            );
+            let flashes: Vec<_> = state
+                .commands
+                .iter()
+                .filter(|c| c.contains("--download_transfer"))
+                .collect();
+            for (cmd, device) in flashes.iter().zip([1, 3, 7, 5]) {
+                assert!(cmd.contains(&format!("pciconf{device}'")));
+            }
+            assert!(state
+                .commands
+                .last()
+                .unwrap()
+                .starts_with("rm -rf -- '/tmp/nvfwupd-flint."));
+        }
+
+        #[tokio::test]
+        async fn last_connector_preflight_failure_prevents_every_flash() {
+            let file = image();
+            let mock = Mock::default();
+            mock.0.lock().unwrap().fault_device = Some(4);
+            assert!(update_linkx_with_access(
+                &mock,
+                request(&file, LinkxConnector::ALL.to_vec()),
+                Duration::from_millis(5)
+            )
+            .await
+            .is_err());
+            let state = mock.0.lock().unwrap();
+            assert!(state.flashed.is_empty());
+            assert!(state.commands.last().unwrap().starts_with("rm -rf"));
+        }
+
+        #[tokio::test]
+        async fn current_connectors_skip_and_missing_tools_fail_before_staging() {
+            let file = image();
+            let mock = Mock::default();
+            mock.0.lock().unwrap().current = true;
+            let report = update_linkx_with_access(
+                &mock,
+                request(&file, LinkxConnector::ALL.to_vec()),
+                Duration::from_millis(5),
+            )
+            .await
+            .unwrap();
+            assert!(report.completed);
+            assert!(report
+                .connectors
+                .iter()
+                .all(|r| r.status == LinkxDisposition::Skipped));
+            assert!(mock.0.lock().unwrap().flashed.is_empty());
+            let mock = Mock::default();
+            mock.0.lock().unwrap().missing_tools = true;
+            assert!(matches!(
+                update_linkx_with_access(
+                    &mock,
+                    request(&file, vec![LinkxConnector::C1]),
+                    Duration::ZERO
+                )
+                .await,
+                Err(NvFwUpdError::HostToolUnavailable { .. })
+            ));
+            assert!(!mock
+                .0
+                .lock()
+                .unwrap()
+                .commands
+                .iter()
+                .any(|c| c.starts_with("mktemp")));
+        }
+
+        #[tokio::test]
+        async fn waits_for_ssh_and_os_after_oob_before_linkx_host_preparation() {
+            let file = image();
+            let mock = Mock::default();
+            mock.0.lock().unwrap().boot_probes = VecDeque::from([
+                failure("connection refused"),
+                CommandOutput {
+                    success: false,
+                    stdout: "system-state:starting".into(),
+                    stderr: String::new(),
+                },
+                ok(""),
+            ]);
+            let report = update_linkx_with_access(
+                &mock,
+                request(&file, vec![LinkxConnector::C1]),
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+
+            assert!(report.completed);
+            let state = mock.0.lock().unwrap();
+            assert_eq!(&state.commands[..3], &[HOST_OS_READY_COMMAND; 3]);
+            assert!(state.commands[3].starts_with("command -v mst"));
+            assert_eq!(state.flashed.len(), 1);
+        }
+
+        #[tokio::test]
+        async fn failed_or_cancelled_os_wait_never_starts_mst_staging_or_flash() {
+            let file = image();
+            for mode in ["timeout", "authentication", "cancelled"] {
+                let mock = Mock::default();
+                let token = CancellationToken::new();
+                let mut req = request(&file, vec![LinkxConnector::C1]);
+                req.cancellation = Some(token.clone());
+                {
+                    let mut state = mock.0.lock().unwrap();
+                    match mode {
+                        "timeout" => {
+                            state.boot_probes = (0..HOST_OS_BOOT_ATTEMPTS)
+                                .map(|_| failure("connection refused"))
+                                .collect()
+                        }
+                        "authentication" => state
+                            .boot_probes
+                            .push_back(failure("authentication failed")),
+                        "cancelled" => state.cancel_on_boot_probe = Some(token),
+                        _ => unreachable!(),
+                    }
+                }
+                let error = update_linkx_with_access(&mock, req, Duration::ZERO)
+                    .await
+                    .unwrap_err();
+                match mode {
+                    "timeout" => assert!(matches!(
+                        error,
+                        NvFwUpdError::Timeout {
+                            operation: "wait for host OS boot",
+                            seconds: HOST_OS_BOOT_TIMEOUT_SECS,
+                        }
+                    )),
+                    "authentication" => assert!(matches!(error, NvFwUpdError::AuthFailed { .. })),
+                    "cancelled" => assert!(matches!(error, NvFwUpdError::Cancelled { .. })),
+                    _ => unreachable!(),
+                }
+                let state = mock.0.lock().unwrap();
+                assert!(state
+                    .commands
+                    .iter()
+                    .all(|command| command == HOST_OS_READY_COMMAND));
+                assert_eq!(
+                    state.commands.len(),
+                    if mode == "timeout" {
+                        HOST_OS_BOOT_ATTEMPTS as usize
+                    } else {
+                        1
+                    }
+                );
+                assert!(state.flashed.is_empty());
+            }
+        }
+
+        #[tokio::test]
+        async fn query_errors_preserve_command_and_cause_and_prevent_flashing() {
+            let file = image();
+            let failures = [
+                (
+                    "mlxlink -d '/dev/mst/mt4133_pciconf0.3' -m",
+                    "mlxlink: device query failed",
+                ),
+                (
+                    "cat /sys/class/net/eth_r0_p0/operstate",
+                    "connection refused",
+                ),
+            ];
+            for (command, cause) in failures {
+                let mock = Mock::default();
+                mock.0
+                    .lock()
+                    .unwrap()
+                    .query_failures
+                    .push((command.into(), cause.into()));
+                let evidence = inspect_linkx_connector(&mock, LinkxConnector::C1, NEW).await;
+                assert_eq!(evidence.query_errors.len(), 1);
+                assert_eq!(evidence.query_errors[0].command, command);
+                assert!(evidence.query_errors[0].error.contains(cause));
+                assert!(!evidence.inspection_timed_out);
+                let error = update_linkx_with_access(
+                    &mock,
+                    request(&file, vec![LinkxConnector::C1]),
+                    Duration::ZERO,
+                )
+                .await
+                .unwrap_err();
+                assert!(matches!(&error, NvFwUpdError::TaskFailed { .. }));
+                assert!(error.to_string().contains(command));
+                assert!(error.to_string().contains(cause));
+                assert!(error.to_string().contains("C1 preflight"));
+                let state = mock.0.lock().unwrap();
+                assert!(state.flashed.is_empty());
+                assert!(state.commands.last().unwrap().starts_with("rm -rf"));
+            }
+        }
+
+        #[tokio::test]
+        async fn postcheck_query_error_retains_partial_update_report_and_stops_next_connector() {
+            let file = image();
+            let mock = Mock::default();
+            let command = "cat /sys/class/net/eth_r0_p0/operstate";
+            {
+                let mut state = mock.0.lock().unwrap();
+                state
+                    .query_failures
+                    .push((command.into(), "connection refused".into()));
+                state.query_failures_after_flash = true;
+            }
+            let report = update_linkx_with_access(
+                &mock,
+                request(&file, LinkxConnector::ALL.to_vec()),
+                Duration::from_millis(10),
+            )
+            .await
+            .unwrap();
+            assert!(!report.completed);
+            assert_eq!(
+                report.connectors[0].status,
+                LinkxDisposition::PostcheckFailed
+            );
+            let after = report.connectors[0].after.as_ref().unwrap();
+            assert_eq!(after.version_state, LinkxVersionState::Target);
+            assert_eq!(after.links_up, 7);
+            assert!(after.query_errors.iter().any(
+                |error| error.command == command && error.error.contains("connection refused")
+            ));
+            assert_eq!(report.connectors[1].status, LinkxDisposition::NotAttempted);
+            assert_eq!(mock.0.lock().unwrap().flashed.len(), 1);
+        }
+
+        #[tokio::test]
+        async fn postcheck_deadline_retains_versions_and_links_from_completed_queries() {
+            let file = image();
+            let mock = Mock::default();
+            let command = "cat /sys/class/net/eth_r1_p3/operstate";
+            mock.0.lock().unwrap().stalled_query_after_flash = Some(command.into());
+            let report = update_linkx_with_access(
+                &mock,
+                request(&file, LinkxConnector::ALL.to_vec()),
+                Duration::from_millis(250),
+            )
+            .await
+            .unwrap();
+
+            assert!(!report.completed);
+            assert_eq!(
+                report.connectors[0].status,
+                LinkxDisposition::PostcheckFailed
+            );
+            let after = report.connectors[0].after.as_ref().unwrap();
+            assert_eq!(after.versions, [Some(NEW.into()), Some(NEW.into())]);
+            assert_eq!(after.version_state, LinkxVersionState::Target);
+            assert_eq!(after.links_up, 7);
+            assert!(after.inspection_timed_out);
+            assert_eq!(after.query_errors[0].command, command);
+            assert!(after.query_errors[0].error.contains("deadline exceeded"));
+            assert_eq!(report.connectors[1].status, LinkxDisposition::NotAttempted);
+            assert_eq!(mock.0.lock().unwrap().flashed.len(), 1);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn postcheck_deadline_retains_previous_probe_without_claiming_success() {
+            let file = image();
+            let mock = Mock::default();
+            let command = "mlxlink -d '/dev/mst/mt4133_pciconf0.3' -m";
+
+            {
+                let mut state = mock.0.lock().unwrap();
+                state.stalled_query_after_flash = Some(command.into());
+                state.successful_queries_before_stall = 1;
+                state.query_failures_after_flash = true;
+                state.query_failures.push((
+                    "cat /sys/class/net/eth_r0_p0/operstate".into(),
+                    "connection refused".into(),
+                ));
+            }
+
+            // The first recovery probe sees both versions and seven links.
+            // The next probe times out before returning any new observations.
+            // Paused time keeps runner scheduling from exhausting the deadline
+            // before the second probe starts; Tokio advances it while waiting.
+            let report = update_linkx_with_access(
+                &mock,
+                request(&file, LinkxConnector::ALL.to_vec()),
+                Duration::from_millis(250),
+            )
+            .await
+            .unwrap();
+
+            assert!(!report.completed);
+            assert_eq!(
+                report.connectors[0].status,
+                LinkxDisposition::PostcheckFailed
+            );
+
+            let evidence = report.connectors[0].after.as_ref().unwrap();
+
+            assert_eq!(evidence.version_state, LinkxVersionState::Target);
+            assert_eq!(evidence.links_up, 7);
+            assert!(evidence.module_health_ok);
+            assert!(evidence.inspection_timed_out);
+            assert_eq!(evidence.query_errors[0].command, command);
+            assert_eq!(report.connectors[1].status, LinkxDisposition::NotAttempted);
+        }
+
+        #[tokio::test]
+        async fn failures_stop_without_retry_and_preserve_target_but_links_down() {
+            let file = image();
+            for failed_flash in [true, false] {
+                let mock = Mock::default();
+                {
+                    let mut state = mock.0.lock().unwrap();
+                    state.flash_failure = failed_flash;
+                    state.degraded_after_flash = !failed_flash;
+                }
+                let report = update_linkx_with_access(
+                    &mock,
+                    request(&file, LinkxConnector::ALL.to_vec()),
+                    Duration::from_millis(5),
+                )
+                .await
+                .unwrap();
+                assert!(!report.completed);
+                assert_eq!(
+                    report.connectors[0].status,
+                    if failed_flash {
+                        LinkxDisposition::FlashFailed
+                    } else {
+                        LinkxDisposition::PostcheckFailed
+                    }
+                );
+                assert_eq!(
+                    report.connectors[0].after.as_ref().unwrap().version_state,
+                    LinkxVersionState::Target
+                );
+                assert_eq!(report.connectors[1].status, LinkxDisposition::NotAttempted);
+                assert_eq!(mock.0.lock().unwrap().flashed.len(), 1);
+            }
+        }
+
+        #[tokio::test]
+        async fn cancellation_before_flash_is_error_after_flash_retains_evidence() {
+            let file = image();
+            let mock = Mock::default();
+            let token = CancellationToken::new();
+            let mut req = request(&file, LinkxConnector::ALL.to_vec());
+            req.cancellation = Some(token.clone());
+            token.cancel();
+            assert!(matches!(
+                update_linkx_with_access(&mock, req, Duration::ZERO).await,
+                Err(NvFwUpdError::Cancelled { .. })
+            ));
+            assert!(mock.0.lock().unwrap().commands.is_empty());
+            let token = CancellationToken::new();
+            mock.0.lock().unwrap().cancel_on_flash = Some(token.clone());
+            let mut req = request(&file, LinkxConnector::ALL.to_vec());
+            req.cancellation = Some(token);
+            let report = update_linkx_with_access(&mock, req, Duration::from_millis(10))
+                .await
+                .unwrap();
+            assert!(report.cancellation_requested);
+            assert!(!report.completed);
+            assert_eq!(report.connectors[0].status, LinkxDisposition::Completed);
+            assert_eq!(report.connectors[1].status, LinkxDisposition::NotAttempted);
+        }
+
+        #[tokio::test]
+        async fn image_type_and_checksums_fail_closed_and_cleanup() {
+            let file = image();
+            for remote_hash in [true, false] {
+                let mock = Mock::default();
+                {
+                    let mut state = mock.0.lock().unwrap();
+                    state.wrong_hash = remote_hash;
+                    state.wrong_image = !remote_hash;
+                }
+                assert!(update_linkx_with_access(
+                    &mock,
+                    request(&file, vec![LinkxConnector::C1]),
+                    Duration::ZERO
+                )
+                .await
+                .is_err());
+                let state = mock.0.lock().unwrap();
+                assert!(state.flashed.is_empty());
+                assert!(state.commands.last().unwrap().starts_with("rm -rf"));
+            }
+            let mock = Mock::default();
+            let mut req = request(&file, vec![LinkxConnector::C1]);
+            req.targets[0].policy.sha256 = "0".repeat(64);
+            assert!(update_linkx_with_access(&mock, req, Duration::ZERO)
+                .await
+                .is_err());
+            assert!(mock.0.lock().unwrap().commands.is_empty());
+        }
+    }
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
 
@@ -1390,6 +2894,33 @@ mod tests {
                 .expect("commands lock")
                 .push(format!("upload {local_path} {remote_path}"));
             success("")
+        }
+    }
+
+    #[tokio::test]
+    async fn temp_directory_validation_preserves_existing_flint_cli_behavior() {
+        for (path, accepted) in [
+            ("/tmp/nvfwupd-flint.ABC123\n", true),
+            ("/tmp/nvfwupd-flint.ABC-123", true),
+            ("/tmp/nvfwupd-flint.ABC_123", true),
+            ("/tmp/nvfwupd-flint.ABC 123", false),
+            ("/tmp/nvfwupd-flint.ABC\n123", false),
+            ("/tmp/nvfwupd-flint.", false),
+            ("/tmp/other.ABC123", false),
+        ] {
+            let access = FakeAccess::new(vec![success(path)]);
+            let result = create_remote_temp_dir(&access, QUERY_TIMEOUT_SECS).await;
+            if accepted {
+                assert_eq!(result.unwrap(), path.trim());
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(NvFwUpdError::InvalidResponse {
+                        context: "remote temporary directory",
+                        ..
+                    })
+                ));
+            }
         }
     }
 
@@ -1842,7 +3373,12 @@ mod tests {
 
     #[test]
     fn command_errors_classify_sudo_and_timeouts() {
-        let _guard = crate::utils::SanitizeTestGuard::new();
+        let _sanitize_guard = crate::utils::SanitizeTestGuard::new();
+        crate::utils::Util::set_sanitize_config(Some(HashMap::from([(
+            "password".to_owned(),
+            "password is required".to_owned(),
+        )])));
+
         let sudo = command_error(
             "host",
             "mst",

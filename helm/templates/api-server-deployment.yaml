@@ -1,5 +1,8 @@
 {{- if .Values.apiServer.enabled }}
 {{- include "rack-manager.validateSftpOptions" . -}}
+{{- include "rack-manager.validateFirmwareTaskOptions" . -}}
+{{- include "rack-manager.validateComputePowerOnOptions" . -}}
+{{- include "rack-manager.validateTracingOptions" . -}}
 {{- $firmwarePersistentVolumeClaim := .Values.apiServer.firmwarePersistentVolumeClaim | default "" | trim }}
 apiVersion: apps/v1
 kind: Deployment
@@ -25,7 +28,11 @@ spec:
         # Roll the Deployment when the rendered config.toml changes, since RMS
         # reads the mounted file only once at startup.
         checksum/config: {{ include "rack-manager.apiServerConfigToml" . | sha256sum }}
+        {{- with omit (.Values.apiServer.podAnnotations | default dict) "checksum/config" }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
     spec:
+      terminationGracePeriodSeconds: {{ include "rack-manager.terminationGracePeriodSeconds" . }}
       {{- with .Values.apiServer.affinity }}
       affinity:
         {{- toYaml . | nindent 8 }}
@@ -174,6 +181,23 @@ spec:
               value: "postgres://$(DB_USER):$(DB_PASSWORD)@$(DB_HOST):$(DB_PORT)/$(DB_NAME)?sslmode={{ .Values.database.sslMode }}"
             {{- end }}
           {{- end }}
+        {{- if .Values.nvssvt.enabled }}
+        # NVSSVT scan launcher. Deliberately a sidecar and not its own
+        # Deployment: sharing the pod's network namespace is what lets RMS
+        # reach it on 127.0.0.1:8000 (the fixed address RMS targets), and keeps the
+        # scanner's lifecycle tied to the API server that drives it. The port
+        # is not published on a Service -- nothing outside the pod calls it.
+        - name: nvssvt-server
+          image: {{ include "rack-manager.nvssvtImage" . | quote }}
+          imagePullPolicy: {{ .Values.nvssvt.image.pullPolicy | default "IfNotPresent" }}
+          ports:
+            - containerPort: 8000
+              name: nvssvt
+          {{- with .Values.nvssvt.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+        {{- end }}
       volumes:
         - name: rms-config
           configMap:

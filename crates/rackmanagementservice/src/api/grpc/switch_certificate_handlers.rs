@@ -18,10 +18,12 @@
 //! Handlers for ConfigureSwitchCertificate and GetConfigureSwitchCertificateJobStatus.
 //! BatchDisableSwitchMtls uses the existing switch mTLS unset workflow.
 
+use std::collections::BTreeSet;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use librms::protos::rack_manager as rm;
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -45,12 +47,20 @@ use crate::libgnmi::{
 };
 use crate::libnmxc::{Endpoint, NmxcClientPool, NmxcTlsConfig};
 use crate::nodes::SwitchScaleUpManagement;
+use crate::nodes::nvos::GnmiClientCa;
 use crate::nodes::switch_gb200_nvidia::{SwitchGb200Nvidia, grpc_port_for_app};
 use crate::nodes::switch_gb300_nvidia::SwitchGb300Nvidia;
 use crate::nodes::switch_mtls::{
-    StableNmxcTlsConfig, SwitchMtlsMaterialPaths, SwitchMtlsService, mtls_remote_file_specs,
-    sftp_copy_stage_name,
+    CertificateBindings, CertificateInventory, CertificateStore, GNMI_CLIENT_AUTHENTICATION_MTLS,
+    GNMI_CLIENT_AUTHENTICATION_SERVER_CERTIFICATE_ONLY, MtlsSftpCopyOutcome, MtlsUnsetReport,
+    MtlsUnsetStage, NVOS_CERTIFICATE_STORE_LIMIT, StableNmxcTlsConfig, SwitchMtlsMaterialPaths,
+    SwitchMtlsService, mtls_remote_file_specs, plan_store_reclaim, sftp_copy_stage_name,
 };
+#[cfg(test)]
+use crate::nodes::switch_mtls::{
+    MtlsPersistOutcome, MtlsServiceOutcome, MtlsUnsetFailureSite, MtlsUnsetStatus,
+};
+use crate::nodes::switch_vrnvl72_nvidia::SwitchVrnvl72Nvidia;
 use crate::orchestrator::job_lifecycle::{JobError, JobFailure, JobJoinHandle};
 use crate::orchestrator::job_tracker::JobTracker;
 use crate::orchestrator::job_tracker::{JobType, RmsJobHandle};
@@ -174,10 +184,16 @@ fn switch_certificate_job_stages(
 ) -> Vec<Stage> {
     let stage = |name: String, description: String| Stage::new(name, description);
 
-    let mut stages = vec![stage(
-        "prepare_remote_dir".to_owned(),
-        "Prepare remote TLS directories on switch via SSH".to_owned(),
-    )];
+    let mut stages = vec![
+        stage(
+            "reclaim_certificate_capacity".to_owned(),
+            "Make room in the NVOS certificate stores".to_owned(),
+        ),
+        stage(
+            "prepare_remote_dir".to_owned(),
+            "Prepare remote TLS directories on switch via SSH".to_owned(),
+        ),
+    ];
 
     for spec in mtls_remote_file_specs(material) {
         stages.push(stage(
@@ -193,6 +209,13 @@ fn switch_certificate_job_stages(
         "import_material".to_owned(),
         "Import TLS certificates into NVOS security store".to_owned(),
     ));
+
+    if certificate_job_discovers_nvue_capabilities(services) {
+        stages.push(stage(
+            "discover_nvue_capabilities".to_owned(),
+            "Discover switch capabilities from live NVUE".to_owned(),
+        ));
+    }
 
     for service in ordered_bind_services(services) {
         stages.push(stage(
@@ -259,14 +282,207 @@ enum SwitchMtlsUnsetMode {
     InsecureSwitch,
 }
 
-// The registered client stays isolated during bootstrap and joins the verified
-// transport transition only after the switch enables mTLS.
+/// Verified client state prepared before the switch enables NVUE mTLS.
+///
+/// The registered client stays isolated during bootstrap and joins the
+/// transition only after the switch starts enforcing the new transport.
 #[derive(Clone)]
-struct NvueTlsTransition {
+pub(crate) struct NvueTlsTransition {
     tls: nvue_client::ClientTls,
     server_name: String,
     fingerprint: [u8; 32],
     registered_client: Option<nvue_client::SharedClient>,
+}
+
+/// A certificate-install phase reported to the caller-owned progress sink.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SwitchCertificateInstallStage {
+    /// Make room for the import in the NVOS certificate stores.
+    ReclaimCertificateCapacity,
+
+    /// Prepare the switch-side staging directory.
+    PrepareRemoteDirectory,
+
+    /// Transfer one certificate material file.
+    TransferMaterial(&'static str),
+
+    /// Import the staged material into the NVOS security store.
+    ImportMaterial,
+
+    /// Classify live NVUE capabilities before a gNMI bind.
+    DiscoverNvueCapabilities,
+
+    /// Bind the imported material to one switch service.
+    BindService(SwitchMtlsService),
+
+    /// Verify every requested service binding.
+    VerifyServices,
+
+    /// Test the verified NVUE API transport.
+    TestNvueHello,
+
+    /// Test the verified NMX transport.
+    TestNmxHello,
+
+    /// Test the verified gNMI transport.
+    TestGnmiCapabilities,
+}
+
+impl SwitchCertificateInstallStage {
+    pub(crate) fn name(self) -> String {
+        match self {
+            Self::ReclaimCertificateCapacity => "reclaim_certificate_capacity".to_owned(),
+            Self::PrepareRemoteDirectory => "prepare_remote_dir".to_owned(),
+            Self::TransferMaterial(remote_name) => sftp_copy_stage_name(remote_name),
+            Self::ImportMaterial => "import_material".to_owned(),
+            Self::DiscoverNvueCapabilities => "discover_nvue_capabilities".to_owned(),
+            Self::BindService(service) => bind_service_stage_name(service),
+            Self::VerifyServices => "verify_services".to_owned(),
+            Self::TestNvueHello => "test_nvue_hello".to_owned(),
+            Self::TestNmxHello => "test_nmx_hello".to_owned(),
+            Self::TestGnmiCapabilities => "test_gnmi_capabilities".to_owned(),
+        }
+    }
+}
+
+/// Receives certificate-install stage transitions without owning job state.
+///
+/// The certificate RPC uses this interface to retain its detailed timeline.
+/// Callers that already have a coarser outer stage may use a no-op sink.
+pub(crate) trait SwitchCertificateInstallProgress: Send {
+    /// Start `stage` before its switch operation runs.
+    fn start_stage(&mut self, stage: SwitchCertificateInstallStage) -> Result<()>;
+
+    /// Complete the current stage with its diagnostic details.
+    fn complete_stage(&mut self, details: Value);
+}
+
+/// Switch operations required by the shared certificate installer.
+///
+/// Implementations must make cleanup best-effort: cleanup failures must not
+/// replace an installation error or turn an otherwise successful install into
+/// a failure.
+#[async_trait]
+pub(crate) trait SwitchCertificateInstallNode: Send + Sync {
+    /// Return the node identifier used for cleanup diagnostics.
+    fn node_id(&self) -> &str;
+
+    /// List the entries in both NVOS certificate stores.
+    async fn read_certificate_inventory(&self) -> Result<CertificateInventory>;
+
+    /// Read which certificate-store entries every switch service is bound to,
+    /// including services the request does not bind.
+    async fn read_certificate_bindings(&self) -> Result<CertificateBindings>;
+
+    /// Delete one RMS-created entry from an NVOS certificate store.
+    async fn delete_certificate_entry(&self, store: CertificateStore, id: &str) -> Result<()>;
+
+    /// Prepare the remote staging directory.
+    async fn prepare_mtls_remote_dirs(&self, material: &SwitchMtlsMaterialPaths) -> Result<()>;
+
+    /// Copy one material file into the remote staging directory.
+    async fn sftp_copy_mtls_file(
+        &self,
+        material: &SwitchMtlsMaterialPaths,
+        remote_file_name: &str,
+        cancel: CancellationToken,
+    ) -> Result<MtlsSftpCopyOutcome>;
+
+    /// Import staged certificate material into the NVOS security store.
+    async fn import_mtls_material(&self, material: &SwitchMtlsMaterialPaths) -> Result<()>;
+
+    /// Classify live NVUE capabilities before binding a service that depends on them.
+    async fn initialize_nvue_capabilities(&self) -> Result<GnmiClientCa>;
+
+    /// Remove staged material without changing the operation outcome.
+    async fn cleanup_mtls_remote_dir_best_effort(&self, material: &SwitchMtlsMaterialPaths);
+
+    /// Bind imported material to `service`, including the verified NVUE
+    /// transport transition when binding the NVUE API itself.
+    async fn bind_mtls_service_for_install(
+        &self,
+        material: &SwitchMtlsMaterialPaths,
+        service: SwitchMtlsService,
+        nvue_transition: Option<&NvueTlsTransition>,
+    ) -> Result<()>;
+
+    /// Verify every requested service binding.
+    async fn verify_mtls_services(
+        &self,
+        material: &SwitchMtlsMaterialPaths,
+        services: &[SwitchMtlsService],
+    ) -> Result<Value>;
+}
+
+#[async_trait]
+impl SwitchCertificateInstallNode for SwitchGb200Nvidia {
+    fn node_id(&self) -> &str {
+        self.id()
+    }
+
+    async fn read_certificate_inventory(&self) -> Result<CertificateInventory> {
+        SwitchGb200Nvidia::read_certificate_inventory(self).await
+    }
+
+    async fn read_certificate_bindings(&self) -> Result<CertificateBindings> {
+        Ok(SwitchGb200Nvidia::read_certificate_bindings(self).await)
+    }
+
+    async fn delete_certificate_entry(&self, store: CertificateStore, id: &str) -> Result<()> {
+        SwitchGb200Nvidia::delete_certificate_entry(self, store, id).await
+    }
+
+    async fn prepare_mtls_remote_dirs(&self, material: &SwitchMtlsMaterialPaths) -> Result<()> {
+        SwitchGb200Nvidia::prepare_mtls_remote_dirs(self, material).await
+    }
+
+    async fn sftp_copy_mtls_file(
+        &self,
+        material: &SwitchMtlsMaterialPaths,
+        remote_file_name: &str,
+        cancel: CancellationToken,
+    ) -> Result<MtlsSftpCopyOutcome> {
+        SwitchGb200Nvidia::sftp_copy_mtls_file(self, material, remote_file_name, cancel).await
+    }
+
+    async fn import_mtls_material(&self, material: &SwitchMtlsMaterialPaths) -> Result<()> {
+        SwitchGb200Nvidia::import_mtls_material(self, material).await
+    }
+
+    async fn initialize_nvue_capabilities(&self) -> Result<GnmiClientCa> {
+        SwitchGb200Nvidia::initialize_nvue_capabilities(self).await
+    }
+
+    async fn cleanup_mtls_remote_dir_best_effort(&self, material: &SwitchMtlsMaterialPaths) {
+        SwitchGb200Nvidia::cleanup_mtls_remote_dir_best_effort(self, material).await;
+    }
+
+    async fn bind_mtls_service_for_install(
+        &self,
+        material: &SwitchMtlsMaterialPaths,
+        service: SwitchMtlsService,
+        nvue_transition: Option<&NvueTlsTransition>,
+    ) -> Result<()> {
+        if service != SwitchMtlsService::NvueApi {
+            return SwitchGb200Nvidia::bind_mtls_service(self, material, service).await;
+        }
+
+        let Some(transition) = nvue_transition else {
+            return Err(RmsError::failed_precondition(
+                "NVUE mTLS requires RMS client TLS material",
+            ));
+        };
+
+        bind_nvue_mtls_with_client_transition(self, material, transition).await
+    }
+
+    async fn verify_mtls_services(
+        &self,
+        material: &SwitchMtlsMaterialPaths,
+        services: &[SwitchMtlsService],
+    ) -> Result<Value> {
+        SwitchGb200Nvidia::verify_mtls_services(self, material, services).await
+    }
 }
 
 struct SwitchCertificateInstallMode {
@@ -293,20 +509,55 @@ struct PreparedSwitchCertificateNode {
     switch_host_port: u16,
 }
 
+/// One service's outcome as reported to the client.
+#[derive(Serialize)]
+struct SwitchMtlsUnsetServiceResult<'a> {
+    service: &'a str,
+    stage: &'static str,
+    status: &'static str,
+}
+
+/// One persist operation's outcome as reported to the client.
+#[derive(Serialize)]
+struct SwitchMtlsUnsetPersistResult {
+    stage: &'static str,
+    status: &'static str,
+}
+
+/// Where an unset run stopped. `service` is omitted when apply or save failed,
+/// since neither is attributable to a single service.
+#[derive(Serialize)]
+struct SwitchMtlsUnsetFailure<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    service: Option<&'a str>,
+    stage: &'static str,
+    message: &'a str,
+}
+
+/// The job result for an mTLS unset run.
+///
+/// Reports what changed per service rather than the `nv` command lines that
+/// changed it: command text is an NVOS implementation detail that belongs in
+/// RMS logs, not in a client-visible payload.
 #[derive(Serialize)]
 struct SwitchMtlsUnsetResult<'a> {
     status: &'a str,
     operation: &'static str,
     mode: SwitchMtlsUnsetMode,
     services: &'a [&'a str],
+    service_results: Vec<SwitchMtlsUnsetServiceResult<'a>>,
+    persist: Vec<SwitchMtlsUnsetPersistResult>,
     timing_summary: Value,
     #[serde(skip_serializing_if = "Option::is_none")]
-    commands: Option<&'a [String]>,
+    failure: Option<SwitchMtlsUnsetFailure<'a>>,
 }
 
 enum SwitchCertificateMode {
-    // Secure mode installs switch-side certificates and configures selected
-    // services to require mTLS.
+    // Secure mode installs switch-side certificates and binds the selected
+    // services. NVUE and NMX require a client CA. gNMI binds a client CA when
+    // the image exposes `/system/gnmi-server/mtls`. A 404 binds the server
+    // certificate only, and the completed job records
+    // `gnmi_client_authentication` as `server-certificate-only`.
     Install(Box<SwitchCertificateInstallMode>),
 
     // Insecure switch mode is an opt-out from certificate management. The same
@@ -484,8 +735,8 @@ async fn activate_nvue_client_tls_with_retries(
     }))
 }
 
-async fn prepare_nvue_tls_transition(
-    switch: &SwitchGb200Nvidia,
+pub(crate) async fn prepare_nvue_tls_transition(
+    client: Option<&nvue_client::SharedClient>,
     tls: Option<&nvue_client::ClientTls>,
     server_name: String,
     registered_client: Option<nvue_client::SharedClient>,
@@ -494,8 +745,11 @@ async fn prepare_nvue_tls_transition(
         return Ok(None);
     };
 
-    let prepared = switch
-        .nvue_client()?
+    let client = client.ok_or_else(|| {
+        RmsError::failed_precondition("NVUE client is required for the verified TLS transition")
+    })?;
+
+    let prepared = client
         .prepare_verified_client_tls(tls.clone(), Some(&server_name))
         .await?;
 
@@ -690,7 +944,7 @@ async fn test_nmx_hello_with_retries(
                     max_attempts = NMX_HELLO_CONNECT_ATTEMPTS,
                     retry_in_secs = NMX_HELLO_CONNECT_RETRY_WAIT.as_secs(),
                     error = %e.message,
-                    "NMX Hello connect failed; retrying after mTLS bind"
+                    "NMX Hello connect failed; retrying"
                 );
                 last_err = Some(e);
                 tokio::time::sleep(NMX_HELLO_CONNECT_RETRY_WAIT).await;
@@ -702,31 +956,28 @@ async fn test_nmx_hello_with_retries(
     Err(last_err.unwrap_or_else(|| RmsError::internal("NMX Hello connect failed after retries")))
 }
 
-/// Configures manager mTLS after a Hello transport failure, then verifies it.
-/// Decides whether the primary's NMX Controller mTLS binding must be
-/// (re)configured.
+/// Reconciles the primary's NMX Controller mTLS binding and checks Hello.
 ///
-/// A stale binding is reconfigured even though the superseded certificate
-/// still completes a handshake; otherwise a rotated NVUE certificate would only
-/// reach NMX Controller once the old one expired. A current binding is only
-/// checked: rebinding identical certificate objects cannot fix a failed
-/// connectivity check, so that failure is reported as-is. Only when the
-/// binding cannot be read does a connect failure trigger the rebind, because
-/// the binding may then be missing altogether.
+/// A stale binding is reconfigured before Hello, even if the superseded
+/// certificate still completes a handshake. A current binding is checked with
+/// bounded retries for Hello connect failures, without rebinding. When the
+/// binding cannot be read, a one-shot Hello connect failure triggers a rebind
+/// followed by the same retry check; other Hello failures are returned directly.
 async fn ensure_primary_nmx_controller_mtls(
     binding_is_current: impl Future<Output = Result<bool>>,
     check: impl Future<Output = Result<()>>,
     configure: impl Future<Output = Result<()>>,
-    verify: impl Future<Output = Result<()>>,
+    check_with_retries: impl Future<Output = Result<()>>,
 ) -> Result<()> {
     match binding_is_current.await {
-        Ok(true) => return check.await,
+        Ok(true) => return check_with_retries.await,
         Ok(false) => {
             tracing::info!(
                 "configuring primary NMX Controller mTLS with the current NVUE API certificate material"
             );
+
             configure.await?;
-            return verify.await;
+            return check_with_retries.await;
         }
         Err(error) => {
             tracing::warn!(
@@ -748,7 +999,7 @@ async fn ensure_primary_nmx_controller_mtls(
     }
 
     configure.await?;
-    verify.await
+    check_with_retries.await
 }
 
 async fn test_gnmi_capabilities(
@@ -851,6 +1102,32 @@ fn bind_service_stage_name(service: SwitchMtlsService) -> String {
     format!("bind_{}", service.as_str())
 }
 
+/// Job-result and discover-stage label for a gNMI client-CA classification.
+fn gnmi_client_authentication_label(capabilities: GnmiClientCa) -> &'static str {
+    if capabilities.is_supported() {
+        GNMI_CLIENT_AUTHENTICATION_MTLS
+    } else {
+        GNMI_CLIENT_AUTHENTICATION_SERVER_CERTIFICATE_ONLY
+    }
+}
+
+/// Copy a named gNMI authentication outcome out of service verification.
+///
+/// `null` means gNMI was not selected. A string is `mtls` or
+/// `server-certificate-only` and belongs on the completed job result beside
+/// `services`.
+fn recorded_gnmi_client_authentication(service_verification: &Value) -> Option<Value> {
+    service_verification
+        .get("gnmi_client_authentication")
+        .filter(|value| value.is_string())
+        .cloned()
+}
+
+/// gNMI bind/verify classifies the live NVOS image; other services do not.
+fn certificate_job_discovers_nvue_capabilities(services: &[SwitchMtlsService]) -> bool {
+    services.contains(&SwitchMtlsService::ScaleUpFabricTelemetryInterface)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_switch_certificate_result_json(
     status: &str,
@@ -879,21 +1156,111 @@ fn build_switch_certificate_result_json(
     result.to_string()
 }
 
+/// The per-service outcomes of `report`, as the result JSON renders them.
+fn switch_mtls_unset_service_results(
+    report: &MtlsUnsetReport,
+) -> Vec<SwitchMtlsUnsetServiceResult<'_>> {
+    report
+        .services
+        .iter()
+        .map(|outcome| SwitchMtlsUnsetServiceResult {
+            service: outcome.service.as_str(),
+            stage: MtlsUnsetStage::UnsetBinding.as_str(),
+            status: outcome.status.as_str(),
+        })
+        .collect()
+}
+
+/// The persist outcomes of `report`, as the result JSON renders them.
+fn switch_mtls_unset_persist_results(
+    report: &MtlsUnsetReport,
+) -> Vec<SwitchMtlsUnsetPersistResult> {
+    report
+        .persist
+        .iter()
+        .map(|outcome| SwitchMtlsUnsetPersistResult {
+            stage: outcome.stage.as_str(),
+            status: outcome.status.as_str(),
+        })
+        .collect()
+}
+
+/// Where `report` stopped, as the result JSON renders it.
+fn switch_mtls_unset_failure(report: &MtlsUnsetReport) -> Option<SwitchMtlsUnsetFailure<'_>> {
+    report.failure.as_ref().map(|site| SwitchMtlsUnsetFailure {
+        service: site.service.map(SwitchMtlsService::as_str),
+        stage: site.stage.as_str(),
+        message: &site.message,
+    })
+}
+
 fn build_switch_mtls_unset_result<'a>(
     status: &'a str,
     mode: SwitchMtlsUnsetMode,
     services: &'a [&'a str],
     timeline: &StageTimeline,
-    commands: Option<&'a [String]>,
+    report: &'a MtlsUnsetReport,
 ) -> SwitchMtlsUnsetResult<'a> {
     SwitchMtlsUnsetResult {
         status,
         operation: "unset_mtls",
         mode,
         services,
+        service_results: switch_mtls_unset_service_results(report),
+        persist: switch_mtls_unset_persist_results(report),
         timing_summary: timeline.to_json(),
-        commands,
+        failure: switch_mtls_unset_failure(report),
     }
+}
+
+/// The per-service view of `report`, for a stage's `details` field.
+///
+/// Serializes the same typed values the result JSON uses, rather than
+/// rebuilding them, so a stage entry and the top-level result cannot disagree
+/// about what happened -- including which keys are present at all, since
+/// `failure.service` is omitted rather than null for a persist failure.
+fn switch_mtls_unset_stage_details(services: &[&str], report: &MtlsUnsetReport) -> Value {
+    let mut details = json!({ "services": services });
+
+    let Value::Object(fields) = &mut details else {
+        return details;
+    };
+
+    for (key, value) in [
+        (
+            "service_results",
+            serde_json::to_value(switch_mtls_unset_service_results(report)),
+        ),
+        (
+            "persist",
+            serde_json::to_value(switch_mtls_unset_persist_results(report)),
+        ),
+    ] {
+        match value {
+            Ok(value) => {
+                fields.insert(key.to_owned(), value);
+            }
+            Err(error) => tracing::error!(
+                error = %error,
+                key,
+                "failed to serialize switch mTLS unset stage details"
+            ),
+        }
+    }
+
+    if let Some(failure) = switch_mtls_unset_failure(report) {
+        match serde_json::to_value(failure) {
+            Ok(value) => {
+                fields.insert("failure".to_owned(), value);
+            }
+            Err(error) => tracing::error!(
+                error = %error,
+                "failed to serialize switch mTLS unset failure site"
+            ),
+        }
+    }
+
+    details
 }
 
 fn serialize_switch_mtls_unset_result(result: &SwitchMtlsUnsetResult<'_>) -> String {
@@ -941,12 +1308,13 @@ async fn run_switch_mtls_unset_job(
     // abandoned" message and a noisy panic backtrace.
     let Ok((_stage, description)) = timeline.start_stage() else {
         timeline.skip_remaining();
+        let report = MtlsUnsetReport::not_attempted(&services);
         let result = build_switch_mtls_unset_result(
             "failed",
             result_mode,
             &requested_services,
             &timeline,
-            None,
+            &report,
         );
         let result_json = serialize_switch_mtls_unset_result(&result);
         job.fail(
@@ -956,41 +1324,28 @@ async fn run_switch_mtls_unset_job(
     };
     job.progress(description);
 
+    // Cancellation is handled inside the flow. Dropping the unset future at
+    // an arbitrary await point would discard the report describing how far it
+    // got, and `nv action restore` takes effect on the switch immediately, so
+    // an abandoned run cannot honestly be described as having attempted
+    // nothing.
     let cancellation_token = job.cancellation_token();
-    let commands = match tokio::select! {
-        biased;
+    let report = match switch
+        .unset_mtls_services(&services, &cancellation_token)
+        .await
+    {
+        Ok(report) => report,
+        Err(failure) => {
+            // The partial report is the whole point of the failure path: it
+            // names which services had already been cleared before the run
+            // stopped, and which were never attempted.
+            let report = failure.report;
+            let error = failure.error;
 
-        _ = cancellation_token.cancelled() => {
-            let message = "switch mTLS unset job cancelled";
-            timeline.fail_current(
-                true,
-                message,
-                json!({ "services": requested_services.clone() }),
-            );
-            timeline.skip_remaining();
-
-            let result = build_switch_mtls_unset_result(
-                "cancelled",
-                result_mode,
-                &requested_services,
-                &timeline,
-                None,
-            );
-
-            let result_json = serialize_switch_mtls_unset_result(&result);
-
-            job.fail(JobFailure::new(JobError::Internal, message).with_result_json(result_json));
-
-            return;
-        }
-        result = switch.unset_mtls_services(&services) => result,
-    } {
-        Ok(commands) => commands,
-        Err(e) => {
             timeline.fail_current(
                 false,
-                &e.message,
-                json!({ "error": e.message, "services": requested_services.clone() }),
+                &error.message,
+                switch_mtls_unset_stage_details(&requested_services, &report),
             );
             timeline.skip_remaining();
 
@@ -999,27 +1354,59 @@ async fn run_switch_mtls_unset_job(
                 result_mode,
                 &requested_services,
                 &timeline,
-                None,
+                &report,
             );
 
             let result_json = serialize_switch_mtls_unset_result(&result);
 
-            job.fail(JobFailure::new(JobError::Other, &e.message).with_result_json(result_json));
+            job.fail(
+                JobFailure::new(JobError::Other, &error.message).with_result_json(result_json),
+            );
 
             return;
         }
     };
 
-    timeline.complete_current(
-        json!({ "services": requested_services.clone(), "commands": commands.clone() }),
-    );
+    if report.cancelled {
+        let message = "switch mTLS unset job cancelled";
+
+        // The report carries whatever the run got through before it stopped,
+        // so a client can see which services were already changed and that
+        // config_apply / config_save never ran -- i.e. that any staged change
+        // is uncommitted on the switch.
+        timeline.fail_current(
+            true,
+            message,
+            switch_mtls_unset_stage_details(&requested_services, &report),
+        );
+        timeline.skip_remaining();
+
+        let result = build_switch_mtls_unset_result(
+            "cancelled",
+            result_mode,
+            &requested_services,
+            &timeline,
+            &report,
+        );
+
+        let result_json = serialize_switch_mtls_unset_result(&result);
+
+        job.fail(JobFailure::new(JobError::Other, message).with_result_json(result_json));
+
+        return;
+    }
+
+    timeline.complete_current(switch_mtls_unset_stage_details(
+        &requested_services,
+        &report,
+    ));
 
     let result = build_switch_mtls_unset_result(
         "completed",
         result_mode,
         &requested_services,
         &timeline,
-        Some(&commands),
+        &report,
     );
 
     let result_json = serialize_switch_mtls_unset_result(&result);
@@ -1042,41 +1429,7 @@ fn dispatch_switch_mtls_unset_job(
     services: Vec<SwitchMtlsService>,
 ) -> JobJoinHandle {
     job_tracker.spawn_job(job, move |job| async move {
-        #[cfg(not(test))]
-        {
-            run_switch_mtls_unset_job(job, switch, services, SwitchMtlsUnsetMode::InsecureSwitch)
-                .await;
-        }
-
-        #[cfg(test)]
-        {
-            // Handler unit tests verify request routing and job creation without
-            // opening real SSH sessions. The job runner itself is covered with a
-            // fake SSH executor.
-            let job_id = job.id().to_string();
-            let requested_services = services
-                .iter()
-                .map(|service| service.as_str())
-                .collect::<Vec<_>>();
-            let commands = Vec::new();
-            let mut timeline = switch_mtls_unset_job_timeline(&job_id, &switch);
-            let Ok((_stage, description)) = timeline.start_stage() else {
-                job.fail(JobFailure::new(JobError::Other, "stage list exhausted"));
-                return;
-            };
-            job.progress(description);
-            timeline.complete_current(
-                json!({ "services": requested_services.clone(), "commands": commands.clone() }),
-            );
-            let result = build_switch_mtls_unset_result(
-                "completed",
-                SwitchMtlsUnsetMode::InsecureSwitch,
-                &requested_services,
-                &timeline,
-                Some(&commands),
-            );
-            job.complete("Completed", serialize_switch_mtls_unset_result(&result));
-        }
+        run_switch_mtls_unset_job(job, switch, services, SwitchMtlsUnsetMode::InsecureSwitch).await;
     })
 }
 
@@ -1093,6 +1446,7 @@ fn dispatch_switch_mtls_disable_job(
 
 fn prepare_switch_mtls_disable_switch(
     device: &rm::NodeInfo,
+    insecure_bmc: bool,
 ) -> std::result::Result<Arc<SwitchGb200Nvidia>, String> {
     let node_id = device.node_id.clone();
     let rack_id = device.rack_id.clone();
@@ -1126,7 +1480,7 @@ fn prepare_switch_mtls_disable_switch(
 
     // Disabling mTLS uses only the host SSH endpoint. A malformed optional BMC
     // endpoint does not prevent the operation.
-    let bmc_endpoint = match flat.optional_bmc_endpoint() {
+    let bmc_endpoint = match flat.optional_bmc_endpoint(insecure_bmc) {
         Ok(endpoint) => endpoint,
         Err(error) => {
             tracing::warn!(
@@ -1153,12 +1507,15 @@ fn prepare_switch_mtls_disable_switch(
         bmc_endpoint,
         host_endpoint: Some(host_endpoint),
         expected_inventory: None,
+        recovery: None,
+        runtime_config: None,
     };
 
     let switch = match node_type {
         DomainNodeType::SwitchGb200Nvidia => SwitchGb200Nvidia::from_config(&config, &rack_id),
         DomainNodeType::SwitchGb300Nvidia => SwitchGb300Nvidia::from_config(&config, &rack_id),
-        DomainNodeType::SwitchVrnvl72Nvidia => SwitchGb200Nvidia::from_config(&config, &rack_id),
+        DomainNodeType::SwitchVrnvl72Nvidia => SwitchVrnvl72Nvidia::from_config(&config, &rack_id)
+            .map(SwitchVrnvl72Nvidia::into_shared_switch),
         _ => Err(RmsError::unimplemented("disable switch mTLS", node_type)),
     }
     .map_err(|error| error.message)?;
@@ -1174,6 +1531,7 @@ fn reserve_switch_mtls_disable_jobs(
     parent_job_id: &str,
     devices: Vec<rm::NodeInfo>,
     batch: &mut rm::NodeBatchResponse,
+    insecure_bmc: bool,
 ) -> (Vec<QueuedSwitchMtlsDisableJob>, u32) {
     let total_nodes = devices.len() as u32;
 
@@ -1181,7 +1539,7 @@ fn reserve_switch_mtls_disable_jobs(
         parent_job_id,
         JobType::SwitchMtlsDisable,
         batch_targets(devices),
-        prepare_switch_mtls_disable_switch,
+        |device| prepare_switch_mtls_disable_switch(device, insecure_bmc),
     );
 
     batch.node_results.extend(failed_node_results(rejected));
@@ -1235,8 +1593,694 @@ fn fail_stage(
     );
 }
 
+struct SwitchCertificateJobProgress<'a> {
+    timeline: &'a mut StageTimeline,
+    job: &'a RmsJobHandle,
+}
+
+impl SwitchCertificateInstallProgress for SwitchCertificateJobProgress<'_> {
+    fn start_stage(&mut self, stage: SwitchCertificateInstallStage) -> Result<()> {
+        let (actual_name, description) = self.timeline.start_stage()?;
+        let expected_name = stage.name();
+
+        if actual_name != expected_name {
+            return Err(RmsError::internal(format!(
+                "switch certificate stage mismatch: expected {expected_name}, got {actual_name}"
+            )));
+        }
+
+        self.job.progress(description);
+
+        Ok(())
+    }
+
+    fn complete_stage(&mut self, details: Value) {
+        self.timeline.complete_current(details);
+    }
+}
+
+/// Successful output from the shared switch certificate installation.
+pub(crate) struct SwitchCertificateInstallResult {
+    /// Services that were bound before verification completed.
+    pub(crate) configured_services: Vec<&'static str>,
+
+    /// Switch-reported verification details for the configured services.
+    pub(crate) service_verification: Value,
+}
+
+/// Failure output from the shared switch certificate installation.
+#[derive(Debug)]
+pub(crate) struct SwitchCertificateInstallFailure {
+    /// Error returned by the failed installation phase.
+    pub(crate) error: RmsError,
+
+    /// Phase-specific diagnostics suitable for a stage timeline.
+    pub(crate) details: Value,
+
+    /// Services successfully bound before the failure occurred.
+    pub(crate) configured_services: Vec<&'static str>,
+}
+
+impl SwitchCertificateInstallFailure {
+    fn new(error: RmsError, details: Value, configured_services: &[&'static str]) -> Self {
+        Self {
+            error,
+            details,
+            configured_services: configured_services.to_vec(),
+        }
+    }
+}
+
+/// Panic-safe backstop that removes staged mTLS material from the switch.
+///
+/// [`install_switch_certificate_material`] calls
+/// `cleanup_mtls_remote_dir_best_effort` on every normal success/failure path
+/// and [`Self::disarm`]s this guard immediately afterwards, so in the common
+/// case its drop is a no-op. Its sole purpose is the one path those explicit,
+/// awaited calls cannot cover: an unexpected unwind or early drop after the
+/// client private key has been staged but before it is imported.
+///
+/// Cleanup is async and `Drop` is not, so an armed drop spawns a detached
+/// best-effort cleanup task rather than awaiting. That is deliberately a hygiene
+/// backstop: the operation future is already being torn down and a leaked
+/// scratch directory is recoverable, so a detached best-effort removal is the
+/// right trade-off.
+struct StagedMaterialCleanupGuard {
+    switch: Arc<dyn SwitchCertificateInstallNode>,
+    material: SwitchMtlsMaterialPaths,
+    armed: bool,
+}
+
+impl StagedMaterialCleanupGuard {
+    fn armed(
+        switch: Arc<dyn SwitchCertificateInstallNode>,
+        material: SwitchMtlsMaterialPaths,
+    ) -> Self {
+        Self {
+            switch,
+            material,
+            armed: true,
+        }
+    }
+
+    /// Disarm on a normal path once the staged material has already been
+    /// removed (or handed off to the switch), making drop a no-op.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for StagedMaterialCleanupGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+
+        // Only reachable on an unexpected unwind/early drop -- every normal path
+        // disarms. We cannot await here, so hand the cleanup to a detached task.
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            tracing::error!(
+                node = %self.switch.node_id(),
+                remote_dir = %self.material.remote_dir(),
+                "switch certificate operation dropped with staged mTLS material but no runtime \
+                 is available to remove it; manual cleanup may be required"
+            );
+            return;
+        };
+
+        tracing::warn!(
+            node = %self.switch.node_id(),
+            remote_dir = %self.material.remote_dir(),
+            "switch certificate operation dropped with staged mTLS material still present; \
+             spawning best-effort cleanup so the client key does not outlive the operation"
+        );
+
+        let switch = Arc::clone(&self.switch);
+        let material = self.material.clone();
+        runtime.spawn(async move {
+            switch.cleanup_mtls_remote_dir_best_effort(&material).await;
+        });
+    }
+}
+
+async fn cleanup_staged_certificate_material(
+    switch: &Arc<dyn SwitchCertificateInstallNode>,
+    material: &SwitchMtlsMaterialPaths,
+    cleanup_guard: &mut StagedMaterialCleanupGuard,
+) {
+    switch.cleanup_mtls_remote_dir_best_effort(material).await;
+    cleanup_guard.disarm();
+}
+
+async fn transfer_and_import_switch_certificate_material(
+    switch: &Arc<dyn SwitchCertificateInstallNode>,
+    material: &SwitchMtlsMaterialPaths,
+    cancel: &CancellationToken,
+    progress: &mut dyn SwitchCertificateInstallProgress,
+) -> std::result::Result<(), SwitchCertificateInstallFailure> {
+    progress
+        .start_stage(SwitchCertificateInstallStage::PrepareRemoteDirectory)
+        .map_err(|error| SwitchCertificateInstallFailure::new(error, json!({}), &[]))?;
+
+    if let Err(error) = switch.prepare_mtls_remote_dirs(material).await {
+        let details = json!({ "error": &error.message });
+
+        return Err(SwitchCertificateInstallFailure::new(error, details, &[]));
+    }
+
+    progress.complete_stage(json!({ "remote_dir": material.remote_dir() }));
+
+    // The guard covers unexpected cancellation or unwind after the remote
+    // directory exists. Every ordinary exit below performs awaited cleanup.
+    let mut cleanup_guard = StagedMaterialCleanupGuard::armed(Arc::clone(switch), material.clone());
+
+    for spec in mtls_remote_file_specs(material) {
+        if let Err(error) = progress.start_stage(SwitchCertificateInstallStage::TransferMaterial(
+            spec.remote_name,
+        )) {
+            cleanup_staged_certificate_material(switch, material, &mut cleanup_guard).await;
+
+            return Err(SwitchCertificateInstallFailure::new(error, json!({}), &[]));
+        }
+
+        let copy_result = switch
+            .sftp_copy_mtls_file(material, spec.remote_name, cancel.clone())
+            .await;
+
+        let copy_outcome = match copy_result {
+            Ok(copy_outcome) => copy_outcome,
+            Err(error) => {
+                cleanup_staged_certificate_material(switch, material, &mut cleanup_guard).await;
+
+                let details = json!({
+                    "error": &error.message,
+                    "remote_file": spec.remote_name,
+                    "local_path": spec.local_path.display().to_string(),
+                });
+
+                return Err(SwitchCertificateInstallFailure::new(error, details, &[]));
+            }
+        };
+
+        progress.complete_stage(json!({
+            "remote_file": spec.remote_name,
+            "remote_path": copy_outcome.remote_path,
+            "bytes": copy_outcome.bytes,
+        }));
+    }
+
+    if let Err(error) = progress.start_stage(SwitchCertificateInstallStage::ImportMaterial) {
+        cleanup_staged_certificate_material(switch, material, &mut cleanup_guard).await;
+
+        return Err(SwitchCertificateInstallFailure::new(error, json!({}), &[]));
+    }
+
+    if let Err(error) = switch.import_mtls_material(material).await {
+        cleanup_staged_certificate_material(switch, material, &mut cleanup_guard).await;
+
+        let details = json!({ "error": &error.message });
+
+        return Err(SwitchCertificateInstallFailure::new(error, details, &[]));
+    }
+
+    cleanup_staged_certificate_material(switch, material, &mut cleanup_guard).await;
+
+    progress.complete_stage(json!({
+        "ca_certificate_id": material.ca_cert_id(),
+        "entity_certificate_id": material.entity_cert_id(),
+    }));
+
+    Ok(())
+}
+
+async fn bind_and_verify_switch_certificate_services(
+    switch: &Arc<dyn SwitchCertificateInstallNode>,
+    material: &SwitchMtlsMaterialPaths,
+    nvue_transition: Option<&NvueTlsTransition>,
+    services: &[SwitchMtlsService],
+    progress: &mut dyn SwitchCertificateInstallProgress,
+) -> std::result::Result<SwitchCertificateInstallResult, SwitchCertificateInstallFailure> {
+    let mut configured_services = Vec::with_capacity(services.len());
+
+    if certificate_job_discovers_nvue_capabilities(services) {
+        progress
+            .start_stage(SwitchCertificateInstallStage::DiscoverNvueCapabilities)
+            .map_err(|error| {
+                SwitchCertificateInstallFailure::new(error, json!({}), &configured_services)
+            })?;
+
+        let capabilities = match switch.initialize_nvue_capabilities().await {
+            Ok(capabilities) => capabilities,
+            Err(error) => {
+                let details = json!({ "error": &error.message });
+
+                return Err(SwitchCertificateInstallFailure::new(
+                    error,
+                    details,
+                    &configured_services,
+                ));
+            }
+        };
+
+        progress.complete_stage(json!({
+            "gnmi_client_authentication": gnmi_client_authentication_label(capabilities),
+        }));
+    }
+
+    for service in ordered_bind_services(services) {
+        progress
+            .start_stage(SwitchCertificateInstallStage::BindService(*service))
+            .map_err(|error| {
+                SwitchCertificateInstallFailure::new(error, json!({}), &configured_services)
+            })?;
+
+        if let Err(error) = switch
+            .bind_mtls_service_for_install(material, *service, nvue_transition)
+            .await
+        {
+            let details = json!({
+                "error": &error.message,
+                "service": service.as_str(),
+            });
+
+            return Err(SwitchCertificateInstallFailure::new(
+                error,
+                details,
+                &configured_services,
+            ));
+        }
+
+        configured_services.push(service.as_str());
+        progress.complete_stage(json!({ "service": service.as_str() }));
+    }
+
+    progress
+        .start_stage(SwitchCertificateInstallStage::VerifyServices)
+        .map_err(|error| {
+            SwitchCertificateInstallFailure::new(error, json!({}), &configured_services)
+        })?;
+
+    let service_verification = switch
+        .verify_mtls_services(material, services)
+        .await
+        .map_err(|error| {
+            let details = json!({ "error": &error.message });
+
+            SwitchCertificateInstallFailure::new(error, details, &configured_services)
+        })?;
+
+    progress.complete_stage(service_verification.clone());
+
+    Ok(SwitchCertificateInstallResult {
+        configured_services,
+        service_verification,
+    })
+}
+
+/// Gives each NVOS certificate store room for this install's import.
+///
+/// A store with room is left alone, and service bindings are read only when a
+/// store is full. A full store loses its oldest RMS-created entries that no
+/// switch service uses, just enough for one import. Both stores are planned
+/// before anything is deleted, so a store that cannot be reclaimed leaves the
+/// other untouched. After deleting, the stores are listed again and the
+/// install proceeds only when each has room.
+///
+/// Every failure here happens before staging, import, or binding, so the
+/// switch keeps every entry its services are bound to. Cancellation is checked
+/// before the stores are read and before each deletion, so a cancelled job
+/// keeps its remaining unused entries.
+async fn reclaim_certificate_store_capacity(
+    switch: &Arc<dyn SwitchCertificateInstallNode>,
+    material: &SwitchMtlsMaterialPaths,
+    cancel: &CancellationToken,
+) -> std::result::Result<Value, SwitchCertificateInstallFailure> {
+    let limit = NVOS_CERTIFICATE_STORE_LIMIT;
+
+    let fail = |error: RmsError, deleted: &[Value]| {
+        let details = json!({ "error": &error.message, "deleted": deleted });
+
+        SwitchCertificateInstallFailure::new(error, details, &[])
+    };
+
+    let cancelled = |deleted: &[Value]| {
+        fail(
+            RmsError::cancelled(
+                "certificate store reclamation cancelled; nothing was imported or bound",
+            ),
+            deleted,
+        )
+    };
+
+    if cancel.is_cancelled() {
+        return Err(cancelled(&[]));
+    }
+
+    let inventory = switch
+        .read_certificate_inventory()
+        .await
+        .map_err(|error| fail(error, &[]))?;
+
+    let bindings = if inventory.needs_space(limit) {
+        switch
+            .read_certificate_bindings()
+            .await
+            .map_err(|error| fail(error, &[]))?
+    } else {
+        CertificateBindings::default()
+    };
+
+    let protected = BTreeSet::from([material.ca_cert_id(), material.entity_cert_id()]);
+
+    let plans = CertificateStore::ALL
+        .into_iter()
+        .map(|store| {
+            plan_store_reclaim(
+                store,
+                inventory.store(store),
+                bindings.store(store),
+                &protected,
+                limit,
+            )
+        })
+        .collect::<Result<Vec<_>>>()
+        .map_err(|error| fail(error, &[]))?;
+
+    let mut deleted = Vec::new();
+
+    for plan in &plans {
+        for id in &plan.deletions {
+            if cancel.is_cancelled() {
+                return Err(cancelled(&deleted));
+            }
+
+            if let Err(error) = switch.delete_certificate_entry(plan.store, id).await {
+                let error = RmsError::new(
+                    error.code,
+                    format!(
+                        "failed to delete unused NVOS {} entry {id}: {}; nothing was imported \
+                         or bound",
+                        plan.store, error.message
+                    ),
+                );
+
+                return Err(fail(error, &deleted));
+            }
+
+            deleted.push(json!({ "store": plan.store, "certificate_id": id }));
+        }
+    }
+
+    if deleted.is_empty() {
+        return Ok(json!({ "limit": limit, "stores": plans, "deleted": deleted }));
+    }
+
+    let after = switch
+        .read_certificate_inventory()
+        .await
+        .map_err(|error| fail(error, &deleted))?;
+
+    for store in CertificateStore::ALL {
+        let entries = after.store(store).entries.len();
+
+        if entries >= limit {
+            let error = RmsError::failed_precondition(format!(
+                "NVOS {store} store still lists {entries} of {limit} entries after RMS deleted \
+                 unused entries; nothing was imported or bound"
+            ));
+
+            return Err(fail(error, &deleted));
+        }
+    }
+
+    tracing::info!(
+        node = %switch.node_id(),
+        deleted = deleted.len(),
+        entity_entries = after.entity.entries.len(),
+        ca_entries = after.ca.entries.len(),
+        "reclaimed NVOS certificate store capacity"
+    );
+
+    Ok(json!({
+        "limit": limit,
+        "stores": plans,
+        "deleted": deleted,
+        "entries_after": {
+            "entity-certificate": after.entity.entries.len(),
+            "ca-certificate": after.ca.entries.len(),
+        },
+    }))
+}
+
+/// Install, bind, and verify switch certificate material without creating or
+/// sealing a tracked RMS job.
+///
+/// The caller owns progress reporting. This operation owns staging cleanup,
+/// including the panic-safe backstop that prevents private-key material from
+/// being stranded when its future is dropped.
+pub(crate) async fn install_switch_certificate_material(
+    switch: Arc<dyn SwitchCertificateInstallNode>,
+    material: &SwitchMtlsMaterialPaths,
+    nvue_transition: Option<&NvueTlsTransition>,
+    services: &[SwitchMtlsService],
+    cancel: &CancellationToken,
+    progress: &mut dyn SwitchCertificateInstallProgress,
+) -> std::result::Result<SwitchCertificateInstallResult, SwitchCertificateInstallFailure> {
+    progress
+        .start_stage(SwitchCertificateInstallStage::ReclaimCertificateCapacity)
+        .map_err(|error| SwitchCertificateInstallFailure::new(error, json!({}), &[]))?;
+
+    let reclaimed = reclaim_certificate_store_capacity(&switch, material, cancel).await?;
+
+    progress.complete_stage(reclaimed);
+
+    transfer_and_import_switch_certificate_material(&switch, material, cancel, progress).await?;
+
+    bind_and_verify_switch_certificate_services(
+        &switch,
+        material,
+        nvue_transition,
+        services,
+        progress,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_switch_certificate_connectivity_tests(
+    switch: &SwitchGb200Nvidia,
+    services: &[SwitchMtlsService],
+    test_hello: bool,
+    external_client_tls: Option<&NmxcTlsConfig>,
+    switch_host: &str,
+    switch_host_port: u16,
+    nmx_gateway_id: &str,
+    configured_services: &[&'static str],
+    progress: &mut dyn SwitchCertificateInstallProgress,
+) -> std::result::Result<serde_json::Map<String, Value>, SwitchCertificateInstallFailure> {
+    let mut results = serde_json::Map::new();
+
+    if !test_hello {
+        return Ok(results);
+    }
+
+    if services.contains(&SwitchMtlsService::NvueApi) {
+        progress
+            .start_stage(SwitchCertificateInstallStage::TestNvueHello)
+            .map_err(|error| {
+                SwitchCertificateInstallFailure::new(error, json!({}), configured_services)
+            })?;
+
+        if let Err(error) = test_nvue_hello_with_retries(switch).await {
+            let details = json!({
+                "error": &error.message,
+                "switch_host": switch_host,
+                "switch_host_port": switch_host_port,
+            });
+
+            return Err(SwitchCertificateInstallFailure::new(
+                error,
+                details,
+                configured_services,
+            ));
+        }
+
+        progress.complete_stage(json!({
+            "switch_host": switch_host,
+            "switch_host_port": switch_host_port,
+        }));
+
+        results.insert("nvue_hello_test".into(), json!("success"));
+    }
+
+    if let (true, Some(client_tls)) = (
+        services.contains(&SwitchMtlsService::ScaleUpFabricManager),
+        external_client_tls,
+    ) {
+        progress
+            .start_stage(SwitchCertificateInstallStage::TestNmxHello)
+            .map_err(|error| {
+                SwitchCertificateInstallFailure::new(error, json!({}), configured_services)
+            })?;
+
+        if let Err(error) =
+            test_nmx_hello_with_retries(switch, switch_host, client_tls, nmx_gateway_id).await
+        {
+            let details = json!({
+                "error": &error.message,
+                "switch_host": switch_host,
+                "tls_authority": client_tls.authority.as_deref().unwrap_or("(unknown)"),
+            });
+
+            return Err(SwitchCertificateInstallFailure::new(
+                error,
+                details,
+                configured_services,
+            ));
+        }
+
+        progress.complete_stage(json!({
+            "switch_host": switch_host,
+            "tls_authority": client_tls.authority.as_deref().unwrap_or("(unknown)"),
+        }));
+
+        results.insert("hello_test".into(), json!("success"));
+    }
+
+    if let (true, Some(client_tls)) = (
+        services.contains(&SwitchMtlsService::ScaleUpFabricTelemetryInterface),
+        external_client_tls,
+    ) {
+        progress
+            .start_stage(SwitchCertificateInstallStage::TestGnmiCapabilities)
+            .map_err(|error| {
+                SwitchCertificateInstallFailure::new(error, json!({}), configured_services)
+            })?;
+
+        if let Err(error) =
+            test_gnmi_capabilities_with_retries(switch, switch_host, client_tls).await
+        {
+            let details = json!({
+                "error": &error.message,
+                "switch_host": switch_host,
+                "tls_authority": client_tls.authority.as_deref(),
+            });
+
+            return Err(SwitchCertificateInstallFailure::new(
+                error,
+                details,
+                configured_services,
+            ));
+        }
+
+        progress.complete_stage(json!({
+            "switch_host": switch_host,
+            "tls_authority": client_tls.authority.as_deref(),
+        }));
+
+        results.insert("gnmi_capabilities_test".into(), json!("success"));
+    }
+
+    Ok(results)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn finish_switch_certificate_job(
+    job: RmsJobHandle,
+    switch: &SwitchGb200Nvidia,
+    material: &SwitchMtlsMaterialPaths,
+    services: &[SwitchMtlsService],
+    test_hello: bool,
+    external_client_tls: Option<&NmxcTlsConfig>,
+    switch_host: &str,
+    switch_host_port: u16,
+    nmx_gateway_id: &str,
+    install: SwitchCertificateInstallResult,
+    timeline: &mut StageTimeline,
+    build_result_json: &impl Fn(&str, &[&str], &StageTimeline) -> String,
+) {
+    let configured = install.configured_services;
+    let mut extra = serde_json::Map::new();
+
+    if let Some(authentication) = recorded_gnmi_client_authentication(&install.service_verification)
+    {
+        extra.insert("gnmi_client_authentication".into(), authentication);
+    }
+    extra.insert("service_verification".into(), install.service_verification);
+
+    let connectivity_result = {
+        let mut progress = SwitchCertificateJobProgress {
+            timeline,
+            job: &job,
+        };
+
+        run_switch_certificate_connectivity_tests(
+            switch,
+            services,
+            test_hello,
+            external_client_tls,
+            switch_host,
+            switch_host_port,
+            nmx_gateway_id,
+            &configured,
+            &mut progress,
+        )
+        .await
+    };
+
+    let connectivity_results = match connectivity_result {
+        Ok(results) => results,
+        Err(failure) => {
+            let outcome = if failure.error.code == ErrorCode::Cancelled {
+                "cancelled"
+            } else {
+                "failed"
+            };
+
+            fail_stage(
+                timeline,
+                job,
+                outcome,
+                &failure.error.message,
+                failure.details,
+                &failure.configured_services,
+                build_result_json,
+            );
+
+            return;
+        }
+    };
+
+    extra.extend(connectivity_results);
+
+    let result_json = build_switch_certificate_result_json(
+        "completed",
+        &material.domain,
+        &material.ca_cert_id(),
+        &material.entity_cert_id(),
+        &material.remote_dir(),
+        &configured,
+        timeline,
+        Value::Object(extra),
+    );
+
+    tracing::info!(
+        job_id = %job.id(),
+        node = %switch.id(),
+        rack = %switch.rack_id(),
+        domain = %material.domain,
+        test_hello,
+        configured_services = ?configured,
+        result_bytes = result_json.len(),
+        "switch certificate configuration job completed"
+    );
+
+    job.complete_verified("Completed", result_json);
+}
+
 // Per-node orchestrator for ConfigureSwitchCertificate.
-// Stages: prepare_remote_dir, sftp_copy_<file>, import_material, bind_<service>,
+// Stages: reclaim_certificate_capacity, prepare_remote_dir, sftp_copy_<file>, import_material,
+// discover_nvue_capabilities (gNMI only), bind_<service>, verify_services,
 // test_nvue_hello, test_nmx_hello, test_gnmi_capabilities.
 #[allow(clippy::too_many_arguments)]
 async fn run_switch_certificate_job(
@@ -1274,13 +2318,6 @@ async fn run_switch_certificate_job(
         external_client_tls.is_some(),
         &switch,
     );
-
-    // Services successfully bound so far -- the one piece of state that
-    // grows across the function's lifetime, so (unlike `domain`/
-    // `ca_cert_id`/`entity_cert_id`/`remote_dir` below) it can't be
-    // captured by `build_result_json` and must be threaded through each
-    // `fail_stage` call explicitly instead.
-    let mut configured: Vec<&str> = Vec::with_capacity(services.len());
 
     // Builds the `result_json` embedded in every early-exit `fail` seal
     // below (with the full stage timing_summary), parameterized by what
@@ -1327,401 +2364,72 @@ async fn run_switch_certificate_job(
         "switch certificate configuration job starting"
     );
 
-    // ── Stage: prepare_remote_dir ──
-    //
-    // Starts the next predefined stage, or fails the job and returns if the
-    // predefined stage list and this function's control flow have drifted
-    // out of sync -- a programming error, not a runtime condition. Without
-    // this, `start_stage()` running past the end of the list would panic
-    // through `.expect(...)`; the job supervisor's Drop-based safety net
-    // (see `JobHandle`'s `Drop` impl) still catches that and marks the job
-    // failed, but only with a generic "job abandoned" message and a noisy
-    // panic backtrace, dropping the timeline's partial progress that
-    // `fail_stage` would otherwise record.
-    let Ok((_stage, description)) = timeline.start_stage() else {
-        fail_stage(
-            &mut timeline,
-            job,
-            "failed",
-            "stage list exhausted",
-            json!({}),
-            &[],
-            &build_result_json,
-        );
-        return;
+    let install_switch: Arc<dyn SwitchCertificateInstallNode> = switch.clone();
+    let install_result = {
+        let mut progress = SwitchCertificateJobProgress {
+            timeline: &mut timeline,
+            job: &job,
+        };
+
+        install_switch_certificate_material(
+            install_switch,
+            &material,
+            nvue_transition.as_ref(),
+            &services,
+            &cancellation_token,
+            &mut progress,
+        )
+        .await
     };
-    job.progress(description);
-    if let Err(e) = switch.prepare_mtls_remote_dirs(&material).await {
-        let outcome = if e.code == ErrorCode::Cancelled {
-            "cancelled"
-        } else {
-            "failed"
-        };
-        fail_stage(
-            &mut timeline,
-            job,
-            outcome,
-            &e.message,
-            json!({ "error": e.message }),
-            &[],
-            &build_result_json,
-        );
-        return;
-    }
-    timeline.complete_current(json!({ "remote_dir": remote_dir }));
 
-    // ── Stage: sftp_copy_<file> (one per TLS material file) ──
-    for spec in mtls_remote_file_specs(&material) {
-        let Ok((_stage, description)) = timeline.start_stage() else {
-            fail_stage(
-                &mut timeline,
-                job,
-                "failed",
-                "stage list exhausted",
-                json!({}),
-                &[],
-                &build_result_json,
-            );
-            return;
-        };
-        job.progress(description);
-        match switch
-            .sftp_copy_mtls_file(&material, spec.remote_name, cancellation_token.clone())
-            .await
-        {
-            Ok(copy_outcome) => {
-                timeline.complete_current(json!({
-                    "remote_file": spec.remote_name,
-                    "remote_path": copy_outcome.remote_path,
-                    "bytes": copy_outcome.bytes,
-                }));
-            }
-            Err(e) => {
-                let outcome = if e.code == ErrorCode::Cancelled {
-                    "cancelled"
-                } else {
-                    "failed"
-                };
-                fail_stage(
-                    &mut timeline,
-                    job,
-                    outcome,
-                    &e.message,
-                    json!({
-                        "error": e.message,
-                        "remote_file": spec.remote_name,
-                        "local_path": spec.local_path.display().to_string(),
-                    }),
-                    &[],
-                    &build_result_json,
-                );
-                return;
-            }
-        }
-    }
-
-    // ── Stage: import_material ──
-    let Ok((_stage, description)) = timeline.start_stage() else {
-        fail_stage(
-            &mut timeline,
-            job,
-            "failed",
-            "stage list exhausted",
-            json!({}),
-            &[],
-            &build_result_json,
-        );
-        return;
-    };
-    job.progress(description);
-    if let Err(e) = switch.import_mtls_material(&material).await {
-        let outcome = if e.code == ErrorCode::Cancelled {
-            "cancelled"
-        } else {
-            "failed"
-        };
-        fail_stage(
-            &mut timeline,
-            job,
-            outcome,
-            &e.message,
-            json!({ "error": e.message }),
-            &[],
-            &build_result_json,
-        );
-        return;
-    }
-    timeline.complete_current(json!({
-        "ca_certificate_id": ca_cert_id,
-        "entity_certificate_id": entity_cert_id,
-    }));
-
-    // ── Stage: bind_<service> (one per requested service) ──
-    for service in ordered_bind_services(&services) {
-        let Ok((_stage, description)) = timeline.start_stage() else {
-            fail_stage(
-                &mut timeline,
-                job,
-                "failed",
-                "stage list exhausted",
-                json!({}),
-                &configured,
-                &build_result_json,
-            );
-            return;
-        };
-        job.progress(description);
-        let bind_result = if *service == SwitchMtlsService::NvueApi {
-            match nvue_transition.as_ref() {
-                Some(transition) => {
-                    bind_nvue_mtls_with_client_transition(&switch, &material, transition).await
-                }
-                None => Err(RmsError::failed_precondition(
-                    "NVUE mTLS requires RMS client TLS material",
-                )),
-            }
-        } else {
-            switch.bind_mtls_service(&material, *service).await
-        };
-
-        if let Err(e) = bind_result {
-            let outcome = if e.code == ErrorCode::Cancelled {
+    let install = match install_result {
+        Ok(install) => install,
+        Err(failure) => {
+            let outcome = if failure.error.code == ErrorCode::Cancelled {
                 "cancelled"
             } else {
                 "failed"
             };
+
             fail_stage(
                 &mut timeline,
                 job,
                 outcome,
-                &e.message,
-                json!({
-                    "error": e.message,
-                    "service": service.as_str(),
-                }),
-                &configured,
+                &failure.error.message,
+                failure.details,
+                &failure.configured_services,
                 &build_result_json,
             );
-            return;
-        }
-        configured.push(service.as_str());
-        timeline.complete_current(json!({ "service": service.as_str() }));
-    }
 
-    let Ok((_stage, description)) = timeline.start_stage() else {
-        fail_stage(
-            &mut timeline,
-            job,
-            "failed",
-            "stage list exhausted",
-            json!({}),
-            &configured,
-            &build_result_json,
-        );
-        return;
-    };
-    job.progress(description);
-    let service_verification = match switch.verify_mtls_services(&material, &services).await {
-        Ok(verification) => {
-            timeline.complete_current(verification.clone());
-            verification
-        }
-        Err(e) => {
-            let outcome = if e.code == ErrorCode::Cancelled {
-                "cancelled"
-            } else {
-                "failed"
-            };
-            fail_stage(
-                &mut timeline,
-                job,
-                outcome,
-                &e.message,
-                json!({ "error": e.message }),
-                &configured,
-                &build_result_json,
-            );
             return;
         }
     };
 
-    let mut extra = serde_json::Map::new();
-    extra.insert("service_verification".into(), service_verification);
-
-    if test_hello {
-        if services.contains(&SwitchMtlsService::NvueApi) {
-            let Ok((_stage, description)) = timeline.start_stage() else {
-                fail_stage(
-                    &mut timeline,
-                    job,
-                    "failed",
-                    "stage list exhausted",
-                    json!({}),
-                    &configured,
-                    &build_result_json,
-                );
-                return;
-            };
-            job.progress(description);
-
-            if let Err(e) = test_nvue_hello_with_retries(&switch).await {
-                let outcome = if e.code == ErrorCode::Cancelled {
-                    "cancelled"
-                } else {
-                    "failed"
-                };
-                fail_stage(
-                    &mut timeline,
-                    job,
-                    outcome,
-                    &e.message,
-                    json!({
-                        "error": e.message,
-                        "switch_host": switch_host,
-                        "switch_host_port": switch_host_port,
-                    }),
-                    &configured,
-                    &build_result_json,
-                );
-                return;
-            }
-            timeline.complete_current(json!({
-                "switch_host": switch_host,
-                "switch_host_port": switch_host_port,
-            }));
-            extra.insert("nvue_hello_test".into(), json!("success"));
-        }
-
-        if let (true, Some(client_tls)) = (
-            services.contains(&SwitchMtlsService::ScaleUpFabricManager),
-            external_client_tls,
-        ) {
-            let tls_authority = client_tls.authority.as_deref().unwrap_or("(unknown)");
-            let Ok((_stage, description)) = timeline.start_stage() else {
-                fail_stage(
-                    &mut timeline,
-                    job,
-                    "failed",
-                    "stage list exhausted",
-                    json!({}),
-                    &configured,
-                    &build_result_json,
-                );
-                return;
-            };
-            job.progress(description);
-
-            if let Err(e) =
-                test_nmx_hello_with_retries(&switch, &switch_host, client_tls, &nmx_gateway_id)
-                    .await
-            {
-                let outcome = if e.code == ErrorCode::Cancelled {
-                    "cancelled"
-                } else {
-                    "failed"
-                };
-                fail_stage(
-                    &mut timeline,
-                    job,
-                    outcome,
-                    &e.message,
-                    json!({
-                        "error": e.message,
-                        "switch_host": switch_host,
-                        "tls_authority": tls_authority,
-                    }),
-                    &configured,
-                    &build_result_json,
-                );
-                return;
-            }
-            timeline.complete_current(json!({
-                "switch_host": switch_host,
-                "tls_authority": tls_authority,
-            }));
-            extra.insert("hello_test".into(), json!("success"));
-        }
-
-        if let (true, Some(client_tls)) = (
-            services.contains(&SwitchMtlsService::ScaleUpFabricTelemetryInterface),
-            external_client_tls,
-        ) {
-            let Ok((_stage, description)) = timeline.start_stage() else {
-                fail_stage(
-                    &mut timeline,
-                    job,
-                    "failed",
-                    "stage list exhausted",
-                    json!({}),
-                    &configured,
-                    &build_result_json,
-                );
-                return;
-            };
-            job.progress(description);
-            if let Err(e) =
-                test_gnmi_capabilities_with_retries(&switch, &switch_host, client_tls).await
-            {
-                let outcome = if e.code == ErrorCode::Cancelled {
-                    "cancelled"
-                } else {
-                    "failed"
-                };
-                fail_stage(
-                    &mut timeline,
-                    job,
-                    outcome,
-                    &e.message,
-                    json!({
-                        "error": e.message,
-                        "switch_host": switch_host,
-                        "tls_authority": client_tls.authority.as_deref(),
-                    }),
-                    &configured,
-                    &build_result_json,
-                );
-                return;
-            }
-            timeline.complete_current(json!({
-                "switch_host": switch_host,
-                "tls_authority": client_tls.authority.as_deref(),
-            }));
-            extra.insert("gnmi_capabilities_test".into(), json!("success"));
-        }
-    }
-
-    let result_json = build_switch_certificate_result_json(
-        "completed",
-        &domain,
-        &ca_cert_id,
-        &entity_cert_id,
-        &remote_dir,
-        &configured,
-        &timeline,
-        Value::Object(extra),
-    );
-    tracing::info!(
-        job_id = %job_id,
-        node = %switch.id(),
-        rack = %switch.rack_id(),
-        domain = %domain,
+    finish_switch_certificate_job(
+        job,
+        &switch,
+        &material,
+        &services,
         test_hello,
-        configured_services = ?configured,
-        result_bytes = result_json.len(),
-        "switch certificate configuration job completed"
-    );
-    job.complete("Completed", result_json);
+        external_client_tls,
+        &switch_host,
+        switch_host_port,
+        &nmx_gateway_id,
+        install,
+        &mut timeline,
+        &build_result_json,
+    )
+    .await;
 }
 
 impl RackManagerServiceImpl {
     /// Ensures the selected primary uses the configured NMX Controller security mode.
     ///
-    /// NMX Controller is rebound whenever its certificate objects differ from
-    /// the ones `ConfigureSwitchCertificate` bound to the NVUE API, so a
-    /// rotated certificate reaches NMX Controller before the old one expires.
-    /// Otherwise NMX Hello is the idempotent connectivity check and its result
-    /// is final; a connect failure only triggers the rebind when the binding
-    /// could not be read.
+    /// NMX Controller is rebound when its certificate or CA ID differs from
+    /// the NVUE API material, or its manager encryption is not `mtls`.
+    /// A matching binding uses NMX Hello with bounded connect retries and no
+    /// rebind. When the binding cannot be read, a one-shot Hello connect failure
+    /// triggers a rebind followed by the retry check.
     pub(crate) async fn enforce_primary_nmx_controller_security(
         &self,
         switch: &dyn SwitchScaleUpManagement,
@@ -1731,7 +2439,7 @@ impl RackManagerServiceImpl {
         cancellation_token: CancellationToken,
     ) -> Result<()> {
         if self.switch_tls_roots.insecure_switch {
-            return disable_insecure_nmx_controller_mtls(switch).await;
+            return disable_insecure_nmx_controller_mtls(switch, &cancellation_token).await;
         }
 
         let switch = switch.as_switch_gb200().ok_or_else(|| {
@@ -1836,7 +2544,7 @@ impl RackManagerServiceImpl {
             ));
         }
 
-        let bmc_endpoint = match flat.optional_bmc_endpoint() {
+        let bmc_endpoint = match flat.optional_bmc_endpoint(self.insecure_bmc) {
             Ok(endpoint) => endpoint,
             Err(e) => {
                 tracing::warn!(
@@ -1908,13 +2616,16 @@ impl RackManagerServiceImpl {
             bmc_endpoint,
             host_endpoint: Some(host_endpoint),
             expected_inventory: None,
+            recovery: None,
+            runtime_config: None,
         };
 
         let switch = match node_type {
             DomainNodeType::SwitchGb200Nvidia => SwitchGb200Nvidia::from_config(&config, &rack_id),
             DomainNodeType::SwitchGb300Nvidia => SwitchGb300Nvidia::from_config(&config, &rack_id),
             DomainNodeType::SwitchVrnvl72Nvidia => {
-                SwitchGb200Nvidia::from_config(&config, &rack_id)
+                SwitchVrnvl72Nvidia::from_config(&config, &rack_id)
+                    .map(SwitchVrnvl72Nvidia::into_shared_switch)
             }
             _ => Err(RmsError::unimplemented(
                 "configure switch certificate",
@@ -2295,7 +3006,7 @@ impl RackManagerServiceImpl {
                             }
 
                             let nvue_transition = match prepare_nvue_tls_transition(
-                                &switch,
+                                switch.optional_nvue_client(),
                                 nvue_client_tls.as_ref(),
                                 nvue_server_name_spawn,
                                 registered_nvue_client,
@@ -2335,21 +3046,13 @@ impl RackManagerServiceImpl {
                         .detach();
                 }
                 SwitchCertificateMode::UnsetMtls => {
-                    let handle = dispatch_switch_mtls_unset_job(
+                    dispatch_switch_mtls_unset_job(
                         self.job_tracker.clone(),
                         job,
                         switch,
                         services_spawn,
-                    );
-
-                    #[cfg(not(test))]
-                    handle.detach();
-
-                    #[cfg(test)]
-                    handle
-                        .wait()
-                        .await
-                        .expect("switch mTLS unset test job supervisor should complete");
+                    )
+                    .detach();
                 }
             }
         }
@@ -2471,6 +3174,7 @@ impl RackManagerServiceImpl {
             &parent_id,
             devices,
             &mut batch,
+            self.insecure_bmc,
         );
 
         let jobs_created = queued_jobs.len() as u32;
@@ -2611,9 +3315,125 @@ mod tests {
 
     use super::*;
     use crate::api::grpc::server::SwitchTlsRoots;
+    use crate::nodes::nvos::GnmiClientCa;
+    use crate::nodes::switch_mtls::{
+        GNMI_CLIENT_AUTHENTICATION_MTLS, GNMI_CLIENT_AUTHENTICATION_SERVER_CERTIFICATE_ONLY,
+    };
     use crate::orchestrator::job_lifecycle::JobState;
     use crate::orchestrator::rack_manager::RackManager;
     use crate::persistence::Backends;
+
+    #[derive(Default)]
+    struct RecordingCertificateInstallProgress {
+        started: Vec<SwitchCertificateInstallStage>,
+        completed: Vec<Value>,
+    }
+
+    impl SwitchCertificateInstallProgress for RecordingCertificateInstallProgress {
+        fn start_stage(&mut self, stage: SwitchCertificateInstallStage) -> Result<()> {
+            self.started.push(stage);
+            Ok(())
+        }
+
+        fn complete_stage(&mut self, details: Value) {
+            self.completed.push(details);
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeCertificateInstallNode {
+        operations: Mutex<Vec<String>>,
+
+        /// Remote file whose SFTP copy fails.
+        failing_copy: Option<&'static str>,
+    }
+
+    impl FakeCertificateInstallNode {
+        fn record(&self, operation: impl Into<String>) {
+            self.operations.lock().unwrap().push(operation.into());
+        }
+    }
+
+    #[async_trait]
+    impl SwitchCertificateInstallNode for FakeCertificateInstallNode {
+        fn node_id(&self) -> &str {
+            "test-switch"
+        }
+
+        async fn read_certificate_inventory(&self) -> Result<CertificateInventory> {
+            self.record("inventory");
+            Ok(CertificateInventory::default())
+        }
+
+        async fn read_certificate_bindings(&self) -> Result<CertificateBindings> {
+            self.record("bindings");
+            Ok(CertificateBindings::default())
+        }
+
+        async fn delete_certificate_entry(&self, store: CertificateStore, id: &str) -> Result<()> {
+            self.record(format!("delete:{store}:{id}"));
+            Ok(())
+        }
+
+        async fn prepare_mtls_remote_dirs(
+            &self,
+            _material: &SwitchMtlsMaterialPaths,
+        ) -> Result<()> {
+            self.record("prepare");
+            Ok(())
+        }
+
+        async fn sftp_copy_mtls_file(
+            &self,
+            material: &SwitchMtlsMaterialPaths,
+            remote_file_name: &str,
+            _cancel: CancellationToken,
+        ) -> Result<MtlsSftpCopyOutcome> {
+            self.record(format!("copy:{remote_file_name}"));
+
+            if self.failing_copy == Some(remote_file_name) {
+                return Err(RmsError::unavailable("SFTP upload failed"));
+            }
+
+            Ok(MtlsSftpCopyOutcome {
+                remote_path: format!("{}/{remote_file_name}", material.remote_dir()),
+                bytes: 1,
+            })
+        }
+
+        async fn import_mtls_material(&self, _material: &SwitchMtlsMaterialPaths) -> Result<()> {
+            self.record("import");
+            Ok(())
+        }
+
+        async fn initialize_nvue_capabilities(&self) -> Result<GnmiClientCa> {
+            self.record("discover");
+            Ok(GnmiClientCa::Unsupported)
+        }
+
+        async fn cleanup_mtls_remote_dir_best_effort(&self, _material: &SwitchMtlsMaterialPaths) {
+            self.record("cleanup");
+        }
+
+        async fn bind_mtls_service_for_install(
+            &self,
+            _material: &SwitchMtlsMaterialPaths,
+            service: SwitchMtlsService,
+            _nvue_transition: Option<&NvueTlsTransition>,
+        ) -> Result<()> {
+            self.record(format!("bind:{}", service.as_str()));
+            Ok(())
+        }
+
+        async fn verify_mtls_services(
+            &self,
+            _material: &SwitchMtlsMaterialPaths,
+            _services: &[SwitchMtlsService],
+        ) -> Result<Value> {
+            self.record("verify");
+            Ok(json!({ "verified": true }))
+        }
+    }
 
     fn test_service(switch_tls_roots: SwitchTlsRoots) -> RackManagerServiceImpl {
         RackManagerServiceImpl {
@@ -2622,10 +3442,23 @@ mod tests {
             firmware_download_cancellations: Arc::new(Mutex::new(HashMap::new())),
             backends: Backends::memory(),
             firmware_dir: PathBuf::from("firmware"),
+            artifact_require_sha256: false,
+            insecure_bmc: true,
+            artifact_download_policy:
+                crate::api::grpc::artifact_download::ArtifactDownloadPolicy::default(),
             switch_tls_roots,
-            sftp_upload_options: crate::transport::ssh::SftpUploadOptions::default(),
+            sftp_upload_options: crate::transport::ssh::SshUploadOptions::default(),
             nmx_gateway_id: crate::libnmxc::DEFAULT_NMX_C_GATEWAY_ID.to_owned(),
             expected_inventory_catalog: crate::config::ExpectedInventoryCatalog::default(),
+            workflow_timings: crate::config::WorkflowTimings::default(),
+            recovery_profiles: crate::config::RecoveryProfiles::default(),
+            fabric_operations: std::sync::Arc::new(Default::default()),
+            fabric_layout_catalog: std::sync::Arc::new(
+                crate::config::fabric_layout::FabricLayoutCatalog::default(),
+            ),
+            hardware_profiles: Arc::new(
+                crate::config::hardware_profiles::HardwareProfileCatalog::built_in().unwrap(),
+            ),
         }
     }
 
@@ -2665,6 +3498,62 @@ mod tests {
             bind_service_stage_name(SwitchMtlsService::NvueApi),
             "bind_nvue-api"
         );
+    }
+
+    #[tokio::test]
+    async fn switch_certificate_job_stages_discovers_nvue_capabilities_only_for_gnmi() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let ca_cert_path = dir.path().join("ca.pem");
+        let entity_cert_path = dir.path().join("client.pem");
+        let entity_key_path = dir.path().join("client.key");
+        std::fs::write(&ca_cert_path, b"ca").expect("write ca.pem");
+        std::fs::write(&entity_cert_path, b"cert").expect("write client.pem");
+        std::fs::write(&entity_key_path, b"key").expect("write client.key");
+
+        let material = SwitchMtlsMaterialPaths::load_stable(
+            "example.com".to_owned(),
+            ca_cert_path,
+            entity_cert_path,
+            entity_key_path,
+        )
+        .await
+        .expect("load_stable");
+
+        let nvue_names: Vec<String> =
+            switch_certificate_job_stages(&material, &[SwitchMtlsService::NvueApi], false, false)
+                .iter()
+                .map(|stage| stage.name().to_owned())
+                .collect();
+        assert!(
+            !nvue_names
+                .iter()
+                .any(|name| name == "discover_nvue_capabilities"),
+            "NVUE-only jobs must not plan capability discovery: {nvue_names:?}"
+        );
+
+        let gnmi_names: Vec<String> = switch_certificate_job_stages(
+            &material,
+            &[SwitchMtlsService::ScaleUpFabricTelemetryInterface],
+            false,
+            false,
+        )
+        .iter()
+        .map(|stage| stage.name().to_owned())
+        .collect();
+        let import = gnmi_names
+            .iter()
+            .position(|name| name == "import_material")
+            .expect("import_material");
+        let initialize = gnmi_names
+            .iter()
+            .position(|name| name == "discover_nvue_capabilities")
+            .expect("discover_nvue_capabilities");
+        let bind = gnmi_names
+            .iter()
+            .position(|name| name == "bind_scale-up-fabric-telemetry-interface")
+            .expect("bind gNMI");
+        assert_eq!(initialize, import + 1);
+        assert_eq!(bind, initialize + 1);
     }
 
     #[test]
@@ -2775,10 +3664,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_switch_certificate_job_records_cancelled_outcome_when_sftp_copy_is_cancelled() {
-        // Regression test: `sftp_copy_mtls_file` can return
-        // `RmsError::cancelled` (its cancellation token fires before the
-        // copy starts), but `fail_stage` previously hardcoded
+    async fn run_switch_certificate_job_records_cancelled_outcome_when_cancelled() {
+        // Regression test: a stage can return `RmsError::cancelled` (here,
+        // store reclamation sees the job's token already cancelled), but
+        // `fail_stage` previously hardcoded
         // `timeline.fail_current(false, ...)` and a `"failed"` result
         // status regardless of the triggering error's code, so a
         // cancelled certificate job was misreported as failed. Compare to
@@ -2807,9 +3696,8 @@ mod tests {
             .expect("create switch certificate job");
         let job_id = job.id().to_string();
 
-        // Cancel before the SFTP copy stage starts, so
-        // `sftp_copy_mtls_file`'s own `cancel.is_cancelled()` check
-        // returns `RmsError::cancelled` instead of attempting a copy.
+        // Cancel before the job starts, so reclamation returns
+        // `RmsError::cancelled` before touching the stores.
         job.cancellation_token().cancel();
 
         let switch = Arc::new(
@@ -2839,7 +3727,1334 @@ mod tests {
             serde_json::from_str(&info.result_json).expect("result_json should parse");
         assert_eq!(
             result["status"], "cancelled",
-            "a cancelled SFTP copy should record a cancelled outcome, not failed"
+            "a cancelled job should record a cancelled outcome, not failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn install_cleans_up_staged_material_when_sftp_copy_fails() {
+        // Regression test for the "always clean staged mTLS material" invariant.
+        // When an SFTP copy fails, the installer must remove the scratch dir
+        // before returning, so the client private key never outlives the
+        // failed attempt. `cleanup_mtls_remote_dir_removes_the_staged_directory`
+        // pins that the cleanup issues the `rm -rf`.
+        let (material, _dir) = staged_test_material().await;
+        let switch = Arc::new(FakeCertificateInstallNode {
+            failing_copy: Some("client.key"),
+            ..FakeCertificateInstallNode::default()
+        });
+        let install_switch: Arc<dyn SwitchCertificateInstallNode> = switch.clone();
+        let mut progress = RecordingCertificateInstallProgress::default();
+
+        let outcome = install_switch_certificate_material(
+            install_switch,
+            &material,
+            None,
+            &[SwitchMtlsService::ScaleUpFabricManager],
+            &CancellationToken::new(),
+            &mut progress,
+        )
+        .await;
+        let Err(failure) = outcome else {
+            panic!("install with a failing SFTP copy succeeded");
+        };
+
+        assert_eq!(failure.error.code, ErrorCode::Unavailable);
+        assert_eq!(failure.details["remote_file"], "client.key");
+        assert_eq!(
+            *switch.operations.lock().unwrap(),
+            vec![
+                "inventory",
+                "prepare",
+                "copy:ca.pem",
+                "copy:client.pem",
+                "copy:client.key",
+                "cleanup",
+            ]
+        );
+    }
+
+    /// Write throwaway PEMs and load them as stable mTLS material for the
+    /// certificate-job cleanup tests below. Returns the material plus the temp
+    /// dir (kept alive by the caller so the files outlive the load).
+    async fn staged_test_material() -> (SwitchMtlsMaterialPaths, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let ca_cert_path = dir.path().join("ca.pem");
+        let entity_cert_path = dir.path().join("client.pem");
+        let entity_key_path = dir.path().join("client.key");
+        std::fs::write(&ca_cert_path, b"ca").expect("write ca.pem");
+        std::fs::write(&entity_cert_path, b"cert").expect("write client.pem");
+        std::fs::write(&entity_key_path, b"key").expect("write client.key");
+
+        let material = SwitchMtlsMaterialPaths::load_stable(
+            "example.com".to_owned(),
+            ca_cert_path,
+            entity_cert_path,
+            entity_key_path,
+        )
+        .await
+        .expect("load_stable");
+        (material, dir)
+    }
+
+    fn recording_switch() -> (Arc<SwitchGb200Nvidia>, Arc<Mutex<Vec<String>>>) {
+        let commands = Arc::new(Mutex::new(Vec::<String>::new()));
+        let observed = Arc::clone(&commands);
+        let switch = Arc::new(
+            SwitchGb200Nvidia::for_test("http://127.0.0.1").with_ssh_exec_for_test(
+                move |command| {
+                    observed.lock().unwrap().push(command.to_owned());
+                    Ok(String::new())
+                },
+            ),
+        );
+        (switch, commands)
+    }
+
+    /// B2 regression test: on the import-stage SUCCESS path, once
+    /// `import_mtls_material` returns Ok the job must issue the scratch-dir
+    /// `rm -rf <remote_dir>` exactly once so the staged client private key never
+    /// outlives a successful import. Comment #7's fix covered the sftp-copy
+    /// failure branch; this covers the newer import-success cleanup call site
+    /// that fix did not reach.
+    ///
+    /// The import-*failure* branch shares the identical
+    /// `cleanup_mtls_remote_dir_best_effort` call but is not drivable end-to-end
+    /// with this harness: the `with_ssh_exec_for_test` seam that records the
+    /// SSH-side cleanup also short-circuits the NVUE import that would otherwise
+    /// fail, so import always succeeds here. This success test and the panic-safe
+    /// guard tests below together exercise the shared cleanup call.
+    #[tokio::test]
+    async fn run_switch_certificate_job_cleans_up_staged_material_after_successful_import() {
+        let (material, _dir) = staged_test_material().await;
+        let remote_dir = material.remote_dir().as_str().to_owned();
+
+        let tracker = Arc::new(JobTracker::new());
+        let job = tracker
+            .create_job("rack-01", "sw-01", JobType::SwitchCertificate)
+            .expect("create switch certificate job");
+
+        // Under the test stub prepare/sftp/import/bind are skipped and succeed,
+        // so the run reaches -- and only reaches -- the import-success cleanup.
+        let (switch, commands) = recording_switch();
+
+        run_switch_certificate_job(
+            job,
+            switch,
+            material,
+            None,
+            None,
+            vec![SwitchMtlsService::ScaleUpFabricManager],
+            false,
+            "sw-01.example.com".to_owned(),
+            443,
+            "gateway-1".to_owned(),
+        )
+        .await;
+
+        let issued = commands.lock().expect("command log");
+        let cleanups = issued
+            .iter()
+            .filter(|command| command.contains("rm -rf") && command.contains(&remote_dir))
+            .count();
+        assert_eq!(
+            cleanups, 1,
+            "a successful import must clean up the scratch dir exactly once, got: {issued:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_certificate_install_operation_runs_without_a_tracked_job() {
+        let (material, _dir) = staged_test_material().await;
+        let switch = Arc::new(FakeCertificateInstallNode::default());
+        let install_switch: Arc<dyn SwitchCertificateInstallNode> = switch.clone();
+        let mut progress = RecordingCertificateInstallProgress::default();
+
+        let result = install_switch_certificate_material(
+            install_switch,
+            &material,
+            None,
+            &[SwitchMtlsService::ScaleUpFabricManager],
+            &CancellationToken::new(),
+            &mut progress,
+        )
+        .await
+        .expect("job-independent certificate install should succeed");
+
+        assert_eq!(
+            progress.started,
+            vec![
+                SwitchCertificateInstallStage::ReclaimCertificateCapacity,
+                SwitchCertificateInstallStage::PrepareRemoteDirectory,
+                SwitchCertificateInstallStage::TransferMaterial("ca.pem"),
+                SwitchCertificateInstallStage::TransferMaterial("client.pem"),
+                SwitchCertificateInstallStage::TransferMaterial("client.key"),
+                SwitchCertificateInstallStage::ImportMaterial,
+                SwitchCertificateInstallStage::BindService(SwitchMtlsService::ScaleUpFabricManager,),
+                SwitchCertificateInstallStage::VerifyServices,
+            ]
+        );
+
+        assert_eq!(progress.completed.len(), progress.started.len());
+
+        assert_eq!(
+            result.configured_services,
+            vec![SwitchMtlsService::ScaleUpFabricManager.as_str()]
+        );
+
+        assert_eq!(result.service_verification, json!({ "verified": true }));
+
+        assert_eq!(
+            *switch.operations.lock().unwrap(),
+            vec![
+                "inventory",
+                "prepare",
+                "copy:ca.pem",
+                "copy:client.pem",
+                "copy:client.key",
+                "import",
+                "cleanup",
+                "bind:scale-up-fabric-manager",
+                "verify",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn discover_stage_records_unsupported_gnmi_client_authentication() {
+        let (material, _dir) = staged_test_material().await;
+        let switch = Arc::new(FakeCertificateInstallNode::default());
+        let install_switch: Arc<dyn SwitchCertificateInstallNode> = switch.clone();
+        let mut progress = RecordingCertificateInstallProgress::default();
+
+        install_switch_certificate_material(
+            install_switch,
+            &material,
+            None,
+            &[SwitchMtlsService::ScaleUpFabricTelemetryInterface],
+            &CancellationToken::new(),
+            &mut progress,
+        )
+        .await
+        .expect("gNMI certificate install should succeed");
+
+        assert!(progress.completed.iter().any(|details| {
+            details["gnmi_client_authentication"]
+                == GNMI_CLIENT_AUTHENTICATION_SERVER_CERTIFICATE_ONLY
+        }));
+        assert!(
+            switch
+                .operations
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|operation| operation == "discover")
+        );
+    }
+
+    /// Installs against NVOS certificate stores that enforce their entry limit
+    /// on import.
+    mod certificate_store_capacity {
+        use std::collections::BTreeMap;
+
+        use chrono::{NaiveDate, NaiveDateTime, TimeDelta};
+        use wiremock::matchers::{body_json, body_string_contains, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        use super::*;
+        use crate::nodes::switch_mtls::{ReportedUsage, StoreInventory};
+
+        const LIMIT: usize = NVOS_CERTIFICATE_STORE_LIMIT;
+
+        const ENTITY_COLLECTION: &str = "/nvue_v1/system/security/certificate";
+        const CA_COLLECTION: &str = "/nvue_v1/system/security/ca-certificate";
+
+        fn imported_at(index: u32) -> NaiveDateTime {
+            NaiveDate::from_ymd_opt(2026, 1, 1)
+                .and_then(|date| date.and_hms_opt(0, 0, 0))
+                .expect("valid date")
+                + TimeDelta::seconds(i64::from(index))
+        }
+
+        /// Material for the `index`th import. Every index reads the same PEM
+        /// paths, so the CA material never changes between installs.
+        fn material(index: u32) -> SwitchMtlsMaterialPaths {
+            SwitchMtlsMaterialPaths::for_test_at(imported_at(index))
+        }
+
+        fn ids(material: &SwitchMtlsMaterialPaths) -> (String, String) {
+            (material.entity_cert_id(), material.ca_cert_id())
+        }
+
+        #[derive(Default)]
+        struct Faults {
+            store_listing: bool,
+            unreadable_binding: Option<SwitchMtlsService>,
+            delete: Option<CertificateStore>,
+
+            /// Deletes in this store report success but leave the entry listed.
+            kept_after_delete: Option<CertificateStore>,
+
+            /// Cancelled once the first deletion succeeds.
+            cancel_after_delete: Option<CancellationToken>,
+            entity_import: bool,
+            bind: Option<SwitchMtlsService>,
+            verify: bool,
+        }
+
+        #[derive(Default)]
+        struct SwitchState {
+            entity: BTreeSet<String>,
+            ca: BTreeSet<String>,
+
+            /// Service name to the `(entity, CA)` IDs it is bound to.
+            bindings: BTreeMap<&'static str, (String, String)>,
+
+            deleted: Vec<(CertificateStore, String)>,
+            peak_entity: usize,
+            peak_ca: usize,
+            imports: usize,
+            faults: Faults,
+        }
+
+        impl SwitchState {
+            fn store(&self, store: CertificateStore) -> &BTreeSet<String> {
+                match store {
+                    CertificateStore::Entity => &self.entity,
+                    CertificateStore::Ca => &self.ca,
+                }
+            }
+
+            fn bound_ids(&self, store: CertificateStore) -> BTreeSet<&String> {
+                self.bindings
+                    .values()
+                    .map(|(entity, ca)| match store {
+                        CertificateStore::Entity => entity,
+                        CertificateStore::Ca => ca,
+                    })
+                    .collect()
+            }
+
+            fn assert_every_binding_is_listed(&self) {
+                for store in CertificateStore::ALL {
+                    for id in self.bound_ids(store) {
+                        assert!(
+                            self.store(store).contains(id),
+                            "bound {store} entry {id} is gone"
+                        );
+                    }
+                }
+            }
+        }
+
+        /// A switch whose stores refuse an import once they hold [`LIMIT`]
+        /// entries, independently of RMS's accounting, and whose services keep
+        /// the entries they were last bound to. Deleting a bound or non-RMS
+        /// entry panics the test.
+        #[derive(Default)]
+        struct StoreEnforcingSwitch {
+            state: Mutex<SwitchState>,
+        }
+
+        impl StoreEnforcingSwitch {
+            fn seeded(entity: Vec<String>, ca: Vec<String>) -> Arc<Self> {
+                let switch = Self::default();
+                {
+                    let mut state = switch.state();
+                    state.entity.extend(entity);
+                    state.ca.extend(ca);
+                }
+                Arc::new(switch)
+            }
+
+            fn state(&self) -> std::sync::MutexGuard<'_, SwitchState> {
+                self.state.lock().unwrap()
+            }
+        }
+
+        #[async_trait]
+        impl SwitchCertificateInstallNode for StoreEnforcingSwitch {
+            fn node_id(&self) -> &str {
+                "sw-01"
+            }
+
+            async fn read_certificate_inventory(&self) -> Result<CertificateInventory> {
+                let state = self.state();
+
+                if state.faults.store_listing {
+                    return Err(RmsError::unavailable("NVUE returned 503"));
+                }
+
+                // NVOS reports the NVUE API and gNMI server as consumers of
+                // their entity certificate; cluster apps are not reported.
+                let reported = |id: &String| {
+                    let services: Vec<String> = [
+                        (SwitchMtlsService::NvueApi, "nvue-rest-api"),
+                        (
+                            SwitchMtlsService::ScaleUpFabricTelemetryInterface,
+                            "gnmi-server",
+                        ),
+                    ]
+                    .into_iter()
+                    .filter(|(service, _)| {
+                        state
+                            .bindings
+                            .get(service.as_str())
+                            .is_some_and(|(entity, _)| entity == id)
+                    })
+                    .map(|(_, consumer)| consumer.to_owned())
+                    .collect();
+
+                    if services.is_empty() {
+                        ReportedUsage::None
+                    } else {
+                        ReportedUsage::Services(services)
+                    }
+                };
+
+                Ok(CertificateInventory {
+                    entity: StoreInventory {
+                        entries: state
+                            .entity
+                            .iter()
+                            .map(|id| (id.clone(), reported(id)))
+                            .collect(),
+                    },
+                    ca: StoreInventory {
+                        entries: state
+                            .ca
+                            .iter()
+                            .map(|id| (id.clone(), ReportedUsage::None))
+                            .collect(),
+                    },
+                })
+            }
+
+            async fn read_certificate_bindings(&self) -> Result<CertificateBindings> {
+                let state = self.state();
+                let mut bindings = CertificateBindings::default();
+
+                for service in SwitchMtlsService::ALL {
+                    for store in CertificateStore::ALL {
+                        let read = if state.faults.unreadable_binding == Some(service) {
+                            Err("GET timed out".to_owned())
+                        } else {
+                            Ok(state
+                                .bindings
+                                .get(service.as_str())
+                                .map(|(entity, ca)| match store {
+                                    CertificateStore::Entity => entity.clone(),
+                                    CertificateStore::Ca => ca.clone(),
+                                })
+                                .into_iter()
+                                .collect())
+                        };
+
+                        bindings.record(store, service, read);
+                    }
+                }
+
+                Ok(bindings)
+            }
+
+            async fn delete_certificate_entry(
+                &self,
+                store: CertificateStore,
+                id: &str,
+            ) -> Result<()> {
+                let mut state = self.state();
+
+                assert!(id.starts_with("rms-"), "deleted non-RMS {store} entry {id}");
+                assert!(
+                    !state.bound_ids(store).contains(&id.to_owned()),
+                    "deleted bound {store} entry {id}"
+                );
+
+                if state.faults.delete == Some(store) {
+                    return Err(RmsError::internal("NVUE returned 500"));
+                }
+
+                if state.faults.kept_after_delete == Some(store) {
+                    return Ok(());
+                }
+
+                let removed = match store {
+                    CertificateStore::Entity => state.entity.remove(id),
+                    CertificateStore::Ca => state.ca.remove(id),
+                };
+                assert!(removed, "deleted missing {store} entry {id}");
+
+                state.deleted.push((store, id.to_owned()));
+
+                if let Some(cancel) = &state.faults.cancel_after_delete {
+                    cancel.cancel();
+                }
+
+                Ok(())
+            }
+
+            async fn prepare_mtls_remote_dirs(
+                &self,
+                _material: &SwitchMtlsMaterialPaths,
+            ) -> Result<()> {
+                Ok(())
+            }
+
+            async fn sftp_copy_mtls_file(
+                &self,
+                material: &SwitchMtlsMaterialPaths,
+                remote_file_name: &str,
+                _cancel: CancellationToken,
+            ) -> Result<MtlsSftpCopyOutcome> {
+                Ok(MtlsSftpCopyOutcome {
+                    remote_path: format!("{}/{remote_file_name}", material.remote_dir()),
+                    bytes: 1,
+                })
+            }
+
+            async fn import_mtls_material(&self, material: &SwitchMtlsMaterialPaths) -> Result<()> {
+                let mut state = self.state();
+                state.imports += 1;
+
+                if state.ca.len() >= LIMIT {
+                    return Err(RmsError::failed_precondition(
+                        "CA certificate store is full",
+                    ));
+                }
+                state.ca.insert(material.ca_cert_id());
+                state.peak_ca = state.peak_ca.max(state.ca.len());
+
+                if state.faults.entity_import {
+                    return Err(RmsError::internal("entity certificate import failed"));
+                }
+
+                if state.entity.len() >= LIMIT {
+                    return Err(RmsError::failed_precondition(
+                        "entity certificate store is full",
+                    ));
+                }
+                state.entity.insert(material.entity_cert_id());
+                state.peak_entity = state.peak_entity.max(state.entity.len());
+
+                Ok(())
+            }
+
+            async fn initialize_nvue_capabilities(&self) -> Result<GnmiClientCa> {
+                Ok(GnmiClientCa::Unsupported)
+            }
+
+            async fn cleanup_mtls_remote_dir_best_effort(
+                &self,
+                _material: &SwitchMtlsMaterialPaths,
+            ) {
+            }
+
+            async fn bind_mtls_service_for_install(
+                &self,
+                material: &SwitchMtlsMaterialPaths,
+                service: SwitchMtlsService,
+                _nvue_transition: Option<&NvueTlsTransition>,
+            ) -> Result<()> {
+                let mut state = self.state();
+
+                if state.faults.bind == Some(service) {
+                    return Err(RmsError::internal(format!(
+                        "bind {} failed",
+                        service.as_str()
+                    )));
+                }
+
+                let (entity, ca) = ids(material);
+                assert!(
+                    state.entity.contains(&entity) && state.ca.contains(&ca),
+                    "bound material that was never imported"
+                );
+
+                state.bindings.insert(service.as_str(), (entity, ca));
+                Ok(())
+            }
+
+            async fn verify_mtls_services(
+                &self,
+                material: &SwitchMtlsMaterialPaths,
+                services: &[SwitchMtlsService],
+            ) -> Result<Value> {
+                let state = self.state();
+
+                if state.faults.verify {
+                    return Err(RmsError::failed_precondition("verification failed"));
+                }
+
+                for service in services {
+                    assert_eq!(state.bindings.get(service.as_str()), Some(&ids(material)));
+                }
+
+                Ok(json!({ "verified": true }))
+            }
+        }
+
+        type InstallOutcome =
+            std::result::Result<SwitchCertificateInstallResult, SwitchCertificateInstallFailure>;
+
+        async fn install(
+            switch: &Arc<StoreEnforcingSwitch>,
+            material: &SwitchMtlsMaterialPaths,
+            services: &[SwitchMtlsService],
+            cancel: &CancellationToken,
+        ) -> (InstallOutcome, RecordingCertificateInstallProgress) {
+            let node: Arc<dyn SwitchCertificateInstallNode> = switch.clone();
+            let mut progress = RecordingCertificateInstallProgress::default();
+
+            let outcome = install_switch_certificate_material(
+                node,
+                material,
+                None,
+                services,
+                cancel,
+                &mut progress,
+            )
+            .await;
+
+            (outcome, progress)
+        }
+
+        async fn install_ok(
+            switch: &Arc<StoreEnforcingSwitch>,
+            material: &SwitchMtlsMaterialPaths,
+            services: &[SwitchMtlsService],
+        ) {
+            if let (Err(failure), _) =
+                install(switch, material, services, &CancellationToken::new()).await
+            {
+                panic!(
+                    "install of {} failed: {}",
+                    material.entity_cert_id(),
+                    failure.error.message
+                );
+            }
+        }
+
+        async fn install_err(
+            switch: &Arc<StoreEnforcingSwitch>,
+            material: &SwitchMtlsMaterialPaths,
+            services: &[SwitchMtlsService],
+        ) -> (
+            SwitchCertificateInstallFailure,
+            RecordingCertificateInstallProgress,
+        ) {
+            match install(switch, material, services, &CancellationToken::new()).await {
+                (Err(failure), progress) => (failure, progress),
+                (Ok(_), _) => panic!("install of {} succeeded", material.entity_cert_id()),
+            }
+        }
+
+        /// `count` unused RMS entries per store, imported at indices
+        /// `0..count`.
+        fn rms_seed(count: u32) -> (Vec<String>, Vec<String>) {
+            (0..count).map(|index| ids(&material(index))).unzip()
+        }
+
+        fn site_seed(prefix: &str, count: usize) -> Vec<String> {
+            (0..count)
+                .map(|index| format!("site-{prefix}-{index}"))
+                .collect()
+        }
+
+        #[tokio::test]
+        async fn more_than_25_installs_stay_within_both_store_limits() {
+            let switch = Arc::new(StoreEnforcingSwitch::default());
+
+            for index in 0..40 {
+                install_ok(&switch, &material(index), &SwitchMtlsService::ALL).await;
+            }
+
+            let state = switch.state();
+            assert_eq!(state.imports, 40);
+            assert_eq!((state.peak_entity, state.peak_ca), (LIMIT, LIMIT));
+
+            for service in SwitchMtlsService::ALL {
+                assert_eq!(state.bindings[service.as_str()], ids(&material(39)));
+            }
+
+            assert_eq!(
+                state.deleted[..2],
+                [
+                    (CertificateStore::Entity, material(0).entity_cert_id()),
+                    (CertificateStore::Ca, material(0).ca_cert_id()),
+                ]
+            );
+        }
+
+        #[tokio::test]
+        async fn services_omitted_from_later_installs_keep_their_oldest_entries() {
+            let switch = Arc::new(StoreEnforcingSwitch::default());
+            let first = material(0);
+
+            install_ok(&switch, &first, &SwitchMtlsService::ALL).await;
+
+            for index in 1..=40 {
+                install_ok(&switch, &material(index), &[SwitchMtlsService::NvueApi]).await;
+            }
+
+            let state = switch.state();
+            assert!(state.peak_entity <= LIMIT && state.peak_ca <= LIMIT);
+
+            for service in [
+                SwitchMtlsService::ScaleUpFabricTelemetry,
+                SwitchMtlsService::ScaleUpFabricManager,
+                SwitchMtlsService::ScaleUpFabricTelemetryInterface,
+            ] {
+                assert_eq!(state.bindings[service.as_str()], ids(&first));
+            }
+            assert_eq!(
+                state.bindings[SwitchMtlsService::NvueApi.as_str()],
+                ids(&material(40))
+            );
+            state.assert_every_binding_is_listed();
+        }
+
+        #[tokio::test]
+        async fn installs_reclaim_when_either_or_both_stores_start_full() {
+            // (non-RMS entity, RMS entity, non-RMS CA, RMS CA, deletions per store)
+            let cases = [
+                (3, 22, 0, 9, (1, 0)),
+                (0, 5, 4, 21, (0, 1)),
+                (2, 23, 6, 19, (1, 1)),
+            ];
+
+            for (site_entity, rms_entity, site_ca, rms_ca, expected) in cases {
+                let (entity, _) = rms_seed(rms_entity);
+                let (_, ca) = rms_seed(rms_ca);
+                let switch = StoreEnforcingSwitch::seeded(
+                    [site_seed("cert", site_entity), entity].concat(),
+                    [site_seed("ca", site_ca), ca].concat(),
+                );
+
+                // The oldest RMS entries stay bound to a service the request omits.
+                switch.state().bindings.insert(
+                    SwitchMtlsService::ScaleUpFabricTelemetry.as_str(),
+                    ids(&material(0)),
+                );
+
+                install_ok(&switch, &material(1000), &[SwitchMtlsService::NvueApi]).await;
+
+                let state = switch.state();
+                let deleted = |store| {
+                    state
+                        .deleted
+                        .iter()
+                        .filter(|(deleted, _)| *deleted == store)
+                        .map(|(_, id)| id.clone())
+                        .collect::<Vec<_>>()
+                };
+
+                let expected_ids = |store, count: usize| {
+                    (0..count)
+                        .map(|_| match store {
+                            CertificateStore::Entity => material(1).entity_cert_id(),
+                            CertificateStore::Ca => material(1).ca_cert_id(),
+                        })
+                        .collect::<Vec<_>>()
+                };
+
+                assert_eq!(
+                    deleted(CertificateStore::Entity),
+                    expected_ids(CertificateStore::Entity, expected.0),
+                    "case {site_entity}/{rms_entity}/{site_ca}/{rms_ca}"
+                );
+                assert_eq!(
+                    deleted(CertificateStore::Ca),
+                    expected_ids(CertificateStore::Ca, expected.1),
+                    "case {site_entity}/{rms_entity}/{site_ca}/{rms_ca}"
+                );
+                assert!(state.peak_entity <= LIMIT && state.peak_ca <= LIMIT);
+                assert!(
+                    site_seed("cert", site_entity)
+                        .iter()
+                        .all(|id| state.entity.contains(id))
+                );
+                assert!(
+                    site_seed("ca", site_ca)
+                        .iter()
+                        .all(|id| state.ca.contains(id))
+                );
+                state.assert_every_binding_is_listed();
+            }
+        }
+
+        #[tokio::test]
+        async fn a_store_without_reclaimable_entries_fails_before_any_change() {
+            let (entity, _) = rms_seed(25);
+            let (_, bound_ca) = ids(&material(0));
+            let switch = StoreEnforcingSwitch::seeded(
+                entity,
+                [site_seed("ca", 24), vec![bound_ca]].concat(),
+            );
+            switch.state().bindings.insert(
+                SwitchMtlsService::ScaleUpFabricManager.as_str(),
+                ids(&material(0)),
+            );
+
+            let (failure, progress) =
+                install_err(&switch, &material(1000), &[SwitchMtlsService::NvueApi]).await;
+
+            assert_eq!(failure.error.code, ErrorCode::FailedPrecondition);
+            assert!(
+                failure
+                    .error
+                    .message
+                    .contains("ca-certificate store is full (25 of 25 entries, 1 created by RMS)"),
+                "{}",
+                failure.error.message
+            );
+            assert_eq!(
+                progress.started,
+                [SwitchCertificateInstallStage::ReclaimCertificateCapacity]
+            );
+
+            // The entity store could have been reclaimed, but nothing is
+            // deleted unless both stores can make room.
+            let state = switch.state();
+            assert!(state.deleted.is_empty());
+            assert_eq!(state.imports, 0);
+            assert_eq!(state.bindings.len(), 1);
+        }
+
+        #[tokio::test]
+        async fn an_unconfirmed_binding_blocks_reclaim() {
+            let (entity, ca) = rms_seed(25);
+            let switch = StoreEnforcingSwitch::seeded(entity, ca);
+            switch.state().faults.unreadable_binding =
+                Some(SwitchMtlsService::ScaleUpFabricTelemetry);
+
+            let (failure, _) =
+                install_err(&switch, &material(1000), &[SwitchMtlsService::NvueApi]).await;
+
+            assert_eq!(failure.error.code, ErrorCode::FailedPrecondition);
+            assert!(
+                failure
+                    .error
+                    .message
+                    .contains("scale-up-fabric-telemetry: GET timed out"),
+                "{}",
+                failure.error.message
+            );
+
+            let state = switch.state();
+            assert!(state.deleted.is_empty());
+            assert_eq!(state.imports, 0);
+        }
+
+        #[tokio::test]
+        async fn a_failed_store_listing_fails_before_any_change() {
+            let switch = Arc::new(StoreEnforcingSwitch::default());
+            switch.state().faults.store_listing = true;
+
+            let (failure, progress) =
+                install_err(&switch, &material(0), &[SwitchMtlsService::NvueApi]).await;
+
+            assert_eq!(failure.error.code, ErrorCode::Unavailable);
+            assert_eq!(
+                progress.started,
+                [SwitchCertificateInstallStage::ReclaimCertificateCapacity]
+            );
+            assert_eq!(switch.state().imports, 0);
+        }
+
+        #[tokio::test]
+        async fn a_failed_deletion_fails_before_import_and_reports_what_was_deleted() {
+            let (entity, ca) = rms_seed(25);
+            let switch = StoreEnforcingSwitch::seeded(entity, ca);
+            switch.state().faults.delete = Some(CertificateStore::Ca);
+
+            let (failure, _) =
+                install_err(&switch, &material(1000), &[SwitchMtlsService::NvueApi]).await;
+
+            assert_eq!(failure.error.code, ErrorCode::Internal);
+            assert!(
+                failure.error.message.contains(&format!(
+                    "failed to delete unused NVOS ca-certificate entry {}",
+                    material(0).ca_cert_id()
+                )),
+                "{}",
+                failure.error.message
+            );
+            assert!(
+                failure
+                    .error
+                    .message
+                    .contains("nothing was imported or bound")
+            );
+            assert_eq!(
+                failure.details["deleted"],
+                json!([{
+                    "store": "entity-certificate",
+                    "certificate_id": material(0).entity_cert_id(),
+                }])
+            );
+            assert_eq!(switch.state().imports, 0);
+        }
+
+        #[tokio::test]
+        async fn a_store_still_full_after_deletion_fails_before_import() {
+            let (entity, ca) = rms_seed(25);
+            let switch = StoreEnforcingSwitch::seeded(entity, ca);
+            switch.state().faults.kept_after_delete = Some(CertificateStore::Ca);
+
+            let (failure, progress) =
+                install_err(&switch, &material(1000), &[SwitchMtlsService::NvueApi]).await;
+
+            assert_eq!(failure.error.code, ErrorCode::FailedPrecondition);
+            assert!(
+                failure.error.message.contains(
+                    "NVOS ca-certificate store still lists 25 of 25 entries after RMS deleted \
+                     unused entries; nothing was imported or bound"
+                ),
+                "{}",
+                failure.error.message
+            );
+            assert_eq!(
+                progress.started,
+                [SwitchCertificateInstallStage::ReclaimCertificateCapacity]
+            );
+            assert_eq!(
+                failure.details["deleted"],
+                json!([
+                    {
+                        "store": "entity-certificate",
+                        "certificate_id": material(0).entity_cert_id(),
+                    },
+                    {
+                        "store": "ca-certificate",
+                        "certificate_id": material(0).ca_cert_id(),
+                    },
+                ])
+            );
+
+            let state = switch.state();
+            assert_eq!(state.imports, 0);
+            assert!(state.bindings.is_empty());
+        }
+
+        #[tokio::test]
+        async fn a_cancelled_install_deletes_nothing() {
+            let (entity, ca) = rms_seed(25);
+            let switch = StoreEnforcingSwitch::seeded(entity, ca);
+            let cancel = CancellationToken::new();
+            cancel.cancel();
+
+            let (outcome, progress) = install(
+                &switch,
+                &material(1000),
+                &[SwitchMtlsService::NvueApi],
+                &cancel,
+            )
+            .await;
+            let Err(failure) = outcome else {
+                panic!("cancelled install succeeded");
+            };
+
+            assert_eq!(failure.error.code, ErrorCode::Cancelled);
+            assert_eq!(
+                progress.started,
+                [SwitchCertificateInstallStage::ReclaimCertificateCapacity]
+            );
+            assert_eq!(failure.details["deleted"], json!([]));
+
+            let state = switch.state();
+            assert!(state.deleted.is_empty());
+            assert_eq!(state.imports, 0);
+        }
+
+        #[tokio::test]
+        async fn cancellation_between_deletions_stops_and_reports_what_was_deleted() {
+            let (entity, ca) = rms_seed(25);
+            let switch = StoreEnforcingSwitch::seeded(entity, ca);
+            let cancel = CancellationToken::new();
+            switch.state().faults.cancel_after_delete = Some(cancel.clone());
+
+            let (outcome, _) = install(
+                &switch,
+                &material(1000),
+                &[SwitchMtlsService::NvueApi],
+                &cancel,
+            )
+            .await;
+            let Err(failure) = outcome else {
+                panic!("cancelled install succeeded");
+            };
+
+            assert_eq!(failure.error.code, ErrorCode::Cancelled);
+            assert_eq!(
+                failure.details["deleted"],
+                json!([{
+                    "store": "entity-certificate",
+                    "certificate_id": material(0).entity_cert_id(),
+                }])
+            );
+
+            let state = switch.state();
+            assert_eq!(
+                state.deleted,
+                [(CertificateStore::Entity, material(0).entity_cert_id())]
+            );
+            assert!(state.ca.contains(&material(0).ca_cert_id()));
+            assert_eq!(state.imports, 0);
+        }
+
+        #[tokio::test]
+        async fn later_installs_reclaim_imports_left_by_failed_jobs() {
+            let switch = Arc::new(StoreEnforcingSwitch::default());
+            let first = material(0);
+            install_ok(&switch, &first, &SwitchMtlsService::ALL).await;
+
+            // The entity import fails after the CA import, leaving an unbound CA.
+            let orphaned = material(1);
+            switch.state().faults.entity_import = true;
+            install_err(&switch, &orphaned, &[SwitchMtlsService::NvueApi]).await;
+            switch.state().faults.entity_import = false;
+            assert!(switch.state().ca.contains(&orphaned.ca_cert_id()));
+
+            // NMX Controller binds before the NVUE API, so a failed NVUE bind
+            // leaves the two services on different entries.
+            let partial = material(2);
+            switch.state().faults.bind = Some(SwitchMtlsService::NvueApi);
+            install_err(
+                &switch,
+                &partial,
+                &[
+                    SwitchMtlsService::NvueApi,
+                    SwitchMtlsService::ScaleUpFabricManager,
+                ],
+            )
+            .await;
+            switch.state().faults.bind = None;
+
+            // Verification fails after the bind took effect.
+            let unverified = material(3);
+            switch.state().faults.verify = true;
+            install_err(
+                &switch,
+                &unverified,
+                &[SwitchMtlsService::ScaleUpFabricTelemetry],
+            )
+            .await;
+            switch.state().faults.verify = false;
+
+            switch.state().assert_every_binding_is_listed();
+
+            for index in 4..60 {
+                install_ok(
+                    &switch,
+                    &material(index),
+                    &[SwitchMtlsService::ScaleUpFabricTelemetryInterface],
+                )
+                .await;
+            }
+
+            let state = switch.state();
+            assert!(
+                state
+                    .deleted
+                    .contains(&(CertificateStore::Ca, orphaned.ca_cert_id()))
+            );
+            assert_eq!(state.bindings["nvue-api"], ids(&first));
+            assert_eq!(state.bindings["scale-up-fabric-manager"], ids(&partial));
+            assert_eq!(
+                state.bindings["scale-up-fabric-telemetry"],
+                ids(&unverified)
+            );
+            assert!(state.peak_entity <= LIMIT && state.peak_ca <= LIMIT);
+            state.assert_every_binding_is_listed();
+        }
+
+        fn store_listing(
+            store: CertificateStore,
+            active: &SwitchMtlsMaterialPaths,
+            superseded: &SwitchMtlsMaterialPaths,
+            unused: &[SwitchMtlsMaterialPaths],
+        ) -> Value {
+            let id = |material: &SwitchMtlsMaterialPaths| match store {
+                CertificateStore::Entity => material.entity_cert_id(),
+                CertificateStore::Ca => material.ca_cert_id(),
+            };
+
+            let mut listing = serde_json::Map::new();
+            let active_entry = match store {
+                CertificateStore::Entity => json!({ "installed": ["nvue-rest-api"] }),
+                CertificateStore::Ca => json!({}),
+            };
+            listing.insert(id(active), active_entry);
+            listing.insert(id(superseded), json!({}));
+            for material in unused {
+                listing.insert(id(material), json!({}));
+            }
+
+            Value::Object(listing)
+        }
+
+        /// After a reclaim, ConfigureScaleUpFabricManager V2 still binds NMX
+        /// Controller to the certificate and CA the NVUE API is using, and the
+        /// reclaim kept the superseded entries NMX Controller was bound to.
+        #[tokio::test]
+        async fn nmx_controller_binds_to_the_active_nvue_material_after_reclaim() {
+            let server = MockServer::start().await;
+
+            let active = material(100);
+            let superseded = material(50);
+            let unused: Vec<_> = (0..23).map(material).collect();
+
+            for (store, collection) in [
+                (CertificateStore::Entity, ENTITY_COLLECTION),
+                (CertificateStore::Ca, CA_COLLECTION),
+            ] {
+                Mock::given(method("GET"))
+                    .and(path(collection))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(store_listing(
+                        store,
+                        &active,
+                        &superseded,
+                        &unused,
+                    )))
+                    .up_to_n_times(1)
+                    .mount(&server)
+                    .await;
+
+                Mock::given(method("GET"))
+                    .and(path(collection))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(store_listing(
+                        store,
+                        &active,
+                        &superseded,
+                        &unused[1..],
+                    )))
+                    .mount(&server)
+                    .await;
+            }
+
+            let reads = [
+                (
+                    "/nvue_v1/system/api",
+                    json!({ "certificate": active.entity_cert_id() }),
+                ),
+                (
+                    "/nvue_v1/system/api/mtls",
+                    json!({ "ca-certificate": active.ca_cert_id() }),
+                ),
+                (
+                    "/nvue_v1/cluster",
+                    json!({ "state": "enabled", "nmxc-conn": { "state": "up" } }),
+                ),
+                (
+                    "/nvue_v1/cluster/apps/nmx-controller",
+                    json!({
+                        "status": "ok",
+                        "additional-info": "CONTROL_PLANE_STATE_CONFIGURED",
+                        "manager": { "state": "enabled" }
+                    }),
+                ),
+                (
+                    "/nvue_v1/cluster/apps/nmx-controller/manager",
+                    json!({ "state": "enabled" }),
+                ),
+                (
+                    "/nvue_v1/cluster/apps/nmx-controller/manager/encryption",
+                    json!({ "encryption": "mtls" }),
+                ),
+            ];
+            for (endpoint, body) in reads {
+                Mock::given(method("GET"))
+                    .and(path(endpoint))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                    .mount(&server)
+                    .await;
+            }
+
+            for endpoint in [
+                "/nvue_v1/system/gnmi-server",
+                "/nvue_v1/system/gnmi-server/mtls",
+                "/nvue_v1/cluster/apps/nmx-telemetry/manager/certificate",
+                "/nvue_v1/cluster/apps/nmx-telemetry/manager/ca-certificate",
+            ] {
+                Mock::given(method("GET"))
+                    .and(path(endpoint))
+                    .respond_with(ResponseTemplate::new(404))
+                    .mount(&server)
+                    .await;
+            }
+
+            // NMX Controller reads back its superseded binding during the
+            // reclaim and the active material once it has been rebound.
+            for (field, superseded_id, active_id) in [
+                (
+                    "certificate",
+                    superseded.entity_cert_id(),
+                    active.entity_cert_id(),
+                ),
+                (
+                    "ca-certificate",
+                    superseded.ca_cert_id(),
+                    active.ca_cert_id(),
+                ),
+            ] {
+                let endpoint = format!("/nvue_v1/cluster/apps/nmx-controller/manager/{field}");
+
+                Mock::given(method("GET"))
+                    .and(path(endpoint.clone()))
+                    .respond_with(
+                        ResponseTemplate::new(200).set_body_json(json!({ field: superseded_id })),
+                    )
+                    .up_to_n_times(1)
+                    .mount(&server)
+                    .await;
+
+                Mock::given(method("GET"))
+                    .and(path(endpoint.clone()))
+                    .respond_with(
+                        ResponseTemplate::new(200).set_body_json(json!({ field: active_id })),
+                    )
+                    .mount(&server)
+                    .await;
+
+                Mock::given(method("POST"))
+                    .and(path(endpoint))
+                    .and(body_string_contains(active_id.as_str()))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+            }
+
+            Mock::given(method("POST"))
+                .and(path(
+                    "/nvue_v1/cluster/apps/nmx-controller/manager/encryption",
+                ))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+                .mount(&server)
+                .await;
+
+            for (collection_entry, action_id) in [
+                (
+                    format!("{ENTITY_COLLECTION}/{}", unused[0].entity_cert_id()),
+                    "delete-entity",
+                ),
+                (
+                    format!("{CA_COLLECTION}/{}", unused[0].ca_cert_id()),
+                    "delete-ca",
+                ),
+            ] {
+                Mock::given(method("POST"))
+                    .and(path(collection_entry))
+                    .and(body_json(json!({ "@delete": { "state": "start" } })))
+                    .respond_with(ResponseTemplate::new(201).set_body_json(action_id))
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+
+                Mock::given(method("GET"))
+                    .and(path(format!("/nvue_v1/action/{action_id}")))
+                    .respond_with(
+                        ResponseTemplate::new(200)
+                            .set_body_json(json!({ "state": "action_success" })),
+                    )
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+            }
+
+            Mock::given(method("POST"))
+                .and(body_string_contains("@delete"))
+                .respond_with(ResponseTemplate::new(500))
+                .expect(0)
+                .named("@delete of any other entry")
+                .mount(&server)
+                .await;
+
+            let switch = Arc::new(SwitchGb200Nvidia::for_test(&server.uri()));
+            let node: Arc<dyn SwitchCertificateInstallNode> = switch.clone();
+
+            let reclaimed = reclaim_certificate_store_capacity(
+                &node,
+                &material(200),
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("reclaim should succeed");
+
+            assert_eq!(
+                reclaimed["deleted"],
+                json!([
+                    {
+                        "store": "entity-certificate",
+                        "certificate_id": unused[0].entity_cert_id(),
+                    },
+                    {
+                        "store": "ca-certificate",
+                        "certificate_id": unused[0].ca_cert_id(),
+                    },
+                ])
+            );
+
+            switch
+                .bind_nmx_controller_to_nvue_api_material()
+                .await
+                .expect("NMX Controller should bind to the active NVUE material");
+        }
+    }
+
+    /// B1 regression test: an armed guard dropped without an explicit cleanup --
+    /// the panic / early-drop case the straight-line `fail_stage` cleanups cannot
+    /// cover -- still removes the staged material so the client private key is
+    /// never stranded on the switch.
+    #[tokio::test]
+    async fn staged_material_cleanup_guard_removes_material_on_armed_drop() {
+        let (material, _dir) = staged_test_material().await;
+        let remote_dir = material.remote_dir().as_str().to_owned();
+        let (switch, commands) = recording_switch();
+
+        drop(StagedMaterialCleanupGuard::armed(switch.clone(), material));
+
+        // Drop spawns a detached cleanup task; give it a chance to run.
+        for _ in 0..100 {
+            if commands
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|c| c.contains("rm -rf") && c.contains(&remote_dir))
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        let issued = commands.lock().expect("command log");
+        assert!(
+            issued
+                .iter()
+                .any(|c| c.contains("rm -rf") && c.contains(&remote_dir)),
+            "an armed guard drop must clean up staged material, got: {issued:?}"
+        );
+    }
+
+    /// B1: a disarmed guard (the normal path, where an explicit awaited cleanup
+    /// already ran) must not issue a second, redundant cleanup on drop.
+    #[tokio::test]
+    async fn staged_material_cleanup_guard_is_noop_after_disarm() {
+        let (material, _dir) = staged_test_material().await;
+        let (switch, commands) = recording_switch();
+
+        {
+            let mut guard = StagedMaterialCleanupGuard::armed(switch.clone(), material);
+            guard.disarm();
+        }
+
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+
+        assert!(
+            commands.lock().expect("command log").is_empty(),
+            "a disarmed guard must not issue any cleanup"
         );
     }
 
@@ -2868,26 +5083,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn current_nmx_binding_with_failed_hello_reports_error_without_rebinding() {
+    async fn current_nmx_binding_with_exhausted_hello_retries_reports_error_without_rebinding() {
         let configured = std::cell::Cell::new(false);
+        let checked_once = std::cell::Cell::new(false);
 
         let error = ensure_primary_nmx_controller_mtls(
             ready(Ok(true)),
-            ready(Err(RmsError::internal("NMX Hello connect failed for test"))),
+            async {
+                checked_once.set(true);
+                Ok(())
+            },
             async {
                 configured.set(true);
                 Ok(())
             },
-            ready(Ok(())),
+            ready(Err(RmsError::internal(
+                "NMX Hello connect failed after retries",
+            ))),
         )
         .await
         .unwrap_err();
 
-        assert!(error.message.contains("NMX Hello connect failed"));
         assert!(
-            !configured.get(),
-            "rebinding identical certificate objects cannot fix a connectivity failure"
+            error
+                .message
+                .contains("NMX Hello connect failed after retries")
         );
+
+        assert!(!checked_once.get());
+        assert!(!configured.get());
     }
 
     #[tokio::test]
@@ -3024,40 +5248,183 @@ mod tests {
     }
 
     #[test]
-    fn build_switch_mtls_unset_result_marks_insecure_operation() {
+    fn recorded_gnmi_client_authentication_keeps_a_named_outcome() {
+        assert_eq!(
+            recorded_gnmi_client_authentication(&json!({
+                "gnmi_client_authentication": GNMI_CLIENT_AUTHENTICATION_SERVER_CERTIFICATE_ONLY
+            })),
+            Some(json!(GNMI_CLIENT_AUTHENTICATION_SERVER_CERTIFICATE_ONLY))
+        );
+        assert_eq!(
+            recorded_gnmi_client_authentication(&json!({
+                "gnmi_client_authentication": GNMI_CLIENT_AUTHENTICATION_MTLS
+            })),
+            Some(json!(GNMI_CLIENT_AUTHENTICATION_MTLS))
+        );
+        assert_eq!(
+            recorded_gnmi_client_authentication(&json!({
+                "gnmi_client_authentication": Value::Null
+            })),
+            None
+        );
+        assert_eq!(recorded_gnmi_client_authentication(&json!({})), None);
+    }
+
+    #[test]
+    fn build_switch_certificate_result_json_surfaces_server_certificate_only() {
         let timeline = StageTimeline::new();
-        let commands = vec!["nv unset system api mtls ca-certificate".to_owned()];
+        let json = build_switch_certificate_result_json(
+            "completed",
+            "fabric-a",
+            "rms-fabric-a-ca",
+            "rms-fabric-a-cert",
+            "/home/admin/certs/run",
+            &["scale-up-fabric-telemetry-interface"],
+            &timeline,
+            json!({
+                "gnmi_client_authentication": GNMI_CLIENT_AUTHENTICATION_SERVER_CERTIFICATE_ONLY
+            }),
+        );
+        let parsed: Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["status"], "completed");
+        assert_eq!(parsed["services"][0], "scale-up-fabric-telemetry-interface");
+        assert_eq!(
+            parsed["gnmi_client_authentication"],
+            GNMI_CLIENT_AUTHENTICATION_SERVER_CERTIFICATE_ONLY
+        );
+    }
+
+    #[test]
+    fn build_switch_mtls_unset_result_reports_services_not_commands() {
+        let timeline = StageTimeline::new();
+        let report = MtlsUnsetReport::all_cleared(&[SwitchMtlsService::NvueApi]);
 
         let result = build_switch_mtls_unset_result(
             "completed",
             SwitchMtlsUnsetMode::InsecureSwitch,
             &["nvue-api"],
             &timeline,
-            Some(&commands),
+            &report,
         );
 
         let parsed = serde_json::to_value(result).unwrap();
 
         assert_eq!(parsed["operation"], "unset_mtls");
         assert_eq!(parsed["mode"], "insecure-switch");
-        assert_eq!(parsed["services"][0], "nvue-api");
+        assert_eq!(parsed["services"], json!(["nvue-api"]));
 
         assert_eq!(
-            parsed["commands"][0],
-            "nv unset system api mtls ca-certificate"
+            parsed["service_results"],
+            json!([{ "service": "nvue-api", "stage": "unset_binding", "status": "cleared" }])
         );
+        assert_eq!(
+            parsed["persist"],
+            json!([
+                { "stage": "config_apply", "status": "cleared" },
+                { "stage": "config_save", "status": "cleared" },
+            ])
+        );
+
+        // `nv` command text is an NVOS implementation detail and must not
+        // appear in a client-visible result, in either mode.
+        assert!(parsed.get("commands").is_none());
+        assert!(!parsed.to_string().contains("nv unset"));
+
+        // `failure` is omitted rather than null on the success path.
+        assert!(parsed.get("failure").is_none());
+    }
+
+    /// A persist failure is not attributable to any one service, so `service`
+    /// is absent. The stage details and the result JSON must agree on that --
+    /// a client reading one surface and then the other must not see the key
+    /// appear as `null` in one and vanish in the other.
+    #[test]
+    fn switch_mtls_unset_stage_details_match_the_result_on_a_persist_failure() {
+        let timeline = StageTimeline::new();
+        let report = MtlsUnsetReport {
+            services: vec![MtlsServiceOutcome {
+                service: SwitchMtlsService::NvueApi,
+                status: MtlsUnsetStatus::Cleared,
+            }],
+            persist: vec![MtlsPersistOutcome {
+                stage: MtlsUnsetStage::ConfigApply,
+                status: MtlsUnsetStatus::Failed,
+            }],
+            failure: Some(MtlsUnsetFailureSite {
+                service: None,
+                stage: MtlsUnsetStage::ConfigApply,
+                message: "exit status 1".to_owned(),
+            }),
+            cancelled: false,
+        };
+
+        let result = serde_json::to_value(build_switch_mtls_unset_result(
+            "failed",
+            SwitchMtlsUnsetMode::DisableMtls,
+            &["nvue-api"],
+            &timeline,
+            &report,
+        ))
+        .unwrap();
+        let details = switch_mtls_unset_stage_details(&["nvue-api"], &report);
+
+        assert_eq!(details["failure"], result["failure"]);
+        assert!(details["failure"].get("service").is_none());
+        assert!(result["failure"].get("service").is_none());
+
+        // The rest of the shared shape must match too, since the two are now
+        // rendered from the same typed values.
+        for key in ["services", "service_results", "persist"] {
+            assert_eq!(details[key], result[key], "stage details diverged on {key}");
+        }
+    }
+
+    /// An attributed failure carries the service, in both surfaces.
+    #[test]
+    fn switch_mtls_unset_stage_details_match_the_result_on_a_service_failure() {
+        let timeline = StageTimeline::new();
+        let report = MtlsUnsetReport {
+            services: vec![MtlsServiceOutcome {
+                service: SwitchMtlsService::NvueApi,
+                status: MtlsUnsetStatus::Failed,
+            }],
+            persist: vec![MtlsPersistOutcome {
+                stage: MtlsUnsetStage::ConfigApply,
+                status: MtlsUnsetStatus::NotAttempted,
+            }],
+            failure: Some(MtlsUnsetFailureSite {
+                service: Some(SwitchMtlsService::NvueApi),
+                stage: MtlsUnsetStage::UnsetBinding,
+                message: "exit status 1".to_owned(),
+            }),
+            cancelled: false,
+        };
+
+        let result = serde_json::to_value(build_switch_mtls_unset_result(
+            "failed",
+            SwitchMtlsUnsetMode::DisableMtls,
+            &["nvue-api"],
+            &timeline,
+            &report,
+        ))
+        .unwrap();
+        let details = switch_mtls_unset_stage_details(&["nvue-api"], &report);
+
+        assert_eq!(details["failure"], result["failure"]);
+        assert_eq!(details["failure"]["service"], "nvue-api");
     }
 
     #[test]
     fn build_switch_mtls_unset_result_marks_explicit_disable_operation() {
         let timeline = StageTimeline::new();
+        let report = MtlsUnsetReport::not_attempted(&[SwitchMtlsService::NvueApi]);
 
         let result = build_switch_mtls_unset_result(
-            "completed",
+            "failed",
             SwitchMtlsUnsetMode::DisableMtls,
             &["nvue-api"],
             &timeline,
-            None,
+            &report,
         );
 
         let parsed = serde_json::to_value(result).unwrap();
@@ -3065,6 +5432,7 @@ mod tests {
         assert_eq!(parsed["operation"], "unset_mtls");
         assert_eq!(parsed["mode"], "disable-mtls");
         assert!(parsed.get("commands").is_none());
+        assert_eq!(parsed["service_results"][0]["status"], "not_attempted");
     }
 
     #[tokio::test]
@@ -3095,10 +5463,227 @@ mod tests {
         assert_eq!(result["operation"], "unset_mtls");
         assert_eq!(result["mode"], "insecure-switch");
 
+        assert_eq!(result["service_results"][0]["service"], "nvue-api");
+        assert_eq!(result["service_results"][0]["status"], "cleared");
+        assert!(result.get("commands").is_none());
+        assert!(result.get("failure").is_none());
+
+        // The stage details mirror the result, so a client reading either one
+        // gets the same account of what happened.
+        let stages = result["timing_summary"]["stages"].as_array().unwrap();
         assert_eq!(
-            result["commands"][0],
-            "nv unset system api mtls ca-certificate"
+            stages[0]["details"]["service_results"][0]["status"],
+            "cleared"
         );
+    }
+
+    /// Graceful shutdown can cancel this job after `run_flow` has already
+    /// issued commands. The result must then describe the work that reached
+    /// the switch, not write the whole run off as unattempted.
+    #[tokio::test]
+    async fn run_switch_mtls_unset_job_reports_work_done_before_cancellation() {
+        let tracker = Arc::new(JobTracker::new());
+        let job = tracker
+            .create_job("rack-01", "sw-01", JobType::SwitchCertificate)
+            .expect("create switch certificate job");
+        let job_id = job.id().to_string();
+
+        // Cancel once the first command has landed, the way a shutdown
+        // partway through the flow would.
+        let trigger = job.cancellation_token();
+        let switch = Arc::new(
+            SwitchGb200Nvidia::for_test("http://127.0.0.1").with_ssh_exec_for_test(move |_| {
+                trigger.cancel();
+
+                Ok(String::new())
+            }),
+        );
+
+        run_switch_mtls_unset_job(
+            job,
+            switch,
+            vec![
+                SwitchMtlsService::ScaleUpFabricManager,
+                SwitchMtlsService::NvueApi,
+            ],
+            SwitchMtlsUnsetMode::DisableMtls,
+        )
+        .await;
+
+        let info = tracker.get_job(&job_id).expect("switch mTLS unset job");
+        let result: Value = serde_json::from_str(&info.result_json).unwrap();
+
+        assert_eq!(info.state, JobState::Failed);
+        assert_eq!(info.error_code, JobError::Other);
+        assert_eq!(result["status"], "cancelled");
+        assert!(info.error_message.contains("cancelled"));
+
+        assert_eq!(
+            result["service_results"],
+            json!([
+                {
+                    "service": "scale-up-fabric-manager",
+                    "stage": "unset_binding",
+                    "status": "cleared",
+                },
+                {
+                    "service": "nvue-api",
+                    "stage": "unset_binding",
+                    "status": "not_attempted",
+                },
+            ])
+        );
+        assert_eq!(
+            result["persist"],
+            json!([
+                { "stage": "config_apply", "status": "not_attempted" },
+                { "stage": "config_save", "status": "not_attempted" },
+            ])
+        );
+
+        // Cancelling is not failing, so there is no attributed failure site.
+        assert!(result.get("failure").is_none());
+
+        let stages = result["timing_summary"]["stages"].as_array().unwrap();
+        assert_eq!(
+            stages[0]["details"]["service_results"][0]["status"],
+            "cleared"
+        );
+    }
+
+    /// A run that clears one service and then fails must say so: the cleared
+    /// service, the failing one, and the untouched remainder all need to be
+    /// distinguishable from each other.
+    #[tokio::test]
+    async fn run_switch_mtls_unset_job_reports_a_partial_failure() {
+        let tracker = Arc::new(JobTracker::new());
+        let job = tracker
+            .create_job("rack-01", "sw-01", JobType::SwitchCertificate)
+            .expect("create switch certificate job");
+        let job_id = job.id().to_string();
+
+        let switch = Arc::new(
+            SwitchGb200Nvidia::for_test("http://127.0.0.1").with_ssh_exec_for_test(|command| {
+                if command == "nv action restore cluster apps nmx-controller manager encryption" {
+                    return Err(RmsError::internal("permission denied"));
+                }
+
+                Ok(String::new())
+            }),
+        );
+
+        run_switch_mtls_unset_job(
+            job,
+            switch,
+            vec![
+                SwitchMtlsService::NvueApi,
+                SwitchMtlsService::ScaleUpFabricManager,
+                SwitchMtlsService::ScaleUpFabricTelemetry,
+            ],
+            SwitchMtlsUnsetMode::DisableMtls,
+        )
+        .await;
+
+        let info = tracker.get_job(&job_id).expect("switch mTLS unset job");
+        let result: Value = serde_json::from_str(&info.result_json).unwrap();
+
+        assert_eq!(info.state, JobState::Failed);
+        assert_eq!(result["status"], "failed");
+
+        assert_eq!(
+            result["service_results"],
+            json!([
+                { "service": "nvue-api", "stage": "unset_binding", "status": "cleared" },
+                {
+                    "service": "scale-up-fabric-manager",
+                    "stage": "unset_binding",
+                    "status": "failed",
+                },
+                {
+                    "service": "scale-up-fabric-telemetry",
+                    "stage": "unset_binding",
+                    "status": "not_attempted",
+                },
+            ])
+        );
+        assert_eq!(
+            result["persist"],
+            json!([
+                { "stage": "config_apply", "status": "not_attempted" },
+                { "stage": "config_save", "status": "not_attempted" },
+            ])
+        );
+        assert_eq!(
+            result["failure"],
+            json!({
+                "service": "scale-up-fabric-manager",
+                "stage": "unset_binding",
+                "message": "permission denied",
+            })
+        );
+
+        // The client-visible error names the service and stage, never the
+        // command that failed.
+        assert!(info.error_message.contains("scale-up-fabric-manager"));
+        assert!(info.error_message.contains("unset_binding"));
+        assert!(!info.error_message.contains("nv action"));
+        assert!(!info.result_json.contains("nv action"));
+    }
+
+    /// A real SSH failure names the command it ran: `SshError::CommandFailed`
+    /// renders `SSH command {command:?} on {host} failed with ...`. That text
+    /// becomes the step's failure message and would otherwise ride the report
+    /// out to the client, so the transport strips it. The switch's own
+    /// diagnostics have to survive that strip, or the payload is useless.
+    #[tokio::test]
+    async fn run_switch_mtls_unset_job_strips_command_text_from_a_transport_error() {
+        let tracker = Arc::new(JobTracker::new());
+        let job = tracker
+            .create_job("rack-01", "sw-01", JobType::SwitchCertificate)
+            .expect("create switch certificate job");
+        let job_id = job.id().to_string();
+
+        let switch = Arc::new(
+            SwitchGb200Nvidia::for_test("http://127.0.0.1").with_ssh_exec_for_test(|command| {
+                if command == "nv action restore cluster apps nmx-controller manager encryption" {
+                    // Mirrors the real `SshError::CommandFailed` rendering.
+                    return Err(RmsError::internal(format!(
+                        "SSH command {command:?} on 127.0.0.1 failed with exit status 1; \
+                         stderr: Error: permission denied"
+                    )));
+                }
+
+                Ok(String::new())
+            }),
+        );
+
+        run_switch_mtls_unset_job(
+            job,
+            switch,
+            vec![
+                SwitchMtlsService::NvueApi,
+                SwitchMtlsService::ScaleUpFabricManager,
+            ],
+            SwitchMtlsUnsetMode::DisableMtls,
+        )
+        .await;
+
+        let info = tracker.get_job(&job_id).expect("switch mTLS unset job");
+
+        for surface in [&info.error_message, &info.result_json] {
+            assert!(
+                !surface.contains("nv action"),
+                "command text leaked to a client surface: {surface}"
+            );
+            assert!(
+                surface.contains("permission denied"),
+                "the switch's own diagnostics were lost: {surface}"
+            );
+        }
+
+        // Attribution still works, and the placeholder marks what was removed.
+        assert!(info.error_message.contains("scale-up-fabric-manager"));
+        assert!(info.error_message.contains("<command>"));
     }
 
     #[tokio::test]
@@ -3109,9 +5694,8 @@ mod tests {
             .expect("create switch certificate job");
         let job_id = job.id().to_string();
 
-        // Cancel before the stage even starts, so `tokio::select!`'s
-        // `biased` cancellation branch always wins the race against the
-        // (fake, effectively-instant) SSH call below.
+        // Cancel before the run starts, so the flow stops at its first
+        // checkpoint and no command reaches the switch.
         job.cancellation_token().cancel();
 
         let switch = Arc::new(
@@ -3129,6 +5713,7 @@ mod tests {
 
         let info = tracker.get_job(&job_id).expect("switch mTLS unset job");
         assert_eq!(info.state, JobState::Failed);
+        assert_eq!(info.error_code, JobError::Other);
         assert!(info.error_message.contains("cancelled"));
 
         // Cancellation must record the stage failure, skip any remaining
@@ -3141,6 +5726,25 @@ mod tests {
         let stages = result["timing_summary"]["stages"].as_array().unwrap();
         assert_eq!(stages[0]["status"], "failed");
         assert!(stages[0]["message"].as_str().unwrap().contains("cancelled"));
+
+        // Nothing ran, so the report must say every requested service was
+        // never attempted -- not omit them, which would read as "unknown".
+        assert_eq!(
+            result["service_results"],
+            json!([{
+                "service": "nvue-api",
+                "stage": "unset_binding",
+                "status": "not_attempted",
+            }])
+        );
+        assert_eq!(
+            result["persist"],
+            json!([
+                { "stage": "config_apply", "status": "not_attempted" },
+                { "stage": "config_save", "status": "not_attempted" },
+            ])
+        );
+        assert!(result.get("failure").is_none());
     }
 
     #[tokio::test]
@@ -3217,6 +5821,40 @@ mod tests {
         );
     }
 
+    /// The insecure-switch dispatch runs the same job as the mTLS disable
+    /// dispatch; the reported mode is all that distinguishes them.
+    #[tokio::test]
+    async fn dispatch_switch_mtls_unset_job_runs_the_job_in_insecure_switch_mode() {
+        let tracker = Arc::new(JobTracker::new());
+
+        let job = tracker
+            .create_job_if_node_idle("rack-01", "sw-01", JobType::SwitchCertificate)
+            .expect("create switch certificate job");
+
+        let job_id = job.id().to_string();
+
+        let switch = Arc::new(
+            SwitchGb200Nvidia::for_test("http://127.0.0.1")
+                .with_ssh_exec_for_test(|_| Ok(String::new())),
+        );
+
+        let handle = dispatch_switch_mtls_unset_job(
+            Arc::clone(&tracker),
+            job,
+            switch,
+            vec![SwitchMtlsService::NvueApi],
+        );
+
+        handle.wait().await.expect("supervisor join");
+
+        let info = tracker.get_job(&job_id).expect("switch mTLS unset job");
+        let result: Value = serde_json::from_str(&info.result_json).unwrap();
+
+        assert_eq!(info.state, JobState::Completed);
+        assert_eq!(result["mode"], "insecure-switch");
+        assert_eq!(result["service_results"][0]["status"], "cleared");
+    }
+
     #[tokio::test]
     async fn configure_switch_certificate_insecure_mode_accepts_all_switch_types() {
         for (node_type, dns_domain) in [
@@ -3253,19 +5891,17 @@ mod tests {
             assert_eq!(batch.node_results.len(), 0);
             assert_eq!(response.jobs.len(), 1);
             assert!(batch.message.contains("switch mTLS unset"));
-            let job = service
-                .job_tracker
-                .get_job(&response.jobs[0].job_id)
-                .expect("switch mTLS unset job");
-            let result: Value = serde_json::from_str(&job.result_json).unwrap();
 
-            assert_eq!(job.state, JobState::Completed);
-            assert_eq!(result["status"], "completed");
-            assert_eq!(result["operation"], "unset_mtls");
-            assert_eq!(result["mode"], "insecure-switch");
-            assert_eq!(result["services"], json!(["nvue-api"]));
-            assert_eq!(result["commands"], json!([]));
-            assert!(result["timing_summary"]["stages"].is_array());
+            // The job is dispatched detached and talks to a switch that is
+            // not there, so this asserts admission only. What the run
+            // reports is covered against a fake SSH executor by the
+            // `run_switch_mtls_unset_job` tests above.
+            assert!(
+                service
+                    .job_tracker
+                    .get_job(&response.jobs[0].job_id)
+                    .is_some()
+            );
         }
     }
 

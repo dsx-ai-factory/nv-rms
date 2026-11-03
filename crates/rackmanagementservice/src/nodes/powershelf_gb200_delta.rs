@@ -18,8 +18,9 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
-use secrecy::{ExposeSecret, SecretString};
-use serde_json::Value;
+use serde::Deserialize;
+use serde::de::DeserializeOwned;
+use serde_json::{Map, Value};
 
 use crate::domain::node::{
     ExpectedInventoryPolicy, FirmwareActivationMode, FirmwareActivationRequest,
@@ -29,28 +30,37 @@ use crate::domain::node::{
 };
 use crate::domain::rack::{EndpointConfig, NodeConfig};
 use crate::nodes::nvfwupd_adapter;
-use crate::transport::http_client::{HttpClient, REDFISH_V1_ROOT};
+use crate::nodes::redfish_action_info::{
+    ActionInfoResource, ChassisResetRequest, EmptyActionRequest, ResetType, reset_allowable_values,
+    to_action_payload,
+};
+use crate::transport::redfish_client::{
+    ODataLink, RedfishClient, ResourceCollection, redfish_client_from_powershelf_endpoint,
+};
 use crate::utilities::error::{Result, RmsError};
 
 const DELTA_CHASSIS_COLLECTION_ENDPOINT: &str = "/redfish/v1/Chassis";
 const DELTA_POWER_SHELVES_COLLECTION_ENDPOINT: &str = "/redfish/v1/PowerEquipment/PowerShelves";
-const DELTA_OEM_KEY: &str = "deltaenergysystems";
 const DELTA_TURN_ON_ACTION: &str = "#PowerShelf.TurnOnPSUs";
 const DELTA_TURN_OFF_ACTION: &str = "#PowerShelf.TurnOffPSUs";
+const DELTA_CHASSIS_RESET_ACTION: &str = "#Chassis.Reset";
 
 /// Delta GB200 powershelf node.
 ///
 /// Delta GB200 and GB300 powershelves share this Redfish behavior. Power state
-/// is exposed through Delta OEM PSU properties, while power control is exposed
-/// under `/redfish/v1/PowerEquipment/PowerShelves`. Firmware workflows use the
-/// shared NVFWUPD PowerShelf server type.
+/// is exposed through Delta OEM PSU properties. Power control depends on
+/// `DeltaPowerControl`: GB200/GB300 shelves use Delta OEM actions under
+/// `/redfish/v1/PowerEquipment/PowerShelves`, while VR NVL72 shelves use the
+/// standard `#Chassis.Reset` action. Firmware workflows use the shared NVFWUPD
+/// PowerShelf server type.
 pub struct PowershelfGb200Delta {
     id: String,
     rack_id: String,
     node_type: NodeType,
     bmc_endpoint: EndpointConfig,
     expected_inventory: Option<ExpectedInventoryPolicy>,
-    http: HttpClient,
+    redfish: RedfishClient,
+    power_control: DeltaPowerControl,
 
     // Serializes full node operations across shared Redfish/NVFWUPD clients.
     // The guard is held across awaits so BMC operations cannot interleave.
@@ -58,8 +68,22 @@ pub struct PowershelfGb200Delta {
 
     chassis_url: tokio::sync::OnceCell<String>,
     power_shelf_url: tokio::sync::OnceCell<String>,
+    reset_chassis_url: tokio::sync::OnceCell<String>,
 }
 
+/// Redfish power-control interface a Delta shelf exposes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeltaPowerControl {
+    /// Delta OEM `#PowerShelf.TurnOnPSUs` / `#PowerShelf.TurnOffPSUs` actions
+    /// on a `/redfish/v1/PowerEquipment/PowerShelves` member (GB200/GB300).
+    OemPsuActions,
+    /// Standard `#Chassis.Reset` on the Delta shelf chassis, with `ResetType`
+    /// `On` or `ForceOff` (VR NVL72 shelves managed by an NVIDIA PMC).
+    ChassisReset,
+}
+
+/// Power transition a Delta shelf can perform. Delta shelves have no graceful
+/// power off, so every off request becomes `ForceOff`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DeltaPowerIntent {
     On,
@@ -67,6 +91,7 @@ enum DeltaPowerIntent {
 }
 
 impl DeltaPowerIntent {
+    /// Returns the Delta OEM action key for this intent.
     fn action_key(self) -> &'static str {
         match self {
             Self::On => DELTA_TURN_ON_ACTION,
@@ -75,7 +100,24 @@ impl DeltaPowerIntent {
     }
 }
 
+/// Maps an intent to its `#Chassis.Reset` `ResetType`.
+impl From<DeltaPowerIntent> for ResetType {
+    fn from(intent: DeltaPowerIntent) -> Self {
+        match intent {
+            DeltaPowerIntent::On => Self::On,
+            DeltaPowerIntent::ForceOff => Self::ForceOff,
+        }
+    }
+}
+
 impl PowershelfGb200Delta {
+    /// Builds a Delta GB200 shelf node that uses the OEM PSU power actions.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Unimplemented` if `config.node_type` is not
+    /// `PowershelfGb200Delta`, `InvalidArgument` if no BMC endpoint is
+    /// configured, or any error from building the Redfish client.
     pub fn from_config(config: &NodeConfig, rack_id: &str) -> Result<Self> {
         if config.node_type != NodeType::PowershelfGb200Delta {
             return Err(RmsError::unimplemented(
@@ -88,23 +130,7 @@ impl PowershelfGb200Delta {
                 "bmc_endpoint is required for powershelf nodes",
             ));
         };
-        let credentials = bmc_endpoint.credentials.as_ref();
-        let username = credentials
-            .map(|credentials| credentials.username.as_str())
-            .unwrap_or_default();
-        let password = credentials
-            .map(|credentials| credentials.password.expose_secret())
-            .unwrap_or_default();
-
-        let http = HttpClient::new(
-            &bmc_endpoint.endpoint.ip_address,
-            bmc_endpoint.endpoint.port,
-            username,
-            password,
-            bmc_endpoint.dangerously_accept_invalid_certs,
-            true,
-        )?
-        .require_path_prefix(REDFISH_V1_ROOT);
+        let redfish = redfish_client_from_powershelf_endpoint(bmc_endpoint)?;
 
         Ok(Self {
             id: config.id.clone(),
@@ -112,50 +138,67 @@ impl PowershelfGb200Delta {
             node_type: config.node_type,
             bmc_endpoint: bmc_endpoint.clone(),
             expected_inventory: config.expected_inventory.clone(),
-            http,
+            redfish,
+            power_control: DeltaPowerControl::OemPsuActions,
             op_lock: tokio::sync::Mutex::new(()),
             chassis_url: tokio::sync::OnceCell::new(),
             power_shelf_url: tokio::sync::OnceCell::new(),
+            reset_chassis_url: tokio::sync::OnceCell::new(),
         })
     }
 
-    async fn resolve_chassis_url(&self, http: &HttpClient) -> Result<&str> {
+    /// Selects the Redfish power-control interface. Defaults to
+    /// [`DeltaPowerControl::OemPsuActions`].
+    pub(crate) fn with_power_control(mut self, power_control: DeltaPowerControl) -> Self {
+        self.power_control = power_control;
+        self
+    }
+
+    /// Returns the URL of the chassis that advertises `#Chassis.Reset`,
+    /// discovering it on first use. A failed discovery is not cached.
+    async fn resolve_reset_chassis_url(&self, redfish: &RedfishClient) -> Result<&str> {
+        self.reset_chassis_url
+            .get_or_try_init(|| discover_delta_reset_chassis_url(redfish))
+            .await
+            .map(String::as_str)
+    }
+
+    /// Returns the URL of the shelf chassis used for power-state reads,
+    /// discovering it on first use. A failed discovery is not cached.
+    async fn resolve_chassis_url(&self, redfish: &RedfishClient) -> Result<&str> {
         self.chassis_url
-            .get_or_try_init(|| discover_delta_chassis_url(http))
+            .get_or_try_init(|| discover_delta_chassis_url(redfish))
             .await
             .map(String::as_str)
     }
 
-    async fn resolve_power_shelf_url(&self, http: &HttpClient) -> Result<&str> {
+    /// Returns the URL of the `PowerShelves` member that carries the OEM PSU
+    /// actions, discovering it on first use. A failed discovery is not cached.
+    async fn resolve_power_shelf_url(&self, redfish: &RedfishClient) -> Result<&str> {
         self.power_shelf_url
-            .get_or_try_init(|| discover_delta_power_shelf_url(http))
+            .get_or_try_init(|| discover_delta_power_shelf_url(redfish))
             .await
             .map(String::as_str)
     }
 
+    /// Points the node at a test Redfish server and clears the cached
+    /// resource URLs.
     #[cfg(test)]
-    pub(crate) fn replace_http_for_test(&mut self, base_url: &str) {
-        self.http = HttpClient::for_test(base_url);
+    pub(crate) fn replace_redfish_for_test(&mut self, base_url: &str) {
+        self.redfish = crate::transport::redfish_client::redfish_client_for_test(base_url);
         self.chassis_url = tokio::sync::OnceCell::new();
         self.power_shelf_url = tokio::sync::OnceCell::new();
+        self.reset_chassis_url = tokio::sync::OnceCell::new();
     }
 
+    /// Returns the NVFWUPD target for this shelf's BMC. TLS verification is on
+    /// unless the endpoint sets `dangerously_accept_invalid_certs`.
     fn nvfwupd_target_config(&self) -> nvfwupd::workflow::TargetConfig {
-        let credentials = self.bmc_endpoint.credentials.as_ref();
-        let username = credentials
-            .map(|credentials| credentials.username.as_str())
-            .unwrap_or_default();
-        let default_password = SecretString::default();
-        let password = credentials
-            .map(|credentials| &credentials.password)
-            .unwrap_or(&default_password);
-
-        nvfwupd_adapter::to_target_config_with_secret(
+        nvfwupd_adapter::to_target_config_with_credentials(
             self.node_type,
             &self.bmc_endpoint.endpoint.ip_address,
             self.bmc_endpoint.endpoint.port,
-            username,
-            password,
+            self.bmc_endpoint.credentials.as_ref(),
             !self.bmc_endpoint.dangerously_accept_invalid_certs,
         )
     }
@@ -197,14 +240,19 @@ impl Node for PowershelfGb200Delta {
         self.expected_inventory.as_ref()
     }
 
+    /// Aggregates the shelf's PSU power states.
+    ///
+    /// Returns `Off` if any PSU reports off, `On` only if every PSU reports
+    /// on, and `Unknown` otherwise, including when no PSU can be read.
+    /// Individual PSU read failures are logged, not returned.
     async fn get_power_state(&self) -> Result<PowerState> {
         let _op_guard = self.op_lock.lock().await;
-        let http = &self.http;
+        let redfish = &self.redfish;
 
         tracing::debug!(node = %self.id(), "get_power_state");
-        let chassis_url = self.resolve_chassis_url(http).await?;
-        let chassis = http.get(chassis_url, HttpClient::DEFAULT_TIMEOUT).await?;
-        let psu_states = fetch_delta_psu_power_states(http, &chassis).await;
+        let chassis_url = self.resolve_chassis_url(redfish).await?;
+        let chassis: DeltaResource = redfish_get(redfish, chassis_url).await?;
+        let psu_states = fetch_delta_psu_power_states(redfish, &chassis).await;
         let state = aggregate_delta_psu_power_states(&psu_states);
         tracing::debug!(
             node = %self.id(),
@@ -215,11 +263,26 @@ impl Node for PowershelfGb200Delta {
         Ok(state)
     }
 
+    /// Powers the shelf on or off through the configured `DeltaPowerControl`.
+    ///
+    /// `On` and `ForceOn` power on. `Off`, `GracefulShutdown`, and `ForceOff`
+    /// all perform a hard power off, and the graceful requests log a warning.
+    /// `target` is ignored.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidArgument` for any other operation, and fails if the
+    /// shelf does not advertise the required action.
     async fn set_power_state(&self, op: PowerOp, _target: PowerTargetType) -> Result<()> {
         tracing::info!(node = %self.id(), ?op, "set_power_state");
         let intent = match op {
             PowerOp::On | PowerOp::ForceOn => DeltaPowerIntent::On,
-            PowerOp::Off | PowerOp::ForceOff => DeltaPowerIntent::ForceOff,
+            // Delta shelves have no graceful power off, only TurnOffPSUs or a
+            // ForceOff reset. RMS serves graceful requests with that action so
+            // callers never see the hardware gap.
+            PowerOp::Off | PowerOp::GracefulShutdown | PowerOp::ForceOff => {
+                DeltaPowerIntent::ForceOff
+            }
             _ => {
                 return Err(RmsError::invalid_argument(format!(
                     "{op:?} is not supported for powershelf power control"
@@ -228,9 +291,28 @@ impl Node for PowershelfGb200Delta {
         };
 
         let _op_guard = self.op_lock.lock().await;
-        let http = &self.http;
-        let power_shelf_url = self.resolve_power_shelf_url(http).await?;
-        invoke_delta_power_action(http, power_shelf_url, intent).await
+        let redfish = &self.redfish;
+        let action = match self.power_control {
+            DeltaPowerControl::OemPsuActions => {
+                let power_shelf_url = self.resolve_power_shelf_url(redfish).await?;
+                invoke_delta_power_action(redfish, power_shelf_url, intent).await?;
+                intent.action_key()
+            }
+            DeltaPowerControl::ChassisReset => {
+                let chassis_url = self.resolve_reset_chassis_url(redfish).await?;
+                invoke_delta_chassis_reset(redfish, chassis_url, intent).await?;
+                DELTA_CHASSIS_RESET_ACTION
+            }
+        };
+        if matches!(op, PowerOp::Off | PowerOp::GracefulShutdown) {
+            tracing::warn!(
+                node = %self.id(),
+                ?op,
+                action,
+                "Delta powershelf has no graceful power off; served the request as ForceOff"
+            );
+        }
+        Ok(())
     }
 
     async fn get_firmware_inventory(&self) -> Result<Vec<FirmwareInfo>> {
@@ -245,6 +327,11 @@ impl Node for PowershelfGb200Delta {
             .collect())
     }
 
+    /// Updates shelf firmware through NVFWUPD.
+    ///
+    /// Only the target's firmware file and expected version are sent; its
+    /// component, resolution, and LinkX policy are cleared. The node's
+    /// expected-inventory AP names, if any, are passed through.
     async fn update_firmware(
         &self,
         target: &FirmwareTarget,
@@ -257,6 +344,8 @@ impl Node for PowershelfGb200Delta {
             component: String::new(),
             firmware_file: target.firmware_file.clone(),
             expected_version: target.expected_version.clone(),
+            resolution: None,
+            linkx_policy: None,
         };
         let request = nvfwupd_adapter::to_update_request(&target, force_update, options);
         let expected_inventory = self
@@ -295,6 +384,7 @@ impl Node for PowershelfGb200Delta {
         Ok(nvfwupd_adapter::map_activation_summary(summary))
     }
 
+    /// Activates staged firmware with a non-forced power shelf reset.
     async fn activate_firmware(&self) -> Result<()> {
         self.activate_firmware_with(FirmwareActivationRequest {
             mode: FirmwareActivationMode::PowerShelfReset { force: false },
@@ -305,9 +395,13 @@ impl Node for PowershelfGb200Delta {
     }
 }
 
-async fn discover_delta_chassis_url(http: &HttpClient) -> Result<String> {
+/// Finds the Delta shelf chassis used for power-state reads.
+///
+/// Prefers a chassis with a `PowerSubsystem` and a Delta marker. Otherwise
+/// falls back to the first chassis with a `PowerSubsystem`.
+async fn discover_delta_chassis_url(redfish_client: &RedfishClient) -> Result<String> {
     discover_member_url(
-        http,
+        redfish_client,
         DELTA_CHASSIS_COLLECTION_ENDPOINT,
         chassis_resource_looks_like_delta_powershelf,
         chassis_has_power_subsystem,
@@ -317,9 +411,13 @@ async fn discover_delta_chassis_url(http: &HttpClient) -> Result<String> {
     .await
 }
 
-async fn discover_delta_power_shelf_url(http: &HttpClient) -> Result<String> {
+/// Finds the `PowerShelves` member that carries the Delta OEM PSU actions.
+///
+/// Prefers a member that also looks like a Delta power shelf. Otherwise falls
+/// back to the first member with origin-relative TurnOn and TurnOff targets.
+async fn discover_delta_power_shelf_url(redfish_client: &RedfishClient) -> Result<String> {
     discover_member_url(
-        http,
+        redfish_client,
         DELTA_POWER_SHELVES_COLLECTION_ENDPOINT,
         power_shelf_resource_looks_like_delta,
         power_shelf_has_delta_actions,
@@ -327,6 +425,94 @@ async fn discover_delta_power_shelf_url(http: &HttpClient) -> Result<String> {
         "failed to inspect PowerShelf member while discovering Delta powershelf actions",
     )
     .await
+}
+
+/// Finds the Delta shelf chassis that advertises `#Chassis.Reset`.
+///
+/// There is deliberately no looser fallback: posting a reset to a chassis that
+/// is not the Delta shelf would power the wrong device.
+async fn discover_delta_reset_chassis_url(redfish_client: &RedfishClient) -> Result<String> {
+    discover_member_url(
+        redfish_client,
+        DELTA_CHASSIS_COLLECTION_ENDPOINT,
+        chassis_resource_has_delta_reset,
+        |_| false,
+        "no Delta powershelf chassis with #Chassis.Reset found in /redfish/v1/Chassis",
+        "failed to inspect chassis member while discovering Delta powershelf #Chassis.Reset",
+    )
+    .await
+}
+
+/// Fields RMS reads from a Delta chassis or `PowerShelves` member during
+/// discovery and power control.
+#[derive(Debug, Clone, Default, Deserialize)]
+struct DeltaResource {
+    #[serde(rename = "EquipmentType")]
+    equipment_type: Option<String>,
+    #[serde(rename = "Name")]
+    name: Option<String>,
+    #[serde(rename = "Manufacturer")]
+    manufacturer: Option<String>,
+    #[serde(rename = "PowerSubsystem")]
+    power_subsystem: Option<ODataLink>,
+    // Kept untyped so a null or unexpected entry cannot fail decoding of the
+    // whole resource; only the VR path reads `#Chassis.Reset` out of it.
+    #[serde(rename = "Actions", default)]
+    actions: Option<Map<String, Value>>,
+    #[serde(rename = "Oem", default)]
+    oem: DeltaOem,
+}
+
+/// A resource's `Oem` object: the `deltaenergysystems` section, plus every
+/// other vendor key so their names can be checked for a Delta marker.
+#[derive(Debug, Clone, Default, Deserialize)]
+struct DeltaOem {
+    #[serde(rename = "deltaenergysystems")]
+    delta: Option<DeltaEnergyOem>,
+    #[serde(flatten)]
+    others: Map<String, Value>,
+}
+
+/// The `Oem.deltaenergysystems` section: OEM PSU actions on a shelf, or the
+/// OEM power value on a PSU.
+#[derive(Debug, Clone, Default, Deserialize)]
+struct DeltaEnergyOem {
+    #[serde(rename = "Actions", default)]
+    actions: HashMap<String, DeltaAction>,
+    #[serde(rename = "Power")]
+    power: Option<Value>,
+}
+
+/// One advertised Redfish action: its POST target and optional ActionInfo link.
+#[derive(Debug, Clone, Default, Deserialize)]
+struct DeltaAction {
+    target: Option<String>,
+    #[serde(rename = "@Redfish.ActionInfo")]
+    action_info: Option<String>,
+}
+
+/// A chassis `PowerSubsystem`, read only for its `PowerSupplies` link.
+#[derive(Debug, Clone, Default, Deserialize)]
+struct PowerSubsystemResource {
+    #[serde(rename = "PowerSupplies")]
+    power_supplies: Option<ODataLink>,
+}
+
+/// One PSU, read for its OEM power value and its standard `PowerState`.
+#[derive(Debug, Clone, Default, Deserialize)]
+struct PowerSupplyResource {
+    #[serde(rename = "PowerState")]
+    power_state: Option<Value>,
+    #[serde(rename = "Oem", default)]
+    oem: DeltaOem,
+}
+
+/// Fetches and decodes the Redfish resource at `path`.
+async fn redfish_get<T>(redfish: &RedfishClient, path: &str) -> Result<T>
+where
+    T: DeserializeOwned + Clone + Send + Sync + 'static,
+{
+    redfish.get_resource(path).await.map_err(RmsError::from)
 }
 
 /// Resolves a single member URL out of a Redfish collection.
@@ -345,7 +531,7 @@ async fn discover_delta_power_shelf_url(http: &HttpClient) -> Result<String> {
 /// first-match-wins for now; hardening (fail-loud on multiple matches) is
 /// tracked separately as it is riskier than it looks.
 async fn discover_member_url<F, G>(
-    http: &HttpClient,
+    redfish: &RedfishClient,
     collection_endpoint: &str,
     is_match: F,
     is_fallback: G,
@@ -353,23 +539,17 @@ async fn discover_member_url<F, G>(
     inspect_error_msg: &str,
 ) -> Result<String>
 where
-    F: Fn(&Value) -> bool,
-    G: Fn(&Value) -> bool,
+    F: Fn(&DeltaResource) -> bool,
+    G: Fn(&DeltaResource) -> bool,
 {
-    let collection = http
-        .get(collection_endpoint, HttpClient::DEFAULT_TIMEOUT)
-        .await?;
-    let members = members_array(&collection, collection_endpoint)?;
+    let collection: ResourceCollection = redfish_get(redfish, collection_endpoint).await?;
     let mut fallback = None;
 
-    for member in members {
-        let Some(uri) = member.get("@odata.id").and_then(|v| v.as_str()) else {
+    for member in &collection.members {
+        let Some(uri) = member.nonempty() else {
             continue;
         };
-        if uri.is_empty() {
-            continue;
-        }
-        match http.get(uri, HttpClient::DEFAULT_TIMEOUT).await {
+        match redfish_get::<DeltaResource>(redfish, uri).await {
             Ok(resource) if is_match(&resource) => {
                 return Ok(uri.to_owned());
             }
@@ -390,14 +570,8 @@ where
     fallback.ok_or_else(|| RmsError::internal(not_found_msg))
 }
 
-fn members_array<'a>(collection: &'a Value, endpoint: &str) -> Result<&'a Vec<Value>> {
-    collection
-        .get("Members")
-        .and_then(|m| m.as_array())
-        .ok_or_else(|| RmsError::internal(format!("{endpoint} response missing Members array")))
-}
-
-fn chassis_resource_looks_like_delta_powershelf(chassis: &Value) -> bool {
+/// Returns `true` if the chassis has a `PowerSubsystem` and a Delta marker.
+fn chassis_resource_looks_like_delta_powershelf(chassis: &DeltaResource) -> bool {
     chassis_has_power_subsystem(chassis) && has_delta_marker(chassis)
 }
 
@@ -414,94 +588,206 @@ fn chassis_resource_looks_like_delta_powershelf(chassis: &Value) -> bool {
 /// fallback (e.g. also requiring `ChassisType == "Shelf"`) was considered but
 /// deferred: it risks failing discovery on shelves whose firmware does not set
 /// that field, so it should be validated against real hardware first.
-fn chassis_has_power_subsystem(chassis: &Value) -> bool {
+fn chassis_has_power_subsystem(chassis: &DeltaResource) -> bool {
     chassis
-        .pointer("/PowerSubsystem/@odata.id")
-        .and_then(|v| v.as_str())
-        .is_some_and(|uri| !uri.is_empty())
+        .power_subsystem
+        .as_ref()
+        .and_then(ODataLink::nonempty)
+        .is_some()
 }
 
-fn power_shelf_resource_looks_like_delta(power_shelf: &Value) -> bool {
+/// Returns `true` if the member has a Delta marker, identifies as a power
+/// shelf, and has usable TurnOn and TurnOff targets.
+fn power_shelf_resource_looks_like_delta(power_shelf: &DeltaResource) -> bool {
     has_delta_marker(power_shelf)
         && resource_looks_like_power_shelf(power_shelf)
         && power_shelf_has_delta_actions(power_shelf)
 }
 
-fn resource_looks_like_power_shelf(resource: &Value) -> bool {
-    string_field_contains(resource, "EquipmentType", "powershelf")
-        || string_field_contains(resource, "Name", "power shelf")
+/// Returns `true` if `EquipmentType` contains `powershelf` or `Name` contains
+/// `power shelf`, ignoring ASCII case.
+fn resource_looks_like_power_shelf(resource: &DeltaResource) -> bool {
+    string_field_contains(resource.equipment_type.as_deref(), "powershelf")
+        || string_field_contains(resource.name.as_deref(), "power shelf")
 }
 
-fn has_delta_marker(resource: &Value) -> bool {
-    string_field_contains(resource, "Manufacturer", "delta")
-        || resource.pointer("/Oem/deltaenergysystems").is_some()
+/// Returns `true` if `Manufacturer` contains `delta`, `Oem` has a
+/// `deltaenergysystems` section, or another `Oem` key contains `delta`.
+/// The `Manufacturer` and other-key checks ignore ASCII case.
+fn has_delta_marker(resource: &DeltaResource) -> bool {
+    string_field_contains(resource.manufacturer.as_deref(), "delta")
+        || resource.oem.delta.is_some()
         || resource
-            .get("Oem")
-            .and_then(|oem| oem.as_object())
-            .is_some_and(|oem| {
-                oem.keys()
-                    .any(|key| key.to_ascii_lowercase().contains("delta"))
-            })
+            .oem
+            .others
+            .keys()
+            .any(|key| key.to_ascii_lowercase().contains("delta"))
 }
 
-fn string_field_contains(resource: &Value, key: &str, needle: &str) -> bool {
-    resource
-        .get(key)
-        .and_then(|value| value.as_str())
-        .is_some_and(|value| value.to_ascii_lowercase().contains(needle))
+/// Returns `true` if `value` is present and its ASCII-lowercased form contains
+/// `needle`. `needle` must already be lowercase.
+fn string_field_contains(value: Option<&str>, needle: &str) -> bool {
+    value.is_some_and(|value| value.to_ascii_lowercase().contains(needle))
 }
 
-fn power_shelf_has_delta_actions(power_shelf: &Value) -> bool {
-    delta_power_action_target(power_shelf, DELTA_TURN_ON_ACTION).is_some()
-        && delta_power_action_target(power_shelf, DELTA_TURN_OFF_ACTION).is_some()
+/// Returns `true` if both OEM TurnOn and TurnOff actions have origin-relative
+/// targets.
+fn power_shelf_has_delta_actions(power_shelf: &DeltaResource) -> bool {
+    delta_power_action_target(power_shelf, DELTA_TURN_ON_ACTION)
+        .is_some_and(|target| is_bmc_relative_action_target(&target))
+        && delta_power_action_target(power_shelf, DELTA_TURN_OFF_ACTION)
+            .is_some_and(|target| is_bmc_relative_action_target(&target))
 }
 
+/// Returns `true` if the chassis has a Delta marker and a `#Chassis.Reset`
+/// action with an origin-relative target.
+fn chassis_resource_has_delta_reset(chassis: &DeltaResource) -> bool {
+    has_delta_marker(chassis)
+        && chassis_reset_action(chassis)
+            .as_ref()
+            .and_then(chassis_reset_target)
+            .is_some_and(is_bmc_relative_action_target)
+}
+
+/// Decodes the Delta chassis reset action.
+///
+/// If the reset action is not present, silently returns `None`.
+/// If the action is present but cannot be decoded, logs an error and returns `None`.
+fn chassis_reset_action(chassis: &DeltaResource) -> Option<DeltaAction> {
+    let action = chassis.actions.as_ref()?.get(DELTA_CHASSIS_RESET_ACTION)?;
+    match serde_json::from_value(action.clone()) {
+        Ok(action) => Some(action),
+        Err(e) => {
+            tracing::error!(
+                action = DELTA_CHASSIS_RESET_ACTION,
+                error = %e,
+                "failed to decode Delta chassis reset action"
+            );
+            None
+        }
+    }
+}
+
+/// Returns the action's `target`, or `None` if it is missing or empty.
+fn chassis_reset_target(action: &DeltaAction) -> Option<&str> {
+    action.target.as_deref().filter(|target| !target.is_empty())
+}
+
+/// Same origin-relative rules as `RedfishClient::post_action`: skip members
+/// whose advertised action targets would be rejected at POST time.
+fn is_bmc_relative_action_target(uri: &str) -> bool {
+    let uri = uri.trim();
+    !uri.is_empty() && uri.starts_with('/') && !uri.starts_with("//") && !uri.contains("://")
+}
+
+/// Re-reads the `PowerShelves` member and posts the intent's OEM action with an
+/// empty body.
+///
+/// # Errors
+///
+/// Fails if the member no longer advertises the action's target.
 async fn invoke_delta_power_action(
-    http: &HttpClient,
+    redfish: &RedfishClient,
     power_shelf_url: &str,
     intent: DeltaPowerIntent,
 ) -> Result<()> {
-    let power_shelf = http
-        .get(power_shelf_url, HttpClient::DEFAULT_TIMEOUT)
-        .await?;
+    let power_shelf: DeltaResource = redfish_get(redfish, power_shelf_url).await?;
     let target = delta_power_action_target(&power_shelf, intent.action_key()).ok_or_else(|| {
         RmsError::internal(format!(
             "Delta powershelf Actions missing {} target",
             intent.action_key()
         ))
     })?;
-    http.post(
-        &target,
-        &Value::Object(serde_json::Map::new()),
-        HttpClient::DEFAULT_TIMEOUT,
-    )
-    .await?;
+    let payload = to_action_payload(&EmptyActionRequest {})?;
+    redfish
+        .post_action(&target, &payload)
+        .await
+        .map_err(RmsError::from)?;
     Ok(())
 }
 
-fn delta_power_action_target(power_shelf: &Value, action: &str) -> Option<String> {
+/// Posts `#Chassis.Reset` with the intent's `ResetType`.
+///
+/// When the action's ActionInfo lists `ResetType` allowable values, a reset
+/// type outside them is refused without sending anything.
+async fn invoke_delta_chassis_reset(
+    redfish: &RedfishClient,
+    chassis_url: &str,
+    intent: DeltaPowerIntent,
+) -> Result<()> {
+    let chassis: DeltaResource = redfish_get(redfish, chassis_url).await?;
+    let action = chassis_reset_action(&chassis).ok_or_else(|| {
+        RmsError::internal(format!(
+            "Delta powershelf chassis Actions missing {DELTA_CHASSIS_RESET_ACTION}"
+        ))
+    })?;
+    let target = chassis_reset_target(&action).ok_or_else(|| {
+        RmsError::internal(format!(
+            "Delta powershelf chassis Actions missing {DELTA_CHASSIS_RESET_ACTION} target"
+        ))
+    })?;
+    let reset_type = ResetType::from(intent);
+
+    if let Some(action_info_url) = action.action_info.as_deref().filter(|url| !url.is_empty()) {
+        let action_info: ActionInfoResource = redfish_get(redfish, action_info_url).await?;
+        if let Some(allowed) = reset_allowable_values(&action_info)
+            && !reset_type.is_in(&allowed)
+        {
+            return Err(RmsError::failed_precondition(format!(
+                "{DELTA_CHASSIS_RESET_ACTION} ResetType {:?} is not in \
+                 AllowableValues {allowed:?}; refusing to send an unsupported reset",
+                reset_type.as_str()
+            )));
+        }
+    }
+
+    let payload = to_action_payload(&ChassisResetRequest { reset_type })?;
+    tracing::debug!(
+        action = DELTA_CHASSIS_RESET_ACTION,
+        target,
+        payload = %payload,
+        "invoke_delta_chassis_reset"
+    );
+    Ok(redfish.post_action(target, &payload).await?)
+}
+
+/// Returns the target of the named `Oem.deltaenergysystems` action, or `None`
+/// if it is missing or empty.
+fn delta_power_action_target(power_shelf: &DeltaResource, action: &str) -> Option<String> {
     power_shelf
-        .get("Oem")
-        .and_then(|oem| oem.get(DELTA_OEM_KEY))
-        .and_then(|delta| delta.get("Actions"))
-        .and_then(|actions| actions.get(action))
-        .and_then(|action| action.get("target"))
-        .and_then(|target| target.as_str())
+        .oem
+        .delta
+        .as_ref()?
+        .actions
+        .get(action)?
+        .target
+        .as_deref()
         .filter(|target| !target.is_empty())
         .map(str::to_owned)
 }
 
-async fn fetch_delta_psu_power_states(http: &HttpClient, chassis: &Value) -> Vec<Option<bool>> {
+/// Walks the chassis `PowerSubsystem` to its PSUs and decodes each one's power
+/// state.
+///
+/// Returns one entry per `PowerSupplies` member, in order. A member that
+/// cannot be read or decoded is `None`. Returns an empty vector if a link is
+/// missing or the subsystem or collection cannot be fetched. Failures are
+/// logged, not returned.
+async fn fetch_delta_psu_power_states(
+    redfish: &RedfishClient,
+    chassis: &DeltaResource,
+) -> Vec<Option<bool>> {
     let Some(subsystem_url) = chassis
-        .pointer("/PowerSubsystem/@odata.id")
-        .and_then(|v| v.as_str())
-        .filter(|uri| !uri.is_empty())
+        .power_subsystem
+        .as_ref()
+        .and_then(ODataLink::nonempty)
+        .map(str::to_owned)
     else {
         tracing::warn!("Delta powershelf chassis exposes no PowerSubsystem link");
         return Vec::new();
     };
 
-    let subsystem = match http.get(subsystem_url, HttpClient::DEFAULT_TIMEOUT).await {
+    let subsystem: PowerSubsystemResource = match redfish_get(redfish, &subsystem_url).await {
         Ok(v) => v,
         Err(e) => {
             tracing::warn!(
@@ -514,15 +800,16 @@ async fn fetch_delta_psu_power_states(http: &HttpClient, chassis: &Value) -> Vec
     };
 
     let Some(supplies_url) = subsystem
-        .pointer("/PowerSupplies/@odata.id")
-        .and_then(|v| v.as_str())
-        .filter(|uri| !uri.is_empty())
+        .power_supplies
+        .as_ref()
+        .and_then(ODataLink::nonempty)
+        .map(str::to_owned)
     else {
         tracing::warn!(url = %subsystem_url, "Delta PowerSubsystem has no PowerSupplies link");
         return Vec::new();
     };
 
-    let collection = match http.get(supplies_url, HttpClient::DEFAULT_TIMEOUT).await {
+    let collection: ResourceCollection = match redfish_get(redfish, &supplies_url).await {
         Ok(v) => v,
         Err(e) => {
             tracing::warn!(
@@ -534,21 +821,13 @@ async fn fetch_delta_psu_power_states(http: &HttpClient, chassis: &Value) -> Vec
         }
     };
 
-    let Some(members) = collection.get("Members").and_then(|m| m.as_array()) else {
-        return Vec::new();
-    };
-
-    let mut out = Vec::with_capacity(members.len());
-    for member in members {
-        let Some(uri) = member.get("@odata.id").and_then(|v| v.as_str()) else {
+    let mut out = Vec::with_capacity(collection.members.len());
+    for member in &collection.members {
+        let Some(uri) = member.nonempty() else {
             out.push(None);
             continue;
         };
-        if uri.is_empty() {
-            out.push(None);
-            continue;
-        }
-        match http.get(uri, HttpClient::DEFAULT_TIMEOUT).await {
+        match redfish_get::<PowerSupplyResource>(redfish, uri).await {
             Ok(psu) => out.push(decode_delta_psu_power_state(&psu)),
             Err(e) => {
                 tracing::warn!(uri, error = %e.message, "failed to fetch Delta PowerSupply");
@@ -559,11 +838,20 @@ async fn fetch_delta_psu_power_states(http: &HttpClient, chassis: &Value) -> Vec
     out
 }
 
-fn decode_delta_psu_power_state(psu: &Value) -> Option<bool> {
-    decode_power_value(psu.pointer("/Oem/deltaenergysystems/Power"))
-        .or_else(|| decode_power_value(psu.get("PowerState")))
+/// Decodes a PSU's power state, preferring the Delta OEM `Power` value over
+/// the standard `PowerState`. Returns `None` if neither decodes.
+fn decode_delta_psu_power_state(psu: &PowerSupplyResource) -> Option<bool> {
+    decode_power_value(
+        psu.oem
+            .delta
+            .as_ref()
+            .and_then(|delta| delta.power.as_ref()),
+    )
+    .or_else(|| decode_power_value(psu.power_state.as_ref()))
 }
 
+/// Decodes a boolean, or the strings `on`/`true` and `off`/`false` in any
+/// ASCII case. Returns `None` for anything else.
 fn decode_power_value(field: Option<&Value>) -> Option<bool> {
     match field? {
         Value::Bool(b) => Some(*b),
@@ -576,6 +864,10 @@ fn decode_power_value(field: Option<&Value>) -> Option<bool> {
     }
 }
 
+/// Combines PSU states into a shelf state.
+///
+/// Returns `Off` if any PSU is off, `On` if every PSU is on, and `Unknown` if
+/// the list is empty or any PSU state is unknown and none is off.
 fn aggregate_delta_psu_power_states(states: &[Option<bool>]) -> PowerState {
     if states.is_empty() {
         return PowerState::Unknown;
@@ -619,17 +911,23 @@ mod tests {
             )),
             host_endpoint: None,
             expected_inventory: None,
+            recovery: None,
+            runtime_config: None,
         }
     }
 
     fn test_node(base_url: &str) -> PowershelfGb200Delta {
         let config = test_config(NodeType::PowershelfGb200Delta);
         let mut powershelf = PowershelfGb200Delta::from_config(&config, "rack-01").unwrap();
-        powershelf.replace_http_for_test(base_url);
+        powershelf.replace_redfish_for_test(base_url);
         powershelf
     }
 
-    fn delta_psu(power: Value) -> Value {
+    fn parse<T: DeserializeOwned>(value: Value) -> T {
+        serde_json::from_value(value).expect("test fixture JSON")
+    }
+
+    fn delta_psu_json(power: Value) -> Value {
         serde_json::json!({
             "Oem": {
                 "deltaenergysystems": {
@@ -639,11 +937,11 @@ mod tests {
         })
     }
 
-    /// Mounts the chassis-collection -> chassis-document discovery layers that
-    /// `get_power_state` walks before reaching the PowerSubsystem. The chassis
-    /// `PowerSubsystem` link points at [`DELTA_TEST_SUBSYSTEM_PATH`], so this
-    /// composes with [`mount_delta_supplies_collection`].
-    async fn mount_delta_chassis_discovery(server: &MockServer) {
+    fn delta_psu(power: Value) -> PowerSupplyResource {
+        parse(delta_psu_json(power))
+    }
+
+    async fn mount_delta_power_state_tree(server: &MockServer, psu_powers: &[bool]) {
         Mock::given(method("GET"))
             .and(path(DELTA_CHASSIS_COLLECTION_ENDPOINT))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -661,7 +959,7 @@ mod tests {
                 "Manufacturer": "DELTA",
                 "Model": "810",
                 "PowerSubsystem": {
-                    "@odata.id": DELTA_TEST_SUBSYSTEM_PATH
+                    "@odata.id": "/redfish/v1/Chassis/chassis/PowerSubsystem"
                 },
                 "Oem": {
                     "deltaenergysystems": {}
@@ -669,10 +967,6 @@ mod tests {
             })))
             .mount(server)
             .await;
-    }
-
-    async fn mount_delta_power_state_tree(server: &MockServer, psu_powers: &[bool]) {
-        mount_delta_chassis_discovery(server).await;
         Mock::given(method("GET"))
             .and(path("/redfish/v1/Chassis/chassis/PowerSubsystem"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -709,47 +1003,11 @@ mod tests {
             Mock::given(method("GET"))
                 .and(path(psu_path))
                 .respond_with(
-                    ResponseTemplate::new(200).set_body_json(delta_psu(Value::Bool(*power))),
+                    ResponseTemplate::new(200).set_body_json(delta_psu_json(Value::Bool(*power))),
                 )
                 .mount(server)
                 .await;
         }
-    }
-
-    const DELTA_TEST_SUBSYSTEM_PATH: &str = "/redfish/v1/Chassis/chassis/PowerSubsystem";
-    const DELTA_TEST_SUPPLIES_PATH: &str =
-        "/redfish/v1/Chassis/chassis/PowerSubsystem/PowerSupplies";
-
-    /// Minimal chassis document whose `PowerSubsystem` link points at the tree
-    /// mounted by [`mount_delta_supplies_collection`], for driving
-    /// `fetch_delta_psu_power_states` directly.
-    fn delta_test_chassis() -> Value {
-        serde_json::json!({
-            "@odata.id": "/redfish/v1/Chassis/chassis",
-            "PowerSubsystem": { "@odata.id": DELTA_TEST_SUBSYSTEM_PATH }
-        })
-    }
-
-    /// Mounts only the `PowerSubsystem` -> `PowerSupplies` collection layers so a
-    /// test can exercise `fetch_delta_psu_power_states` with an arbitrary
-    /// `Members` array (including malformed or absent `@odata.id`s). Modeled on
-    /// [`mount_delta_power_state_tree`], but exposes the raw members and leaves
-    /// individual PSU documents to the caller so failure paths can be driven.
-    async fn mount_delta_supplies_collection(server: &MockServer, members: Value) {
-        Mock::given(method("GET"))
-            .and(path(DELTA_TEST_SUBSYSTEM_PATH))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "PowerSupplies": { "@odata.id": DELTA_TEST_SUPPLIES_PATH }
-            })))
-            .mount(server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path(DELTA_TEST_SUPPLIES_PATH))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "Members": members })),
-            )
-            .mount(server)
-            .await;
     }
 
     async fn mount_delta_power_shelf_tree(server: &MockServer) {
@@ -807,7 +1065,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path(FALLBACK_ENDPOINT))
             .respond_with(
-                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "kind": "fallback" })),
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "Name": "fallback" })),
             )
             .mount(&server)
             .await;
@@ -819,17 +1077,17 @@ mod tests {
         Mock::given(method("GET"))
             .and(path(MATCH_ENDPOINT))
             .respond_with(
-                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "kind": "match" })),
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "Name": "match" })),
             )
             .mount(&server)
             .await;
-        let http = HttpClient::for_test(&server.uri());
+        let redfish = crate::transport::redfish_client::redfish_client_for_test(&server.uri());
 
         let discovered = discover_member_url(
-            &http,
+            &redfish,
             COLLECTION_ENDPOINT,
-            |resource| resource.get("kind").and_then(Value::as_str) == Some("match"),
-            |resource| resource.get("kind").and_then(Value::as_str) == Some("fallback"),
+            |resource| resource.name.as_deref() == Some("match"),
+            |resource| resource.name.as_deref() == Some("fallback"),
             "test member not found",
             "failed to inspect test member",
         )
@@ -855,17 +1113,17 @@ mod tests {
         Mock::given(method("GET"))
             .and(path(FALLBACK_ENDPOINT))
             .respond_with(
-                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "kind": "fallback" })),
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "Name": "fallback" })),
             )
             .mount(&server)
             .await;
-        let http = HttpClient::for_test(&server.uri());
+        let redfish = crate::transport::redfish_client::redfish_client_for_test(&server.uri());
 
         let discovered = discover_member_url(
-            &http,
+            &redfish,
             COLLECTION_ENDPOINT,
             |_| false,
-            |resource| resource.get("kind").and_then(Value::as_str) == Some("fallback"),
+            |resource| resource.name.as_deref() == Some("fallback"),
             "test member not found",
             "failed to inspect test member",
         )
@@ -873,6 +1131,126 @@ mod tests {
         .unwrap();
 
         assert_eq!(discovered, FALLBACK_ENDPOINT);
+    }
+
+    fn delta_shelf_with_action_targets(on: &str, off: &str) -> DeltaResource {
+        parse(serde_json::json!({
+            "Oem": {
+                "deltaenergysystems": {
+                    "Actions": {
+                        "#PowerShelf.TurnOnPSUs": { "target": on },
+                        "#PowerShelf.TurnOffPSUs": { "target": off }
+                    }
+                }
+            }
+        }))
+    }
+
+    #[test]
+    fn power_shelf_has_delta_actions_requires_origin_relative_targets() {
+        let relative = "/redfish/v1/PowerEquipment/PowerShelves/1/Oem/deltaenergysystems/Actions/PowerShelf.TurnOnPSUs";
+        let off = "/redfish/v1/PowerEquipment/PowerShelves/1/Oem/deltaenergysystems/Actions/PowerShelf.TurnOffPSUs";
+
+        assert!(power_shelf_has_delta_actions(
+            &delta_shelf_with_action_targets(relative, off)
+        ));
+        assert!(!power_shelf_has_delta_actions(
+            &delta_shelf_with_action_targets("https://evil.example/TurnOn", off)
+        ));
+        assert!(!power_shelf_has_delta_actions(
+            &delta_shelf_with_action_targets(relative, "//evil.example/TurnOff")
+        ));
+        assert!(!power_shelf_has_delta_actions(
+            &delta_shelf_with_action_targets("PowerShelf.TurnOnPSUs", off)
+        ));
+    }
+
+    #[test]
+    fn delta_chassis_decodes_null_action_shapes() {
+        for actions in [
+            Value::Null,
+            serde_json::json!({ "Oem": null }),
+            serde_json::json!({ "#Chassis.Reset": null }),
+        ] {
+            let chassis: DeltaResource = parse(serde_json::json!({
+                "Manufacturer": "DELTA",
+                "PowerSubsystem": { "@odata.id": "/redfish/v1/Chassis/chassis/PowerSubsystem" },
+                "Actions": actions,
+            }));
+
+            assert!(
+                chassis_resource_looks_like_delta_powershelf(&chassis),
+                "{actions}"
+            );
+            assert!(!chassis_resource_has_delta_reset(&chassis), "{actions}");
+        }
+    }
+
+    #[tokio::test]
+    async fn discover_member_url_skips_power_shelf_with_absolute_action_targets() {
+        const COLLECTION_ENDPOINT: &str = "/redfish/v1/PowerEquipment/PowerShelves";
+        const ABSOLUTE_ENDPOINT: &str = "/redfish/v1/PowerEquipment/PowerShelves/absolute";
+        const RELATIVE_ENDPOINT: &str = "/redfish/v1/PowerEquipment/PowerShelves/relative";
+        let on = "/redfish/v1/PowerEquipment/PowerShelves/relative/Actions/TurnOn";
+        let off = "/redfish/v1/PowerEquipment/PowerShelves/relative/Actions/TurnOff";
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(COLLECTION_ENDPOINT))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Members": [
+                    { "@odata.id": ABSOLUTE_ENDPOINT },
+                    { "@odata.id": RELATIVE_ENDPOINT }
+                ]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(ABSOLUTE_ENDPOINT))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Oem": {
+                    "deltaenergysystems": {
+                        "Actions": {
+                            "#PowerShelf.TurnOnPSUs": {
+                                "target": "https://evil.example/TurnOn"
+                            },
+                            "#PowerShelf.TurnOffPSUs": {
+                                "target": "https://evil.example/TurnOff"
+                            }
+                        }
+                    }
+                }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(RELATIVE_ENDPOINT))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Oem": {
+                    "deltaenergysystems": {
+                        "Actions": {
+                            "#PowerShelf.TurnOnPSUs": { "target": on },
+                            "#PowerShelf.TurnOffPSUs": { "target": off }
+                        }
+                    }
+                }
+            })))
+            .mount(&server)
+            .await;
+        let redfish = crate::transport::redfish_client::redfish_client_for_test(&server.uri());
+
+        let discovered = discover_member_url(
+            &redfish,
+            COLLECTION_ENDPOINT,
+            power_shelf_has_delta_actions,
+            |_| false,
+            "no actionable Delta powershelf found",
+            "failed to inspect test member",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(discovered, RELATIVE_ENDPOINT);
     }
 
     #[test]
@@ -891,7 +1269,7 @@ mod tests {
     }
 
     #[test]
-    fn replace_http_for_test_clears_cached_resource_urls() {
+    fn replace_redfish_for_test_clears_cached_resource_urls() {
         let mut powershelf = PowershelfGb200Delta::from_config(
             &test_config(NodeType::PowershelfGb200Delta),
             "rack-01",
@@ -906,7 +1284,7 @@ mod tests {
             .set("/redfish/v1/PowerEquipment/PowerShelves/old".to_owned())
             .unwrap();
 
-        powershelf.replace_http_for_test("http://127.0.0.1:12345");
+        powershelf.replace_redfish_for_test("http://127.0.0.1:12345");
 
         assert!(powershelf.chassis_url.get().is_none());
         assert!(powershelf.power_shelf_url.get().is_none());
@@ -950,17 +1328,20 @@ mod tests {
             decode_delta_psu_power_state(&delta_psu(serde_json::json!("PoweringOn"))),
             None
         );
-        assert_eq!(decode_delta_psu_power_state(&serde_json::json!({})), None);
+        assert_eq!(
+            decode_delta_psu_power_state(&parse(serde_json::json!({}))),
+            None
+        );
     }
 
     #[test]
     fn decode_delta_psu_power_state_falls_back_to_top_level_power_state() {
         assert_eq!(
-            decode_delta_psu_power_state(&serde_json::json!({"PowerState": "On"})),
+            decode_delta_psu_power_state(&parse(serde_json::json!({"PowerState": "On"}))),
             Some(true)
         );
         assert_eq!(
-            decode_delta_psu_power_state(&serde_json::json!({"PowerState": "Off"})),
+            decode_delta_psu_power_state(&parse(serde_json::json!({"PowerState": "Off"}))),
             Some(false)
         );
     }
@@ -981,168 +1362,6 @@ mod tests {
         let powershelf = test_node(&server.uri());
 
         assert_eq!(powershelf.get_power_state().await.unwrap(), PowerState::Off);
-    }
-
-    #[tokio::test]
-    async fn fetch_delta_psu_power_states_yields_one_entry_per_member_none_on_failure() {
-        const PSU_ON: &str = "/redfish/v1/Chassis/chassis/PowerSubsystem/PowerSupplies/on";
-        const PSU_OFF: &str = "/redfish/v1/Chassis/chassis/PowerSubsystem/PowerSupplies/off";
-        const PSU_UNREACHABLE: &str =
-            "/redfish/v1/Chassis/chassis/PowerSubsystem/PowerSupplies/unreachable";
-
-        let server = MockServer::start().await;
-        mount_delta_supplies_collection(
-            &server,
-            serde_json::json!([
-                { "@odata.id": PSU_ON },          // readable, powered on   -> Some(true)
-                { "@odata.id": PSU_OFF },         // readable, powered off  -> Some(false)
-                { "@odata.id": PSU_UNREACHABLE }, // fetch fails (503)      -> None
-                { "Name": "no-odata-id" },        // member without @odata.id -> None
-                { "@odata.id": "" },              // member with empty uri  -> None
-            ]),
-        )
-        .await;
-        Mock::given(method("GET"))
-            .and(path(PSU_ON))
-            .respond_with(ResponseTemplate::new(200).set_body_json(delta_psu(Value::Bool(true))))
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path(PSU_OFF))
-            .respond_with(ResponseTemplate::new(200).set_body_json(delta_psu(Value::Bool(false))))
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path(PSU_UNREACHABLE))
-            .respond_with(ResponseTemplate::new(503))
-            .mount(&server)
-            .await;
-
-        let http = HttpClient::for_test(&server.uri());
-        let states = fetch_delta_psu_power_states(&http, &delta_test_chassis()).await;
-
-        // One positional entry per member: Some(_) when the PSU is readable,
-        // None when it is missing an @odata.id, has an empty URI, or fails to
-        // fetch. Regression guard: unreadable PSUs must not be dropped (which
-        // would let the readable ones aggregate to a falsely-confident state).
-        assert_eq!(states, vec![Some(true), Some(false), None, None, None]);
-        assert_eq!(
-            aggregate_delta_psu_power_states(&states),
-            PowerState::Off,
-            "a Some(false) still forces Off even alongside unreadable PSUs"
-        );
-    }
-
-    #[tokio::test]
-    async fn fetch_delta_psu_power_states_unreadable_psu_downgrades_on_to_unknown() {
-        const PSU_ON: &str = "/redfish/v1/Chassis/chassis/PowerSubsystem/PowerSupplies/on";
-        const PSU_UNREACHABLE: &str =
-            "/redfish/v1/Chassis/chassis/PowerSubsystem/PowerSupplies/unreachable";
-
-        let server = MockServer::start().await;
-        mount_delta_supplies_collection(
-            &server,
-            serde_json::json!([
-                { "@odata.id": PSU_ON },
-                { "@odata.id": PSU_UNREACHABLE },
-            ]),
-        )
-        .await;
-        Mock::given(method("GET"))
-            .and(path(PSU_ON))
-            .respond_with(ResponseTemplate::new(200).set_body_json(delta_psu(Value::Bool(true))))
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path(PSU_UNREACHABLE))
-            .respond_with(ResponseTemplate::new(503))
-            .mount(&server)
-            .await;
-
-        let http = HttpClient::for_test(&server.uri());
-        let states = fetch_delta_psu_power_states(&http, &delta_test_chassis()).await;
-
-        assert_eq!(states, vec![Some(true), None]);
-        assert_eq!(
-            aggregate_delta_psu_power_states(&states),
-            PowerState::Unknown,
-            "an unreadable PSU must prevent a false On aggregate"
-        );
-    }
-
-    #[tokio::test]
-    async fn fetch_delta_psu_power_states_is_empty_without_power_subsystem() {
-        let server = MockServer::start().await;
-        let http = HttpClient::for_test(&server.uri());
-
-        // Chassis with no PowerSubsystem link at all.
-        let chassis = serde_json::json!({ "@odata.id": "/redfish/v1/Chassis/chassis" });
-        let states = fetch_delta_psu_power_states(&http, &chassis).await;
-
-        assert!(states.is_empty());
-        assert_eq!(
-            aggregate_delta_psu_power_states(&states),
-            PowerState::Unknown
-        );
-    }
-
-    #[tokio::test]
-    async fn fetch_delta_psu_power_states_is_empty_without_power_supplies_link() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path(DELTA_TEST_SUBSYSTEM_PATH))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!({ "Id": "PowerSubsystem" })),
-            )
-            .mount(&server)
-            .await;
-
-        let http = HttpClient::for_test(&server.uri());
-        let states = fetch_delta_psu_power_states(&http, &delta_test_chassis()).await;
-
-        assert!(states.is_empty());
-        assert_eq!(
-            aggregate_delta_psu_power_states(&states),
-            PowerState::Unknown
-        );
-    }
-
-    #[tokio::test]
-    async fn get_power_state_reports_unknown_when_a_delta_psu_is_unreadable() {
-        const PSU_ON: &str = "/redfish/v1/Chassis/chassis/PowerSubsystem/PowerSupplies/1";
-        const PSU_UNREACHABLE: &str = "/redfish/v1/Chassis/chassis/PowerSubsystem/PowerSupplies/2";
-
-        let server = MockServer::start().await;
-        mount_delta_chassis_discovery(&server).await;
-        mount_delta_supplies_collection(
-            &server,
-            serde_json::json!([
-                { "@odata.id": PSU_ON },
-                { "@odata.id": PSU_UNREACHABLE },
-            ]),
-        )
-        .await;
-        Mock::given(method("GET"))
-            .and(path(PSU_ON))
-            .respond_with(ResponseTemplate::new(200).set_body_json(delta_psu(Value::Bool(true))))
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path(PSU_UNREACHABLE))
-            .respond_with(ResponseTemplate::new(503))
-            .mount(&server)
-            .await;
-
-        let powershelf = test_node(&server.uri());
-
-        // End-to-end through get_power_state: one readable "on" PSU alongside one
-        // unreadable PSU must report Unknown, not On. Before the fix the
-        // unreadable PSU was dropped and the shelf falsely reported On.
-        assert_eq!(
-            powershelf.get_power_state().await.unwrap(),
-            PowerState::Unknown
-        );
     }
 
     #[tokio::test]
@@ -1180,19 +1399,19 @@ mod tests {
             ))
             .and(body_json(serde_json::json!({})))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
-            .expect(2)
+            .expect(3)
             .mount(&server)
             .await;
         let powershelf = test_node(&server.uri());
 
-        powershelf
-            .set_power_state(PowerOp::Off, PowerTargetType::System)
-            .await
-            .unwrap();
-        powershelf
-            .set_power_state(PowerOp::ForceOff, PowerTargetType::System)
-            .await
-            .unwrap();
+        // Graceful requests are served as ForceOff because Delta has no
+        // graceful power off.
+        for op in [PowerOp::Off, PowerOp::GracefulShutdown, PowerOp::ForceOff] {
+            powershelf
+                .set_power_state(op, PowerTargetType::System)
+                .await
+                .unwrap_or_else(|err| panic!("{op:?}: {err}"));
+        }
     }
 
     #[tokio::test]
@@ -1205,7 +1424,6 @@ mod tests {
 
         for op in [
             PowerOp::PowerCycle,
-            PowerOp::GracefulShutdown,
             PowerOp::GracefulRestart,
             PowerOp::ForceRestart,
             PowerOp::Nmi,

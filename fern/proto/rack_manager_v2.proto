@@ -1,0 +1,226 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+syntax = "proto3";
+
+package rack_manager_v2;
+
+import "rack_manager.proto";
+
+service RackManagerV2 {
+  /*
+   * ConfigureScaleUpFabricManager declaratively configures the scale-up fabric across
+   * all supplied switches. The caller describes the desired fabric configuration and
+   * RMS starts a single asynchronous reconciliation job that performs only the actions
+   * required to move the observed switch state toward the desired state: it skips
+   * disabling the fabric when it is already disabled, and does nothing when the observed
+   * configuration matches the request and controller activation is verified.
+   *
+   * The call is safe to invoke periodically in a loop to keep switch configuration
+   * "as intended" without causing fabric availability issues. RMS aims to run one
+   * reconciliation job at a time; callers should poll GetJobStatus before resubmitting
+   * and avoid issuing concurrent ConfigureScaleUpFabricManager requests.
+   *
+   * Without layout, requests with an empty topology_type or otherwise invalid
+   * config are rejected synchronously with INVALID_ARGUMENT; no job is started.
+   *
+   * Returns a job_id; poll it via rack_manager.GetJobStatus. Without layout,
+   * successful jobs return JSON-encoded rack_manager.ScaleUpFabricStatus in
+   * rack_manager.JobStatus.result_json.
+   *
+   * With layout, the resulting configuration contains one cluster and primary per
+   * fabric, with administrative switch connectivity matching the requested layout.
+   * Submit the complete desired fabric set in one request because the fabrics
+   * share switch connectivity settings. GetJobStatus reports execution state and
+   * errors. InspectScaleUpFabrics reports current fabric members and sampled
+   * component status, including partial configurations after a failed job.
+   * Completion requires verified administrative switch settings and configured
+   * fabric-manager control planes, not compute software or operational GPU links.
+   */
+  rpc ConfigureScaleUpFabricManager(ConfigureScaleUpFabricManagerRequest) returns (ConfigureScaleUpFabricManagerResponse) {}
+
+  /*
+   * StartSystemValidation launches an NVSSVT system validation scan against each
+   * Device Under Test (DUT) in the request, each as its own asynchronous RMS job.
+   * NVSSVT itself may run for a long time, and each node's scan runs independently:
+   * one node's admission or launch failure does not affect any other node's scan.
+   *
+   * Returns a parent job_id (response.job_id); poll it via rack_manager.GetJobStatus
+   * to track the batch as a whole. Each admitted node's own scan job_id is also
+   * returned in `jobs`, for polling and result retrieval scoped to that node. On
+   * completion, each scan job's rack_manager.JobStatus.result_json holds its
+   * parsed per-DUT status and summary report JSON.
+   */
+  rpc StartSystemValidation(StartSystemValidationRequest) returns (StartSystemValidationResponse) {}
+}
+
+/*
+ * ScaleUpFabricConfig captures the desired scale-up fabric configuration in logical
+ * terms, so RMS can apply it regardless of which switch API it uses to configure
+ * the fabric manager.
+ */
+message ScaleUpFabricConfig {
+  // Topology to be configured for the scale-up fabric (applied to the fabric manager).
+  string topology_type = 1;
+
+  // Additional static configuration entries to apply to the fabric manager. This is a
+  // generic pass-through for any configuration not modeled by a dedicated field
+  // above; RMS applies each entry via the fabric manager's static-config API. Each
+  // (config_file_name, key) must be unique; duplicate keys are rejected.
+  // With layout, RMS supplies required static settings for each fabric size.
+  // Matching caller values are accepted; conflicts with required settings or removals
+  // are rejected. Omitted unmanaged keys remain unchanged. Without layout, all omitted
+  // static settings remain unchanged.
+  repeated rack_manager.ScaleUpFabricStaticConfig extra_static_configs = 2;
+}
+
+/*
+ * ConfigureScaleUpFabricManagerRequest declaratively describes the desired scale-up
+ * fabric across a set of switches. RMS reconciles the switches toward this desired
+ * state, applying only the changes that are required (for example, it does nothing
+ * when the observed configuration matches this request and controller activation
+ * is verified).
+ *
+ * Direct switch requests use each node's host_endpoint for address and credentials.
+ */
+message ConfigureScaleUpFabricManagerRequest {
+  // Without layout, RMS validates all nodes and configures only switches; other
+  // recognized node types are ignored. With layout, include every physical switch,
+  // even switches outside the requested fabrics, and compute trays for selection.
+  // At least one switch is required, and node IDs must be nonempty and unique.
+  //
+  // RMS uses NodeInfo.type when set to a value other than NODE_TYPE_UNSPECIFIED.
+  // Otherwise, RMS uses node_descriptor to identify the node's role.
+  // Every node must resolve to a supported type. With layout, only switch and
+  // compute nodes are accepted.
+  // The order of nodes does not determine which fabric they belong to.
+  //
+  // Each switch needs host_endpoint and credentials. With layout, each compute entry
+  // represents one tray and needs bmc_endpoint and credentials for reading its position.
+  // RMS reads compute BMCs for layout discovery; it does not configure compute hosts.
+  //
+  // Compute entries are required unless layout requests one fabric covering the full
+  // physical compute and switch capacity. For that layout, either omit all compute
+  // entries or include every compute tray. Omission avoids compute BMC reads.
+  // For other layouts, compute trays outside the requested fabrics may be omitted.
+  rack_manager.NodeSet nodes = 1;
+
+  // ID of the switch node that should run the fabric manager (the primary host).
+  // If absent, RMS selects the switch at the lowest position in the rack.
+  optional string primary_switch_node_id = 2;
+
+  // Selects the CA and RMS client credentials for all switches in this request.
+  // If omitted, RMS uses --default-switch-domain. TLS server-name verification
+  // uses each endpoint's identity or the configured DNS override, not this value.
+  optional string domain = 3;
+
+  // Desired scale-up fabric configuration to reconcile the switches toward.
+  // With layout, caller settings are shared by selected fabrics; managed static
+  // values can differ by fabric size.
+  ScaleUpFabricConfig config = 4;
+
+  // Optional arrangement of independent fabrics within the supplied inventory;
+  // fabric sizes may differ from the complete physical topology.
+  // Supply the complete desired fabric set in one call to coordinate shared links.
+  // Requires config and at least one fabric; primary_switch_node_id must be absent.
+  // One fabric matching the complete physical compute and switch capacity restores
+  // full connectivity and one controller cluster. Other layouts isolate unused capacity.
+  // When absent, one cluster is configured without changing managed link settings.
+  ScaleUpFabricLayout layout = 5;
+}
+
+// ConfigureScaleUpFabricManagerResponse returns the handle to the reconciliation job.
+message ConfigureScaleUpFabricManagerResponse {
+  // ID of the asynchronous job that reconciles the scale-up fabric.
+  // Poll it via rack_manager.GetJobStatus. Read live fabric members and component
+  // status via rack_manager.InspectScaleUpFabrics. Successful no-layout jobs also return
+  // JSON-encoded rack_manager.ScaleUpFabricStatus in result_json.
+  string job_id = 1;
+
+  // Empty without layout. With layout, identifies the nodes and primary selected
+  // for each requested fabric, in request order. Selection does not indicate that
+  // configuration has completed; use job_id to track execution.
+  repeated ScaleUpFabricMembers selected_fabrics = 2;
+}
+
+// Describes the fabrics to create from the nodes in the request.
+// Supported sizes and placements depend on the server and physical topology.
+// Physical positions are discovered from the supplied nodes, not specified by offsets.
+message ScaleUpFabricLayout {
+  // Complete desired fabric set for the supplied inventory.
+  // Unresolved positions, ambiguous topology, or unsupported layouts fail admission.
+  // Selected node groups must not overlap. Unassigned capacity is isolated and
+  // controllers on unassigned switches are disabled. Results follow this list's
+  // order; node selection uses physical positions.
+  repeated ScaleUpFabricSpec fabrics = 1;
+}
+
+// Target size of one independently managed fabric. RMS selects nonoverlapping node
+// groups. The same inventory and layout produce the same selection; changing either
+// may change the selected nodes.
+message ScaleUpFabricSpec {
+  // Positive total number of physical compute trays in this fabric.
+  // The requested size and placement must be supported by the server.
+  uint32 compute_tray_count = 1;
+
+  // Positive total number of physical switch trays in this fabric.
+  uint32 switch_tray_count = 2;
+
+  // Optional primary preference. The selected fabric must include this switch as primary.
+  // If absent, a primary is selected deterministically from this fabric's switches.
+  optional string primary_switch_node_id = 3;
+}
+
+// Nodes and primary selected for one requested fabric, not observed configuration.
+message ScaleUpFabricMembers {
+  // Selected compute tray IDs; empty when full-topology compute inventory is omitted.
+  repeated string compute_node_ids = 1;
+
+  // Selected switch tray IDs from the request's switch inventory.
+  repeated string switch_node_ids = 2;
+
+  // Selected primary switch ID, which belongs to switch_node_ids.
+  string primary_switch_node_id = 3;
+}
+
+// StartSystemValidationRequest identifies the nodes to scan. NVSSVT reaches each
+// Device Under Test (DUT) over its BMC (required) and, when supplied, its host OS, so
+// every node's bmc_endpoint must carry credentials.
+message StartSystemValidationRequest {
+  rack_manager.NodeSet nodes = 1;
+
+  // Passed through to NVSSVT as --config-override for every node's scan. Left
+  // unset, NVSSVT applies its own configuration defaults. RMS does not
+  // interpret or validate this value; NVSSVT rejects it if malformed.
+  string config_override = 2;
+}
+
+// NodeSystemValidationJobInfo pairs a node with its async system validation job ID.
+message NodeSystemValidationJobInfo {
+  string node_id = 1; // Node identifier, as supplied in the request
+  string job_id = 2; // System validation job ID returned for this node
+}
+
+// StartSystemValidationResponse reports the launched scans' job handles, one
+// per admitted node. The NVSSVT process id and log directory live on the
+// launcher's side of the pod and are not addressable by callers, so they are
+// reported in RMS's logs rather than here; each scan's log directory also
+// appears in its job's result_json once it completes.
+message StartSystemValidationResponse {
+  rack_manager.NodeBatchResponse response = 1; // response.job_id is the parent job ID for GetJobStatus
+  repeated NodeSystemValidationJobInfo jobs = 2; // Individual scan job ID per node
+}

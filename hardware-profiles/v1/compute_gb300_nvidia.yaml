@@ -1,0 +1,269 @@
+# NVIDIA GB300: shared HGX targets with the GB300 upload/activation driver.
+schema_version: 1
+profile_id: compute_gb300_nvidia
+matches:
+  node_type: compute_gb300_nvidia
+  enabled: true
+# Runtime settings for the implementation selected by matches.node_type.
+driver:
+  nvfwupd_server_profile: compute_gb300
+  redfish:
+    computer_system_id: System_0
+    bmc_manager_id: BMC_0
+    hmc_manager_id: HGX_BMC_0
+    device_info_timeout: 5m # Limit for a topology/device-info read, not the whole firmware job.
+    connect_timeout: 10s # Maximum time to connect the shared Redfish client.
+    request_timeout: 30s # Limit for one shared Redfish read or power-control request.
+    upload_timeout: 10m # Limit for one direct Redfish multipart upload.
+    # null keeps resource/action discovery; direct reads first try conventional ID-based paths.
+    # Readiness uses the explicit fixed endpoint below.
+    power:
+      system_state_path: null # Host state: direct ID lookup with discovery fallback; activation discovers systems.
+      system_reset_path: null # Discover ComputerSystem.Reset for host on/off/restart.
+      bmc_reset_path: null # Discover Manager.Reset for bmc_manager_id.
+      hmc_reset_path: null # Discover Manager.Reset for hmc_manager_id.
+      aux_power_cycle_path: null # Discover NvidiaChassis.AuxPowerReset on chassis members.
+      bmc_ready_path: /redfish/v1 # GET this fixed endpoint after power cycling.
+
+  # Low-level NVFWUPD timing; firmware.polling below controls RMS task polling.
+  timing:
+    transport: # NVFWUPD HTTP requests and firmware payload uploads.
+      connect_timeout: 15m # Maximum time to establish an NVFWUPD HTTP connection.
+      request_timeout: 15m # Timeout for a normal NVFWUPD Redfish request.
+      upload_timeout: 15m # Timeout for sending one firmware payload to the BMC.
+      reachability_timeout: 2m # Timeout for one NVFWUPD reachability or discovery GET.
+
+    pre_update: # Readiness and write-protection checks before uploading firmware.
+      query_timeout: 30s # Timeout for each background-copy or write-protection query.
+      # Device background copy is reported as Oem.Nvidia.BackgroundCopyStatus on chassis resources.
+      # RMS waits for Completed before upload; artifact downloads use separate limits.
+      background_copy_timeout: 15m # Overall wait budget for device background copy to complete.
+      background_copy_poll_interval: 10s # Delay between polls of device BackgroundCopyStatus.
+      write_protect_inventory_attempts: 3 # Total attempts to discover inventory for write-protection checks.
+      write_protect_inventory_retry_interval: 30s # Delay between failed write-protection inventory reads.
+
+    activation: # Power-cycle command delays and retries.
+      power_off_delay: 20s # Wait after host power-off before auxiliary power cycling.
+      ac_cycle_attempts: 2 # Total auxiliary-cycle attempts in the verified compute_gb200 sequence.
+      ac_cycle_stabilization: 3m # Wait after each auxiliary cycle in that verified sequence; zero is allowed.
+      command_retries: 10 # Retries after the first failed power-off, auxiliary-cycle, or power-on command.
+      command_retry_interval: 1m # Delay between activation command retries.
+
+    recovery: # BMC and host readiness after power cycling.
+      bmc_attempts: 60 # Maximum BMC readiness checks after auxiliary power cycling.
+      bmc_interval: 5s # Wait before each BMC readiness check.
+      power_on_attempts: 60 # Maximum power-state checks; the verified sequence uses this for both Off and On.
+      power_on_interval: 5s # Wait before each host power-state check.
+      power_on_resend_interval: 1m # Minimum polling time before resending power-on while the host remains Off.
+      probe_timeout: 30s # Timeout for activation reads/reset actions and BMC recovery probes.
+
+    inventory_recovery: # Internal expected-inventory retries after activation.
+      retries: 3 # Extra expected-inventory reads after activation when inventory is not ready.
+      retry_interval: 2m # Delay between internal expected-inventory recovery reads.
+
+firmware:
+  polling:
+    task_timeout: 90m # Polling budget per started firmware task; excludes upload and activation.
+    interval: 5s # Delay between firmware task-status polls.
+    transient_error_budget: 15m # Budget for consecutive transient task-poll failures.
+
+  verification:
+    enabled: true
+    settle_delay: 60s # Wait after activation before checking installed firmware versions.
+    attempts: 5 # Total outer version-check attempts, including the first.
+    retry_interval: 60s # Delay between outer version-check attempts.
+
+  # Target legend
+  #
+  # Identity
+  #   id: Unique internal target identifier.
+  #   component_key: Literal component name for requests and manifest filters.
+  #   source_components: Manifest components supplying firmware.
+  #     All eligible Locations are applied in manifest order within the target.
+
+  # Selection
+  #   default_apply: Include when no components are requested (default: true).
+  #     false = opt-in; may still update as part of a full package.
+  #   filename: Optional suffix/contains filters; all must match.
+  #     case_insensitive: Ignore ASCII case (default: false).
+
+  # Destination (choose one)
+  #   request_targets: Explicit Redfish paths.
+  #   driver_default_targets: true = driver/package chooses targets.
+  #   update_parameters.Targets: All paths for one multipart upload; [] is explicit.
+  #     HttpPushUriTargets is an alternative key. Do not combine destination forms.
+  #   update_parameters: JSON/YAML object with other upload parameters.
+  #   oem_parameters: Optional JSON/YAML object sent as OemParameters.
+
+  # Execution
+  #   stage: Positive update-group number for this node; lower numbers run first.
+  #     Example: stage 10 finishes before stage 20 starts; gaps are allowed.
+  #     Targets sharing a stage run sequentially in YAML order.
+  #     Only selected targets run; stages with no selected targets are omitted.
+  #   activate_after_stage: Activate after this stage's updates, before the next stage.
+  #     Requires request activation and at least one applied update.
+  #     All targets in a stage must agree on this flag.
+
+  targets:
+    # Default full-package update of the complete HGX chassis.
+    - id: hmc
+      component_key: HMC
+      source_components: [HMC]
+      request_targets: [/redfish/v1/Chassis/HGX_Chassis_0]
+      default_apply: true
+      stage: 10
+      activate_after_stage: true
+
+    # Optional AP-specific updates sourced from the same HMC package.
+    - id: cpu_0
+      component_key: CPU_0
+      source_components: [HMC]
+      request_targets: [/redfish/v1/UpdateService/FirmwareInventory/HGX_FW_CPU_0]
+      default_apply: false
+      stage: 10
+      activate_after_stage: true
+    - id: cpu_1
+      component_key: CPU_1
+      source_components: [HMC]
+      request_targets: [/redfish/v1/UpdateService/FirmwareInventory/HGX_FW_CPU_1]
+      default_apply: false
+      stage: 10
+      activate_after_stage: true
+    - id: gpu_0
+      component_key: GPU_0
+      source_components: [HMC]
+      request_targets: [/redfish/v1/UpdateService/FirmwareInventory/HGX_FW_GPU_0]
+      default_apply: false
+      stage: 10
+      activate_after_stage: true
+    - id: gpu_1
+      component_key: GPU_1
+      source_components: [HMC]
+      request_targets: [/redfish/v1/UpdateService/FirmwareInventory/HGX_FW_GPU_1]
+      default_apply: false
+      stage: 10
+      activate_after_stage: true
+    - id: gpu_2
+      component_key: GPU_2
+      source_components: [HMC]
+      request_targets: [/redfish/v1/UpdateService/FirmwareInventory/HGX_FW_GPU_2]
+      default_apply: false
+      stage: 10
+      activate_after_stage: true
+    - id: gpu_3
+      component_key: GPU_3
+      source_components: [HMC]
+      request_targets: [/redfish/v1/UpdateService/FirmwareInventory/HGX_FW_GPU_3]
+      default_apply: false
+      stage: 10
+      activate_after_stage: true
+    - id: hgx_bmc_0
+      component_key: HGX_BMC_0
+      source_components: [HMC]
+      request_targets: [/redfish/v1/UpdateService/FirmwareInventory/HGX_FW_BMC_0]
+      default_apply: false
+      stage: 10
+      activate_after_stage: true
+    - id: fpga_0
+      component_key: FPGA_0
+      source_components: [HMC]
+      request_targets: [/redfish/v1/UpdateService/FirmwareInventory/HGX_FW_FPGA_0]
+      default_apply: false
+      stage: 10
+      activate_after_stage: true
+    - id: fpga_1
+      component_key: FPGA_1
+      source_components: [HMC]
+      request_targets: [/redfish/v1/UpdateService/FirmwareInventory/HGX_FW_FPGA_1]
+      default_apply: false
+      stage: 10
+      activate_after_stage: true
+    - id: cpld_0
+      component_key: CPLD_0
+      source_components: [HMC]
+      request_targets: [/redfish/v1/UpdateService/FirmwareInventory/HGX_FW_CPLD_0]
+      default_apply: false
+      stage: 10
+      activate_after_stage: true
+    - id: erot_bmc_0
+      component_key: EROT_BMC_0
+      source_components: [HMC]
+      request_targets: [/redfish/v1/UpdateService/FirmwareInventory/HGX_FW_ERoT_BMC_0]
+      default_apply: false
+      stage: 10
+      activate_after_stage: true
+    - id: erot_cpu_0
+      component_key: EROT_CPU_0
+      source_components: [HMC]
+      request_targets: [/redfish/v1/UpdateService/FirmwareInventory/HGX_FW_ERoT_CPU_0]
+      default_apply: false
+      stage: 10
+      activate_after_stage: true
+    - id: erot_cpu_1
+      component_key: EROT_CPU_1
+      source_components: [HMC]
+      request_targets: [/redfish/v1/UpdateService/FirmwareInventory/HGX_FW_ERoT_CPU_1]
+      default_apply: false
+      stage: 10
+      activate_after_stage: true
+    - id: erot_fpga_0
+      component_key: EROT_FPGA_0
+      source_components: [HMC]
+      request_targets: [/redfish/v1/UpdateService/FirmwareInventory/HGX_FW_ERoT_FPGA_0]
+      default_apply: false
+      stage: 10
+      activate_after_stage: true
+    - id: erot_fpga_1
+      component_key: EROT_FPGA_1
+      source_components: [HMC]
+      request_targets: [/redfish/v1/UpdateService/FirmwareInventory/HGX_FW_ERoT_FPGA_1]
+      default_apply: false
+      stage: 10
+      activate_after_stage: true
+    - id: inforom_gpu_0
+      component_key: INFOROM_GPU_0
+      source_components: [HMC]
+      request_targets: [/redfish/v1/UpdateService/FirmwareInventory/HGX_InfoROM_GPU_0]
+      default_apply: false
+      stage: 10
+      activate_after_stage: true
+    - id: inforom_gpu_1
+      component_key: INFOROM_GPU_1
+      source_components: [HMC]
+      request_targets: [/redfish/v1/UpdateService/FirmwareInventory/HGX_InfoROM_GPU_1]
+      default_apply: false
+      stage: 10
+      activate_after_stage: true
+    - id: inforom_gpu_2
+      component_key: INFOROM_GPU_2
+      source_components: [HMC]
+      request_targets: [/redfish/v1/UpdateService/FirmwareInventory/HGX_InfoROM_GPU_2]
+      default_apply: false
+      stage: 10
+      activate_after_stage: true
+    - id: inforom_gpu_3
+      component_key: INFOROM_GPU_3
+      source_components: [HMC]
+      request_targets: [/redfish/v1/UpdateService/FirmwareInventory/HGX_InfoROM_GPU_3]
+      default_apply: false
+      stage: 10
+      activate_after_stage: true
+    - id: pcie_switch_config_0
+      component_key: PCIE_SWITCH_CONFIG_0
+      source_components: [HMC]
+      request_targets: [/redfish/v1/UpdateService/FirmwareInventory/HGX_PCIeSwitchConfig_0]
+      default_apply: false
+      stage: 10
+      activate_after_stage: true
+
+    # Host-BMC packages intentionally let the driver derive their target list.
+    - id: bmc
+      component_key: BMC
+      source_components: [BMC]
+      driver_default_targets: true
+      default_apply: true
+      stage: 10
+      activate_after_stage: true
+
+  activation:
+    strategy: full_compute_power_cycle

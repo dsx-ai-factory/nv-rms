@@ -100,7 +100,11 @@ spec:
             - -c
             - |
               set -e
-              PATCH='{"spec":{"databases":{"{{ .Values.rmsPostgres.patchExternalCluster.databaseName }}":"{{ .Values.rmsPostgres.patchExternalCluster.userName }}"},"users":{"{{ .Values.rmsPostgres.patchExternalCluster.userName }}":["superuser","createdb"]}}}'
+              # Empty role flags. The operator still creates a LOGIN role and
+              # makes it the owner of the database named in spec.databases.
+              # SUPERUSER and CREATEDB are cluster-wide; sqlx migrations only
+              # create tables in the database this user already owns.
+              PATCH='{"spec":{"databases":{"{{ .Values.rmsPostgres.patchExternalCluster.databaseName }}":"{{ .Values.rmsPostgres.patchExternalCluster.userName }}"},"users":{"{{ .Values.rmsPostgres.patchExternalCluster.userName }}":[]}}}'
               kubectl patch postgresql {{ .Values.rmsPostgres.patchExternalCluster.postgresqlName }} \
                 -n {{ .Values.rmsPostgres.patchExternalCluster.postgresqlNamespace }} \
                 --type=merge -p "$PATCH"

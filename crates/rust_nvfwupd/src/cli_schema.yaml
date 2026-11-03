@@ -108,7 +108,7 @@ Commands:
         Short: b
         Long: background
         Action: store_true
-      - Description: API request timeout value in seconds
+      - Description: API request timeout value in seconds; for NVOS .bin updates, this also controls SFTP upload timeout
         Short: t
         Long: timeout
         Action: store

@@ -1,0 +1,72 @@
+#
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Build a standalone arm64 nvfwupd binary with a glibc 2.17 baseline from an
+# x86_64 builder.
+#
+# The direct aarch64-unknown-linux-gnu Cargo cross-build inherits the host
+# aarch64 sysroot. On newer hosts that can produce binaries requiring newer
+# glibc symbols than the Python nvfwupd_arm64 artifact required.
+#
+# manylinux2014 is based on CentOS 7 and glibc 2.17, which matches the
+# observed GLIBC symbol floor of the existing Python nvfwupd_arm64 binary.
+#
+# Keep this builder on x86_64 and cross-compile with Zig. Building inside the
+# native aarch64 manylinux image works but is very slow on x86 hosts because
+# every Rust crate compiles under QEMU emulation.
+FROM quay.io/pypa/manylinux2014_x86_64:latest@sha256:0d25b049964b2549b83384036abdff06789a8c0b1e9ff003ec80f0d531f79e50 AS builder
+
+ARG RUST_VERSION=1.96.0
+ARG RUSTUP_VERSION=1.28.2
+ARG RUSTUP_INIT_SHA256=20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c
+ARG ZIG_VERSION=0.13.0
+ARG ZIG_SHA256=d45312e61ebcc48032b77bc4cf7fd6915c11fa16e4aad116b66c9468211230ea
+ARG CARGO_ZIGBUILD_VERSION=0.23.0
+ENV CARGO_HOME=/opt/rust/cargo
+ENV RUSTUP_HOME=/opt/rust/rustup
+ENV PATH=/opt/rust/cargo/bin:${PATH}
+
+RUN curl --proto '=https' --tlsv1.2 -fsSL -o /tmp/rustup-init \
+        "https://static.rust-lang.org/rustup/archive/${RUSTUP_VERSION}/x86_64-unknown-linux-gnu/rustup-init" \
+    && echo "${RUSTUP_INIT_SHA256}  /tmp/rustup-init" | sha256sum -c - \
+    && chmod +x /tmp/rustup-init \
+    && /tmp/rustup-init -y --profile minimal --default-toolchain "${RUST_VERSION}" \
+    && rm /tmp/rustup-init \
+    && rustup target add aarch64-unknown-linux-gnu \
+    && rustc --version \
+    && cargo --version \
+    && curl -fsSL -o /tmp/zig.tar.xz \
+        "https://ziglang.org/download/${ZIG_VERSION}/zig-linux-x86_64-${ZIG_VERSION}.tar.xz" \
+    && echo "${ZIG_SHA256}  /tmp/zig.tar.xz" | sha256sum -c - \
+    && mkdir -p /opt/zig \
+    && tar -xf /tmp/zig.tar.xz -C /opt/zig --strip-components=1 \
+    && ln -s /opt/zig/zig /usr/local/bin/zig \
+    && rm /tmp/zig.tar.xz \
+    && cargo install cargo-zigbuild --version "${CARGO_ZIGBUILD_VERSION}" --locked
+
+WORKDIR /app
+
+COPY . .
+
+# The repository prefers lld for developer builds, but this compatibility
+# builder intentionally uses Zig's glibc-versioned linker target.
+RUN sed -i '/fuse-ld=lld/d' .cargo/config.toml \
+    && cargo zigbuild --locked --release -p nvfwupd \
+        --target aarch64-unknown-linux-gnu.2.17 \
+    && install -Dm755 target/aarch64-unknown-linux-gnu/release/nvfwupd /out/nvfwupd
+
+FROM scratch AS artifact
+COPY --from=builder /out/nvfwupd /nvfwupd

@@ -20,19 +20,25 @@ use std::fmt::Display;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
+use crate::orchestrator::job_lifecycle::{
+    JobDomain, JobError, JobFailure, JobHandle, JobId, JobJoinHandle, JobLifecycleState,
+    JobRegistry, JobScope, JobSnapshot, JobSpec, JobState, MutationReservation,
+};
+use crate::utilities::error::RmsError;
+
 use chrono::{DateTime, Utc};
+use opentelemetry::trace::TraceContextExt;
 use prometheus::{CounterVec, IntGaugeVec, Opts};
 use serde::{Deserialize, Serialize};
 #[cfg(test)]
 use tokio_util::sync::CancellationToken;
-
-use crate::orchestrator::job_lifecycle::{
-    JobDomain, JobError, JobFailure, JobHandle, JobId, JobJoinHandle, JobLifecycleState,
-    JobRegistry, JobSnapshot, JobSpec, JobState,
-};
-use crate::utilities::error::RmsError;
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 pub use crate::orchestrator::job_lifecycle::JobType;
+pub(crate) use crate::orchestrator::job_lifecycle::job_error_of;
+
+const FORCED_TASK_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+const CANCELLED_JOB_DESCRIPTION: &str = "Cancelled";
 
 /// The shared lifecycle domain for every async job the `JobTracker` owns
 /// (firmware updates and switch system image updates alike). Because it is not
@@ -94,6 +100,28 @@ impl JobDomain for RmsJobDomain {
             JobError::Internal,
             "server is shutting down; new jobs are not accepted",
         )
+    }
+
+    fn scope_busy_failure(scope: &JobScope, owner_id: &JobId) -> JobFailure {
+        job_failure(
+            JobError::UpdateInProgress,
+            format!("mutation scope {scope:?} is occupied (owner_id {owner_id})"),
+        )
+    }
+
+    fn inactive_job_failure(job_id: &JobId) -> JobFailure {
+        job_failure(
+            JobError::Internal,
+            format!("job {job_id} is missing or terminal; mutation aliases cannot be admitted"),
+        )
+    }
+
+    fn shutdown_failure() -> JobFailure {
+        job_failure(
+            JobError::Other,
+            "job cancelled because the server is shutting down",
+        )
+        .with_description(CANCELLED_JOB_DESCRIPTION)
     }
 
     fn parent_unavailable_failure(parent_job_id: &JobId) -> JobFailure {
@@ -162,8 +190,9 @@ fn reaper_interval(ttl: Duration) -> Duration {
 ///
 /// Stores `JobInfo` entries keyed by UUID. Background tokio tasks update
 /// job progress, gRPC handlers query status. Terminal jobs (completed/failed)
-/// are retained for a configurable TTL (24h by default) then cleaned up by the
-/// background reaper or when an admission encounters a full registry.
+/// are retained for a configurable TTL (24h by default), measured on a
+/// monotonic clock, then cleaned up by the background reaper or when an
+/// admission encounters a full registry.
 ///
 /// Parent jobs aggregate state from their children on read.
 pub struct JobTracker {
@@ -383,13 +412,15 @@ impl JobTracker {
         node_id: &str,
         job_type: JobType,
     ) -> std::result::Result<RmsJobHandle, JobFailure> {
+        let parent_context = current_otel_context();
         let job = self.registry.create_job(
-            JobSpec::new(rack_id, node_id, "Queued", job_span(job_type, "")),
+            JobSpec::new_deferred(rack_id, node_id, "Queued", move |_job_id| {
+                job_span(job_type, "", parent_context)
+            }),
             None,
             false,
         )?;
 
-        self.record_job_id_in_span(&job);
         Ok(job)
     }
 
@@ -404,13 +435,15 @@ impl JobTracker {
         node_id: &str,
         job_type: JobType,
     ) -> std::result::Result<RmsJobHandle, JobFailure> {
+        let parent_context = current_otel_context();
         let job = self.registry.create_job(
-            JobSpec::new(rack_id, node_id, "Queued", job_span(job_type, "")),
+            JobSpec::new_deferred(rack_id, node_id, "Queued", move |_job_id| {
+                job_span(job_type, "", parent_context)
+            }),
             None,
             true,
         )?;
 
-        self.record_job_id_in_span(&job);
         Ok(job)
     }
 
@@ -434,17 +467,18 @@ impl JobTracker {
         job_type: JobType,
     ) -> std::result::Result<RmsJobHandle, JobFailure> {
         let parent_id = JobId::from(parent_job_id);
+        let parent_context = self
+            .registry
+            .span_for_job(&parent_id)
+            .and_then(|span| otel_context(&span));
+        let parent_job_id = parent_job_id.to_string();
         let job = self.registry.create_job(
-            JobSpec::new(
-                rack_id,
-                node_id,
-                "Queued",
-                job_span(job_type, parent_job_id),
-            ),
+            JobSpec::new_deferred(rack_id, node_id, "Queued", move |_job_id| {
+                job_span(job_type, &parent_job_id, parent_context)
+            }),
             Some(&parent_id),
             true,
         )?;
-        self.record_job_id_in_span(&job);
         refresh_parent_state(self, &parent_id);
         Ok(job)
     }
@@ -516,17 +550,51 @@ impl JobTracker {
         node_id: &str,
         job_type: JobType,
     ) -> std::result::Result<RmsJobHandle, JobFailure> {
+        let parent_context = current_otel_context();
         let job = self.registry.create_job(
-            JobSpec::new(rack_id, node_id, "Queued", job_span(job_type, ""))
-                .with_workflow_type(job_type),
+            JobSpec::new_deferred(rack_id, node_id, "Queued", move |_job_id| {
+                job_span(job_type, "", parent_context)
+            })
+            .with_workflow_type(job_type),
             None,
             true,
         )?;
 
-        self.record_job_id_in_span(&job);
         // Started/in-flight metrics are emitted by the registry's creation
         // observer because the spec carries a `workflow_type`.
         Ok(job)
+    }
+
+    /// Creates one explicitly completed workflow after admitting all aliases.
+    ///
+    /// The job has no aggregate-parent owner. Its worker must consume the handle
+    /// after verification or failure, including workflows targeting multiple nodes.
+    pub(crate) fn create_scoped_job(
+        &self,
+        rack_id: &str,
+        node_id: &str,
+        job_type: JobType,
+        scopes: Vec<JobScope>,
+    ) -> std::result::Result<RmsJobHandle, JobFailure> {
+        let parent_context = current_otel_context();
+
+        self.registry.create_job_with_scopes(
+            JobSpec::new_deferred(rack_id, node_id, "Queued", move |_job_id| {
+                job_span(job_type, "", parent_context)
+            })
+            .with_workflow_type(job_type),
+            None,
+            true,
+            scopes,
+        )
+    }
+
+    /// Reserves every alias for a direct mutation until its guard is dropped.
+    pub(crate) fn reserve_mutation(
+        &self,
+        scopes: Vec<JobScope>,
+    ) -> std::result::Result<MutationReservation<RmsJobDomain>, JobFailure> {
+        self.registry.reserve_mutation(scopes)
     }
 
     pub(crate) fn spawn_job<F, Fut>(self: &Arc<Self>, job: RmsJobHandle, run: F) -> JobJoinHandle
@@ -565,13 +633,14 @@ impl JobTracker {
     }
 
     pub fn create_parent_job(&self, rack_id: &str, job_type: JobType) -> Option<String> {
+        let parent_context = current_otel_context();
         let parent_handle = self
             .registry
             .create_job(
-                JobSpec::new_parent(
+                JobSpec::new_parent_deferred(
                     rack_id,
                     format!("Batch {} accepting child jobs", job_type.batch_noun()),
-                    job_span(job_type, ""),
+                    move |_job_id| job_span(job_type, "", parent_context),
                 )
                 .with_workflow_type(job_type),
                 None,
@@ -589,10 +658,6 @@ impl JobTracker {
         // creation observer inside `create_parent`. Refresh afterward
         // re-aggregates any children that completed before this thread returned
         // from `create_parent`.
-        if let Some(span) = self.registry.span_for_job(&parent_id) {
-            span.record("job_id", job_id.as_str());
-        }
-
         Some(job_id)
     }
 
@@ -736,14 +801,16 @@ impl JobTracker {
         self.registry.begin_shutdown();
         let job_ids = self.registry.cancel_active_leaves();
         let to_cancel = job_ids.len();
-        if to_cancel == 0 {
-            return 0;
-        }
-
-        let reached_terminal = self
-            .registry
-            .wait_for_terminal_jobs(&job_ids, Some(timeout))
-            .await;
+        // Reserve the four bounded forced waits below from the budget: short
+        // budgets split into five equal waits, and long ones keep all but four
+        // `FORCED_TASK_DRAIN_TIMEOUT`s for cooperative cancellation.
+        let forced_wait = (timeout / 5).min(FORCED_TASK_DRAIN_TIMEOUT);
+        let cooperative_wait = timeout.saturating_sub(forced_wait * 4);
+        let reached_terminal = job_ids.is_empty()
+            || self
+                .registry
+                .wait_for_terminal_jobs(&job_ids, Some(cooperative_wait))
+                .await;
         if !reached_terminal {
             tracing::warn!(
                 jobs_cancelled = to_cancel,
@@ -753,7 +820,57 @@ impl JobTracker {
             );
         }
 
+        let task_job_ids = self.registry.task_job_ids();
+        if !self
+            .registry
+            .wait_for_tasks(&task_job_ids, forced_wait)
+            .await
+        {
+            self.registry.abort_workers(&task_job_ids);
+            let workers_finished = self
+                .registry
+                .wait_for_workers(&task_job_ids, forced_wait)
+                .await;
+            let tasks_finished = self
+                .registry
+                .wait_for_tasks(&task_job_ids, forced_wait)
+                .await;
+            if !tasks_finished
+                && (workers_finished || self.registry.all_workers_finished(&task_job_ids))
+            {
+                self.registry.abort_supervisors(&task_job_ids);
+                let _ = self
+                    .registry
+                    .wait_for_tasks(&task_job_ids, forced_wait)
+                    .await;
+            } else if !tasks_finished {
+                tracing::warn!(
+                    tasks = task_job_ids.len(),
+                    "job workers did not stop after abort before the shutdown deadline"
+                );
+            }
+        }
+
+        self.refresh_all_parents();
+        self.fail_remaining_parents_for_shutdown();
+        let still_active = self.registry.non_terminal_job_ids();
+        self.registry.fail_non_terminal_for_shutdown(&still_active);
+        self.refresh_all_parents();
+
         to_cancel
+    }
+
+    fn fail_remaining_parents_for_shutdown(&self) {
+        let handles: Vec<_> = self
+            .parent_job_handles
+            .lock()
+            .unwrap()
+            .drain()
+            .map(|(_, handle)| handle)
+            .collect();
+        for handle in handles {
+            handle.fail(RmsJobDomain::shutdown_failure());
+        }
     }
 
     // Two-phase TTL cleanup: first remove expired leaf jobs (protecting
@@ -761,12 +878,6 @@ impl JobTracker {
     #[cfg(test)]
     fn cleanup_expired(&self) {
         self.registry.cleanup_expired();
-    }
-
-    fn record_job_id_in_span(&self, job: &RmsJobHandle) {
-        if let Some(span) = self.registry.span_for_job(job.id()) {
-            span.record("job_id", job.id().as_ref());
-        }
     }
 }
 
@@ -934,101 +1045,76 @@ struct ParsedFirmwareChildResult {
     raw_result_json: Option<String>,
 }
 
-fn job_span(job_type: JobType, parent_job_id: &str) -> tracing::Span {
-    // The span name must be a compile-time constant for the macro callsite, so
-    // each `JobType` needs an explicit arm rather than a runtime `span_name()`.
-    match (job_type, parent_job_id.is_empty()) {
-        (JobType::FirmwareUpdate, true) => tracing::info_span!(
-            "firmware_update",
-            job_id = tracing::field::Empty,
-            parent_job_id = tracing::field::Empty
-        ),
-        (JobType::FirmwareUpdate, false) => tracing::info_span!(
-            "firmware_update",
-            job_id = tracing::field::Empty,
-            parent_job_id
-        ),
-        (JobType::ConfigureScaleUpFabricManagerV2, true) => tracing::info_span!(
-            "configure_scale_up_fabric_manager_v2",
-            job_id = tracing::field::Empty,
-            parent_job_id = tracing::field::Empty
-        ),
-        (JobType::ConfigureScaleUpFabricManagerV2, false) => tracing::info_span!(
-            "configure_scale_up_fabric_manager_v2",
-            job_id = tracing::field::Empty,
-            parent_job_id
-        ),
-        (JobType::SwitchCertificate, true) => tracing::info_span!(
-            "switch_certificate",
-            job_id = tracing::field::Empty,
-            parent_job_id = tracing::field::Empty
-        ),
-        (JobType::SwitchCertificate, false) => tracing::info_span!(
-            "switch_certificate",
-            job_id = tracing::field::Empty,
-            parent_job_id
-        ),
-        (JobType::SwitchMtlsDisable, true) => tracing::info_span!(
-            "switch_mtls_disable",
-            job_id = tracing::field::Empty,
-            parent_job_id = tracing::field::Empty
-        ),
-        (JobType::SwitchMtlsDisable, false) => tracing::info_span!(
-            "switch_mtls_disable",
-            job_id = tracing::field::Empty,
-            parent_job_id
-        ),
-        (JobType::SwitchSdnFactoryDefaultReset, true) => tracing::info_span!(
-            "switch_sdn_factory_default_reset",
-            job_id = tracing::field::Empty,
-            parent_job_id = tracing::field::Empty
-        ),
-        (JobType::SwitchSdnFactoryDefaultReset, false) => tracing::info_span!(
-            "switch_sdn_factory_default_reset",
-            job_id = tracing::field::Empty,
-            parent_job_id
-        ),
-        (JobType::SwitchFactoryDefaultReset, true) => tracing::info_span!(
-            "switch_factory_default_reset",
-            job_id = tracing::field::Empty,
-            parent_job_id = tracing::field::Empty
-        ),
-        (JobType::SwitchFactoryDefaultReset, false) => tracing::info_span!(
-            "switch_factory_default_reset",
-            job_id = tracing::field::Empty,
-            parent_job_id
-        ),
-        (JobType::SwitchSystemPasswordUpdate, true) => tracing::info_span!(
-            "switch_system_password_update",
-            job_id = tracing::field::Empty,
-            parent_job_id = tracing::field::Empty
-        ),
-        (JobType::SwitchSystemPasswordUpdate, false) => tracing::info_span!(
-            "switch_system_password_update",
-            job_id = tracing::field::Empty,
-            parent_job_id
-        ),
-        (JobType::SwitchSystemImageUpdate, true) => tracing::info_span!(
-            "switch_system_image_update",
-            job_id = tracing::field::Empty,
-            parent_job_id = tracing::field::Empty
-        ),
-        (JobType::SwitchSystemImageUpdate, false) => tracing::info_span!(
-            "switch_system_image_update",
-            job_id = tracing::field::Empty,
-            parent_job_id
-        ),
-        (JobType::ColdRebootSequence, true) => tracing::info_span!(
-            "cold_reboot_sequence",
-            job_id = tracing::field::Empty,
-            parent_job_id = tracing::field::Empty
-        ),
-        (JobType::ColdRebootSequence, false) => tracing::info_span!(
-            "cold_reboot_sequence",
-            job_id = tracing::field::Empty,
-            parent_job_id
-        ),
+fn current_otel_context() -> Option<opentelemetry::Context> {
+    otel_context(&tracing::Span::current())
+}
+
+fn otel_context(span: &tracing::Span) -> Option<opentelemetry::Context> {
+    let context = span.context();
+    context.span().span_context().is_valid().then_some(context)
+}
+
+// Span names must remain literals at their tracing callsites. This table also
+// supplies the export catalog, so every job type's span is included there.
+macro_rules! job_spans {
+    ($($variant:ident => $name:literal),+ $(,)?) => {
+        pub(crate) const JOB_SPAN_NAMES: &[&str] = &[$($name),+];
+
+        fn job_span_for(job_type: JobType) -> tracing::Span {
+            match job_type {
+                $(JobType::$variant => tracing::info_span!(
+                    parent: None,
+                    $name,
+                    job_id = tracing::field::Empty,
+                    parent_job_id = tracing::field::Empty,
+                ),)+
+            }
+        }
+    };
+}
+
+job_spans! {
+    FirmwareUpdate => "firmware_update",
+    ConfigureScaleUpFabricManagerV2 => "configure_scale_up_fabric_manager_v2",
+    SwitchCertificate => "switch_certificate",
+    SwitchMtlsDisable => "switch_mtls_disable",
+    SwitchSdnFactoryDefaultReset => "switch_sdn_factory_default_reset",
+    SwitchFactoryDefaultReset => "switch_factory_default_reset",
+    SwitchSystemPasswordUpdate => "switch_system_password_update",
+    SwitchSystemImageUpdate => "switch_system_image_update",
+    ColdRebootSequence => "cold_reboot_sequence",
+    SystemValidation => "system_validation",
+}
+
+fn job_span(
+    job_type: JobType,
+    parent_job_id: &str,
+    otel_parent: Option<opentelemetry::Context>,
+) -> tracing::Span {
+    let span = job_span_for(job_type);
+    if !parent_job_id.is_empty() {
+        span.record("parent_job_id", parent_job_id);
     }
+
+    if let Some(parent) = otel_parent
+        && let Err(error) = span.set_parent(parent)
+    {
+        // Report the first attachment failure without flooding logs or changing job behavior.
+        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            tracing::warn!(
+                parent: None,
+                job_type = job_type.span_name(),
+                error = ?error,
+                "could not apply job trace context"
+            );
+        }
+    }
+    // Start the SDK span now so its builder releases the parent Context. The
+    // retained tracing span remains a tracing-registry root and cannot keep
+    // the request or parent-job tracing span open for the terminal-job TTL.
+    let _ = span.context();
+    span
 }
 
 fn default_failure_result_json(error_code: JobError, error_message: &str) -> String {
@@ -1160,16 +1246,6 @@ fn record_workflow_terminal_metrics(
     workflows_in_flight
         .with_label_values(&[workflow_type_label, is_leaf_label])
         .dec();
-}
-
-/// Recovers the typed [`JobError`] embedded as the root cause of a lifecycle
-/// failure. Falls back to [`JobError::Internal`] if the cause is not a
-/// `JobError` (which should not happen for jobs created through this domain).
-pub(crate) fn job_error_of(error: &anyhow::Error) -> JobError {
-    error
-        .downcast_ref::<JobError>()
-        .copied()
-        .unwrap_or(JobError::Internal)
 }
 
 fn snapshot_to_job_info(snapshot: JobSnapshot) -> JobInfo {
@@ -1394,7 +1470,8 @@ fn parent_failure_result_json(
         | JobType::SwitchSystemPasswordUpdate
         | JobType::SwitchSystemImageUpdate
         | JobType::ConfigureScaleUpFabricManagerV2
-        | JobType::ColdRebootSequence => serialize_result_json(&SwitchParentFailureResult {
+        | JobType::ColdRebootSequence
+        | JobType::SystemValidation => serialize_result_json(&SwitchParentFailureResult {
             completed,
             failed,
             missing,
@@ -1514,9 +1591,531 @@ mod tests {
 
     use std::sync::{Arc, Mutex};
 
+    use opentelemetry::trace::TracerProvider as _;
+    use opentelemetry_sdk::trace::{InMemorySpanExporter, Sampler, SdkTracerProvider};
     use prometheus::{Registry, TextEncoder};
     use serde::Serialize;
     use tracing_subscriber::prelude::*;
+
+    #[test]
+    fn scoped_job_admission_rejects_overlap_without_reserving_other_targets() {
+        let tracker = JobTracker::default();
+
+        let switch = JobScope::PhysicalSwitch {
+            chassis_serial_number: "chassis-a".to_owned(),
+            tray_index: 1,
+        };
+
+        let endpoint = JobScope::endpoint("switch.example", 443);
+
+        let job = tracker
+            .create_scoped_job(
+                "rack-a",
+                "",
+                JobType::ConfigureScaleUpFabricManagerV2,
+                vec![switch.clone()],
+            )
+            .unwrap();
+
+        let refused = tracker.create_scoped_job(
+            "rack-b",
+            "",
+            JobType::SwitchFactoryDefaultReset,
+            vec![endpoint.clone(), switch.clone()],
+        );
+
+        let free_target = tracker.reserve_mutation(vec![endpoint.clone()]);
+
+        assert!(refused.is_err());
+
+        assert_eq!(
+            job_error_of(&refused.err().unwrap().error),
+            JobError::UpdateInProgress
+        );
+
+        assert!(free_target.is_ok());
+        assert!(tracker.reserve_mutation(vec![switch.clone()]).is_err());
+
+        job.complete_verified("Verified", "");
+
+        assert!(tracker.reserve_mutation(vec![switch]).is_ok());
+        drop(free_target);
+
+        assert!(tracker.reserve_mutation(vec![endpoint]).is_ok());
+    }
+
+    #[test]
+    fn mutation_reservation_conflicts_with_node_jobs_and_releases_on_drop() {
+        let tracker = JobTracker::default();
+
+        let node_scope = JobScope::LogicalNode {
+            rack_id: "rack-a".to_owned(),
+            node_id: "switch-a".to_owned(),
+        };
+
+        let reservation = tracker.reserve_mutation(vec![node_scope.clone()]).unwrap();
+
+        let refused = tracker.create_job_if_node_idle(
+            "rack-a",
+            "switch-a",
+            JobType::SwitchFactoryDefaultReset,
+        );
+
+        assert!(refused.is_err());
+        drop(reservation);
+
+        let job = tracker
+            .create_job("rack-a", "switch-a", JobType::SwitchFactoryDefaultReset)
+            .unwrap();
+
+        assert!(tracker.reserve_mutation(vec![node_scope.clone()]).is_err());
+        drop(job);
+
+        assert!(tracker.reserve_mutation(vec![node_scope]).is_ok());
+    }
+
+    #[test]
+    fn scope_endpoint_normalization_and_switch_tray_identity_are_preserved() {
+        let tracker = JobTracker::default();
+
+        let endpoint = tracker
+            .reserve_mutation(vec![JobScope::endpoint("SWITCH.EXAMPLE.", 443)])
+            .unwrap();
+
+        let switch = tracker
+            .reserve_mutation(vec![JobScope::PhysicalSwitch {
+                chassis_serial_number: "shared-chassis".to_owned(),
+                tray_index: 1,
+            }])
+            .unwrap();
+
+        assert!(
+            tracker
+                .reserve_mutation(vec![JobScope::endpoint("switch.example", 443)])
+                .is_err()
+        );
+
+        assert!(
+            tracker
+                .reserve_mutation(vec![JobScope::PhysicalSwitch {
+                    chassis_serial_number: "shared-chassis".to_owned(),
+                    tray_index: 2,
+                }])
+                .is_ok()
+        );
+
+        assert_eq!(
+            JobScope::endpoint("[2001:db8::1]", 443),
+            JobScope::endpoint("2001:0db8:0:0:0:0:0:1", 443)
+        );
+
+        drop((endpoint, switch));
+    }
+
+    #[test]
+    fn equivalent_endpoint_addresses_share_mutation_reservations() {
+        let tracker = JobTracker::default();
+
+        for (first, equivalent) in [
+            ("10.0.0.5", "[::ffff:10.0.0.5]"),
+            ("[::ffff:10.0.0.5]", "10.0.0.5"),
+            ("::ffff:a00:5", "10.0.0.5"),
+            ("fe80::1%eth0", "[fe80:0:0:0:0:0:0:1%eth0]"),
+            ("[fe80:0:0:0:0:0:0:1%ETH0]", "fe80::1%ETH0"),
+        ] {
+            // Raw variants exercise normalization at admission, not just the constructor.
+            let reservation = tracker
+                .reserve_mutation(vec![JobScope::Endpoint {
+                    host: first.to_owned(),
+                    port: 443,
+                }])
+                .unwrap();
+
+            let refused = tracker.reserve_mutation(vec![JobScope::Endpoint {
+                host: equivalent.to_owned(),
+                port: 443,
+            }]);
+
+            let Err(failure) = refused else {
+                panic!("equivalent endpoint {equivalent} must conflict with {first}");
+            };
+
+            assert_eq!(job_error_of(&failure.error), JobError::UpdateInProgress);
+            assert!(failure.message.contains("owner_id"));
+            assert!(!failure.message.contains("job_id"));
+
+            drop(reservation);
+
+            assert!(
+                tracker
+                    .reserve_mutation(vec![JobScope::endpoint(equivalent, 443)])
+                    .is_ok()
+            );
+        }
+    }
+
+    #[test]
+    fn scoped_ipv6_reservations_preserve_zone_and_port_identity() {
+        let tracker = JobTracker::default();
+
+        let reservation = tracker
+            .reserve_mutation(vec![JobScope::endpoint("fe80::1%eth0", 443)])
+            .unwrap();
+
+        for host in ["fe80::1%eth1", "fe80::1%ETH0", "fe80::1%2"] {
+            assert!(
+                tracker
+                    .reserve_mutation(vec![JobScope::endpoint(host, 443)])
+                    .is_ok()
+            );
+        }
+
+        assert!(
+            tracker
+                .reserve_mutation(vec![JobScope::endpoint("fe80::1%eth0", 22)])
+                .is_ok()
+        );
+
+        assert_eq!(
+            JobScope::endpoint("fe80:0:0:0:0:0:0:1%ETH0", 443),
+            JobScope::Endpoint {
+                host: "fe80::1%ETH0".to_owned(),
+                port: 443,
+            }
+        );
+
+        drop(reservation);
+    }
+
+    #[test]
+    fn fabric_job_and_direct_mutation_conflict_across_endpoint_spellings() {
+        let tracker = JobTracker::default();
+
+        let direct_scope = JobScope::LogicalNode {
+            rack_id: "other-rack".to_owned(),
+            node_id: "other-switch".to_owned(),
+        };
+
+        let job = tracker
+            .create_scoped_job(
+                "rack-a",
+                "switch-a",
+                JobType::ConfigureScaleUpFabricManagerV2,
+                vec![JobScope::endpoint("10.0.0.5", 443)],
+            )
+            .unwrap();
+
+        let refused = tracker.reserve_mutation(vec![
+            direct_scope.clone(),
+            JobScope::endpoint("[::ffff:10.0.0.5]", 443),
+        ]);
+
+        assert!(refused.is_err());
+        assert!(tracker.reserve_mutation(vec![direct_scope.clone()]).is_ok());
+
+        drop(job);
+
+        let reservation = tracker
+            .reserve_mutation(vec![
+                direct_scope,
+                JobScope::endpoint("[::ffff:10.0.0.5]", 443),
+            ])
+            .unwrap();
+
+        let refused = tracker.create_scoped_job(
+            "rack-a",
+            "switch-a",
+            JobType::ConfigureScaleUpFabricManagerV2,
+            vec![JobScope::endpoint("10.0.0.5", 443)],
+        );
+
+        assert!(refused.is_err());
+
+        drop(reservation);
+    }
+
+    #[test]
+    fn explicit_fabric_job_holds_aliases_until_verified_completion() {
+        let tracker = JobTracker::default();
+        let scope = JobScope::endpoint("switch.example", 443);
+
+        let job = tracker
+            .create_scoped_job(
+                "rack-a",
+                "",
+                JobType::ConfigureScaleUpFabricManagerV2,
+                vec![scope.clone()],
+            )
+            .unwrap();
+
+        let job_id = job.id().clone();
+
+        assert!(job.progress("Verifying links"));
+        tracker.refresh_all_parents();
+
+        let running = tracker.get_job(job_id.as_ref()).unwrap();
+
+        assert_eq!(running.state, JobState::Running);
+        assert_eq!(running.state_description, "Verifying links");
+        assert!(running.child_job_ids.is_empty());
+        assert!(tracker.reserve_mutation(vec![scope.clone()]).is_err());
+
+        job.complete_verified("Verified", "");
+
+        let completed = tracker.get_job(job_id.as_ref()).unwrap();
+
+        assert_eq!(completed.state, JobState::Completed);
+        assert_eq!(completed.state_description, "Verified");
+        assert!(completed.result_json.is_empty());
+        assert!(tracker.reserve_mutation(vec![scope]).is_ok());
+        assert!(!tracker.registry.mark_running(&job_id, "Late progress"));
+
+        let retained = tracker.get_job(job_id.as_ref()).unwrap();
+
+        assert_eq!(retained.state, JobState::Completed);
+        assert_eq!(retained.state_description, "Verified");
+        assert_eq!(retained.updated_at, completed.updated_at);
+    }
+
+    #[test]
+    fn cancelled_scoped_job_holds_aliases_until_handle_drop() {
+        let tracker = JobTracker::default();
+        let scope = JobScope::endpoint("switch.example", 443);
+
+        let job = tracker
+            .create_scoped_job(
+                "rack-a",
+                "",
+                JobType::ConfigureScaleUpFabricManagerV2,
+                vec![scope.clone()],
+            )
+            .unwrap();
+
+        let job_id = job.id().to_string();
+
+        assert!(job.progress("Configuring"));
+        assert!(tracker.registry.cancel(job.id()));
+        assert!(job.cancellation_token().is_cancelled());
+        assert!(tracker.reserve_mutation(vec![scope.clone()]).is_err());
+        assert_eq!(tracker.get_job(&job_id).unwrap().state, JobState::Running);
+
+        drop(job);
+
+        let failed = tracker.get_job(&job_id).unwrap();
+
+        assert_eq!(failed.state, JobState::Failed);
+        assert_eq!(failed.state_description, CANCELLED_JOB_DESCRIPTION);
+        assert_eq!(failed.error_code, JobError::Other);
+        assert!(tracker.reserve_mutation(vec![scope]).is_ok());
+    }
+
+    #[test]
+    fn failed_scoped_job_records_failure_and_releases_aliases() {
+        let tracker = JobTracker::default();
+        let scope = JobScope::endpoint("switch.example", 443);
+
+        let job = tracker
+            .create_scoped_job(
+                "rack-a",
+                "",
+                JobType::ConfigureScaleUpFabricManagerV2,
+                vec![scope.clone()],
+            )
+            .unwrap();
+
+        let job_id = job.id().to_string();
+
+        job.fail(job_failure(JobError::Timeout, "Verification failed"));
+
+        let failed = tracker.get_job(&job_id).unwrap();
+
+        assert_eq!(failed.state, JobState::Failed);
+        assert_eq!(failed.error_code, JobError::Timeout);
+        assert_eq!(failed.error_message, "Verification failed");
+
+        assert!(tracker.reserve_mutation(vec![scope]).is_ok());
+    }
+
+    #[tokio::test]
+    async fn forced_shutdown_terminalizes_scoped_job_and_drains_worker() {
+        let tracker = Arc::new(JobTracker::default());
+        let scope = JobScope::endpoint("switch.example", 443);
+
+        let job = tracker
+            .create_scoped_job(
+                "rack-a",
+                "",
+                JobType::ConfigureScaleUpFabricManagerV2,
+                vec![scope.clone()],
+            )
+            .unwrap();
+
+        let job_id = job.id().clone();
+        let (started, worker_started) = tokio::sync::oneshot::channel();
+
+        tracker
+            .spawn_job(job, |job| async move {
+                assert!(job.progress("Reconciling"));
+                let _job = job;
+
+                started.send(()).unwrap();
+                std::future::pending::<()>().await;
+            })
+            .detach();
+
+        tokio::time::timeout(Duration::from_secs(1), worker_started)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(tracker.reserve_mutation(vec![scope]).is_err());
+
+        let cancelled = tracker
+            .shutdown_and_await_terminal(Duration::from_millis(50))
+            .await;
+
+        let failed = tracker.get_job(job_id.as_ref()).unwrap();
+
+        assert_eq!(cancelled, 1);
+        assert_eq!(failed.state, JobState::Failed);
+        assert_eq!(failed.state_description, CANCELLED_JOB_DESCRIPTION);
+        assert_eq!(failed.error_code, JobError::Other);
+        assert!(tracker.registry.task_job_ids().is_empty());
+        assert!(!tracker.registry.mark_running(&job_id, "Late progress"));
+    }
+
+    #[test]
+    fn concurrent_overlap_admits_exactly_one_complete_reservation() {
+        let tracker = Arc::new(JobTracker::default());
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+
+        let scopes = vec![
+            JobScope::endpoint("switch-a", 443),
+            JobScope::endpoint("switch-b", 443),
+        ];
+
+        let threads: Vec<_> = (0..2)
+            .map(|index| {
+                let tracker = Arc::clone(&tracker);
+                let barrier = Arc::clone(&barrier);
+                let mut scopes = scopes.clone();
+
+                if index == 1 {
+                    scopes.reverse();
+                }
+
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let reservation = tracker.reserve_mutation(scopes);
+                    let admitted = reservation.is_ok();
+
+                    barrier.wait();
+                    drop(reservation);
+                    admitted
+                })
+            })
+            .collect();
+
+        let admitted = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .filter(|admitted| *admitted)
+            .count();
+
+        assert_eq!(admitted, 1);
+        assert!(tracker.reserve_mutation(scopes).is_ok());
+    }
+
+    #[test]
+    fn capacity_and_shutdown_rejections_leave_scopes_unreserved() {
+        let tracker = JobTracker::builder().max_tracked_jobs(0).build().unwrap();
+        let scope = JobScope::endpoint("switch-a", 443);
+
+        let refused = tracker.create_scoped_job(
+            "rack-a",
+            "",
+            JobType::SwitchFactoryDefaultReset,
+            vec![scope.clone()],
+        );
+
+        assert!(refused.is_err());
+        assert!(tracker.reserve_mutation(vec![scope.clone()]).is_ok());
+        tracker.shutdown();
+
+        assert!(tracker.reserve_mutation(vec![scope]).is_err());
+    }
+
+    #[test]
+    fn worker_alias_attachment_is_atomic_and_retains_existing_job_aliases() {
+        let tracker = JobTracker::default();
+
+        let job = tracker
+            .create_job_if_node_idle("rack-a", "switch-a", JobType::FirmwareUpdate)
+            .unwrap();
+
+        let scope = JobScope::endpoint("switch-a", 443);
+        let occupied = JobScope::endpoint("switch-b", 443);
+        let reservation = tracker.reserve_mutation(vec![occupied.clone()]).unwrap();
+
+        assert!(
+            tracker
+                .registry
+                .reserve_job_scopes(job.id(), vec![scope.clone(), occupied.clone()])
+                .is_err()
+        );
+
+        assert!(tracker.reserve_mutation(vec![scope.clone()]).is_ok());
+        drop(reservation);
+
+        tracker
+            .registry
+            .reserve_job_scopes(job.id(), vec![scope.clone(), occupied.clone()])
+            .unwrap();
+
+        tracker
+            .registry
+            .reserve_job_scopes(job.id(), vec![scope.clone()])
+            .unwrap();
+
+        assert!(
+            tracker
+                .create_job_if_node_idle("rack-a", "switch-a", JobType::FirmwareUpdate)
+                .is_err()
+        );
+
+        assert!(tracker.reserve_mutation(vec![occupied.clone()]).is_err());
+        let job_id = job.id().clone();
+        job.complete_verified("Verified", "");
+
+        assert!(
+            tracker
+                .reserve_mutation(vec![scope.clone(), occupied])
+                .is_ok()
+        );
+
+        assert!(
+            tracker
+                .registry
+                .reserve_job_scopes(&job_id, vec![scope])
+                .is_err()
+        );
+    }
+
+    fn job_span_exporter() -> (SdkTracerProvider, InMemorySpanExporter, tracing::Dispatch) {
+        let exporter = InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_sampler(Sampler::AlwaysOn)
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_opentelemetry::layer()
+                .with_tracer(provider.tracer("job-lifecycle-error-test"))
+                .with_filter(tracing_subscriber::filter::filter_fn(
+                    crate::observability::tracing::should_export,
+                )),
+        );
+        (provider, exporter, tracing::Dispatch::new(subscriber))
+    }
 
     fn workflow_metrics_setup() -> (Arc<Registry>, Arc<JobTracker>) {
         let registry = Arc::new(Registry::new_custom(Some("rms".to_owned()), None).unwrap());
@@ -1548,6 +2147,625 @@ mod tests {
         TextEncoder::new()
             .encode_to_string(&registry.gather())
             .expect("encode metrics")
+    }
+
+    #[test]
+    fn child_job_span_is_parented_to_the_parent_job_span() {
+        if crate::observability::run_test_in_subprocess(concat!(
+            "orchestrator::job_tracker::tests::",
+            "child_job_span_is_parented_to_the_parent_job_span"
+        )) {
+            return;
+        }
+
+        let exporter = InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_sampler(Sampler::AlwaysOn)
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let otel_layer =
+            tracing_opentelemetry::layer().with_tracer(provider.tracer("job-parenting-test"));
+        let subscriber = tracing_subscriber::registry().with(otel_layer);
+
+        tracing::subscriber::with_default(subscriber, || {
+            let tracker = Arc::new(JobTracker::builder().build().unwrap());
+            let request = tracing::info_span!("request");
+            let _request_entered = request.enter();
+            let parent_id = tracker
+                .create_parent_job("rack-1", JobType::FirmwareUpdate)
+                .expect("parent job");
+            let child = tracker
+                .create_child_job(&parent_id, "rack-1", "node-1", JobType::FirmwareUpdate)
+                .expect("child job");
+
+            drop(child);
+            drop(_request_entered);
+            drop(request);
+            drop(tracker);
+        });
+
+        provider.force_flush().unwrap();
+        let spans = exporter.get_finished_spans().unwrap();
+        let request = spans
+            .iter()
+            .find(|span| span.name == "request")
+            .expect("request span");
+        let child = spans
+            .iter()
+            .find(|span| {
+                span.name == "firmware_update"
+                    && span
+                        .attributes
+                        .iter()
+                        .any(|attribute| attribute.key.as_str() == "parent_job_id")
+            })
+            .expect("child job span");
+        let parent = spans
+            .iter()
+            .find(|span| {
+                span.name == "firmware_update"
+                    && !span
+                        .attributes
+                        .iter()
+                        .any(|attribute| attribute.key.as_str() == "parent_job_id")
+            })
+            .expect("parent job span");
+
+        assert_eq!(parent.parent_span_id, request.span_context.span_id());
+        assert_eq!(child.parent_span_id, parent.span_context.span_id());
+        assert_eq!(
+            child.span_context.trace_id(),
+            request.span_context.trace_id()
+        );
+    }
+
+    #[test]
+    fn every_job_type_exports_parent_and_child_spans_for_success_and_failure() {
+        use opentelemetry::trace::Status;
+
+        if crate::observability::run_test_in_subprocess(concat!(
+            "orchestrator::job_tracker::tests::",
+            "every_job_type_exports_parent_and_child_spans_for_success_and_failure"
+        )) {
+            return;
+        }
+
+        let cases = [
+            (JobType::FirmwareUpdate, "firmware_update"),
+            (
+                JobType::ConfigureScaleUpFabricManagerV2,
+                "configure_scale_up_fabric_manager_v2",
+            ),
+            (JobType::SwitchCertificate, "switch_certificate"),
+            (JobType::SwitchMtlsDisable, "switch_mtls_disable"),
+            (
+                JobType::SwitchSdnFactoryDefaultReset,
+                "switch_sdn_factory_default_reset",
+            ),
+            (
+                JobType::SwitchFactoryDefaultReset,
+                "switch_factory_default_reset",
+            ),
+            (
+                JobType::SwitchSystemPasswordUpdate,
+                "switch_system_password_update",
+            ),
+            (
+                JobType::SwitchSystemImageUpdate,
+                "switch_system_image_update",
+            ),
+            (JobType::ColdRebootSequence, "cold_reboot_sequence"),
+            (JobType::SystemValidation, "system_validation"),
+        ];
+        assert_eq!(JOB_SPAN_NAMES.len(), cases.len());
+        let (provider, exporter, dispatch) = job_span_exporter();
+        let _subscriber = tracing::dispatcher::set_default(&dispatch);
+        let tracker = Arc::new(JobTracker::new());
+        let request = tracing::info_span!("request");
+        let request_context = request.context().span().span_context().clone();
+        let entered = request.enter();
+        drop(tracing::info_span!("unlisted_job_span"));
+
+        for (job_type, name) in cases {
+            assert_eq!(job_type.span_name(), name);
+            for failed in [false, true] {
+                let parent_id = tracker.create_parent_job("rack", job_type).unwrap();
+                let child = tracker
+                    .create_child_job(&parent_id, "rack", "node", job_type)
+                    .unwrap();
+                let child_id = child.id().to_string();
+                if failed {
+                    child.fail(job_failure(JobError::Timeout, "private-error-detail"));
+                } else {
+                    child.complete_verified("Verified", "");
+                }
+                assert_eq!(
+                    tracker.get_job(&parent_id).unwrap().state,
+                    if failed {
+                        JobState::Failed
+                    } else {
+                        JobState::Completed
+                    },
+                );
+
+                let spans = exporter.get_finished_spans().unwrap();
+                let span_for_job = |job_id: &str| {
+                    spans
+                        .iter()
+                        .find(|span| {
+                            span.attributes.iter().any(|attribute| {
+                                attribute.key.as_str() == "job_id"
+                                    && attribute.value.as_str() == job_id
+                            })
+                        })
+                        .expect("each terminal job must export through the catalog")
+                };
+                let parent = span_for_job(&parent_id);
+                let child = span_for_job(&child_id);
+                assert_eq!(parent.name, name);
+                assert_eq!(child.name, name);
+                assert_eq!(parent.parent_span_id, request_context.span_id());
+                assert_eq!(child.parent_span_id, parent.span_context.span_id());
+                assert_eq!(parent.span_context.trace_id(), request_context.trace_id());
+                assert_eq!(child.span_context.trace_id(), request_context.trace_id());
+                assert!(
+                    !parent
+                        .attributes
+                        .iter()
+                        .any(|attribute| attribute.key.as_str() == "parent_job_id")
+                );
+                assert_eq!(
+                    child
+                        .attributes
+                        .iter()
+                        .filter(|attribute| attribute.key.as_str() == "parent_job_id")
+                        .count(),
+                    1,
+                );
+                assert!(child.attributes.iter().any(|attribute| {
+                    attribute.key.as_str() == "parent_job_id"
+                        && attribute.value.as_str() == parent_id
+                }));
+                for span in [parent, child] {
+                    assert_eq!(
+                        span.attributes
+                            .iter()
+                            .filter(|attribute| attribute.key.as_str() == "job_id")
+                            .count(),
+                        1
+                    );
+                    assert!(!format!("{span:?}").contains("private-error-detail"));
+                }
+                assert_eq!(
+                    parent.status,
+                    if failed {
+                        Status::error("")
+                    } else {
+                        Status::Unset
+                    }
+                );
+                assert_eq!(
+                    child.status,
+                    if failed {
+                        Status::error("")
+                    } else {
+                        Status::Ok
+                    }
+                );
+                if failed {
+                    for (span, error_type) in [(parent, "other"), (child, "timeout")] {
+                        assert!(span.attributes.iter().any(|attribute| {
+                            attribute.key.as_str() == "error.type"
+                                && attribute.value.as_str() == error_type
+                        }));
+                    }
+                }
+            }
+        }
+        drop(entered);
+        drop(request);
+        provider.force_flush().unwrap();
+        assert_eq!(
+            exporter.get_finished_spans().unwrap().len(),
+            cases.len() * 4 + 1
+        );
+    }
+
+    #[test]
+    fn job_parent_attachment_failure_warns_once_without_failing_jobs() {
+        use opentelemetry::trace::{SpanContext, SpanId, TraceFlags, TraceId, TraceState};
+
+        // Isolate the warning budget and the shared job-span callsites from other tests.
+        if crate::observability::run_test_in_subprocess(concat!(
+            "orchestrator::job_tracker::tests::",
+            "job_parent_attachment_failure_warns_once_without_failing_jobs"
+        )) {
+            return;
+        }
+
+        let parent_span_context = SpanContext::new(
+            TraceId::from(1_u128),
+            SpanId::from(2_u64),
+            TraceFlags::SAMPLED,
+            true,
+            TraceState::from_key_value([("vendor", "private-trace-state")]).unwrap(),
+        );
+        let parent =
+            opentelemetry::Context::new().with_remote_span_context(parent_span_context.clone());
+        for has_otel_layer in [true, false] {
+            let exporter = InMemorySpanExporter::default();
+            let provider = SdkTracerProvider::builder()
+                .with_simple_exporter(exporter.clone())
+                .build();
+            let writer = TestWriter::new();
+            let cloned_writer = writer.clone();
+            let log_layer = crate::logging::logfmt::layer()
+                .with_writer(Arc::new(move || Box::new(cloned_writer.clone())))
+                .with_span_logs(false);
+            let subscriber =
+                tracing_subscriber::registry()
+                    .with(log_layer)
+                    .with(has_otel_layer.then(|| {
+                        tracing_opentelemetry::layer()
+                            .with_tracer(provider.tracer("job-parent-attachment-test"))
+                    }));
+
+            tracing::subscriber::with_default(subscriber, || {
+                let tracker = JobTracker::new();
+                let request = tracing::info_span!("request", rpc.method = "UpdateFirmware");
+                let _entered = request.enter();
+                for job_type in [JobType::FirmwareUpdate, JobType::SwitchSystemImageUpdate] {
+                    let parent = parent.clone();
+                    let job = tracker
+                        .registry
+                        .create_job(
+                            JobSpec::new_deferred(
+                                "private-rack",
+                                "private-node",
+                                "Queued",
+                                move |_| job_span(job_type, "private-parent-job", Some(parent)),
+                            ),
+                            None,
+                            false,
+                        )
+                        .expect("trace attachment must not reject a job");
+                    let job_id = job.id().to_string();
+                    job.complete("Completed", "");
+                    assert_eq!(tracker.get_job(&job_id).unwrap().state, JobState::Completed);
+                }
+            });
+
+            provider.force_flush().unwrap();
+            let spans = exporter.get_finished_spans().unwrap();
+            let logs = writer.text();
+            let warnings: Vec<_> = logs
+                .lines()
+                .filter(|line| line.starts_with("level=WARN"))
+                .collect();
+            if has_otel_layer {
+                assert!(
+                    warnings.is_empty(),
+                    "successful parent attachment must not warn: {logs}"
+                );
+                let job_spans: Vec<_> =
+                    spans.iter().filter(|span| span.name != "request").collect();
+                assert_eq!(job_spans.len(), 2);
+                for span in job_spans {
+                    assert_eq!(span.parent_span_id, parent_span_context.span_id());
+                    assert_eq!(span.span_context.trace_id(), parent_span_context.trace_id());
+                }
+            } else {
+                assert!(spans.is_empty());
+                assert_eq!(
+                    warnings.len(),
+                    1,
+                    "repeated attachment failures must warn once: {logs}"
+                );
+                let warning = warnings[0];
+                assert!(warning.contains("could not apply job trace context"));
+                assert!(warning.contains("job_type=firmware_update"));
+                assert!(warning.contains("error=LayerNotFound"));
+                assert!(
+                    !warning.contains("private-"),
+                    "warning leaked context: {warning}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_job_exports_before_its_retained_snapshot_is_evicted() {
+        let exporter = InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_sampler(Sampler::AlwaysOn)
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let otel_layer =
+            tracing_opentelemetry::layer().with_tracer(provider.tracer("job-terminal-test"));
+        let subscriber = tracing_subscriber::registry().with(otel_layer);
+
+        let (tracker, job_id) = tracing::subscriber::with_default(subscriber, || {
+            let tracker = Arc::new(JobTracker::builder().build().unwrap());
+            let request = tracing::info_span!("request");
+            let _request_entered = request.enter();
+            let job = tracker
+                .create_visible_workflow_job_if_node_idle(
+                    "rack-1",
+                    "node-1",
+                    JobType::FirmwareUpdate,
+                )
+                .expect("job");
+            let job_id = job.id().to_string();
+            job.complete("done", r#"{"status":"ok"}"#);
+            (tracker, job_id)
+        });
+
+        provider.force_flush().unwrap();
+        let spans = exporter.get_finished_spans().unwrap();
+        let request_span = spans
+            .iter()
+            .find(|span| span.name == "request")
+            .expect("request root must export while the terminal job remains retained");
+        let job_span = spans
+            .iter()
+            .find(|span| span.name == "firmware_update")
+            .expect("terminal job span must export while its snapshot remains retained");
+        assert_eq!(job_span.parent_span_id, request_span.span_context.span_id());
+        assert_eq!(job_span.status, opentelemetry::trace::Status::Unset);
+        assert!(
+            tracker.get_job(&job_id).is_some(),
+            "terminal snapshot should still be retained"
+        );
+    }
+
+    #[test]
+    fn verified_job_exports_ok_before_its_snapshot_is_evicted() {
+        let exporter = InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_sampler(Sampler::AlwaysOn)
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let otel_layer =
+            tracing_opentelemetry::layer().with_tracer(provider.tracer("job-verified-test"));
+        let subscriber = tracing_subscriber::registry().with(otel_layer);
+
+        let (tracker, job_id) = tracing::subscriber::with_default(subscriber, || {
+            let tracker = Arc::new(JobTracker::builder().build().unwrap());
+            let job = tracker
+                .create_visible_workflow_job_if_node_idle(
+                    "rack-1",
+                    "node-1",
+                    JobType::SwitchFactoryDefaultReset,
+                )
+                .expect("job");
+            let job_id = job.id().to_string();
+            job.complete_verified("Factory-default readiness verified", "");
+            (tracker, job_id)
+        });
+
+        provider.force_flush().unwrap();
+        let spans = exporter.get_finished_spans().unwrap();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].name, "switch_factory_default_reset");
+        assert_eq!(spans[0].status, opentelemetry::trace::Status::Ok);
+        assert_eq!(tracker.get_job(&job_id).unwrap().state, JobState::Completed);
+    }
+
+    #[test]
+    fn late_verified_completion_cannot_override_a_winning_failure() {
+        if crate::observability::run_test_in_subprocess(concat!(
+            "orchestrator::job_tracker::tests::",
+            "late_verified_completion_cannot_override_a_winning_failure"
+        )) {
+            return;
+        }
+
+        struct CompleteDuringFailureLog(Arc<Mutex<Option<RmsJobHandle>>>);
+
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CompleteDuringFailureLog {
+            fn on_event(
+                &self,
+                _event: &tracing::Event<'_>,
+                _context: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                let job = self.0.lock().unwrap().take();
+                if let Some(job) = job {
+                    // The failure has won the registry transition, but its
+                    // terminal log runs before the SDK status is set or ended.
+                    job.complete_verified("Late worker success", "");
+                }
+            }
+        }
+
+        let exporter = InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_sampler(Sampler::AlwaysOn)
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let otel_layer =
+            tracing_opentelemetry::layer().with_tracer(provider.tracer("job-terminal-race-test"));
+        let late_completion = Arc::new(Mutex::new(None));
+        let subscriber = tracing_subscriber::registry()
+            .with(otel_layer)
+            .with(CompleteDuringFailureLog(late_completion.clone()));
+
+        let (tracker, job_id) = tracing::subscriber::with_default(subscriber, || {
+            let tracker = Arc::new(JobTracker::builder().build().unwrap());
+            let job = tracker
+                .create_visible_workflow_job_if_node_idle(
+                    "rack-1",
+                    "node-1",
+                    JobType::SwitchFactoryDefaultReset,
+                )
+                .expect("job");
+            let job_id = job.id().clone();
+            *late_completion.lock().unwrap() = Some(job);
+            tracker
+                .registry
+                .fail_non_terminal_for_shutdown(std::slice::from_ref(&job_id));
+            assert!(late_completion.lock().unwrap().is_none());
+            (tracker, job_id)
+        });
+
+        provider.force_flush().unwrap();
+        let spans = exporter.get_finished_spans().unwrap();
+        assert_eq!(
+            spans.len(),
+            1,
+            "the losing completion must not export again"
+        );
+        assert_eq!(spans[0].status, opentelemetry::trace::Status::error(""));
+        assert_eq!(
+            tracker.get_job(job_id.as_ref()).unwrap().state,
+            JobState::Failed
+        );
+    }
+
+    #[test]
+    fn parent_of_an_uncertain_completed_child_keeps_unset_status() {
+        let exporter = InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_sampler(Sampler::AlwaysOn)
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let otel_layer =
+            tracing_opentelemetry::layer().with_tracer(provider.tracer("job-parent-status-test"));
+        let subscriber = tracing_subscriber::registry().with(otel_layer);
+
+        let (tracker, parent_id, verified_span_id, uncertain_span_id) =
+            tracing::subscriber::with_default(subscriber, || {
+                let tracker = Arc::new(JobTracker::builder().build().unwrap());
+                let (parent_id, children) = create_test_batch(
+                    tracker.as_ref(),
+                    "rack-1",
+                    &["node-1", "node-2"],
+                    JobType::SwitchSystemImageUpdate,
+                );
+                let [verified, uncertain] = children.try_into().unwrap_or_else(|_| {
+                    panic!("expected two child jobs");
+                });
+                let verified_span_id = verified.span().context().span().span_context().span_id();
+                let uncertain_span_id = uncertain.span().context().span().span_context().span_id();
+                verified.complete_verified("Target state verified", "");
+                uncertain.complete("Submitted; target state not verified", "");
+                assert_eq!(
+                    tracker.get_job(&parent_id).unwrap().state,
+                    JobState::Completed
+                );
+                (tracker, parent_id, verified_span_id, uncertain_span_id)
+            });
+
+        provider.force_flush().unwrap();
+        let spans = exporter.get_finished_spans().unwrap();
+        assert_eq!(spans.len(), 3);
+        for span in &spans {
+            let expected = if span.span_context.span_id() == verified_span_id {
+                opentelemetry::trace::Status::Ok
+            } else {
+                opentelemetry::trace::Status::Unset
+            };
+            assert_eq!(span.status, expected, "span: {span:?}");
+        }
+        assert!(spans.iter().any(|span| {
+            span.span_context.span_id() == uncertain_span_id
+                && span.status == opentelemetry::trace::Status::Unset
+        }));
+        assert_eq!(
+            tracker.get_job(&parent_id).unwrap().state,
+            JobState::Completed
+        );
+    }
+
+    #[test]
+    fn failed_job_exports_bounded_error_taxonomy() {
+        if crate::observability::run_test_in_subprocess(concat!(
+            "orchestrator::job_tracker::tests::",
+            "failed_job_exports_bounded_error_taxonomy"
+        )) {
+            return;
+        }
+
+        let (provider, exporter, dispatch) = job_span_exporter();
+        let _subscriber = tracing::dispatcher::set_default(&dispatch);
+        let tracker = JobTracker::new();
+        for (error, expected_code, error_type) in [
+            (
+                anyhow::Error::new(JobError::Timeout),
+                JobError::Timeout,
+                "timeout",
+            ),
+            (
+                anyhow::Error::new(JobError::ClientError).context("private-error-context"),
+                JobError::ClientError,
+                "client_error",
+            ),
+            (
+                anyhow::anyhow!("private-untyped-error"),
+                JobError::Internal,
+                "internal",
+            ),
+        ] {
+            let job = tracker
+                .create_visible_workflow_job_if_node_idle("rack", "node", JobType::FirmwareUpdate)
+                .unwrap();
+            let job_id = job.id().to_string();
+            job.fail(JobFailure::new(error, "private-failure-detail"));
+            assert_eq!(tracker.get_job(&job_id).unwrap().error_code, expected_code);
+
+            provider.force_flush().unwrap();
+            let spans = exporter.get_finished_spans().unwrap();
+            let span = spans.last().expect("failed job span");
+            assert_eq!(span.name, "firmware_update");
+            assert_eq!(span.status, opentelemetry::trace::Status::error(""));
+            assert!(
+                span.attributes.iter().any(|attribute| {
+                    attribute.key.as_str() == "error.type" && attribute.value.as_str() == error_type
+                }),
+                "span attributes: {:?}",
+                span.attributes
+            );
+            assert!(
+                !format!("{span:?}").contains("private-"),
+                "raw failure detail must not enter trace data"
+            );
+        }
+        assert_eq!(exporter.get_finished_spans().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn rejected_job_admission_does_not_emit_a_job_span() {
+        let exporter = InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_sampler(Sampler::AlwaysOn)
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let otel_layer =
+            tracing_opentelemetry::layer().with_tracer(provider.tracer("job-rejection-test"));
+        let subscriber = tracing_subscriber::registry().with(otel_layer);
+
+        tracing::subscriber::with_default(subscriber, || {
+            let tracker = JobTracker::builder().max_tracked_jobs(1).build().unwrap();
+            let accepted = tracker
+                .create_job_if_node_idle("rack-1", "node-1", JobType::FirmwareUpdate)
+                .expect("first job");
+            let accepted_id = accepted.id().to_string();
+            tracker
+                .create_job_if_node_idle("rack-1", "node-2", JobType::FirmwareUpdate)
+                .expect_err("capacity rejection");
+
+            provider.force_flush().unwrap();
+            assert!(
+                exporter.get_finished_spans().unwrap().is_empty(),
+                "rejected admission must not close an otherwise nonexistent job span"
+            );
+            accepted.complete("done", r#"{"status":"ok"}"#);
+            let spans = exporter.get_finished_spans().unwrap();
+            assert_eq!(spans.len(), 1, "the admitted job must still export");
+            assert_eq!(spans[0].name, "firmware_update");
+            assert!(spans[0].attributes.iter().any(|attribute| {
+                attribute.key.as_str() == "job_id" && attribute.value.as_str() == accepted_id
+            }));
+        });
     }
 
     #[derive(Clone)]
@@ -1718,6 +2936,13 @@ mod tests {
 
     #[test]
     fn child_job_span_records_child_and_parent_job_ids() {
+        if crate::observability::run_test_in_subprocess(concat!(
+            "orchestrator::job_tracker::tests::",
+            "child_job_span_records_child_and_parent_job_ids"
+        )) {
+            return;
+        }
+
         let writer = TestWriter::new();
         let cloned_writer = writer.clone();
         let layer = crate::logging::logfmt::layer()
@@ -2124,6 +3349,15 @@ mod tests {
     /// because the panic unwound past the tail of the future.
     #[tokio::test]
     async fn panicking_child_refreshes_parent_without_polling() {
+        // Unsubscribed parallel tests use the same job-span callsites.
+        if crate::observability::run_test_in_subprocess(concat!(
+            "orchestrator::job_tracker::tests::",
+            "panicking_child_refreshes_parent_without_polling"
+        )) {
+            return;
+        }
+        let (provider, exporter, subscriber) = job_span_exporter();
+        let _subscriber = tracing::dispatcher::set_default(&subscriber);
         let tracker = Arc::new(JobTracker::new());
         let (parent_id, mut children) = create_test_batch(
             tracker.as_ref(),
@@ -2136,7 +3370,8 @@ mod tests {
 
         // The supervisor catches the panic as a JoinError, so `wait` resolves.
         tracker
-            .spawn_job(child, |_job| async move {
+            .spawn_job(child, |job| async move {
+                let _job = job;
                 panic!("worker exploded");
             })
             .wait()
@@ -2163,6 +3398,54 @@ mod tests {
             snapshot_state(&parent.state),
             JobState::Failed,
             "the parent must not still be Running after its only child panicked"
+        );
+
+        provider.force_flush().unwrap();
+        let spans = exporter.get_finished_spans().unwrap();
+        assert_eq!(
+            spans.len(),
+            2,
+            "both failures must export while their snapshots are still retained"
+        );
+        let child_span = spans
+            .iter()
+            .find(|span| {
+                span.attributes.iter().any(|attribute| {
+                    attribute.key.as_str() == "job_id"
+                        && attribute.value.as_str() == child_id.as_ref()
+                })
+            })
+            .expect("panicking child span");
+        let parent_span = spans
+            .iter()
+            .find(|span| {
+                span.attributes.iter().any(|attribute| {
+                    attribute.key.as_str() == "job_id" && attribute.value.as_str() == parent_id
+                })
+            })
+            .expect("failed parent span");
+        for (span, category) in [(child_span, "internal"), (parent_span, "other")] {
+            assert_eq!(span.name, "firmware_update");
+            assert_eq!(span.status, opentelemetry::trace::Status::error(""));
+            assert!(span.attributes.iter().any(|attribute| {
+                attribute.key.as_str() == "error.type" && attribute.value.as_str() == category
+            }));
+        }
+        assert_eq!(
+            child_span.parent_span_id,
+            parent_span.span_context.span_id()
+        );
+        assert_eq!(
+            child_span.span_context.trace_id(),
+            parent_span.span_context.trace_id()
+        );
+        assert_ne!(
+            child_span.span_context.span_id(),
+            parent_span.span_context.span_id()
+        );
+        assert!(
+            !format!("{spans:?}").contains("worker exploded"),
+            "raw panic details must not enter trace data"
         );
     }
 
@@ -2313,7 +3596,7 @@ mod tests {
                 JobSpec::new_parent(
                     "rack-01",
                     "Batch accepting child jobs",
-                    job_span(JobType::FirmwareUpdate, ""),
+                    job_span(JobType::FirmwareUpdate, "", None),
                 )
                 .with_workflow_type(JobType::FirmwareUpdate),
                 None,
@@ -2328,7 +3611,7 @@ mod tests {
                     "rack-01",
                     "n-01",
                     "Queued",
-                    job_span(JobType::FirmwareUpdate, ""),
+                    job_span(JobType::FirmwareUpdate, "", None),
                 ),
                 Some(&parent_id),
                 false,
@@ -2902,22 +4185,294 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shutdown_and_await_terminal_times_out_when_job_never_terminates() {
+    async fn shutdown_and_await_terminal_fails_job_that_never_terminates() {
         let tracker = JobTracker::new();
         let running = tracker
             .create_job("rack-01", "sw-01", JobType::SwitchSystemImageUpdate)
             .unwrap();
         tracker.mark_running(&running, "uploading");
 
-        // The job is cancelled but nothing seals it, so the wait returns once
-        // the bounded timeout elapses rather than blocking teardown forever.
+        // The job is cancelled but nothing seals it, so shutdown terminalizes
+        // it after the bounded cooperative wait.
         let cancelled = tracker
             .shutdown_and_await_terminal(Duration::from_millis(50))
             .await;
 
         assert_eq!(cancelled, 1);
         let job = tracker.get_job(&running).unwrap();
-        assert_eq!(job.state, JobState::Running);
+        assert_eq!(job.state, JobState::Failed);
+        assert_eq!(job.error_code, JobError::Other);
+    }
+
+    #[tokio::test]
+    async fn shutdown_aborts_and_joins_unresponsive_worker() {
+        // Unsubscribed parallel tests use the same job-span callsites.
+        if crate::observability::run_test_in_subprocess(concat!(
+            "orchestrator::job_tracker::tests::",
+            "shutdown_aborts_and_joins_unresponsive_worker"
+        )) {
+            return;
+        }
+        let (provider, exporter, subscriber) = job_span_exporter();
+        let _subscriber = tracing::dispatcher::set_default(&subscriber);
+        let tracker = Arc::new(JobTracker::new());
+        let job = tracker
+            .create_job("rack-01", "sw-01", JobType::SwitchSystemImageUpdate)
+            .unwrap();
+        let job_id = job.id().to_string();
+        let (started, worker_started) = tokio::sync::oneshot::channel();
+        tracker
+            .spawn_job(job, |job| async move {
+                let _job = job;
+                started.send(()).unwrap();
+                std::future::pending::<()>().await;
+            })
+            .detach();
+        tokio::time::timeout(Duration::from_secs(1), worker_started)
+            .await
+            .expect("worker must start before shutdown")
+            .unwrap();
+
+        let cancelled = tracker
+            .shutdown_and_await_terminal(Duration::from_millis(50))
+            .await;
+
+        assert_eq!(cancelled, 1);
+        let job = tracker.get_job(&job_id).unwrap();
+        assert_eq!(job.state, JobState::Failed);
+        assert_eq!(job.error_code, JobError::Other);
+        assert!(tracker.registry.task_job_ids().is_empty());
+
+        provider.force_flush().unwrap();
+        let spans = exporter.get_finished_spans().unwrap();
+        assert_eq!(
+            spans.len(),
+            1,
+            "shutdown must export the failure before provider shutdown or snapshot eviction"
+        );
+        let span = &spans[0];
+        assert_eq!(span.name, "switch_system_image_update");
+        assert_eq!(span.status, opentelemetry::trace::Status::error(""));
+        assert!(span.attributes.iter().any(|attribute| {
+            attribute.key.as_str() == "error.type" && attribute.value.as_str() == "other"
+        }));
+        assert!(span.attributes.iter().any(|attribute| {
+            attribute.key.as_str() == "job_id" && attribute.value.as_str() == job_id
+        }));
+    }
+
+    #[tokio::test]
+    async fn shutdown_rejected_worker_exports_cancelled_error() {
+        use crate::orchestrator::job_lifecycle::CleanupReport;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        if crate::observability::run_test_in_subprocess(concat!(
+            "orchestrator::job_tracker::tests::",
+            "shutdown_rejected_worker_exports_cancelled_error"
+        )) {
+            return;
+        }
+        let (provider, exporter, subscriber) = job_span_exporter();
+        let _subscriber = tracing::dispatcher::set_default(&subscriber);
+        let tracker = Arc::new(JobTracker::new());
+        let job = tracker
+            .create_job("rack-01", "sw-01", JobType::SwitchSystemImageUpdate)
+            .unwrap();
+        let job_id = job.id().clone();
+        assert!(!job.cancellation_token().is_cancelled());
+        let started = Arc::new(AtomicBool::new(false));
+        let worker_started = started.clone();
+
+        // Reproduce shutdown between admission and spawning, before its
+        // cancellation sweep signals the admitted job's token.
+        tracker.registry.begin_shutdown();
+        let result = tracker
+            .spawn_job(job, move |_job| async move {
+                worker_started.store(true, Ordering::SeqCst);
+            })
+            .wait()
+            .await;
+        assert_eq!(result.unwrap(), CleanupReport::Skipped);
+        assert!(
+            tracker
+                .registry
+                .wait_for_terminal_jobs(
+                    std::slice::from_ref(&job_id),
+                    Some(Duration::from_secs(1)),
+                )
+                .await
+        );
+        assert!(!started.load(Ordering::SeqCst));
+        assert!(tracker.registry.task_job_ids().is_empty());
+
+        provider.force_flush().unwrap();
+        let spans = exporter.get_finished_spans().unwrap();
+        assert_eq!(spans.len(), 1);
+        let span = &spans[0];
+        assert_eq!(span.name, "switch_system_image_update");
+        assert_eq!(span.status, opentelemetry::trace::Status::error(""));
+        let category = span
+            .attributes
+            .iter()
+            .find(|attribute| attribute.key.as_str() == "error.type")
+            .expect("rejected worker must export a bounded error category");
+        assert_eq!(category.value.as_str(), "other");
+        let job = tracker.get_job(job_id.as_ref()).unwrap();
+        assert_eq!(job.state, JobState::Failed);
+        assert_eq!(job.error_code, JobError::Other);
+        assert_eq!(job.state_description, "Cancelled");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_drains_late_cleanup_or_aborts_it_at_the_deadline() {
+        use crate::orchestrator::job_lifecycle::{CleanupPlan, CleanupReport};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        for child_completes in [true, false] {
+            let tracker = Arc::new(JobTracker::new());
+            let mut child = Some(
+                tracker
+                    .create_job("rack-01", "sw-01", JobType::SwitchSystemImageUpdate)
+                    .unwrap(),
+            );
+            let child_id = child.as_ref().unwrap().id().clone();
+            let pending = tracker
+                .registry
+                .create_job(
+                    JobSpec::new("", "", "Cache cleanup", tracing::Span::none()),
+                    None,
+                    false,
+                )
+                .unwrap();
+            let cleanup_id = pending.id().clone();
+            let temp = tempfile::tempdir().unwrap();
+            let cache = temp.path().join("cache");
+            std::fs::create_dir(&cache).unwrap();
+            std::fs::write(cache.join("image.bin"), b"temporary image").unwrap();
+            let started = Arc::new(AtomicBool::new(false));
+            let worker_started = started.clone();
+
+            tracker.registry.begin_shutdown();
+            let cleanup = tracker.registry.spawn_job_with_cleanup(
+                pending,
+                CleanupPlan::remove_dir_after_jobs_terminate(
+                    vec![child_id.clone()],
+                    cache.clone(),
+                    None,
+                ),
+                move |_job| async move {
+                    worker_started.store(true, Ordering::SeqCst);
+                },
+            );
+            assert!(
+                tracker
+                    .registry
+                    .wait_for_terminal_jobs(
+                        std::slice::from_ref(&cleanup_id),
+                        Some(Duration::from_secs(1)),
+                    )
+                    .await
+            );
+            assert!(tracker.registry.task_job_ids().contains(&cleanup_id));
+            assert!(cache.join("image.bin").exists());
+            assert!(!started.load(Ordering::SeqCst));
+
+            // Paused time keeps CI scheduling and filesystem latency from
+            // consuming the shutdown budget while cleanup can still progress.
+            // Poll shutdown before releasing the child: cleanup must remain
+            // tracked and must not remove files still owned by active work.
+            let mut drain =
+                Box::pin(tracker.shutdown_and_await_terminal(Duration::from_millis(500)));
+            assert!(
+                std::future::poll_fn(|cx| {
+                    std::task::Poll::Ready(std::future::Future::poll(drain.as_mut(), cx))
+                })
+                .await
+                .is_pending()
+            );
+            assert!(cache.join("image.bin").exists());
+            if child_completes {
+                child.take().unwrap().complete("Finished using cache", "");
+            }
+
+            tokio::time::timeout(Duration::from_secs(2), drain)
+                .await
+                .expect("shutdown must bound cleanup even if its dependency never finishes");
+            let result = tokio::time::timeout(Duration::from_secs(1), cleanup.wait())
+                .await
+                .expect("shutdown must finish or abort the tracked supervisor");
+            if child_completes {
+                assert_eq!(result.unwrap(), CleanupReport::Removed);
+                assert!(!cache.exists());
+            } else {
+                assert!(result.unwrap_err().is_cancelled());
+                assert!(cache.join("image.bin").exists());
+            }
+            assert!(!started.load(Ordering::SeqCst));
+            assert!(tracker.registry.task_job_ids().is_empty());
+            assert_eq!(
+                tracker.get_job(cleanup_id.as_ref()).unwrap().state,
+                JobState::Failed
+            );
+            assert_eq!(
+                tracker.get_job(child_id.as_ref()).unwrap().state,
+                if child_completes {
+                    JobState::Completed
+                } else {
+                    JobState::Failed
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_drains_task_owned_by_terminal_job() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct Dropped(Arc<AtomicBool>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let tracker = Arc::new(JobTracker::new());
+        let job = tracker
+            .create_job("rack-01", "sw-01", JobType::SwitchSystemImageUpdate)
+            .unwrap();
+        let job_id = job.id().to_string();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let worker_dropped = dropped.clone();
+        tracker
+            .spawn_job(job, move |job| async move {
+                job.complete("Completed", "{}");
+                let _dropped = Dropped(worker_dropped);
+                std::future::pending::<()>().await;
+            })
+            .detach();
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if tracker
+                    .get_job(&job_id)
+                    .is_some_and(|job| job.state == JobState::Completed)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let cancelled = tracker
+            .shutdown_and_await_terminal(Duration::from_millis(100))
+            .await;
+
+        assert_eq!(cancelled, 0);
+        assert!(dropped.load(Ordering::SeqCst));
+        assert!(tracker.registry.task_job_ids().is_empty());
+        assert_eq!(tracker.get_job(&job_id).unwrap().state, JobState::Completed);
     }
 
     #[tokio::test]

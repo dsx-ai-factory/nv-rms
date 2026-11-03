@@ -1,0 +1,19 @@
+[package]
+name = "nvdebug_probe"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+publish = false
+description = "Runs nvdebug_cli against a real nvdebug and a real BMC, by hand"
+
+[[bin]]
+name = "nvdebug-probe"
+path = "src/main.rs"
+
+[dependencies]
+clap = { workspace = true }
+eyre = { workspace = true }
+nvdebug_cli = { path = "../nvdebug_cli" }
+secrecy = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal"] }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }

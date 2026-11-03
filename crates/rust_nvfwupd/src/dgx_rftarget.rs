@@ -242,8 +242,12 @@ impl RFTarget for DGXRFTarget {
     // Factory reset override
     // ------------------------------------------------------------------
 
-    /// Perform factory reset with `{"ResetType": "ResetAll"}`.
-    async fn factory_reset(&mut self, _reset_params: Option<&Value>) -> (bool, Value) {
+    /// Perform factory reset with `{"ResetType": "ResetAll"}` unless the caller supplies a body.
+    async fn factory_reset(&mut self, reset_params: Option<&Value>) -> (bool, Value) {
+        if reset_params.is_some() {
+            return self.redfish_factory_reset(reset_params).await;
+        }
+
         let params = json!({"ResetType": "ResetAll"});
 
         let (status, response_dict) = self
@@ -732,7 +736,7 @@ impl DGXRFTarget {
         let uri = format!("/redfish/v1/Chassis/{}", ap_chassis);
         let (status, gpu_dict) = self
             .bmc_access
-            .dispatch_request("GET", &uri, None, None)
+            .dispatch_request_full("GET", &uri, None, None, 30, true, None)
             .await;
         if !status {
             return None;
@@ -756,7 +760,7 @@ impl DGXRFTarget {
         );
         let (status, psu_dict) = self
             .bmc_access
-            .dispatch_request("GET", &uri, None, None)
+            .dispatch_request_full("GET", &uri, None, None, 30, true, None)
             .await;
 
         if !status {
@@ -766,7 +770,7 @@ impl DGXRFTarget {
             );
             let (status2, psu_dict2) = self
                 .bmc_access
-                .dispatch_request("GET", &uri2, None, None)
+                .dispatch_request_full("GET", &uri2, None, None, 30, true, None)
                 .await;
             if !status2 {
                 return None;

@@ -22,7 +22,7 @@ mod error;
 mod task;
 mod types;
 
-pub use client::RedfishClient;
+pub use client::{ODataLink, RedfishClient, ResourceCollection};
 pub use error::{RedfishError, Result};
 pub use nv_redfish::bmc_http::BmcCredentials;
 pub use nv_redfish::core::{DataStream, UploadReader};

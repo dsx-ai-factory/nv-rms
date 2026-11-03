@@ -1,6 +1,10 @@
 [workspace]
 members = [
     "crates/common",
+    "crates/nvdebug_cli",
+    "crates/nvdebug_probe",
+    "crates/nvssvt",
+    "crates/nvswitch_cli",
     "crates/nvue_client",
     "crates/rackmanagementservice",
     "crates/redfish_client",
@@ -28,15 +32,40 @@ flate2 = "1"
 futures = "0.3"
 hex = "0.4"
 http = "1.4.0"
+http-body = "1"
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio", "server-auto", "client-legacy"] }
 indexmap = { version = "2", features = ["serde"] }
-librms = { git = "https://github.com/dsx-ai-factory/nv-rms-client", rev = "966d7a701d6b0f2b6a4c59a805b1b9c1cbeffb61", default-features = false }
+librms = { git = "https://github.com/dsx-ai-factory/nv-rms-client", rev = "7bed078b55673ff2a3c8546c63e9554dc19951d3", default-features = false }
+macaddr = "1.0.1"
 mimalloc = { version = "0.1", features = ["override"] }
+nix = "0.31"
 noyalib = { version = "0.0.8", features = ["compat-serde-yaml"] }
-nv-redfish = { version = "0.11.0", default-features = false }
+nv-redfish = { version = "0.18.1", default-features = false }
 nvfwupd = { path = "crates/rust_nvfwupd" }
+nvssvt = { path = "crates/nvssvt" }
+nvswitch_cli = { path = "crates/nvswitch_cli" }
 nvue_client = { path = "crates/nvue_client" }
+opentelemetry = { version = "=0.32.0", default-features = false, features = ["trace"] }
+opentelemetry-http = { version = "=0.32.0", default-features = false }
+opentelemetry-otlp = { version = "=0.32.0", default-features = false, features = [
+  "trace",
+  "grpc-tonic",
+  "http-proto",
+  "tls-aws-lc",
+  "tls-roots",
+  "experimental-grpc-retry",
+  "experimental-http-retry",
+  "internal-logs",
+] }
+opentelemetry-proto = { version = "=0.32.0", default-features = false, features = [
+  "gen-tonic",
+  "trace",
+] }
+opentelemetry_sdk = { version = "=0.32.1", default-features = false, features = [
+  "trace",
+  "rt-tokio",
+] }
 prometheus = "0.14"
 prost = "0.14"
 prost-types = "0.14"
@@ -47,14 +76,17 @@ redfish_test_support = { path = "crates/redfish_test_support" }
 regex = "1"
 common = { path = "crates/common" }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots", "rustls-tls-native-roots", "multipart", "stream"] }
-russh = "0.63.1"
+russh = "0.63.2"
 russh-sftp = "2"
 rustls = "0.23"
+rustls-native-certs = "0.8"
 rustls-pemfile = "2"
+rustls-pki-types = "1"
 secrecy = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_ignored = "0.1"
 serde_json = "1"
+serde_path_to_error = "0.1"
 sha2 = "0.10"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "json", "chrono", "macros", "migrate"] }
 tar = "0.4"
@@ -62,17 +94,21 @@ tempfile = "3"
 thiserror = "2"
 tokio = "1"
 tokio-rustls = "0.26"
+tokio-stream = { version = "0.1", features = ["net"] }
 tokio-util = "0.7"
-tonic = { version = "0.14", features = ["tls-aws-lc"] }
+tonic = { version = "0.14", features = ["tls-aws-lc", "tls-native-roots"] }
 tonic-prost = "0.14"
 tonic-prost-build = "0.14"
+tonic-types = "0.14"
 tonic_prometheus_layer = "0.3"
 tower = "0.5"
 tracing = "0.1"
 tracing-appender = "0.2"
+tracing-opentelemetry = { version = "=0.33.0", default-features = false }
 tracing-subscriber = "0.3"
 url = "2.5"
 uuid = { version = "1", features = ["v4"] }
 vergen-gitcl = { version = "9", features = ["build", "rustc"] }
+webpki-roots = "1"
 wiremock = "0.5"
 x509-parser = "0.17"

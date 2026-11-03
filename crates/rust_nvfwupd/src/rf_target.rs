@@ -148,6 +148,40 @@ fn target_list_contains_completion_suppress_target(data: &Value) -> bool {
     }
 }
 
+const UPDATE_TASK_TYPE_BMC: &str = "BMC";
+const UPDATE_TASK_TYPE_HMC: &str = "HMC";
+
+fn update_parameter_target_is_hmc(target: &str) -> bool {
+    let target = target.trim().to_ascii_lowercase();
+    target.contains("hgx") || target.contains("hmc")
+}
+
+fn expected_task_type_from_update_parameters(data: &Value) -> Option<&'static str> {
+    let targets = data.get("Targets")?;
+
+    match targets {
+        Value::Array(targets) if targets.is_empty() => Some(UPDATE_TASK_TYPE_BMC),
+        Value::Array(targets) => {
+            let mut saw_string_target = false;
+            for target in targets.iter().filter_map(Value::as_str) {
+                saw_string_target = true;
+                if update_parameter_target_is_hmc(target) {
+                    return Some(UPDATE_TASK_TYPE_HMC);
+                }
+            }
+            saw_string_target.then_some(UPDATE_TASK_TYPE_BMC)
+        }
+        Value::String(target) => {
+            if update_parameter_target_is_hmc(target) {
+                Some(UPDATE_TASK_TYPE_HMC)
+            } else {
+                Some(UPDATE_TASK_TYPE_BMC)
+            }
+        }
+        _ => None,
+    }
+}
+
 pub(crate) async fn should_suppress_update_completion_msg(
     updparams_json: Option<&Value>,
     upd_params_file: Option<&str>,
@@ -398,6 +432,7 @@ pub(crate) static SERVER_TYPE_CLASS_DICT: LazyLock<HashMap<&'static str, &'stati
         m.insert("gb300switch", "GB200SwitchRFTarget");
         m.insert("vrnvl72switch", "GB200SwitchRFTarget");
         m.insert("vrnvl72", "GB200RFTarget");
+        m.insert("lp30", "GB200RFTarget");
         m.insert("powershelf", "PowerShelfRFTarget");
         m
     });
@@ -420,6 +455,7 @@ pub(crate) static TARGET_CLASS_DICT: LazyLock<HashMap<&'static str, &'static str
         m.insert("vr bmc", "GB200RFTarget");
         m.insert("vr hmc", "GB200RFTarget");
         m.insert("vr nvl72", "GB200RFTarget");
+        m.insert("lp30", "GB200RFTarget");
         m.insert("vera mgx", "GB200RFTarget");
         m.insert("vera mgx c1", "GB200RFTarget");
         m.insert("vera mgx c2", "GB200RFTarget");
@@ -756,11 +792,11 @@ pub trait RFTarget: Send + Sync {
         Ok(Some(contents))
     }
 
-    /// Perform a factory reset on the BMC via Redfish.
+    /// Perform a factory reset on the BMC via the common Redfish action path.
     ///
     /// Queries `/redfish/v1/Managers` to discover the BMC ID, then POSTs
-    /// the `Manager.ResetToDefaults` action.
-    async fn factory_reset(&mut self, reset_params: Option<&Value>) -> (bool, Value) {
+    /// the supplied reset body to the `Manager.ResetToDefaults` action.
+    async fn redfish_factory_reset(&mut self, reset_params: Option<&Value>) -> (bool, Value) {
         let (status, response_dict) = self
             .target_access()
             .dispatch_request("GET", "/redfish/v1/Managers", None, None)
@@ -805,6 +841,15 @@ pub trait RFTarget: Send + Sync {
         }
 
         (status, response_dict)
+    }
+
+    /// Perform a factory reset on the BMC via Redfish.
+    ///
+    /// Platform targets may override this when they have platform-specific
+    /// default reset bodies. Callers can still pass `reset_params` to provide an
+    /// explicit body, such as config-file `BMCResetParameters`.
+    async fn factory_reset(&mut self, reset_params: Option<&Value>) -> (bool, Value) {
+        self.redfish_factory_reset(reset_params).await
     }
 
     /// Send a background copy Redfish request.
@@ -1290,6 +1335,48 @@ pub trait RFTarget: Send + Sync {
         "UNKNOWN".to_string()
     }
 
+    /// Return whether this target should use explicit UpdateParameters `Targets`
+    /// to classify the BMC/HMC task type during the running-task preflight.
+    fn use_update_parameters_for_task_type(&self) -> bool {
+        false
+    }
+
+    /// Determine expected update task type for the running-task preflight.
+    ///
+    /// Targets that opt in use user-provided UpdateParameters `Targets` as the
+    /// authoritative BMC/HMC split. Other targets keep their package fallback
+    /// behavior so platform-specific task semantics are not widened.
+    async fn get_expected_task_type(
+        &self,
+        recipe_list: &[String],
+        update_parameters: Option<&[String]>,
+    ) -> String {
+        if self.use_update_parameters_for_task_type() {
+            if let Some(params) = update_parameters {
+                match self.resolve_json_or_file(Some(params), "special").await {
+                    Ok(Some(params_json)) => {
+                        if let Ok(value) = serde_json::from_str::<Value>(&params_json) {
+                            if let Some(task_type) =
+                                expected_task_type_from_update_parameters(&value)
+                            {
+                                return task_type.to_string();
+                            }
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(message) => {
+                        tracing::debug!(
+                            "Unable to resolve update parameters for running-task preflight classification: {}",
+                            NvUtils::sanitize_log(&message)
+                        );
+                    }
+                }
+            }
+        }
+
+        self.get_expected_task_type_from_package(recipe_list)
+    }
+
     /// Check if an update task of the same type (BMC or HMC) is already
     /// running on the target.
     ///
@@ -1297,6 +1384,7 @@ pub trait RFTarget: Send + Sync {
     async fn check_for_running_update_task_by_type(
         &self,
         recipe_list: &[String],
+        update_parameters: Option<&[String]>,
         mut json_dict: Option<&mut Value>,
     ) -> (bool, Option<String>, Option<String>) {
         let (status, tasks_response) = self
@@ -1320,7 +1408,9 @@ pub trait RFTarget: Send + Sync {
             .map(Vec::as_slice)
             .unwrap_or(&[]);
 
-        let expected_type = self.get_expected_task_type_from_package(recipe_list);
+        let expected_type = self
+            .get_expected_task_type(recipe_list, update_parameters)
+            .await;
 
         for member in members {
             let task_uri = member
@@ -1338,9 +1428,9 @@ pub trait RFTarget: Send + Sync {
             // BMC tasks: numerical (0, 1, 2, etc.)
             // HMC tasks: HGX_0, HGX_1, HGX_2, etc.
             let task_type = if task_id.starts_with("HGX_") {
-                "HMC"
+                UPDATE_TASK_TYPE_HMC
             } else {
-                "BMC"
+                UPDATE_TASK_TYPE_BMC
             };
 
             // If expected_type is UNKNOWN, do not block the update.
@@ -1367,11 +1457,10 @@ pub trait RFTarget: Send + Sync {
                 .to_lowercase();
 
             if TASK_PENDING_STATES.contains(&task_state.as_str()) {
-                let task_type_str = if task_type == "HMC" { "HMC" } else { "BMC" };
                 let error_msg = format!(
                     "An update task (ID: {}, Type: {}) is already running. \
                      Please wait for it to complete before starting a new update.",
-                    task_id, task_type_str
+                    task_id, task_type
                 );
                 return (true, Some(task_id.to_string()), Some(error_msg));
             }
@@ -1509,8 +1598,11 @@ pub trait RFTarget: Send + Sync {
             Util::bail_nvfwupd_threadsafe(
                 1,
                 &format!(
-                    "File upload failed with error {:?}",
-                    redacted_json_value(&response_dict)
+                    "File upload failed with error {}",
+                    self.target_access().bounded_submission_text(
+                        &format!("{:?}", redacted_json_value(&response_dict)),
+                        4096,
+                    )
                 ),
                 BailAction::DoNothing,
                 json_dict.as_deref(),
@@ -1614,8 +1706,11 @@ pub trait RFTarget: Send + Sync {
             Util::bail_nvfwupd_threadsafe(
                 1,
                 &format!(
-                    "File upload failed with error {:?}",
-                    redacted_json_value(&response_dict)
+                    "File upload failed with error {}",
+                    self.target_access().bounded_submission_text(
+                        &format!("{:?}", redacted_json_value(&response_dict)),
+                        4096,
+                    )
                 ),
                 BailAction::DoNothing,
                 None,
@@ -1713,7 +1808,11 @@ pub trait RFTarget: Send + Sync {
         // Check if an update task is already running (unless skipping pre-flight checks)
         if !skip_pre_flight_checks {
             let (is_running, _running_task_id, error_msg) = self
-                .check_for_running_update_task_by_type(recipe_list, json_dict.as_deref_mut())
+                .check_for_running_update_task_by_type(
+                    recipe_list,
+                    cmd_args.special.as_deref(),
+                    json_dict.as_deref_mut(),
+                )
                 .await;
             if is_running {
                 Util::bail_nvfwupd(
@@ -2456,6 +2555,8 @@ mod tests {
         fungible_components: Vec<String>,
         update_completion_msg: String,
         progress_table_header_printed: bool,
+        use_update_parameters_for_task_type: bool,
+        expected_task_type_from_package: &'static str,
     }
 
     impl FailingPreconditionTarget {
@@ -2469,7 +2570,19 @@ mod tests {
                 fungible_components: Vec::new(),
                 update_completion_msg: String::new(),
                 progress_table_header_printed: false,
+                use_update_parameters_for_task_type: false,
+                expected_task_type_from_package: UPDATE_TASK_TYPE_BMC,
             }
+        }
+
+        fn with_update_parameter_task_type(mut self) -> Self {
+            self.use_update_parameters_for_task_type = true;
+            self
+        }
+
+        fn with_unknown_package_task_type(mut self) -> Self {
+            self.expected_task_type_from_package = "UNKNOWN";
+            self
         }
     }
 
@@ -2509,6 +2622,14 @@ mod tests {
 
         fn class_name(&self) -> &str {
             "FailingPreconditionTarget"
+        }
+
+        fn get_expected_task_type_from_package(&self, _recipe_list: &[String]) -> String {
+            self.expected_task_type_from_package.to_string()
+        }
+
+        fn use_update_parameters_for_task_type(&self) -> bool {
+            self.use_update_parameters_for_task_type
         }
 
         async fn check_update_preconditions(
@@ -2558,6 +2679,167 @@ mod tests {
         }
     }
 
+    #[test]
+    fn update_parameters_targets_classify_task_type() {
+        assert_eq!(
+            expected_task_type_from_update_parameters(&json!({
+                "Targets": ["/redfish/v1/Chassis/HGX_Chassis_0"]
+            })),
+            Some(UPDATE_TASK_TYPE_HMC)
+        );
+        assert_eq!(
+            expected_task_type_from_update_parameters(&json!({
+                "Targets": ["/redfish/v1/UpdateService/FirmwareInventory/HGX_FW_GPU_0"]
+            })),
+            Some(UPDATE_TASK_TYPE_HMC)
+        );
+        assert_eq!(
+            expected_task_type_from_update_parameters(&json!({"Targets": []})),
+            Some(UPDATE_TASK_TYPE_BMC)
+        );
+        assert_eq!(
+            expected_task_type_from_update_parameters(&json!({
+                "Targets": ["/redfish/v1/UpdateService/FirmwareInventory/FW_BMC_0"]
+            })),
+            Some(UPDATE_TASK_TYPE_BMC)
+        );
+        assert_eq!(
+            expected_task_type_from_update_parameters(&json!({"ForceUpdate": true})),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn running_task_preflight_uses_hgx_targets_before_filename_fallback() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/redfish/v1/TaskService/Tasks"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "Members": [{"@odata.id": "/redfish/v1/TaskService/Tasks/HGX_0"}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/redfish/v1/TaskService/Tasks/HGX_0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "TaskState": "Running"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let target = FailingPreconditionTarget::with_access(BmcAccess::mock_with_base_url(
+            server.uri(),
+            "mock-gb200",
+        ))
+        .with_update_parameter_task_type();
+        let special_list = vec![json!({
+            "ForceUpdate": true,
+            "Targets": ["/redfish/v1/Chassis/HGX_Chassis_0"]
+        })
+        .to_string()];
+        let recipe_list = vec!["generic-bmc-bundle.fwpkg".to_string()];
+
+        let (is_running, task_id, error_msg) = target
+            .check_for_running_update_task_by_type(&recipe_list, Some(&special_list), None)
+            .await;
+
+        assert!(is_running);
+        assert_eq!(task_id.as_deref(), Some("HGX_0"));
+        assert!(error_msg
+            .as_deref()
+            .is_some_and(|message| message.contains("Type: HMC")));
+    }
+
+    #[tokio::test]
+    async fn running_task_preflight_ignores_update_parameters_without_target_opt_in() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/redfish/v1/TaskService/Tasks"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "Members": [{"@odata.id": "/redfish/v1/TaskService/Tasks/HGX_0"}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/redfish/v1/TaskService/Tasks/HGX_0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "TaskState": "Running"
+            })))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let target = FailingPreconditionTarget::with_access(BmcAccess::mock_with_base_url(
+            server.uri(),
+            "mock-dgx",
+        ))
+        .with_unknown_package_task_type();
+        let special_list = vec![json!({
+            "Targets": ["/redfish/v1/Chassis/HGX_Chassis_0"]
+        })
+        .to_string()];
+        let recipe_list = vec!["non-hmc-package.fwpkg".to_string()];
+
+        let (is_running, task_id, error_msg) = target
+            .check_for_running_update_task_by_type(&recipe_list, Some(&special_list), None)
+            .await;
+
+        assert!(!is_running);
+        assert!(task_id.is_none());
+        assert!(error_msg.is_none());
+    }
+
+    #[tokio::test]
+    async fn running_task_preflight_empty_targets_classify_as_bmc() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/redfish/v1/TaskService/Tasks"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "Members": [{"@odata.id": "/redfish/v1/TaskService/Tasks/0"}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/redfish/v1/TaskService/Tasks/0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "TaskState": "Running"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let target = FailingPreconditionTarget::with_access(BmcAccess::mock_with_base_url(
+            server.uri(),
+            "mock-gb200",
+        ))
+        .with_update_parameter_task_type();
+        let special_list = vec![json!({"Targets": []}).to_string()];
+        let recipe_list = vec!["vr-nvl-hmc-p4109-bundle.fwpkg".to_string()];
+
+        let (is_running, task_id, error_msg) = target
+            .check_for_running_update_task_by_type(&recipe_list, Some(&special_list), None)
+            .await;
+
+        assert!(is_running);
+        assert_eq!(task_id.as_deref(), Some("0"));
+        assert!(error_msg
+            .as_deref()
+            .is_some_and(|message| message.contains("Type: BMC")));
+    }
+
     struct UnusedParser;
 
     #[async_trait::async_trait]
@@ -2580,6 +2862,48 @@ mod tests {
                 "parser reached after skipped preconditions".to_string(),
             )
         }
+    }
+
+    #[tokio::test]
+    async fn factory_reset_posts_supplied_reset_parameters() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/redfish/v1/Managers"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "Members": [
+                    {"@odata.id": "/redfish/v1/Managers/BMC_0"}
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(
+                "/redfish/v1/Managers/BMC_0/Actions/Manager.ResetToDefaults",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "TaskState": "Running"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut target = FailingPreconditionTarget::with_access(BmcAccess::mock_with_base_url(
+            server.uri(),
+            "mock-gb200",
+        ));
+        let reset_params = json!({"ResetToDefaultsType": "ResetAll"});
+
+        let (status, response) = target.factory_reset(Some(&reset_params)).await;
+
+        assert!(status);
+        assert_eq!(response["TaskState"], "Running");
+        let requests = server.received_requests().await.unwrap();
+        let body = String::from_utf8_lossy(&requests[1].body);
+        assert!(body.contains("\"ResetToDefaultsType\":\"ResetAll\""));
     }
 
     #[tokio::test]

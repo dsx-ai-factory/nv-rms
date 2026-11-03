@@ -2,12 +2,13 @@
 
 Clients invoke RMS API endpoints via gRPC; RMS then talks to compute BMCs and
 power-shelf controllers over Redfish/HTTPS, and to NVSwitch trays over NVUE REST,
-SSH, SFTP, and NMX-C gRPC. Long-running firmware and switch system-image work is
+SSH, SFTP, and NMX-C gRPC. The SSH transport uses SCP to stage recovery images
+on ONIE hosts. Long-running firmware and switch system-image work is
 modeled as asynchronous jobs: the API starts the operation, returns a job ID, and
 clients poll job status until the work completes or fails.
 
 RMS is built in Rust on **tokio** (async runtime), **tonic** (gRPC), **reqwest**
-(Redfish/NVUE HTTP), **russh** (SSH/SFTP), **sqlx** (optional Postgres
+(Redfish/NVUE HTTP), **russh** (SSH/SCP/SFTP), **sqlx** (optional Postgres
 persistence), and an embedded **nvfwupd** firmware-update workflow library.
 
 ## Scope

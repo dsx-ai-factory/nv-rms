@@ -24,6 +24,7 @@ use serde_json::json;
 use crate::domain::node::*;
 use crate::domain::rack::NodeConfig;
 use crate::nodes::compute_gb300_nvidia::NvidiaGb300Compute;
+use crate::nodes::nvfwupd_adapter;
 use crate::transport::redfish_client::NvidiaMnnvlinkTopology;
 use crate::utilities::error::{Result, RmsError};
 
@@ -64,30 +65,29 @@ impl SupermicroGb300Compute {
     }
 }
 
-fn supermicro_update_options_for_target(
+fn supermicro_bios_target(target: &FirmwareTarget) -> bool {
+    target
+        .component
+        .trim()
+        .eq_ignore_ascii_case(SUPERMICRO_BIOS_TARGET)
+}
+
+pub(crate) fn supermicro_update_options_for_target(
     target: &FirmwareTarget,
-    mut options: FirmwareUpdateOptions,
+    options: FirmwareUpdateOptions,
 ) -> Result<FirmwareUpdateOptions> {
+    if target.resolution.is_some() {
+        return Ok(options);
+    }
     let component = target.component.trim();
-    if component.eq_ignore_ascii_case("HMC")
+    let component = if component.eq_ignore_ascii_case("HMC")
         || component.eq_ignore_ascii_case(SUPERMICRO_HGX_TARGET)
     {
-        ensure_supermicro_payload(target, "nosbios", |filename| {
-            filename.ends_with(".fwpkg") && filename.contains("nosbios")
-        })?;
-        options.special_json = Some(json!({"Targets": [SUPERMICRO_HGX_TARGET]}));
-    } else if component.eq_ignore_ascii_case(SUPERMICRO_BIOS_TARGET) {
-        ensure_supermicro_payload(target, "BIOS", |filename| {
-            filename.ends_with(".bin") && filename.contains("bios")
-        })?;
-        options.special_json = Some(json!({
-            "Targets": [SUPERMICRO_CPU0_TARGET, SUPERMICRO_CPU1_TARGET]
-        }));
+        "HMC"
+    } else if supermicro_bios_target(target) {
+        "BIOS"
     } else if supermicro_bmc_target(target) {
-        ensure_supermicro_payload(target, "BMC", |filename| {
-            filename.ends_with(".bin") && filename.contains("obmc")
-        })?;
-        options.special_json = Some(json!({"Targets": [SUPERMICRO_BMC_TARGET]}));
+        "BMC"
     } else {
         let component = if component.is_empty() {
             "<empty>"
@@ -98,29 +98,20 @@ fn supermicro_update_options_for_target(
             "unsupported Supermicro GB300 firmware target {component} for file {}",
             target.firmware_file
         )));
-    }
-
-    Ok(options)
-}
-
-fn ensure_supermicro_payload(
-    target: &FirmwareTarget,
-    payload_name: &str,
-    matches: impl FnOnce(&str) -> bool,
-) -> Result<()> {
+    };
+    let configured =
+        nvfwupd_adapter::default_update_target(NodeType::ComputeGb300Supermicro, component)?;
     let filename = Path::new(&target.firmware_file)
         .file_name()
         .and_then(|filename| filename.to_str())
-        .unwrap_or(&target.firmware_file)
-        .to_ascii_lowercase();
-    if matches(&filename) {
-        Ok(())
-    } else {
-        Err(RmsError::invalid_argument(format!(
-            "Supermicro GB300 {payload_name} target has incompatible firmware file {}",
+        .unwrap_or(&target.firmware_file);
+    if !configured.filename().matches(filename) {
+        return Err(RmsError::invalid_argument(format!(
+            "Supermicro GB300 {component} target has incompatible firmware file {}",
             target.firmware_file
-        )))
+        )));
     }
+    nvfwupd_adapter::default_update_options(NodeType::ComputeGb300Supermicro, component, options)
 }
 
 pub(crate) fn supermicro_bmc_filename(firmware_file: &str) -> bool {
@@ -143,17 +134,17 @@ fn supermicro_version_check_targets(targets: &[FirmwareTarget]) -> Vec<FirmwareT
     targets
         .iter()
         .flat_map(|target| {
-            if target
-                .component
-                .trim()
-                .eq_ignore_ascii_case(SUPERMICRO_BIOS_TARGET)
-            {
+            if target.resolution.is_some() {
+                vec![target.clone()]
+            } else if supermicro_bios_target(target) {
                 [SUPERMICRO_CPU0_TARGET, SUPERMICRO_CPU1_TARGET]
                     .into_iter()
                     .map(|component| FirmwareTarget {
                         component: component.to_owned(),
                         firmware_file: target.firmware_file.clone(),
                         expected_version: target.expected_version.clone(),
+                        resolution: None,
+                        linkx_policy: None,
                     })
                     .collect()
             } else if supermicro_bmc_target(target) {
@@ -161,6 +152,8 @@ fn supermicro_version_check_targets(targets: &[FirmwareTarget]) -> Vec<FirmwareT
                     component: SUPERMICRO_BMC_TARGET.to_owned(),
                     firmware_file: target.firmware_file.clone(),
                     expected_version: target.expected_version.clone(),
+                    resolution: None,
+                    linkx_policy: None,
                 }]
             } else {
                 vec![target.clone()]
@@ -173,27 +166,46 @@ fn supermicro_bmc_firmware_manifest_version_check(
     targets: &[FirmwareTarget],
     inventory: &[FirmwareInfo],
 ) -> FirmwareVersionCheckSummary {
-    let bmc_inventory = inventory
-        .iter()
-        .find(|component| component.target.eq_ignore_ascii_case(SUPERMICRO_BMC_TARGET));
-    let installed_version = bmc_inventory.map(|component| component.version.as_str());
-
+    use crate::domain::firmware_target::FirmwareDestination;
     let components = targets
         .iter()
         .filter(|target| supermicro_bmc_target(target))
-        .map(|target| {
-            let expected_version = target.expected_version.as_deref().unwrap_or("missing");
-            let matched = installed_version.is_some_and(|installed| {
-                installed
-                    .trim()
-                    .eq_ignore_ascii_case(expected_version.trim())
-            });
-            json!({
-                "name": "FW_BMC_0",
-                "status": if matched { "matched" } else { "mismatched" },
-                "package_version": expected_version,
-                "system_version": installed_version.unwrap_or("missing"),
-                "inventory_path": SUPERMICRO_BMC_TARGET,
+        .flat_map(|target| {
+            let paths = match target
+                .resolution
+                .as_ref()
+                .map(|resolved| &resolved.destination)
+            {
+                Some(FirmwareDestination::Redfish(path)) => vec![path.as_str()],
+                Some(FirmwareDestination::Multipart(paths)) => {
+                    if paths.is_empty() {
+                        vec![""]
+                    } else {
+                        paths.iter().map(|path| path.as_str()).collect()
+                    }
+                }
+                _ => vec![SUPERMICRO_BMC_TARGET],
+            };
+            paths.into_iter().map(move |path| {
+                let expected_version = target.expected_version.as_deref().unwrap_or("missing");
+                let installed_version = inventory
+                    .iter()
+                    .find(|component| {
+                        !path.is_empty() && component.target.eq_ignore_ascii_case(path)
+                    })
+                    .map(|component| component.version.as_str());
+                let matched = installed_version.is_some_and(|installed| {
+                    installed
+                        .trim()
+                        .eq_ignore_ascii_case(expected_version.trim())
+                });
+                json!({
+                    "name": path.rsplit('/').next().filter(|name| !name.is_empty()).unwrap_or("BMC"),
+                    "status": if matched { "matched" } else { "mismatched" },
+                    "package_version": expected_version,
+                    "system_version": installed_version.unwrap_or("missing"),
+                    "inventory_path": path,
+                })
             })
         })
         .collect::<Vec<_>>();
@@ -351,6 +363,8 @@ mod tests {
             )),
             host_endpoint: None,
             expected_inventory: None,
+            recovery: None,
+            runtime_config: None,
         }
     }
 
@@ -359,6 +373,8 @@ mod tests {
             component: component.to_owned(),
             firmware_file: firmware_file.to_owned(),
             expected_version: None,
+            resolution: None,
+            linkx_policy: None,
         }
     }
 
@@ -370,6 +386,7 @@ mod tests {
             updateable: true,
             target: SUPERMICRO_BMC_TARGET.to_owned(),
             health: "OK".to_owned(),
+            state: "Enabled".to_owned(),
             sku: String::new(),
         }
     }
@@ -468,6 +485,49 @@ mod tests {
                 SUPERMICRO_BMC_TARGET
             ]
         );
+    }
+
+    #[test]
+    fn bmc_manifest_verification_requires_every_configured_destination() {
+        use crate::config::hardware_profiles::HardwareUpdatePlan;
+        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../hardware-profiles/v1/compute_gb300_supermicro.yaml"))
+            .replace(
+                r#"{"Targets": ["/redfish/v1/UpdateService/FirmwareInventory/FW_BMC_0"]}"#,
+                r#"{"Targets": ["/redfish/v1/UpdateService/FirmwareInventory/CustomBMC0", "/redfish/v1/UpdateService/FirmwareInventory/CustomBMC1"]}"#,
+            );
+        let profile = HardwareUpdatePlan::from_yaml_str(&source).unwrap();
+        let configured = profile
+            .stages()
+            .iter()
+            .flat_map(|stage| stage.targets())
+            .find(|target| target.component_key() == "BMC")
+            .unwrap();
+        let target = configured
+            .resolve(&FirmwareTarget {
+                component: "BMC".into(),
+                firmware_file: "obmc.bin".into(),
+                expected_version: Some("1.2.3".into()),
+                resolution: None,
+                linkx_policy: None,
+            })
+            .unwrap();
+        let targets = [target];
+        // A matching version at the old default destination is insufficient.
+        assert!(
+            !supermicro_bmc_firmware_manifest_version_check(&targets, &[bmc_inventory("1.2.3")])
+                .matched
+        );
+        let mut inventory = configured
+            .destination_paths()
+            .iter()
+            .map(|path| FirmwareInfo {
+                target: path.as_str().into(),
+                ..bmc_inventory("1.2.3")
+            })
+            .collect::<Vec<_>>();
+        assert!(supermicro_bmc_firmware_manifest_version_check(&targets, &inventory).matched);
+        inventory[1].version = "old".into();
+        assert!(!supermicro_bmc_firmware_manifest_version_check(&targets, &inventory).matched);
     }
 
     #[test]

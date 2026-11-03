@@ -24,23 +24,27 @@
 //! structured status.
 
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::IpAddr;
 use std::time::Duration;
 
 use futures::future::join_all;
 use librms::protos::rack_manager as rm;
+use tokio_util::sync::CancellationToken;
 
 use super::server::RackManagerServiceImpl;
 use crate::api::grpc::conversions::{flatten_node_info, proto_node_type_to_domain};
-use crate::domain::node::NodeKind;
+use crate::domain::node::{NodeKind, NodeType};
 use crate::domain::rack::NodeConfig;
 use crate::libnmxc::{
-    Endpoint, NMX_C_FM_CONFIG_FILE, NMX_C_TOPOLOGY_KEY, Nmxc, NmxcClientPool, NmxcTlsConfig,
-    find_static_config_value,
+    Endpoint, NMX_C_FM_CONFIG_FILE, NMX_C_TOPOLOGY_KEY, Nmxc, NmxcClientPool, NmxcError,
+    NmxcTlsConfig, find_static_config_value,
 };
+use crate::nodes::nvos::NvBridge;
+use crate::nodes::switch_gb200_nvidia::mtls::MtlsUnsetStatus;
 use crate::nodes::switch_mtls::SwitchMtlsService;
 use crate::nodes::{NodeInstance, SwitchScaleUpManagement};
 use crate::utilities::error::{Result, RmsError};
+use crate::utilities::special_purpose_ip::{PrivateUse, is_special_purpose_ip};
 use crate::utilities::url::grpc_target_uri;
 
 mod handlers_v2;
@@ -118,13 +122,6 @@ impl EphemeralSwitch {
     }
 }
 
-fn grpc_port_for_app(app_name: &str) -> i32 {
-    match app_name {
-        "nmx-telemetry" => 9352,
-        _ => 9370,
-    }
-}
-
 pub(super) fn nmx_client_tls_with_endpoint_authority(
     mut tls: NmxcTlsConfig,
     endpoint_tls_server_name: &str,
@@ -140,8 +137,16 @@ pub(super) fn nmx_client_tls_with_endpoint_authority(
 ///
 /// Disabled clusters skip the readiness wait because the unset operation
 /// tolerates that state and V2 retries it after enabling the selected switch.
+/// An enabled cluster waits with
+/// `SwitchGb200Nvidia::require_cluster_app_manager_action_ready` so RMS
+/// does not SSH-restore encryption while the app reports unready. Certificate
+/// bind is an NVUE `@update`; this restore is `nv action restore` plus
+/// `nv config apply`. The wait is fail-closed, not a proven shared
+/// configCallback. A ready app (`status: ok`) is enough; `nmxc-conn` down
+/// does not block.
 pub(super) async fn disable_insecure_nmx_controller_mtls(
     switch: &dyn SwitchScaleUpManagement,
+    cancel: &CancellationToken,
 ) -> Result<()> {
     let Some(switch) = switch.as_switch_gb200() else {
         return Err(RmsError::invalid_argument(
@@ -177,16 +182,35 @@ pub(super) async fn disable_insecure_nmx_controller_mtls(
 
     // Disabled clusters reject manager actions. Skip their readiness wait;
     // the unset path tolerates that rejection, and V2 retries after enabling.
+    // An enabled cluster reuses the certificate-bind fail-closed wait so RMS
+    // does not SSH-restore while the app reports unready. NVUE bind is known
+    // to fail in that state; SSH restore is a different transport and is
+    // gated the same way until a mid-start restore is observed on hardware.
     if !cluster_disabled {
         switch
-            .ensure_cluster_app_manager_action_ready("nmx-controller")
+            .require_cluster_app_manager_action_ready("nmx-controller")
             .await?;
     }
 
-    switch
-        .unset_mtls_services(&[SwitchMtlsService::ScaleUpFabricManager])
+    let report = switch
+        .unset_mtls_services(&[SwitchMtlsService::ScaleUpFabricManager], cancel)
         .await
-        .map(|_| ())
+        .map_err(RmsError::from)?;
+
+    if report.cancelled {
+        let restored = report
+            .services
+            .iter()
+            .any(|outcome| outcome.status == MtlsUnsetStatus::Cleared);
+        let message = if restored {
+            "NMX-C mTLS unset was cancelled after the restore reached the switch and before it was committed"
+        } else {
+            "NMX-C mTLS unset was cancelled before it changed the switch"
+        };
+        return Err(RmsError::cancelled(message));
+    }
+
+    Ok(())
 }
 
 /// Best-effort compensating teardown after a failed
@@ -251,24 +275,9 @@ fn validate_switch_target_host(host: &str) -> Result<IpAddr> {
 }
 
 fn is_disallowed_switch_target_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(ip) => is_disallowed_switch_target_ipv4(ip),
-        IpAddr::V6(ip) => {
-            if let Some(mapped) = ip.to_ipv4_mapped() {
-                return is_disallowed_switch_target_ipv4(mapped);
-            }
-            is_disallowed_switch_target_ipv6(ip)
-        }
-    }
-}
-
-fn is_disallowed_switch_target_ipv4(ip: Ipv4Addr) -> bool {
-    ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() || ip.is_link_local()
-}
-
-fn is_disallowed_switch_target_ipv6(ip: Ipv6Addr) -> bool {
-    let [first, ..] = ip.segments();
-    ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() || (first & 0xffc0) == 0xfe80
+    // In-rack switches use RFC 1918 / unique-local space; every other IANA
+    // special-purpose block is still rejected.
+    is_special_purpose_ip(ip, PrivateUse::Allowed)
 }
 
 /// Helper function to get a specific value by key from the NMX controller's current static config.
@@ -445,6 +454,61 @@ async fn call_nmx_set_static_config(
     NmxSetStaticConfigResult::Failed
 }
 
+/// Reconciles one non-topology static-config entry and verifies its readback.
+///
+/// A successful readback is authoritative when `SetStaticConfig` reports an
+/// error after applying the requested value.
+async fn set_nmx_static_config(
+    client: &mut dyn Nmxc,
+    config_file_name: &str,
+    key: &str,
+    desired_value: &str,
+    gateway_id: &str,
+) -> NmxSetStaticConfigResult {
+    let previous_value =
+        get_nmx_static_config_value(client, config_file_name, key, gateway_id).await;
+
+    if previous_value.as_deref() == Some(desired_value) {
+        tracing::info!(
+            config_file_name,
+            key,
+            desired_value,
+            "NMX static config already configured, skipping"
+        );
+
+        return NmxSetStaticConfigResult::AlreadyConfigured;
+    }
+
+    if let Err(error) = client
+        .set_static_config(config_file_name, key, desired_value, gateway_id)
+        .await
+    {
+        tracing::warn!(
+            config_file_name,
+            key,
+            desired_value,
+            error = %error,
+            "NMX SetStaticConfig failed; checking readback"
+        );
+    }
+
+    let final_value = get_nmx_static_config_value(client, config_file_name, key, gateway_id).await;
+
+    if final_value.as_deref() == Some(desired_value) {
+        NmxSetStaticConfigResult::SetSucceeded
+    } else {
+        tracing::error!(
+            config_file_name,
+            key,
+            desired_value,
+            current_value = final_value.as_deref().unwrap_or("<unavailable>"),
+            "final static config does not match desired value"
+        );
+
+        NmxSetStaticConfigResult::Failed
+    }
+}
+
 /// Retries a failed post-`SetStaticConfig` topology configuration.
 ///
 /// The caller enters this path only after a `SetStaticConfig` attempt failed to
@@ -522,6 +586,101 @@ async fn recover_nmx_topology_after_static_config_failure(
     NmxSetStaticConfigResult::Failed
 }
 
+/// Sets topology and extra static config sequentially on one NMX-C client.
+///
+/// A restarted controller is re-verified before this helper proceeds to extra
+/// keys, so callers never use a client before topology is confirmed. Extra
+/// entries retain request order, and a failure leaves earlier confirmed writes
+/// applied. The result reports `SetSucceeded` when topology or any extra entry
+/// changed, and `AlreadyConfigured` only when the complete batch already matched.
+///
+/// Confirmed writes to `fm_config`, including topology, require an activation
+/// restart after all entries succeed. Unchanged entries do not require a restart.
+async fn configure_nmx_fabric_static_config(
+    switch: &dyn SwitchScaleUpManagement,
+    client: &mut dyn Nmxc,
+    switch_target: &str,
+    topology: &str,
+    extra_static_configs: &[rm::ScaleUpFabricStaticConfig],
+    gateway_id: &str,
+) -> std::result::Result<(NmxSetStaticConfigResult, bool), String> {
+    // Topology gates the batch: extra keys are not attempted until its value is
+    // confirmed, including any soft-reset recovery.
+    let config_result = call_nmx_set_static_config(client, topology, gateway_id).await;
+    let soft_reset_attempted = !config_result.is_success();
+
+    let config_result = if soft_reset_attempted {
+        recover_nmx_topology_after_static_config_failure(
+            switch,
+            client,
+            switch_target,
+            topology,
+            gateway_id,
+        )
+        .await
+    } else {
+        config_result
+    };
+
+    if !config_result.is_success() {
+        return Err(nmx_config_response_message(config_result, soft_reset_attempted).to_owned());
+    }
+
+    let mut extra_config_updated = false;
+    // Readback confirms storage; restart NMX-C to activate a topology write.
+    let mut fm_config_reconciled = config_result == NmxSetStaticConfigResult::SetSucceeded;
+
+    // Each entry is read back before advancing. A mismatch stops later writes;
+    // earlier confirmed entries remain applied.
+    for entry in extra_static_configs {
+        let result = set_nmx_static_config(
+            client,
+            &entry.config_file_name,
+            &entry.key,
+            &entry.value,
+            gateway_id,
+        )
+        .await;
+
+        if !result.is_success() {
+            return Err(format!(
+                "failed to set NMX Controller static config {}/{}",
+                entry.config_file_name, entry.key
+            ));
+        }
+
+        let set_succeeded = result == NmxSetStaticConfigResult::SetSucceeded;
+        extra_config_updated |= set_succeeded;
+        fm_config_reconciled |= set_succeeded && entry.config_file_name == NMX_C_FM_CONFIG_FILE;
+    }
+
+    if fm_config_reconciled {
+        switch
+            .restart_cluster_app(NMX_CONTROLLER_APP_NAME)
+            .await
+            .map_err(|error| {
+                format!(
+                    "failed to restart NMX Controller on switch target '{switch_target}': {}",
+                    error.message
+                )
+            })?;
+
+        tracing::info!(
+            switch_target,
+            config_file_name = NMX_C_FM_CONFIG_FILE,
+            "restarted NMX Controller after static configuration reconciliation"
+        );
+    }
+
+    let config_result = if extra_config_updated {
+        NmxSetStaticConfigResult::SetSucceeded
+    } else {
+        config_result
+    };
+
+    Ok((config_result, soft_reset_attempted))
+}
+
 fn nmx_controller_app_ready_for_config(app_status: &serde_json::Value) -> bool {
     let status = app_status.get("status").and_then(serde_json::Value::as_str);
     let control_plane_state = ["additional-info", "addition-info"]
@@ -538,6 +697,55 @@ fn nmx_controller_grpc_ready_for_config(grpc_status: &serde_json::Value) -> bool
         .and_then(|summary| summary.get("ready_for_external_clients"))
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false)
+}
+
+/// Completes NMX-C Hello, optionally waiting through transient startup errors.
+///
+/// Only `Unavailable` is treated as a controller-startup signal. Other status
+/// codes fail immediately.
+async fn hello_nmx_controller(
+    client: &mut dyn Nmxc,
+    gateway_id: &str,
+    retry_unavailable: bool,
+) -> std::result::Result<(), String> {
+    if !retry_unavailable {
+        return client
+            .hello(gateway_id)
+            .await
+            .map(|_| ())
+            .map_err(|_| "NMX Controller Hello failed".to_owned());
+    }
+
+    let mut last_error = String::new();
+
+    for attempt in 0..=NMX_CONTROLLER_READY_POLL_ATTEMPTS {
+        match client.hello(gateway_id).await {
+            Ok(_) => return Ok(()),
+            Err(error) => {
+                if !matches!(
+                    &error,
+                    NmxcError::Status(status) if status.code() == tonic::Code::Unavailable
+                ) {
+                    return Err(format!("NMX Controller Hello failed: {error}"));
+                }
+
+                last_error = error.to_string();
+
+                tracing::warn!(
+                    attempt = attempt + 1,
+                    max_attempts = NMX_CONTROLLER_READY_POLL_ATTEMPTS + 1,
+                    error = %error,
+                    "NMX Controller Hello is not ready"
+                );
+            }
+        }
+
+        if attempt < NMX_CONTROLLER_READY_POLL_ATTEMPTS {
+            tokio::time::sleep(NMX_CONTROLLER_READY_POLL_DELAY).await;
+        }
+    }
+
+    Err(format!("NMX Controller Hello failed: {last_error}"))
 }
 
 pub(super) async fn wait_for_nmx_controller_ready_for_config(
@@ -588,7 +796,7 @@ pub(super) async fn wait_for_nmx_controller_ready_for_config(
 
 /// Build an ephemeral Switch from a `NodeInfo` using host-endpoint
 /// credentials and validate the switch-facing target address.
-fn build_ephemeral_switch(device: &rm::NodeInfo) -> Result<EphemeralSwitch> {
+fn build_ephemeral_switch(device: &rm::NodeInfo, insecure_bmc: bool) -> Result<EphemeralSwitch> {
     if device.node_id.is_empty() {
         return Err(RmsError::invalid_argument("device node_id is required"));
     }
@@ -608,7 +816,7 @@ fn build_ephemeral_switch(device: &rm::NodeInfo) -> Result<EphemeralSwitch> {
     // ScaleUpFabric is a direct host/NVUE workflow. Require host_endpoint for
     // the actual switch call; keep bmc_endpoint optional because this RPC does
     // not perform Redfish power.
-    let bmc_endpoint = flat.optional_bmc_endpoint()?;
+    let bmc_endpoint = flat.optional_bmc_endpoint(insecure_bmc)?;
     let host_endpoint = flat.switch_host_management_endpoint()?;
     let tls_server_name = host_endpoint
         .endpoint
@@ -633,6 +841,8 @@ fn build_ephemeral_switch(device: &rm::NodeInfo) -> Result<EphemeralSwitch> {
         bmc_endpoint,
         host_endpoint: Some(host_endpoint),
         expected_inventory: None,
+        recovery: None,
+        runtime_config: None,
     };
     let rack_id = device.rack_id.as_str();
     let switch = NodeInstance::create_switch_scale_up(&config, rack_id).map_err(|e| e.message);
@@ -652,7 +862,7 @@ impl RackManagerServiceImpl {
         device: &rm::NodeInfo,
         request_domain: Option<&str>,
     ) -> Result<EphemeralSwitch> {
-        let switch = build_ephemeral_switch(device)?;
+        let switch = build_ephemeral_switch(device, self.insecure_bmc)?;
 
         self.initialize_nvue_client_with_options(
             switch.switch.nvue_client(),
@@ -664,6 +874,212 @@ impl RackManagerServiceImpl {
 
         Ok(switch)
     }
+
+    /// Connects to NMX Controller using switch TLS roots and completes `Hello`.
+    ///
+    /// The request domain selects client credentials and server-name validation;
+    /// `Hello` confirms the authenticated endpoint accepts RMS requests.
+    /// Callers may retry `Unavailable` while a newly enabled controller starts.
+    async fn connect_nmx_controller(
+        &self,
+        switch_target: &str,
+        switch_tls_server_name: &str,
+        request_domain: Option<&str>,
+        retry_unavailable_hello: bool,
+    ) -> std::result::Result<Box<dyn Nmxc>, String> {
+        let use_tls = !self.switch_tls_roots.insecure_switch;
+
+        let nmx_tls = if use_tls {
+            let nmx_server_name = self
+                .switch_tls_roots
+                .tls_server_name_for_endpoint(switch_tls_server_name, request_domain)?;
+
+            let tls = nmx_client_tls_with_endpoint_authority(
+                self.switch_tls_roots.resolve_client_tls(request_domain)?,
+                &nmx_server_name,
+            );
+
+            Some(tls)
+        } else {
+            None
+        };
+
+        let endpoint = Endpoint::new(grpc_target_uri(switch_target, 9370, use_tls))
+            .map_err(|error| format!("invalid NMX Controller target address: {error}"))?;
+
+        let pool = NmxcClientPool::builder()
+            .build()
+            .map_err(|error| format!("failed to create NMX Controller client pool: {error}"))?;
+
+        let mut client = pool
+            .create_client(endpoint, nmx_tls.as_ref())
+            .await
+            .map_err(|error| format!("failed to connect to NMX Controller: {error}"))?;
+
+        hello_nmx_controller(
+            client.as_mut(),
+            &self.nmx_gateway_id,
+            retry_unavailable_hello,
+        )
+        .await?;
+
+        Ok(client)
+    }
+
+    /// Configures one switch and applies all requested NMX-C static config.
+    ///
+    /// Topology and extra keys share the same authenticated NMX-C client. The
+    /// client is scoped to this configuration attempt and dropped afterward.
+    ///
+    /// Insecure-switch mode restores NMX-C manager encryption after the
+    /// readiness poll and before the first plaintext Hello.
+    async fn configure_scale_up_fabric_manager_on_switch(
+        &self,
+        node_id: &str,
+        ephemeral: &EphemeralSwitch,
+        topology: &str,
+        extra_static_configs: &[rm::ScaleUpFabricStaticConfig],
+        request_domain: Option<&str>,
+    ) -> rm::ConfigureScaleUpFabricManagerResponse {
+        let switch = ephemeral.switch.as_ref();
+        let switch_target = ephemeral.target_ip.to_string();
+
+        let mut response = rm::ConfigureScaleUpFabricManagerResponse {
+            status: rm::ReturnCode::Failure.into(),
+            message: String::new(),
+            topology_used: String::new(),
+            scale_up_fabric_state_enabled: false,
+            grpc_enabled: false,
+        };
+
+        if let Err(error) = switch.set_cluster_state(true).await {
+            tracing::warn!(node = node_id, error = %error.message, "set_cluster_state failed");
+            response.message = format!("failed to enable cluster: {}", error.message);
+            return response;
+        }
+
+        response.scale_up_fabric_state_enabled = true;
+
+        if let Err(error) = switch
+            .enable_grpc_for_external_clients(NMX_CONTROLLER_APP_NAME, true)
+            .await
+        {
+            tracing::warn!(node = node_id, error = %error.message, "enable_grpc_for_external_clients failed");
+            response.message = format!("failed to enable gRPC: {}", error.message);
+            return response;
+        }
+
+        // The external-client gRPC port is open from here on. Record the
+        // exposure immediately so every downstream failure path reports it
+        // accurately: rollback clears this flag only on a successful teardown,
+        // so if rollback fails (e.g. an unreachable switch) grpc_enabled stays
+        // true instead of the initial false that would misreport the port as
+        // closed while it is actually still open.
+        response.grpc_enabled = true;
+
+        // Cluster enablement can return before the app and external endpoint
+        // are ready, so use the bounded readiness poll before opening NMX-C.
+        if let Err(error) = wait_for_nmx_controller_ready_for_config(switch, &switch_target).await {
+            tracing::warn!(
+                node = node_id,
+                switch_target,
+                error = %error.message,
+                "NMX Controller not ready for configuration"
+            );
+
+            response.message = "gRPC not ready for external clients".into();
+            rollback_external_grpc(switch, node_id, &mut response).await;
+            return response;
+        }
+
+        if self.switch_tls_roots.insecure_switch {
+            // Restore manager encryption only after the controller is ready,
+            // then connect without client mTLS.
+            //
+            // The V1 RPC reaching here is synchronous with no job behind it,
+            // so there is no token to cancel against; the unset runs to
+            // completion.
+            if let Err(error) =
+                disable_insecure_nmx_controller_mtls(switch, &CancellationToken::new()).await
+            {
+                tracing::warn!(node = node_id, error = %error.message, "failed to disable NMX-C mTLS");
+                response.message = format!("failed to disable NMX-C mTLS: {}", error.message);
+                rollback_external_grpc(switch, node_id, &mut response).await;
+                return response;
+            }
+        }
+
+        let mut client = match self
+            .connect_nmx_controller(
+                &switch_target,
+                &ephemeral.tls_server_name,
+                request_domain,
+                true,
+            )
+            .await
+        {
+            Ok(client) => client,
+            Err(message) => {
+                tracing::error!(node = node_id, error = %message, "failed to connect to NMX Controller");
+                response.message = message;
+                rollback_external_grpc(switch, node_id, &mut response).await;
+                return response;
+            }
+        };
+
+        match configure_nmx_fabric_static_config(
+            switch,
+            client.as_mut(),
+            &switch_target,
+            topology,
+            extra_static_configs,
+            &self.nmx_gateway_id,
+        )
+        .await
+        {
+            Ok((result, soft_reset_attempted)) => {
+                tracing::info!(
+                    node = node_id,
+                    topology,
+                    result = ?result,
+                    "NMX static config set succeeded"
+                );
+
+                response.status = rm::ReturnCode::Success.into();
+                response.message = nmx_config_response_message(result, soft_reset_attempted).into();
+            }
+
+            Err(message) => {
+                tracing::error!(node = node_id, topology, error = %message, "failed to set NMX static config");
+                response.message = message;
+                rollback_external_grpc(switch, node_id, &mut response).await;
+            }
+        }
+
+        response.topology_used = topology.to_owned();
+        response
+    }
+}
+
+/// NVOS rejects cluster disable while cluster-node servers remain configured,
+/// so a VR NVL72 switch clears the node IPs RackManagerV2 may have configured
+/// before its cluster is disabled.
+async fn set_switch_scale_up_fabric_state(
+    switch: &dyn SwitchScaleUpManagement,
+    enabled: bool,
+) -> Result<()> {
+    if !enabled
+        && switch.node_type() == NodeType::SwitchVrnvl72Nvidia
+        && let Some(switch) = switch.as_switch_gb200()
+    {
+        let capabilities = NvBridge::discover(switch).await?;
+
+        return switch
+            .clear_node_ips_and_disable_cluster(capabilities)
+            .await;
+    }
+
+    switch.set_cluster_state(enabled).await
 }
 
 async fn batch_set_scale_up_fabric_state_for_device(
@@ -699,7 +1115,22 @@ async fn batch_set_scale_up_fabric_state_for_device(
     };
 
     let switch = ephemeral.switch;
-    match switch.set_cluster_state(enabled).await {
+
+    let _admission = match service
+        .reserve_switch_mutation(switch.nvue_client(), &device)
+        .await
+    {
+        Ok(reservation) => reservation,
+        Err(error) => {
+            return rm::NodeOperationResult {
+                node_id,
+                status: rm::ReturnCode::Failure.into(),
+                error_message: error.message,
+            };
+        }
+    };
+
+    match set_switch_scale_up_fabric_state(switch.as_ref(), enabled).await {
         Ok(()) => {
             tracing::info!(
                 node = %node_id,
@@ -778,181 +1209,26 @@ impl RackManagerServiceImpl {
             }
         };
 
-        let EphemeralSwitch {
-            switch: sw,
-            target_ip: switch_target_ip,
-            tls_server_name: switch_tls_server_name,
-        } = ephemeral;
-
-        // Step 1: Enable cluster
-        if let Err(e) = sw.set_cluster_state(true).await {
-            tracing::warn!(node = %device.node_id, error = %e.message, "set_cluster_state failed");
-            resp.message = format!("failed to enable cluster: {}", e.message);
-            return Ok(tonic::Response::new(resp));
-        }
-
-        resp.scale_up_fabric_state_enabled = true;
-
-        // Step 2: Enable gRPC for external clients
-        if let Err(e) = sw
-            .enable_grpc_for_external_clients("nmx-controller", true)
+        let _admission = match self
+            .reserve_switch_mutation(ephemeral.switch().nvue_client(), device)
             .await
         {
-            tracing::warn!(node = %device.node_id, error = %e.message, "enable_grpc_for_external_clients failed");
-            resp.message = format!("failed to enable gRPC: {}", e.message);
-            return Ok(tonic::Response::new(resp));
-        }
-
-        // The external-client gRPC port is open from here on. Record the
-        // exposure immediately so every downstream failure path reports it
-        // accurately: rollback clears this flag only on a successful teardown,
-        // so if rollback fails (e.g. an unreachable switch) grpc_enabled stays
-        // true instead of the initial false that would misreport the port as
-        // closed while it is actually still open.
-        resp.grpc_enabled = true;
-
-        if self.switch_tls_roots.insecure_switch {
-            // A prior insecure certificate cleanup can no-op while the cluster
-            // is disabled. Once the cluster is enabled, restore the NMX-C
-            // manager encryption mode before RMS connects without client mTLS.
-            if let Err(e) = disable_insecure_nmx_controller_mtls(sw.as_ref()).await {
-                tracing::warn!(node = %device.node_id, error = %e.message, "failed to disable NMX-C mTLS");
-                resp.message = format!("failed to disable NMX-C mTLS: {}", e.message);
-                rollback_external_grpc(sw.as_ref(), &device.node_id, &mut resp).await;
-                return Ok(tonic::Response::new(resp));
-            }
-        }
-
-        // Step 3: Verify gRPC status
-        let switch_target = switch_target_ip.to_string();
-
-        let status_check = sw.check_grpc_status("nmx-controller", &switch_target).await;
-
-        let ready = status_check
-            .as_ref()
-            .ok()
-            .and_then(|s| s.get("summary"))
-            .and_then(|s| s.get("ready_for_external_clients"))
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-
-        if !ready {
-            tracing::warn!(node = %device.node_id, switch_target = %switch_target, "gRPC not ready for external clients");
-            resp.message = "gRPC not ready for external clients".into();
-            rollback_external_grpc(sw.as_ref(), &device.node_id, &mut resp).await;
-            return Ok(tonic::Response::new(resp));
-        }
-
-        // Step 4: NMX gRPC (Hello + SetStaticConfig with topology_type from request)
-        let nmx_port = grpc_port_for_app("nmx-controller");
-
-        let nmx_tls = if self.switch_tls_roots.insecure_switch {
-            // --insecure-switch disables NMX-C client mTLS. NMX-C uses
-            // plaintext HTTP in this mode because disabling the switch manager
-            // mTLS mode exposes the non-TLS gRPC endpoint.
-            None
-        } else {
-            let nmx_server_name = match self
-                .switch_tls_roots
-                .tls_server_name_for_endpoint(&switch_tls_server_name, request_domain)
-            {
-                Ok(server_name) => server_name,
-                Err(message) => {
-                    resp.message = message;
-                    rollback_external_grpc(sw.as_ref(), &device.node_id, &mut resp).await;
-                    return Ok(tonic::Response::new(resp));
-                }
-            };
-
-            match self.switch_tls_roots.resolve_client_tls(request_domain) {
-                Ok(tls) => Some(nmx_client_tls_with_endpoint_authority(
-                    tls,
-                    &nmx_server_name,
-                )),
-                Err(message) => {
-                    resp.message = message;
-                    rollback_external_grpc(sw.as_ref(), &device.node_id, &mut resp).await;
-                    return Ok(tonic::Response::new(resp));
-                }
-            }
-        };
-
-        let nmx_target = grpc_target_uri(
-            &switch_target,
-            nmx_port as u16,
-            !self.switch_tls_roots.insecure_switch,
-        );
-
-        let endpoint = match Endpoint::new(&nmx_target) {
-            Ok(endpoint) => endpoint,
-            Err(e) => {
-                tracing::warn!(node = %device.node_id, error = %e, "invalid NMX Controller target address");
-                resp.message = format!("invalid NMX Controller target address: {e}");
-                rollback_external_grpc(sw.as_ref(), &device.node_id, &mut resp).await;
+            Ok(reservation) => reservation,
+            Err(error) => {
+                resp.message = error.message;
                 return Ok(tonic::Response::new(resp));
             }
         };
 
-        let pool = match NmxcClientPool::builder().build() {
-            Ok(pool) => pool,
-            Err(e) => {
-                tracing::error!(node = %device.node_id, error = %e, "failed to create NMX Controller client pool");
-                resp.message = format!("failed to create NMX Controller client pool: {e}");
-                rollback_external_grpc(sw.as_ref(), &device.node_id, &mut resp).await;
-                return Ok(tonic::Response::new(resp));
-            }
-        };
-
-        let mut client = match pool.create_client(endpoint, nmx_tls.as_ref()).await {
-            Ok(client) => client,
-            Err(e) => {
-                tracing::error!(node = %device.node_id, error = %e, "failed to connect to NMX Controller");
-                resp.message = format!("failed to connect to NMX Controller: {e}");
-                rollback_external_grpc(sw.as_ref(), &device.node_id, &mut resp).await;
-                return Ok(tonic::Response::new(resp));
-            }
-        };
-
-        // Try gRPC Hello to verify the connection is working.
-        if let Err(e) = client.hello(&self.nmx_gateway_id).await {
-            tracing::error!(error = %e, node = %device.node_id, switch_target = %switch_target, nmx_port, "NMX Hello: RPC failed");
-            resp.message = "NMX Controller Hello failed".into();
-            rollback_external_grpc(sw.as_ref(), &device.node_id, &mut resp).await;
-            return Ok(tonic::Response::new(resp));
-        }
-
-        // Try to set the topology value in the static config.
-        let config_result =
-            call_nmx_set_static_config(client.as_mut(), &r.topology_type, &self.nmx_gateway_id)
-                .await;
-
-        // Check if a soft-reset can help.
-        let soft_reset_attempted = !config_result.is_success();
-
-        let config_result = if soft_reset_attempted {
-            recover_nmx_topology_after_static_config_failure(
-                sw.as_ref(),
-                client.as_mut(),
-                &switch_target,
+        resp = self
+            .configure_scale_up_fabric_manager_on_switch(
+                &device.node_id,
+                &ephemeral,
                 &r.topology_type,
-                &self.nmx_gateway_id,
+                &[],
+                request_domain,
             )
-            .await
-        } else {
-            config_result
-        };
-
-        if config_result.is_success() {
-            tracing::info!(node = %device.node_id, topology = %r.topology_type, result = ?config_result, "NMX topology set succeeded");
-            resp.status = rm::ReturnCode::Success.into();
-        } else {
-            tracing::error!(node = %device.node_id, topology = %r.topology_type, result = ?config_result, "failed to set NMX topology");
-            resp.status = rm::ReturnCode::Failure.into();
-            rollback_external_grpc(sw.as_ref(), &device.node_id, &mut resp).await;
-        }
-
-        resp.message = nmx_config_response_message(config_result, soft_reset_attempted).into();
-        resp.topology_used = r.topology_type;
+            .await;
 
         Ok(tonic::Response::new(resp))
     }
@@ -1165,6 +1441,14 @@ impl RackManagerServiceImpl {
             }
         };
 
+        let _admission = match self.reserve_switch_mutation(sw.nvue_client(), device).await {
+            Ok(reservation) => reservation,
+            Err(error) => {
+                resp.error_message = error.message;
+                return Ok(tonic::Response::new(resp));
+            }
+        };
+
         match sw.gnmi_service(r.enable).await {
             Ok(json) => {
                 resp.status = rm::ReturnCode::Success.into();
@@ -1215,10 +1499,12 @@ mod tests {
     use crate::orchestrator::job_tracker::JobTracker;
     use crate::orchestrator::rack_manager::RackManager;
     use crate::persistence::Backends;
+    use crate::utilities::error::ErrorCode;
 
     #[derive(Default)]
     struct FakeScaleUpSwitch {
         restart_calls: AtomicUsize,
+        restart_results: Mutex<VecDeque<Result<()>>>,
         app_status_calls: AtomicUsize,
         grpc_status_calls: AtomicUsize,
         app_status_results: Mutex<VecDeque<Result<Value>>>,
@@ -1298,7 +1584,12 @@ mod tests {
         async fn restart_cluster_app(&self, app_name: &str) -> Result<()> {
             assert_eq!(app_name, NMX_CONTROLLER_APP_NAME);
             self.restart_calls.fetch_add(1, Ordering::SeqCst);
-            Ok(())
+
+            self.restart_results
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(Ok(()))
         }
 
         async fn reset_sdn_factory_default(&self) -> Result<String> {
@@ -1565,13 +1856,26 @@ mod tests {
             firmware_download_cancellations: Arc::new(Mutex::new(HashMap::new())),
             backends: Backends::memory(),
             firmware_dir: std::path::PathBuf::from("firmware"),
+            artifact_require_sha256: false,
+            insecure_bmc: true,
+            artifact_download_policy:
+                crate::api::grpc::artifact_download::ArtifactDownloadPolicy::default(),
             switch_tls_roots: SwitchTlsRoots {
                 insecure_switch: true,
                 ..SwitchTlsRoots::default()
             },
-            sftp_upload_options: crate::transport::ssh::SftpUploadOptions::default(),
+            sftp_upload_options: crate::transport::ssh::SshUploadOptions::default(),
             nmx_gateway_id: crate::libnmxc::DEFAULT_NMX_C_GATEWAY_ID.to_owned(),
             expected_inventory_catalog: crate::config::ExpectedInventoryCatalog::default(),
+            workflow_timings: crate::config::WorkflowTimings::default(),
+            recovery_profiles: crate::config::RecoveryProfiles::default(),
+            fabric_layout_catalog: std::sync::Arc::new(
+                crate::config::fabric_layout::FabricLayoutCatalog::default(),
+            ),
+            hardware_profiles: Arc::new(
+                crate::config::hardware_profiles::HardwareProfileCatalog::built_in().unwrap(),
+            ),
+            fabric_operations: std::sync::Arc::new(Default::default()),
         }
     }
 
@@ -1605,9 +1909,11 @@ mod tests {
 
     #[test]
     fn build_ephemeral_switch_accepts_regular_host_endpoint() {
-        let ephemeral =
-            build_ephemeral_switch(&switch_node_info("10.0.0.11", Some(" switch.example.com ")))
-                .unwrap();
+        let ephemeral = build_ephemeral_switch(
+            &switch_node_info("10.0.0.11", Some(" switch.example.com ")),
+            true,
+        )
+        .unwrap();
 
         assert_eq!(ephemeral.target_ip, "10.0.0.11".parse::<IpAddr>().unwrap());
         assert_eq!(ephemeral.tls_server_name, "switch.example.com");
@@ -1615,7 +1921,7 @@ mod tests {
 
     #[test]
     fn build_ephemeral_switch_accepts_legacy_endpoint_without_host_name() {
-        let ephemeral = build_ephemeral_switch(&switch_node_info("10.0.0.11", None)).unwrap();
+        let ephemeral = build_ephemeral_switch(&switch_node_info("10.0.0.11", None), true).unwrap();
 
         assert_eq!(ephemeral.target_ip, "10.0.0.11".parse::<IpAddr>().unwrap());
         assert_eq!(ephemeral.tls_server_name, "10.0.0.11");
@@ -1623,11 +1929,14 @@ mod tests {
 
     #[test]
     fn build_ephemeral_switch_accepts_gb300_switch_type_and_nvue() {
-        let ephemeral = build_ephemeral_switch(&switch_node_info_with_type(
-            "10.0.0.11",
-            Some("switch.example.com"),
-            rm::NodeType::SwitchGb300Nvidia,
-        ))
+        let ephemeral = build_ephemeral_switch(
+            &switch_node_info_with_type(
+                "10.0.0.11",
+                Some("switch.example.com"),
+                rm::NodeType::SwitchGb300Nvidia,
+            ),
+            true,
+        )
         .unwrap();
 
         assert_eq!(ephemeral.switch.node_type(), NodeType::SwitchGb300Nvidia);
@@ -1636,10 +1945,23 @@ mod tests {
 
     #[test]
     fn build_ephemeral_switch_rejects_unsafe_host_endpoint() {
-        let Err(err) =
-            build_ephemeral_switch(&switch_node_info("127.0.0.1", Some("switch.example.com")))
-        else {
+        let Err(err) = build_ephemeral_switch(
+            &switch_node_info("127.0.0.1", Some("switch.example.com")),
+            true,
+        ) else {
             panic!("expected unsafe host endpoint to be rejected");
+        };
+
+        assert!(err.message.contains("switch target host is not allowed"));
+    }
+
+    #[test]
+    fn build_ephemeral_switch_rejects_cgnat_host_endpoint() {
+        let Err(err) = build_ephemeral_switch(
+            &switch_node_info("100.64.0.1", Some("switch.example.com")),
+            true,
+        ) else {
+            panic!("expected CGNAT host endpoint to be rejected");
         };
 
         assert!(err.message.contains("switch target host is not allowed"));
@@ -1715,7 +2037,7 @@ mod tests {
                 Ok(String::new())
             });
 
-        disable_insecure_nmx_controller_mtls(&switch).await?;
+        disable_insecure_nmx_controller_mtls(&switch, &CancellationToken::new()).await?;
 
         assert_eq!(
             *commands.lock().unwrap(),
@@ -1755,11 +2077,208 @@ mod tests {
                 Ok(String::new())
             });
 
-        disable_insecure_nmx_controller_mtls(&switch).await?;
+        disable_insecure_nmx_controller_mtls(&switch, &CancellationToken::new()).await?;
 
         assert!(commands.lock().unwrap().is_empty());
 
         Ok(())
+    }
+
+    /// If the cluster is enabled and the app stays unready for the full retry
+    /// budget, RMS must not run `nv action restore … manager encryption`.
+    /// Certificate bind uses NVUE `@update`; this restore is SSH. The wait is
+    /// fail-closed, not a proven shared configCallback.
+    #[tokio::test]
+    async fn disable_insecure_nmx_controller_mtls_does_not_restore_encryption_when_the_app_stays_unready()
+     {
+        let server = MockServer::start().await;
+        let starting = serde_json::json!({
+            "status": "not ok",
+            "additional-info": "CONTROL_PLANE_STATE_UNDEFINED",
+            "manager": {
+                "state": "enabled",
+                "encryption": "mtls",
+            },
+        });
+        Mock::given(method("GET"))
+            .and(path("/nvue_v1/cluster/apps/nmx-controller"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(starting))
+            .named("starting GET /nvue_v1/cluster/apps/nmx-controller")
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/nvue_v1/cluster"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "state": "enabled",
+            })))
+            .named("enabled GET /nvue_v1/cluster")
+            .mount(&server)
+            .await;
+
+        let commands = Arc::new(Mutex::new(Vec::new()));
+        let observed_commands = Arc::clone(&commands);
+        let switch =
+            SwitchGb200Nvidia::for_test(&server.uri()).with_ssh_exec_for_test(move |command| {
+                observed_commands.lock().unwrap().push(command.to_owned());
+                Ok(String::new())
+            });
+
+        let error = disable_insecure_nmx_controller_mtls(&switch, &CancellationToken::new())
+            .await
+            .expect_err("unready app must fail closed before encryption restore");
+        assert_eq!(
+            error.message,
+            "cluster app nmx-controller did not become ready for manager configuration"
+        );
+        assert!(
+            commands.lock().unwrap().is_empty(),
+            "must not SSH-restore manager encryption while the app is unready; got {:?}",
+            commands.lock().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn disable_insecure_nmx_controller_mtls_restores_when_app_is_ok_and_nmxc_conn_is_down()
+    -> Result<()> {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/nvue_v1/cluster/apps/nmx-controller"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "status": "ok",
+                "manager": {
+                    "state": "enabled",
+                    "encryption": "mtls",
+                },
+            })))
+            .named("ready GET /nvue_v1/cluster/apps/nmx-controller while nmxc-conn is down")
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/nvue_v1/cluster"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "state": "enabled",
+                "nmxc-conn": {"state": "down"},
+            })))
+            .named("enabled cluster GET while ready app keeps nmxc-conn down")
+            .mount(&server)
+            .await;
+
+        let commands = Arc::new(Mutex::new(Vec::new()));
+        let observed_commands = Arc::clone(&commands);
+        let switch =
+            SwitchGb200Nvidia::for_test(&server.uri()).with_ssh_exec_for_test(move |command| {
+                observed_commands.lock().unwrap().push(command.to_owned());
+                Ok(String::new())
+            });
+
+        disable_insecure_nmx_controller_mtls(&switch, &CancellationToken::new()).await?;
+
+        assert_eq!(
+            *commands.lock().unwrap(),
+            vec![
+                "nv action restore cluster apps nmx-controller manager encryption",
+                "nv config apply --assume-yes",
+                "nv config save",
+            ]
+        );
+
+        Ok(())
+    }
+
+    /// A cancel after the restore command has reached the switch must not
+    /// look like a completed disable: the change is live and uncommitted.
+    #[tokio::test]
+    async fn disable_insecure_nmx_controller_mtls_reports_cancellation_after_restore() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/nvue_v1/cluster/apps/nmx-controller"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "manager": { "encryption": "mtls" },
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/nvue_v1/cluster"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "state": "disabled",
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let cancel = CancellationToken::new();
+        let commands = Arc::new(Mutex::new(Vec::new()));
+        let observed_commands = Arc::clone(&commands);
+        let trigger = cancel.clone();
+        let switch =
+            SwitchGb200Nvidia::for_test(&server.uri()).with_ssh_exec_for_test(move |command| {
+                observed_commands.lock().unwrap().push(command.to_owned());
+                trigger.cancel();
+                Ok(String::new())
+            });
+
+        let error = disable_insecure_nmx_controller_mtls(&switch, &cancel)
+            .await
+            .expect_err("a cancelled restore must not be reported as success");
+
+        assert_eq!(error.code, ErrorCode::Cancelled);
+        assert_eq!(
+            error.message,
+            "NMX-C mTLS unset was cancelled after the restore reached the switch and before it was committed"
+        );
+        assert_eq!(
+            *commands.lock().unwrap(),
+            vec!["nv action restore cluster apps nmx-controller manager encryption"]
+        );
+    }
+
+    #[tokio::test]
+    async fn disable_insecure_nmx_controller_mtls_reports_cancellation_before_any_command() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/nvue_v1/cluster/apps/nmx-controller"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "manager": { "encryption": "mtls" },
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/nvue_v1/cluster"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "state": "disabled",
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let commands = Arc::new(Mutex::new(Vec::new()));
+        let observed_commands = Arc::clone(&commands);
+        let switch =
+            SwitchGb200Nvidia::for_test(&server.uri()).with_ssh_exec_for_test(move |command| {
+                observed_commands.lock().unwrap().push(command.to_owned());
+                Ok(String::new())
+            });
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let error = disable_insecure_nmx_controller_mtls(&switch, &cancel)
+            .await
+            .expect_err("cancelling before the unset starts must not be reported as success");
+
+        assert_eq!(error.code, ErrorCode::Cancelled);
+        assert_eq!(
+            error.message,
+            "NMX-C mTLS unset was cancelled before it changed the switch"
+        );
+        assert!(commands.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -2139,5 +2658,384 @@ mod tests {
 
         assert_eq!(result, NmxSetStaticConfigResult::SetSucceeded);
         assert_eq!(client.set_calls.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn fabric_static_config_restarts_after_confirmed_topology_write() {
+        for precheck_unavailable in [false, true] {
+            for set_returns_error in [false, true] {
+                let switch = FakeScaleUpSwitch::default();
+                let gateway_id = crate::libnmxc::DEFAULT_NMX_C_GATEWAY_ID;
+
+                let precheck = if precheck_unavailable {
+                    Err(NmxcError::invalid_response("precheck unavailable"))
+                } else {
+                    Ok(FakeNmxc::static_config_response(
+                        NMX_C_FM_CONFIG_FILE,
+                        NMX_C_TOPOLOGY_KEY,
+                        "topology-a",
+                    ))
+                };
+
+                let set_result = if set_returns_error {
+                    Err(NmxcError::invalid_response("set response unavailable"))
+                } else {
+                    Ok(FakeNmxc::success_return_code())
+                };
+
+                let mut client = FakeNmxc {
+                    get_static_config_results: VecDeque::from([
+                        precheck,
+                        Ok(FakeNmxc::static_config_response(
+                            NMX_C_FM_CONFIG_FILE,
+                            NMX_C_TOPOLOGY_KEY,
+                            "topology-b",
+                        )),
+                        Ok(FakeNmxc::static_config_response(
+                            NMX_C_FM_CONFIG_FILE,
+                            NMX_C_TOPOLOGY_KEY,
+                            "topology-b",
+                        )),
+                    ]),
+                    set_results: VecDeque::from([set_result]),
+                    ..FakeNmxc::default()
+                };
+
+                let first = configure_nmx_fabric_static_config(
+                    &switch,
+                    &mut client,
+                    "10.0.0.11",
+                    "topology-b",
+                    &[],
+                    gateway_id,
+                )
+                .await
+                .expect("confirmed topology write should activate");
+
+                assert_eq!(first, (NmxSetStaticConfigResult::SetSucceeded, false));
+                assert_eq!(switch.restart_calls.load(Ordering::SeqCst), 1);
+                assert_eq!(client.set_calls.len(), 1);
+
+                let retry = configure_nmx_fabric_static_config(
+                    &switch,
+                    &mut client,
+                    "10.0.0.11",
+                    "topology-b",
+                    &[],
+                    gateway_id,
+                )
+                .await
+                .expect("matching topology should remain configured");
+
+                assert_eq!(retry, (NmxSetStaticConfigResult::AlreadyConfigured, false));
+                assert_eq!(switch.restart_calls.load(Ordering::SeqCst), 1);
+                assert_eq!(client.set_calls.len(), 1);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn fabric_static_config_restarts_only_for_changed_fm_values() {
+        for (file, old_topology, old_log_level, expected_writes, expected_restarts) in [
+            (NMX_C_FM_CONFIG_FILE, "topology-a", "3", 2, 1),
+            (NMX_C_FM_CONFIG_FILE, "topology-a", "4", 1, 1),
+            (NMX_C_FM_CONFIG_FILE, "topology-b", "3", 1, 1),
+            (NMX_C_FM_CONFIG_FILE, "topology-b", "4", 0, 0),
+            (
+                crate::libnmxc::NMX_C_SM_CONFIG_FILE,
+                "topology-b",
+                "3",
+                1,
+                0,
+            ),
+        ] {
+            let switch = FakeScaleUpSwitch::default();
+
+            let key = if file == NMX_C_FM_CONFIG_FILE {
+                "LOG_LEVEL"
+            } else {
+                "log_flags"
+            };
+
+            let extra = rm::ScaleUpFabricStaticConfig {
+                config_file_name: file.into(),
+                key: key.into(),
+                value: "4".into(),
+            };
+
+            let mut responses = VecDeque::from([Ok(FakeNmxc::static_config_response(
+                NMX_C_FM_CONFIG_FILE,
+                NMX_C_TOPOLOGY_KEY,
+                old_topology,
+            ))]);
+
+            if old_topology != "topology-b" {
+                responses.push_back(Ok(FakeNmxc::static_config_response(
+                    NMX_C_FM_CONFIG_FILE,
+                    NMX_C_TOPOLOGY_KEY,
+                    "topology-b",
+                )));
+            }
+
+            responses.push_back(Ok(FakeNmxc::static_config_response(
+                file,
+                key,
+                old_log_level,
+            )));
+
+            if old_log_level != "4" {
+                responses.push_back(Ok(FakeNmxc::static_config_response(file, key, "4")));
+            }
+
+            let mut client = FakeNmxc {
+                get_static_config_results: responses,
+                set_results: (0..expected_writes)
+                    .map(|_| Ok(FakeNmxc::success_return_code()))
+                    .collect(),
+                ..FakeNmxc::default()
+            };
+
+            let result = configure_nmx_fabric_static_config(
+                &switch,
+                &mut client,
+                "10.0.0.11",
+                "topology-b",
+                &[extra],
+                crate::libnmxc::DEFAULT_NMX_C_GATEWAY_ID,
+            )
+            .await
+            .expect("matching readbacks should complete the batch");
+
+            assert_eq!(
+                switch.restart_calls.load(Ordering::SeqCst),
+                expected_restarts
+            );
+
+            assert_eq!(client.set_calls.len(), expected_writes);
+            assert!(client.get_static_config_results.is_empty());
+
+            assert_eq!(
+                result.0 == NmxSetStaticConfigResult::AlreadyConfigured,
+                expected_writes == 0
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn fabric_static_config_activates_topology_written_after_recovery_restart() {
+        let switch = FakeScaleUpSwitch::default();
+
+        let mut client = FakeNmxc {
+            get_static_config_results: ["topology-a", "topology-a", "topology-a", "topology-b"]
+                .into_iter()
+                .map(|value| {
+                    Ok(FakeNmxc::static_config_response(
+                        NMX_C_FM_CONFIG_FILE,
+                        NMX_C_TOPOLOGY_KEY,
+                        value,
+                    ))
+                })
+                .collect(),
+            set_results: VecDeque::from([
+                Ok(FakeNmxc::success_return_code()),
+                Ok(FakeNmxc::success_return_code()),
+            ]),
+            ..FakeNmxc::default()
+        };
+
+        let result = configure_nmx_fabric_static_config(
+            &switch,
+            &mut client,
+            "10.0.0.11",
+            "topology-b",
+            &[],
+            crate::libnmxc::DEFAULT_NMX_C_GATEWAY_ID,
+        )
+        .await
+        .expect("topology written after recovery should activate");
+
+        assert_eq!(result, (NmxSetStaticConfigResult::SetSucceeded, true));
+        assert_eq!(client.set_calls.len(), 2);
+        assert_eq!(switch.restart_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn fabric_static_config_reports_topology_activation_restart_failure() {
+        let switch = FakeScaleUpSwitch {
+            restart_results: Mutex::new(VecDeque::from([Err(RmsError::internal(
+                "restart failed",
+            ))])),
+            ..FakeScaleUpSwitch::default()
+        };
+
+        let mut client = FakeNmxc {
+            get_static_config_results: ["topology-a", "topology-b"]
+                .into_iter()
+                .map(|value| {
+                    Ok(FakeNmxc::static_config_response(
+                        NMX_C_FM_CONFIG_FILE,
+                        NMX_C_TOPOLOGY_KEY,
+                        value,
+                    ))
+                })
+                .collect(),
+            set_results: VecDeque::from([Ok(FakeNmxc::success_return_code())]),
+            ..FakeNmxc::default()
+        };
+
+        let result = configure_nmx_fabric_static_config(
+            &switch,
+            &mut client,
+            "10.0.0.11",
+            "topology-b",
+            &[],
+            crate::libnmxc::DEFAULT_NMX_C_GATEWAY_ID,
+        )
+        .await;
+
+        let error = result.expect_err("failed activation must fail the request");
+
+        assert!(error.contains("failed to restart NMX Controller"));
+        assert!(error.contains("10.0.0.11"));
+        assert!(error.contains("restart failed"));
+        assert_eq!(client.set_calls.len(), 1);
+        assert_eq!(switch.restart_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn fabric_static_config_applies_topology_and_extra_keys_on_one_client() {
+        let switch = FakeScaleUpSwitch::default();
+
+        let extra = rm::ScaleUpFabricStaticConfig {
+            config_file_name: crate::libnmxc::NMX_C_SM_CONFIG_FILE.into(),
+            key: "ROUTING_MODE".into(),
+            value: "new".into(),
+        };
+
+        let mut client = FakeNmxc {
+            get_static_config_results: VecDeque::from([
+                Ok(FakeNmxc::static_config_response(
+                    NMX_C_FM_CONFIG_FILE,
+                    NMX_C_TOPOLOGY_KEY,
+                    "topology-a",
+                )),
+                Ok(FakeNmxc::static_config_response(
+                    NMX_C_FM_CONFIG_FILE,
+                    NMX_C_TOPOLOGY_KEY,
+                    "topology-b",
+                )),
+                Ok(FakeNmxc::static_config_response(
+                    crate::libnmxc::NMX_C_SM_CONFIG_FILE,
+                    "ROUTING_MODE",
+                    "old",
+                )),
+                Ok(FakeNmxc::static_config_response(
+                    crate::libnmxc::NMX_C_SM_CONFIG_FILE,
+                    "ROUTING_MODE",
+                    "new",
+                )),
+            ]),
+            set_results: VecDeque::from([
+                Ok(FakeNmxc::success_return_code()),
+                Ok(FakeNmxc::success_return_code()),
+            ]),
+            ..FakeNmxc::default()
+        };
+
+        let (topology_result, soft_reset_attempted) = configure_nmx_fabric_static_config(
+            &switch,
+            &mut client,
+            "10.0.0.11",
+            "topology-b",
+            &[extra],
+            crate::libnmxc::DEFAULT_NMX_C_GATEWAY_ID,
+        )
+        .await
+        .expect("topology and extra static config should converge");
+
+        assert_eq!(topology_result, NmxSetStaticConfigResult::SetSucceeded);
+        assert!(!soft_reset_attempted);
+        assert_eq!(client.set_calls.len(), 2);
+        assert_eq!(client.set_calls[0].0, NMX_C_FM_CONFIG_FILE);
+        assert_eq!(client.set_calls[0].1, NMX_C_TOPOLOGY_KEY);
+        assert_eq!(client.set_calls[1].0, crate::libnmxc::NMX_C_SM_CONFIG_FILE);
+        assert_eq!(client.set_calls[1].1, "ROUTING_MODE");
+        assert_eq!(switch.restart_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn fabric_static_config_applies_extra_keys_after_topology_soft_reset()
+    -> std::result::Result<(), String> {
+        let switch = FakeScaleUpSwitch::default();
+        let gateway_id = crate::libnmxc::DEFAULT_NMX_C_GATEWAY_ID;
+
+        let extra = rm::ScaleUpFabricStaticConfig {
+            config_file_name: crate::libnmxc::NMX_C_SM_CONFIG_FILE.into(),
+            key: "ROUTING_MODE".into(),
+            value: "new".into(),
+        };
+
+        let mut client = FakeNmxc {
+            get_static_config_results: VecDeque::from([
+                Ok(FakeNmxc::static_config_response(
+                    NMX_C_FM_CONFIG_FILE,
+                    NMX_C_TOPOLOGY_KEY,
+                    "topology-a",
+                )),
+                Ok(FakeNmxc::static_config_response(
+                    NMX_C_FM_CONFIG_FILE,
+                    NMX_C_TOPOLOGY_KEY,
+                    "topology-a",
+                )),
+                Ok(FakeNmxc::static_config_response(
+                    NMX_C_FM_CONFIG_FILE,
+                    NMX_C_TOPOLOGY_KEY,
+                    "topology-b",
+                )),
+                Ok(FakeNmxc::static_config_response(
+                    crate::libnmxc::NMX_C_SM_CONFIG_FILE,
+                    "ROUTING_MODE",
+                    "old",
+                )),
+                Ok(FakeNmxc::static_config_response(
+                    crate::libnmxc::NMX_C_SM_CONFIG_FILE,
+                    "ROUTING_MODE",
+                    "new",
+                )),
+            ]),
+            set_results: VecDeque::from([
+                Ok(FakeNmxc::success_return_code()),
+                Ok(FakeNmxc::success_return_code()),
+            ]),
+            ..FakeNmxc::default()
+        };
+
+        let (config_result, soft_reset_attempted) = configure_nmx_fabric_static_config(
+            &switch,
+            &mut client,
+            "10.0.0.11",
+            "topology-b",
+            &[extra],
+            gateway_id,
+        )
+        .await?;
+
+        assert_eq!(config_result, NmxSetStaticConfigResult::SetSucceeded);
+        assert!(soft_reset_attempted);
+
+        assert_eq!(
+            nmx_config_response_message(config_result, soft_reset_attempted),
+            "configuration complete"
+        );
+
+        assert_eq!(switch.restart_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(client.hello_calls, vec![gateway_id.to_owned()]);
+        assert_eq!(client.set_calls.len(), 2);
+        assert_eq!(client.set_calls[0].0, NMX_C_FM_CONFIG_FILE);
+        assert_eq!(client.set_calls[0].1, NMX_C_TOPOLOGY_KEY);
+        assert_eq!(client.set_calls[1].0, crate::libnmxc::NMX_C_SM_CONFIG_FILE);
+        assert_eq!(client.set_calls[1].1, "ROUTING_MODE");
+
+        Ok(())
     }
 }

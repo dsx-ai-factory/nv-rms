@@ -18,8 +18,11 @@
 use std::fmt;
 use std::future::Future;
 use std::ops::Deref;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
+use futures::FutureExt as _;
+use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
@@ -42,6 +45,7 @@ pub struct JobHandle<D: JobDomain> {
     span: tracing::Span,
     cancellation_token: CancellationToken,
     finished: bool,
+    result_metadata: serde_json::Map<String, serde_json::Value>,
 }
 
 impl<D: JobDomain> JobHandle<D> {
@@ -57,7 +61,49 @@ impl<D: JobDomain> JobHandle<D> {
             span,
             cancellation_token,
             finished: false,
+            result_metadata: serde_json::Map::new(),
         }
+    }
+
+    /// Adds trusted metadata to every terminal result, including handle abandonment.
+    ///
+    /// Metadata keys take precedence over result keys. Empty results become an
+    /// object; non-object payloads are preserved under `result`. Jobs without
+    /// metadata retain their existing result bytes. This does not persist jobs
+    /// or change the queued/running status payload.
+    pub(crate) fn with_result_metadata(
+        mut self,
+        metadata: serde_json::Map<String, serde_json::Value>,
+    ) -> Self {
+        self.result_metadata.extend(metadata);
+        self
+    }
+
+    fn result_with_metadata(&self, result_json: String) -> String {
+        if self.result_metadata.is_empty() {
+            return result_json;
+        }
+        let mut result = if result_json.is_empty() {
+            serde_json::Map::new()
+        } else {
+            match serde_json::from_str(&result_json) {
+                Ok(serde_json::Value::Object(result)) => result,
+                parsed => serde_json::Map::from_iter([(
+                    "result".to_owned(),
+                    parsed.unwrap_or(serde_json::Value::String(result_json)),
+                )]),
+            }
+        };
+        result.extend(self.result_metadata.clone());
+        serde_json::Value::Object(result).to_string()
+    }
+
+    fn failure_with_metadata(&self, mut failure: JobFailure) -> JobFailure {
+        if !self.result_metadata.is_empty() {
+            failure.result_json =
+                Some(self.result_with_metadata(failure.result_json.take().unwrap_or_default()));
+        }
+        failure
     }
 
     /// Returns this job's ID.
@@ -78,25 +124,52 @@ impl<D: JobDomain> JobHandle<D> {
     /// Updates the visible progress message when the job is still active.
     ///
     /// The registry logs the `job started`/`job progress` chokepoint event on
-    /// a successful update; this only warns when the update is ignored
-    /// because the job is no longer active.
-    pub fn progress(&self, description: impl Into<String>) {
-        if !self.registry.mark_running(&self.job_id, description) {
+    /// a successful update. Returns `false` and warns when the job is missing
+    /// or terminal; returns `true` when the description is accepted.
+    pub fn progress(&self, description: impl Into<String>) -> bool {
+        let accepted = self.registry.mark_running(&self.job_id, description);
+
+        if !accepted {
             tracing::warn!(
                 job_id = %self.job_id,
                 "progress update ignored; job no longer active"
             );
         }
+
+        accepted
     }
 
     /// Marks the job completed with a description and result payload.
     ///
     /// The registry logs the `job completed` chokepoint event on the
-    /// transition.
+    /// transition. Completion alone leaves the span status unset.
     pub fn complete(mut self, description: impl Into<String>, result_json: impl Into<String>) {
         self.finished = true;
-        self.registry
-            .mark_completed(&self.job_id, description, result_json);
+        self.registry.mark_completed(
+            &self.job_id,
+            description,
+            self.result_with_metadata(result_json.into()),
+            false,
+        );
+    }
+
+    /// Completes a job whose requested outcome has been verified successful.
+    ///
+    /// The registry sets the span status to `Ok` only if this completion wins
+    /// the terminal transition. Use [`Self::complete`] when the final outcome
+    /// remains uncertain, including work that was only submitted or accepted.
+    pub fn complete_verified(
+        mut self,
+        description: impl Into<String>,
+        result_json: impl Into<String>,
+    ) {
+        self.finished = true;
+        self.registry.mark_completed(
+            &self.job_id,
+            description,
+            self.result_with_metadata(result_json.into()),
+            true,
+        );
     }
 
     /// Marks the job failed with the supplied failure payload.
@@ -105,7 +178,8 @@ impl<D: JobDomain> JobHandle<D> {
     /// transition.
     pub fn fail(mut self, failure: JobFailure) {
         self.finished = true;
-        self.registry.mark_failed(&self.job_id, failure);
+        self.registry
+            .mark_failed(&self.job_id, self.failure_with_metadata(failure));
     }
 }
 
@@ -145,8 +219,13 @@ impl<D: JobDomain> Drop for JobHandle<D> {
     fn drop(&mut self) {
         if !self.finished {
             self.finished = true;
+            let failure = if self.cancellation_token.is_cancelled() {
+                D::shutdown_failure()
+            } else {
+                D::dropped_failure()
+            };
             self.registry
-                .mark_failed(&self.job_id, D::dropped_failure());
+                .mark_failed(&self.job_id, self.failure_with_metadata(failure));
         }
     }
 }
@@ -214,14 +293,29 @@ impl<D: JobDomain> JobRegistry<D> {
         Fut: Future<Output = ()> + Send + 'static,
     {
         let job_id = job.id().clone();
+        let cancellation_token = job.cancellation_token();
         let worker_span = job.span();
         let supervisor_span = worker_span.clone();
         let cleanup_span = worker_span.clone();
-        let worker = tokio::spawn(run(job).instrument(worker_span));
+        let (worker_start_tx, worker_start_rx) = oneshot::channel();
+        let worker = tokio::spawn(
+            async move {
+                if worker_start_rx.await.is_ok() {
+                    run(job).await;
+                }
+            }
+            .instrument(worker_span),
+        );
+        let worker_abort = worker.abort_handle();
         let registry = Arc::clone(self);
+        let registration = TaskRegistration {
+            registry: Arc::clone(self),
+            job_id: job_id.clone(),
+        };
 
         let supervisor = tokio::spawn(
             async move {
+                let _registration = registration;
                 if let Err(error) = worker.await {
                     tracing::warn!(%error, "job worker task exited unsuccessfully");
                 }
@@ -235,45 +329,54 @@ impl<D: JobDomain> JobRegistry<D> {
             }
             .instrument(supervisor_span),
         );
+        let supervisor_abort = supervisor.abort_handle();
+        if self.register_task(job_id.clone(), worker_abort.clone(), supervisor_abort) {
+            let _ = worker_start_tx.send(());
+        } else {
+            // Preserve shutdown classification when admission closes before the cancellation sweep.
+            cancellation_token.cancel();
+            worker_abort.abort();
+        }
 
         JobJoinHandle { job_id, supervisor }
     }
 }
 
-/// Runs the cleanup plan inside its own task so a panic during cleanup is
-/// caught as a [`tokio::task::JoinError`] instead of escaping as a bare Tokio
-/// task error.
+struct TaskRegistration<D: JobDomain> {
+    registry: Arc<JobRegistry<D>>,
+    job_id: JobId,
+}
+
+impl<D: JobDomain> Drop for TaskRegistration<D> {
+    fn drop(&mut self) {
+        self.registry.remove_task(&self.job_id);
+    }
+}
+
+/// Runs cleanup inside the tracked supervisor and converts panics into a
+/// bounded report.
 async fn run_cleanup_supervised<D: JobDomain>(
     cleanup_plan: CleanupPlan,
     registry: Arc<JobRegistry<D>>,
     cleanup_span: tracing::Span,
 ) -> CleanupReport {
-    let cleanup =
-        tokio::spawn(async move { cleanup_plan.run(registry).await }.instrument(cleanup_span));
-
-    match cleanup.await {
+    match AssertUnwindSafe(cleanup_plan.run(registry).instrument(cleanup_span))
+        .catch_unwind()
+        .await
+    {
         Ok(report) => report,
-        Err(error) if error.is_panic() => {
-            let message = panic_message_from_join_error(error);
+        Err(payload) => {
+            let message = panic_message(payload);
             tracing::error!(
                 panic_message = %message,
                 "job cleanup panicked; resource may be leaked"
             );
             CleanupReport::Panicked(message)
         }
-        Err(error) if error.is_cancelled() => {
-            tracing::warn!("job cleanup was cancelled before completing");
-            CleanupReport::Skipped
-        }
-        Err(error) => {
-            tracing::warn!(%error, "job cleanup exited with an unknown join error");
-            CleanupReport::Skipped
-        }
     }
 }
 
-fn panic_message_from_join_error(error: tokio::task::JoinError) -> String {
-    let payload = error.into_panic();
+fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
     match payload.downcast::<String>() {
         Ok(message) => *message,
         Err(payload) => match payload.downcast::<&'static str>() {

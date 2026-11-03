@@ -1,22 +1,36 @@
 PowerShelf Platform Update Examples
 ------------------------------------
 
-NVFWUPD 2.0.9 introduces support for Delta and LiteOn PowerShelf platforms. NVFWUPD 2.1.2 adds support for Megmeet PowerShelf platforms. Firmware updates use Redfish APIs.
+NVFWUPD 2.0.9 introduced support for Delta and LiteOn PowerShelf platforms. NVFWUPD 2.1.2 added support for Megmeet PowerShelf platforms. NVFWUPD 2.1.3 adds support for Flex PowerShelf platforms.
 
 Supported PowerShelf Platforms
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-PowerShelf platforms from various manufacturers are supported, including:
+PowerShelf platforms from the following manufacturers are supported:
 
 - **Delta PowerShelf**: Delta power distribution and management systems
 - **LiteOn PowerShelf**: LiteOn power distribution and management systems
 - **Megmeet PowerShelf**: Megmeet power distribution and management systems
+- **Flex PowerShelf**: Flex power distribution and management systems
 
-All PowerShelf platforms use the same servertype: ``Powershelf``
+All PowerShelf platforms use the same servertype value: ``Powershelf``
 
+Vera Rubin NVL72 LiteOn PF-1114-1RD
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Displaying Current PowerShelf Firmware Versions
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+PSU versions for this model are read from the LiteOn OEM ``PowerUnits``
+inventory (``powerdevice1`` through ``powerdevice6``). PMC and PSU firmware are
+updated through ``UpdateService.HttpPushUri``. Supply the PSU package without a
+``LiteOnPowerDeviceId`` selector to update all PSUs in one upload. The tool
+tracks the returned task and verifies the PSU versions when it completes.
+Per-PSU selectors are rejected on this model.
+
+If the PMC restarts during an all-PSU update, NVFWUPD waits for it to return
+and, when needed, uploads the package again. The update is abandoned after one
+hour.
+
+Display Current PowerShelf Firmware Versions
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 To display the current firmware versions on a PowerShelf platform, use the ``show_version`` command with servertype ``Powershelf``:
 
@@ -78,7 +92,9 @@ Example 3: Megmeet PowerShelf
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 .. note::
-    Megmeet PowerShelf PMC package versioning is not supported in the show_version output. As a result, the package version field displays N/A. Support will be added in a future release.
+    Megmeet PowerShelf PMC package versioning is not supported in the
+    ``show_version`` output. As a result, the package version field displays
+    ``N/A``. Support will be added in a future release.
 
 .. code-block::
 
@@ -107,7 +123,56 @@ Example 3: Megmeet PowerShelf
     ------------------------------------------------------------------------------------
     Error Code: 0
 
-Updating PowerShelf Firmware
+Example 4: Flex PowerShelf
+^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Flex PowerShelf platforms show PMC and PSU firmware versions in the ``show_version`` output. Flex systems use ``FW_PMC_0`` for the PowerShelf management controller and ``FW_PSU_<n>`` entries for individual PSUs.
+
+.. code-block::
+
+    $ nvfwupd -t ip=<PowerShelf BMC IP> user=*** password=*** servertype=Powershelf show_version -p OBMC-flex-bigwig-v3.0.13.fwpkg
+    System Model: NVD-P-0000ADT00
+    Part number: $TRAY_PART_NUMBER
+    Serial number: $TRAY_SERIAL_NUMBER
+    Packages: ['v3.0.13']
+    Connection Status: Successful
+
+    Firmware Devices:
+    AP Name      Sys Version   Pkg Version   Up-To-Date
+    -------      -----------   -----------   ----------
+    FW_PMC_0     v3.0.12       v3.0.13       No
+    FW_PSU_1     004C0A0B      N/A           No
+    FW_PSU_2     004C0A0B      N/A           No
+    FW_PSU_3     004C0A0B      N/A           No
+    FW_PSU_4     004C0A0B      N/A           No
+    FW_PSU_5     004C0A0B      N/A           No
+    FW_PSU_6     004C0A0B      N/A           No
+    ----------------------------------------------------
+    Error Code: 0
+
+.. code-block::
+
+    $ nvfwupd -t ip=<PowerShelf BMC IP> user=*** password=*** servertype=Powershelf show_version -p Flex_N18400_VR200_V005C0A0B.fwpkg
+    System Model: NVD-P-0000ADT00
+    Part number: $TRAY_PART_NUMBER
+    Serial number: $TRAY_SERIAL_NUMBER
+    Packages: ['005C0A0B']
+    Connection Status: Successful
+
+    Firmware Devices:
+    AP Name      Sys Version   Pkg Version   Up-To-Date
+    -------      -----------   -----------   ----------
+    FW_PMC_0     v3.0.13       N/A           No
+    FW_PSU_1     004C0A0B      005C0A0B      No
+    FW_PSU_2     004C0A0B      005C0A0B      No
+    FW_PSU_3     004C0A0B      005C0A0B      No
+    FW_PSU_4     004C0A0B      005C0A0B      No
+    FW_PSU_5     004C0A0B      005C0A0B      No
+    FW_PSU_6     004C0A0B      005C0A0B      No
+    ----------------------------------------------------
+    Error Code: 0
+
+Update PowerShelf Firmware
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 To update components on a PowerShelf platform, run the ``update_fw`` command without specifying individual targets:
@@ -363,9 +428,72 @@ Megmeet PMC updates start immediately and return a task ID. That task ID cannot 
     Error Code: 0
 
 
+**Flex PMC Update:**
+
+Flex PMC updates start immediately and return a Redfish task ID. They do not required a vendor-specific JSON file.
+
+.. code-block::
+
+    $ nvfwupd -t ip=<PowerShelf BMC IP> user=*** password=*** servertype=Powershelf show_version -p OBMC-flex-bigwig-v3.0.13.fwpkg
+    System Model: NVD-P-0000ADT00
+    Part number: $TRAY_PART_NUMBER
+    Serial number: $TRAY_SERIAL_NUMBER
+    Packages: ['v3.0.13']
+    Connection Status: Successful
+
+    Firmware Devices:
+    AP Name      Sys Version   Pkg Version   Up-To-Date
+    -------      -----------   -----------   ----------
+    FW_PMC_0     v3.0.12       v3.0.13       No
+    FW_PSU_1     004C0A0B      N/A           No
+    FW_PSU_2     004C0A0B      N/A           No
+    FW_PSU_3     004C0A0B      N/A           No
+    FW_PSU_4     004C0A0B      N/A           No
+    FW_PSU_5     004C0A0B      N/A           No
+    FW_PSU_6     004C0A0B      N/A           No
+    ----------------------------------------------------
+    Error Code: 0
+
+    $ nvfwupd -t ip=<PowerShelf BMC IP> user=*** password=*** servertype=Powershelf update_fw -p OBMC-flex-bigwig-v3.0.13.fwpkg
+    Updating ip address: ip=XXXX
+    FW package: ['OBMC-flex-bigwig-v3.0.13.fwpkg']
+    Ok to proceed with firmware update? <Y/N>
+    y
+    ApplyTime already set to 'Immediate'.
+    FW update started, Task Id: 0
+    Firmware update in progress
+    use show_update_progress command to monitor the progress
+    ----------------------------------------------------
+    Error Code: 0
+
+Wait approximately 10 minutes, then verify that FW_PMC_0 is updated.
+
+.. code-block::
+
+    $ nvfwupd -t ip=<PowerShelf BMC IP> user=*** password=*** servertype=Powershelf show_version -p OBMC-flex-bigwig-v3.0.13.fwpkg
+    System Model: NVD-P-0000ADT00
+    Part number: $TRAY_PART_NUMBER
+    Serial number: $TRAY_SERIAL_NUMBER
+    Packages: ['v3.0.13']
+    Connection Status: Successful
+
+    Firmware Devices:
+    AP Name      Sys Version   Pkg Version   Up-To-Date
+    -------      -----------   -----------   ----------
+    FW_PMC_0     v3.0.13       v3.0.13       Yes
+    FW_PSU_1     004C0A0B      N/A           No
+    FW_PSU_2     004C0A0B      N/A           No
+    FW_PSU_3     004C0A0B      N/A           No
+    FW_PSU_4     004C0A0B      N/A           No
+    FW_PSU_5     004C0A0B      N/A           No
+    FW_PSU_6     004C0A0B      N/A           No
+    ----------------------------------------------------
+    Error Code: 0
+
+
 **LiteOn PSU Update:**
 
-LiteOn PSUs may only be updated one at a time. To select the PSU to update, a special JSON file containing the "LiteOnPowerDeviceId" value is required. The index value matches exactly to the powerdevice index in the firmware inventory.
+LiteOn PSUs can be updated only one at a time. To select the PSU to update, provide a JSON file that contains the `LiteOnPowerDeviceId` value. The index value must match the power device index in the firmware inventory.
 
 .. note::
     Currently, LiteOn PSU package versioning in the ``show_version`` output is not supported, therefore "N/A" is expected for the package version field. This will be improved in a future release.
@@ -783,11 +911,73 @@ Megmeet PSUs update simultaneously and do not require a special JSON file. To mo
     ------------------------------------------------------------------------------------
     Error Code: 0
 
+**Flex PSU Update:**
+
+Flex PSUs update through the standard PowerShelf Redfish update path. NVFWUPD matches the Flex PSU package against the `FW_PSU_<n>` inventory entries. To monitor update progress, use `show_update_progress` with the returned task ID.
+
+.. code-block::
+
+    $ nvfwupd -t ip=<PowerShelf BMC IP> user=*** password=*** servertype=Powershelf show_version -p Flex_N18400_VR200_V005C0A0B.fwpkg
+    System Model: NVD-P-0000ADT00
+    Part number: $TRAY_PART_NUMBER
+    Serial number: $TRAY_SERIAL_NUMBER
+    Packages: ['005C0A0B']
+    Connection Status: Successful
+
+    Firmware Devices:
+    AP Name      Sys Version   Pkg Version   Up-To-Date
+    -------      -----------   -----------   ----------
+    FW_PMC_0     v3.0.13       N/A           No
+    FW_PSU_1     004C0A0B      005C0A0B      No
+    FW_PSU_2     004C0A0B      005C0A0B      No
+    FW_PSU_3     004C0A0B      005C0A0B      No
+    FW_PSU_4     004C0A0B      005C0A0B      No
+    FW_PSU_5     004C0A0B      005C0A0B      No
+    FW_PSU_6     004C0A0B      005C0A0B      No
+    ----------------------------------------------------
+    Error Code: 0
+
+    $ nvfwupd -t ip=<PowerShelf BMC IP> user=*** password=*** servertype=Powershelf update_fw -p Flex_N18400_VR200_V005C0A0B.fwpkg
+    Updating ip address: ip=XXXX
+    FW package: ['Flex_N18400_VR200_V005C0A0B.fwpkg']
+    Ok to proceed with firmware update? <Y/N>
+    y
+    ApplyTime already set to 'Immediate'.
+    FW update started, Task Id: 0
+    Firmware update in progress
+    use show_update_progress command to monitor the progress
+    ----------------------------------------------------
+    Error Code: 0
+
+    $ nvfwupd -t ip=<PowerShelf BMC IP> user=*** password=*** servertype=Powershelf show_version -p Flex_N18400_VR200_V005C0A0B.fwpkg
+    System Model: NVD-P-0000ADT00
+    Part number: $TRAY_PART_NUMBER
+    Serial number: $TRAY_SERIAL_NUMBER
+    Packages: ['005C0A0B']
+    Connection Status: Successful
+
+    Firmware Devices:
+    AP Name      Sys Version   Pkg Version   Up-To-Date
+    -------      -----------   -----------   ----------
+    FW_PMC_0     v3.0.13       N/A           No
+    FW_PSU_1     V005C0A0B     005C0A0B      Yes
+    FW_PSU_2     V005C0A0B     005C0A0B      Yes
+    FW_PSU_3     V005C0A0B     005C0A0B      Yes
+    FW_PSU_4     V005C0A0B     005C0A0B      Yes
+    FW_PSU_5     V005C0A0B     005C0A0B      Yes
+    FW_PSU_6     V005C0A0B     005C0A0B      Yes
+    ----------------------------------------------------
+    Error Code: 0
+
+.. note::
+
+    Some Flex PSU firmware reports the running version with a leading `V` prefix. NVFWUPD matches that value against the package version and reports the PSU as up to date.
+
 
 Configuration File for PowerShelf Updates
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-PowerShelf updates can be configured using a YAML configuration file for easier management:
+You can configure PowerShelf updates using a YAML configuration file for easier management:
 
 .. code-block:: yaml
 
@@ -801,7 +991,7 @@ PowerShelf updates can be configured using a YAML configuration file for easier 
     RF_PASSWORD: "PMC_PASSWORD"
 
 
-Using the configuration file:
+Use the configuration file:
 
 .. code-block::
 
@@ -859,11 +1049,12 @@ Monitor the progress of PowerShelf firmware updates using the ``show_update_prog
 .. note::
     1. Delta Powershelf PMC updates may be monitored to around 60% completion before the PMC reboots itself for activation. This is normal and expected behavior.
     2. If the PMC becomes unresponsive, LiteOn Powershelf PMC updates might not be monitored until the update is complete and the new PMC firmware is activated.
-    3. Delta Powershelf PSU updates may be monitored with a provided task ID and the PSU will reboot itself after the update is complete.
-    4. LiteOn Powershelf PSU updates do not utilize the Redfish taskservice, so a LiteOn OEM page displays the UpdateProgress as part of the PSU power status output.
+    3. Delta PowerShelf PSU updates can be monitored with a provided task ID, and the PSU reboots after the update is complete.
+    4. LiteOn Powershelf PSU updates do not use the Redfish taskservice, so a LiteOn OEM page displays the UpdateProgress as part of the PSU power status output.
     5. Monitor Megmeet Powershelf PSU updates with a provided task ID.
+    6. Flex Powershelf PMC and PSU updates return a Redfish task ID and can be monitored with ``show_update_progress``.
 
-Verifying Update Completion
+Verify Update Completion
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 After the update completes, PowerShelf components automatically activate the new firmware. Wait for any component reboots to complete, then verify the firmware versions:
@@ -956,7 +1147,7 @@ Valid values for "ApplyTime" are "Immediate" and "OnReset". If not provided, the
     ================================================================================
     Error Code: 0
 
-3. After the update begins, monitor it's progress using the ``show_update_progress`` command with the Task ID:
+3. After the update begins, monitor the progress using the ``show_update_progress`` command with the Task ID:
 
 .. code-block::
 

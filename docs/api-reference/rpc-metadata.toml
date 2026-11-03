@@ -1,0 +1,480 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Curated metadata for the generated RMS gRPC API reference.
+#
+# The protos (fern/proto/*.proto) define the request and response shapes and
+# the RPC descriptions. This file adds what the protos cannot express:
+# whether an RPC is synchronous or asynchronous, which RPC polls its job, and
+# whether it targets registered or caller-supplied nodes.
+#
+# `just api-ref-check` fails when:
+#   - an RPC in the protos has no entry here, or an entry has no RPC;
+#   - an RPC is marked `sync` but its proto comment says it is asynchronous;
+#   - an asynchronous RPC has no response job field or names a missing poller.
+#
+# Fields per RPC (key: <Service>/<Method>):
+#   category          Key into `categories` below. Required.
+#   execution         sync | async-job | async-batch | sync-with-background.
+#                     Required.
+#                       sync                 Full result is in the response.
+#                       async-job            Response carries one job ID.
+#                       async-batch          Response carries a parent job ID
+#                                            and usually one child job per node.
+#                       sync-with-background Result is in the response, and
+#                                            work continues in the background.
+#   poll_with         Method that reports job progress. Required for async-*.
+#   target            registered | ephemeral | none. Required.
+#                       registered  Acts on nodes added with CreateNodes.
+#                       ephemeral   Acts on nodes supplied in the request.
+#                                   RMS does not store them.
+#                       none        Acts on the service or a catalog.
+#   operations_page   Path under docs/ of the page that explains the behavior.
+#   result_json       What JobStatus.result_json holds, when verified.
+#   grpc_errors       Map of gRPC status code to the condition, when verified.
+#   note              Extra caution for readers, rendered as a callout.
+#   client_command    rack_manager_client arguments after <host> <port>.
+#   summary           One-line summary for the catalog. Defaults to the first
+#                     sentence of the proto comment. Required when that
+#                     sentence is longer than 220 characters.
+#   override_async_check
+#                     Set true to skip the "comment says asynchronous" check
+#                     for a synchronous RPC whose comment only describes the
+#                     asynchronous jobs it reports on.
+
+version = 1
+
+[categories.power-control]
+title = "Power Control"
+summary = "Read and change node power state, and run the coordinated rack cold reboot."
+
+[categories.inventory]
+title = "Inventory and Device Info"
+summary = "Register nodes, list racks and nodes, and read tray and chassis location data."
+
+[categories.firmware-inventory]
+title = "Firmware Inventory"
+summary = "Read installed firmware versions and compare them with a firmware manifest."
+
+[categories.firmware-objects]
+title = "Firmware Object Catalog"
+summary = "Store, list, and manage firmware objects, and read their apply history."
+
+[categories.firmware-updates]
+title = "Firmware Updates"
+summary = "Start firmware updates on one node, many nodes, or from a firmware object."
+
+[categories.switch-management]
+title = "Switch Management"
+summary = "Manage switch firmware and NVOS system images, passwords, factory reset, and attestation."
+
+[categories.scale-up-fabric]
+title = "Scale-Up Fabric"
+summary = "Configure and inspect the scale-up fabric manager on switches."
+
+[categories.switch-tls]
+title = "Switch TLS and Certificates"
+summary = "Install switch mTLS certificates and disable switch mTLS."
+
+[categories.validation]
+title = "System Validation"
+summary = "Start NVSSVT system validation scans on nodes."
+
+[categories.utility-jobs]
+title = "Utility and Jobs"
+summary = "Read the server version and poll asynchronous jobs."
+
+[rpcs."RackManager/SetPowerState"]
+category = "power-control"
+execution = "sync"
+target = "registered"
+operations_page = "operations/power-control.md"
+client_command = "power <rack_id> <node_id> <operation>"
+[rpcs."RackManager/SetPowerState".grpc_errors]
+INVALID_ARGUMENT = "The `operation` value is not a valid `PowerOperation`."
+
+[rpcs."RackManager/BatchSetPowerState"]
+category = "power-control"
+execution = "sync"
+target = "ephemeral"
+operations_page = "operations/power-control.md"
+client_command = "batch_set_power_state <nodes.csv> <operation>"
+[rpcs."RackManager/BatchSetPowerState".grpc_errors]
+INVALID_ARGUMENT = "The `operation` value is not a valid `PowerOperation`."
+
+[rpcs."RackManager/GetPowerState"]
+category = "power-control"
+execution = "sync"
+target = "registered"
+operations_page = "operations/power-control.md"
+client_command = "status <rack_id> <node_id>"
+
+[rpcs."RackManager/BatchGetPowerState"]
+category = "power-control"
+execution = "sync"
+target = "ephemeral"
+operations_page = "operations/power-control.md"
+client_command = "batch_get_power_state <nodes.csv>"
+
+[rpcs."RackManager/ExecuteColdReboot"]
+category = "power-control"
+operations_page = "operations/power-control.md"
+summary = "Run the full rack cold reboot sequence on caller-supplied nodes as one asynchronous job."
+execution = "async-job"
+target = "ephemeral"
+poll_with = "GetJobStatus"
+result_json = "the full per-stage timeline of the reboot sequence, written on completion or failure"
+note = "The sequence stops at the first failed stage and does not roll back. The response `job_id` identifies the coordinator job."
+
+[rpcs."RackManager/ListNodeInventory"]
+category = "inventory"
+execution = "sync"
+target = "registered"
+operations_page = "operations/inventory.md"
+client_command = "list_node_inventory"
+
+[rpcs."RackManager/CreateNodes"]
+category = "inventory"
+execution = "sync"
+target = "registered"
+operations_page = "operations/inventory.md"
+client_command = "add_nodes <devices.csv>"
+
+[rpcs."RackManager/UpdateNode"]
+category = "inventory"
+execution = "sync"
+target = "registered"
+operations_page = "operations/inventory.md"
+note = "Not implemented. The server always returns `RETURN_CODE_FAILURE` with the message \"UpdateNode not yet implemented\"."
+
+[rpcs."RackManager/DeleteNode"]
+category = "inventory"
+execution = "sync"
+target = "registered"
+operations_page = "operations/inventory.md"
+
+[rpcs."RackManager/ListRacks"]
+category = "inventory"
+execution = "sync"
+target = "registered"
+operations_page = "operations/inventory.md"
+client_command = "list_racks"
+
+[rpcs."RackManager/GetNodeDeviceInfo"]
+category = "inventory"
+execution = "sync"
+target = "registered"
+operations_page = "operations/inventory.md"
+client_command = "switch device_info <rack_id> <node_id>"
+
+[rpcs."RackManager/ListNodeDeviceInfoByNodeType"]
+category = "inventory"
+execution = "sync"
+target = "registered"
+operations_page = "operations/inventory.md"
+client_command = "switch device_info_by_type <rack_id> <node_type>"
+
+[rpcs."RackManager/BatchGetNodeDeviceInfo"]
+category = "inventory"
+execution = "sync"
+target = "ephemeral"
+operations_page = "operations/inventory.md"
+client_command = "switch device_info_batch <nodes.csv>"
+
+[rpcs."RackManager/GetNodeFirmwareInventory"]
+category = "firmware-inventory"
+execution = "sync"
+target = "registered"
+operations_page = "operations/firmware.md"
+client_command = "firmware_inventory_node <rack_id> <node_id>"
+
+[rpcs."RackManager/BatchGetFirmwareInventory"]
+category = "firmware-inventory"
+execution = "sync"
+target = "ephemeral"
+operations_page = "operations/firmware.md"
+client_command = "batch_get_firmware_inventory <nodes.csv>"
+
+[rpcs."RackManager/CompareFirmwareObject"]
+category = "firmware-inventory"
+execution = "sync"
+target = "ephemeral"
+operations_page = "operations/firmware.md"
+client_command = "compare_firmware_object <nodes.csv> <manifest.json> <firmware_type>"
+
+[rpcs."RackManager/GetRackFirmwareInventory"]
+category = "firmware-inventory"
+execution = "sync"
+target = "registered"
+operations_page = "operations/firmware.md"
+
+[rpcs."RackManager/AddFirmwareObject"]
+category = "firmware-objects"
+execution = "sync-with-background"
+target = "none"
+operations_page = "operations/firmware.md"
+note = "The call returns after RMS stores the object. RMS downloads the referenced artifacts in the background. Call `GetFirmwareObject` or `ListFirmwareObjects` and wait for `FirmwareObject.available` before you apply the object."
+
+[rpcs."RackManager/GetFirmwareObject"]
+category = "firmware-objects"
+execution = "sync"
+target = "none"
+operations_page = "operations/firmware.md"
+
+[rpcs."RackManager/ListFirmwareObjects"]
+category = "firmware-objects"
+execution = "sync"
+target = "none"
+operations_page = "operations/firmware.md"
+
+[rpcs."RackManager/DeleteFirmwareObject"]
+category = "firmware-objects"
+execution = "sync"
+target = "none"
+operations_page = "operations/firmware.md"
+
+[rpcs."RackManager/SetDefaultFirmwareObject"]
+category = "firmware-objects"
+execution = "sync"
+target = "none"
+operations_page = "operations/firmware.md"
+
+[rpcs."RackManager/GetFirmwareObjectHistory"]
+category = "firmware-objects"
+execution = "sync"
+target = "none"
+operations_page = "operations/firmware.md"
+
+[rpcs."RackManager/UpdateFirmware"]
+category = "firmware-updates"
+execution = "async-job"
+target = "registered"
+poll_with = "GetFirmwareJobStatus"
+operations_page = "operations/firmware.md"
+client_command = "update_firmware <rack_id> <node_id> <target:filename>..."
+
+[rpcs."RackManager/BatchUpdateFirmwareByNodeType"]
+category = "firmware-updates"
+execution = "async-batch"
+target = "registered"
+poll_with = "GetFirmwareJobStatus"
+operations_page = "operations/firmware.md"
+client_command = "batch_update_firmware_by_node_type <rack_id> <node_type> <target:filename>..."
+
+[rpcs."RackManager/BatchUpdateFirmware"]
+category = "firmware-updates"
+execution = "async-batch"
+target = "ephemeral"
+poll_with = "GetFirmwareJobStatus"
+operations_page = "operations/firmware.md"
+client_command = "batch_update_firmware <nodes.csv> <targets.csv>"
+
+[rpcs."RackManager/ApplyStoredFirmwareObject"]
+category = "firmware-updates"
+execution = "async-batch"
+target = "ephemeral"
+poll_with = "GetFirmwareJobStatus"
+operations_page = "operations/firmware.md"
+
+[rpcs."RackManager/ApplyFirmwareObject"]
+category = "firmware-updates"
+execution = "async-batch"
+target = "ephemeral"
+poll_with = "GetFirmwareJobStatus"
+operations_page = "operations/firmware.md"
+
+[rpcs."RackManager/ListSwitchFirmware"]
+category = "switch-management"
+execution = "sync"
+target = "registered"
+operations_page = "operations/switch-management.md"
+
+[rpcs."RackManager/PushSwitchFirmware"]
+category = "switch-management"
+execution = "sync"
+target = "registered"
+operations_page = "operations/switch-management.md"
+note = "This call uploads the file to the switch and does not install it."
+
+[rpcs."RackManager/ListSwitchSystemImages"]
+category = "switch-management"
+execution = "sync"
+target = "registered"
+operations_page = "operations/switch-management.md"
+
+[rpcs."RackManager/UpdateSwitchSystemImage"]
+category = "switch-management"
+execution = "async-batch"
+target = "ephemeral"
+poll_with = "GetSwitchSystemImageJobStatus"
+operations_page = "operations/switch-management.md"
+
+[rpcs."RackManager/ApplySwitchSystemImage"]
+category = "switch-management"
+execution = "async-batch"
+target = "ephemeral"
+poll_with = "GetSwitchSystemImageJobStatus"
+operations_page = "operations/firmware.md"
+
+[rpcs."RackManager/ApplyStoredSwitchSystemImage"]
+category = "switch-management"
+execution = "async-batch"
+target = "ephemeral"
+poll_with = "GetSwitchSystemImageJobStatus"
+operations_page = "operations/firmware.md"
+
+[rpcs."RackManager/BatchResetSwitchFactoryDefault"]
+category = "switch-management"
+execution = "async-batch"
+target = "ephemeral"
+poll_with = "GetJobStatus"
+operations_page = "operations/switch-management.md"
+note = "This operation is destructive. It wipes NVOS configuration."
+
+[rpcs."RackManager/UpdateSwitchSystemPassword"]
+category = "switch-management"
+execution = "async-batch"
+target = "ephemeral"
+poll_with = "GetJobStatus"
+operations_page = "operations/switch-management.md"
+note = "The per-node results in the response report job admission only. Poll the jobs to learn whether each password change succeeded. The request sets only the new password for `username` and takes no current password. RMS reaches each switch with the credentials in that node's endpoint, and those credentials can belong to a different user than `username`. On a retry, RMS probes `password` to detect an earlier partial success."
+
+[rpcs."RackManager/BatchCollectSwitchSpdmAttestationEvidence"]
+category = "switch-management"
+execution = "sync"
+target = "ephemeral"
+operations_page = "operations/switch-management.md"
+
+[rpcs."RackManager/ConfigureScaleUpFabricManager"]
+category = "scale-up-fabric"
+execution = "sync"
+target = "ephemeral"
+operations_page = "operations/switch-management.md"
+note = "This is the single-switch version. For declarative configuration of a whole fabric, use `RackManagerV2/ConfigureScaleUpFabricManager`."
+
+[rpcs."RackManager/GetScaleUpFabricStatus"]
+category = "scale-up-fabric"
+execution = "sync"
+target = "ephemeral"
+operations_page = "operations/switch-management.md"
+
+[rpcs."RackManager/InspectScaleUpFabrics"]
+category = "scale-up-fabric"
+execution = "sync"
+target = "ephemeral"
+operations_page = "operations/switch-management.md"
+note = "This server returns UNIMPLEMENTED for live multi-fabric inspection."
+[rpcs."RackManager/InspectScaleUpFabrics".grpc_errors]
+UNIMPLEMENTED = "Live multi-fabric inspection is not implemented by this server."
+
+[rpcs."RackManager/BatchResetSwitchSdnFactoryDefault"]
+category = "scale-up-fabric"
+execution = "async-batch"
+target = "ephemeral"
+poll_with = "GetJobStatus"
+operations_page = "operations/switch-management.md"
+note = "This operation is destructive. After a reset, reconfigure the scale-up fabric."
+
+[rpcs."RackManager/BatchSetScaleUpFabricState"]
+category = "scale-up-fabric"
+execution = "sync"
+target = "ephemeral"
+operations_page = "operations/switch-management.md"
+
+[rpcs."RackManager/BatchGetScaleUpFabricServiceStatus"]
+category = "scale-up-fabric"
+execution = "sync"
+target = "ephemeral"
+operations_page = "operations/switch-management.md"
+
+[rpcs."RackManager/GetScaleUpFabricState"]
+category = "scale-up-fabric"
+execution = "sync"
+target = "ephemeral"
+operations_page = "operations/switch-management.md"
+
+[rpcs."RackManager/SetScaleUpFabricTelemetryInterfaceState"]
+category = "scale-up-fabric"
+execution = "sync"
+target = "ephemeral"
+operations_page = "operations/switch-management.md"
+
+[rpcs."RackManagerV2/ConfigureScaleUpFabricManager"]
+category = "scale-up-fabric"
+execution = "async-job"
+target = "ephemeral"
+poll_with = "GetJobStatus"
+operations_page = "operations/switch-management.md"
+result_json = "a JSON-encoded `ScaleUpFabricStatus` for successful no-layout and full-capacity layout jobs; partial layouts use `InspectScaleUpFabrics` for live status"
+note = "Layout requests require matching deployment rules and the complete physical switch inventory. Without layout, RMS validates every node ID and type, then configures only switches."
+[rpcs."RackManagerV2/ConfigureScaleUpFabricManager".grpc_errors]
+INVALID_ARGUMENT = "The topology, inventory, or layout request is invalid. No job starts."
+FAILED_PRECONDITION = "Physical discovery, deployment planning, or switch ownership prevents admission. No configuration worker starts."
+INTERNAL = "Job admission or coordinator state fails internally. No configuration worker starts."
+UNIMPLEMENTED = "Layout configuration has no installed deployment catalog or the switch family is unsupported. No job starts."
+
+[rpcs."RackManager/ConfigureSwitchCertificate"]
+category = "switch-tls"
+execution = "async-batch"
+target = "ephemeral"
+poll_with = "GetConfigureSwitchCertificateJobStatus"
+operations_page = "operations/switch-management.md"
+client_command = "switch configure_certificate <switches.csv> --service <service>"
+
+[rpcs."RackManager/BatchDisableSwitchMtls"]
+category = "switch-tls"
+execution = "async-batch"
+target = "ephemeral"
+poll_with = "GetJobStatus"
+operations_page = "operations/switch-management.md"
+client_command = "switch disable_mtls <switches.csv> --service <service>"
+
+[rpcs."RackManagerV2/StartSystemValidation"]
+category = "validation"
+operations_page = "operations/validation.md"
+execution = "async-batch"
+target = "ephemeral"
+poll_with = "GetJobStatus"
+result_json = "the parsed status and the summary report for that node's scan"
+note = "Each node's scan runs as its own job. A failure to admit or launch one node does not affect the other nodes."
+
+[rpcs."RackManager/GetVersion"]
+category = "utility-jobs"
+execution = "sync"
+target = "none"
+operations_page = "operations/utility.md"
+client_command = "version"
+
+[rpcs."RackManager/GetJobStatus"]
+category = "utility-jobs"
+execution = "sync"
+target = "none"
+operations_page = "operations/utility.md"
+client_command = "job_status <job_id> [--include-child-job-states]"
+[rpcs."RackManager/GetJobStatus".grpc_errors]
+INVALID_ARGUMENT = "The `job_id` is empty."
+NOT_FOUND = "No tracked job has the supplied `job_id`."
+
+[rpcs."RackManager/GetFirmwareJobStatus"]
+override_async_check = true
+category = "utility-jobs"
+execution = "sync"
+target = "none"
+operations_page = "operations/firmware.md"
+client_command = "firmware_job_status <job_id>"
+
+[rpcs."RackManager/GetSwitchSystemImageJobStatus"]
+override_async_check = true
+category = "utility-jobs"
+execution = "sync"
+target = "none"
+operations_page = "operations/switch-management.md"
+client_command = "switch_system_image_job_status <job_id>"
+
+[rpcs."RackManager/GetConfigureSwitchCertificateJobStatus"]
+override_async_check = true
+category = "utility-jobs"
+execution = "sync"
+target = "none"
+operations_page = "operations/switch-management.md"
+client_command = "switch configure_certificate_status <job_id>"

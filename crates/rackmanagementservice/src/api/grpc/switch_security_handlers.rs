@@ -329,7 +329,7 @@ impl RackManagerServiceImpl {
         // retained when valid for later Redfish power use. Malformed BMC
         // endpoint configuration is dropped with a warning rather than
         // failing the node.
-        let bmc_endpoint = match flat.optional_bmc_endpoint() {
+        let bmc_endpoint = match flat.optional_bmc_endpoint(self.insecure_bmc) {
             Ok(endpoint) => endpoint,
             Err(e) => {
                 tracing::warn!(
@@ -369,6 +369,8 @@ impl RackManagerServiceImpl {
             bmc_endpoint,
             host_endpoint: Some(host_endpoint),
             expected_inventory: None,
+            recovery: None,
+            runtime_config: None,
         };
 
         let switch_result = NodeInstance::create_switch_password(&config, &rack_id);
@@ -467,8 +469,8 @@ fn switch_password_job_result_json(
     .unwrap_or_else(|_| "{}".to_owned())
 }
 
-fn switch_password_job_error(error: &RmsError) -> JobError {
-    match error.code {
+fn switch_password_job_failure(error: RmsError) -> JobFailure {
+    let code = match error.code {
         ErrorCode::InvalidArgument | ErrorCode::FailedPrecondition => JobError::InvalidArgument,
         ErrorCode::Unauthenticated => JobError::Unauthenticated,
         ErrorCode::Timeout => JobError::Timeout,
@@ -477,21 +479,22 @@ fn switch_password_job_error(error: &RmsError) -> JobError {
             JobError::ClientError
         }
         ErrorCode::Cancelled => JobError::Other,
-        ErrorCode::AlreadyExists | ErrorCode::Internal | ErrorCode::Unimplemented => {
-            JobError::Internal
-        }
-    }
+        ErrorCode::AlreadyExists
+        | ErrorCode::Internal
+        | ErrorCode::Unimplemented
+        | ErrorCode::Aborted => JobError::Internal,
+    };
+
+    JobFailure::new(code, error.message)
 }
 
 fn fail_switch_password_update_job(
     job: RmsJobHandle,
     input: &SwitchPasswordJobInput,
-    error: RmsError,
+    mut failure: JobFailure,
 ) {
-    let error_code = switch_password_job_error(&error);
-
     let error_message = redact_password_rotation_error(
-        &error.message,
+        &failure.message,
         &[input.endpoint_password.as_str(), input.password.as_ref()],
     );
 
@@ -505,7 +508,8 @@ fn fail_switch_password_update_job(
         Some(&error_message),
     );
 
-    job.fail(JobFailure::new(error_code, error_message).with_result_json(result_json));
+    failure.message = error_message;
+    job.fail(failure.with_result_json(result_json));
 }
 
 /// Execute one accepted switch password update job.
@@ -524,7 +528,19 @@ async fn run_switch_password_update_job(
     let cancel = job.cancellation_token();
 
     let outcome_result = async {
+        if cancel.is_cancelled() {
+            return Err(JobFailure::new(JobError::Other,
+                "switch password update job cancelled before updating password",
+            ));
+        }
+
         job.progress("Initializing switch password update");
+
+        let scopes = crate::api::grpc::switch_scope::configured_switch_scopes(
+            switch.as_ref(), switch.optional_nvue_client(),
+        ).map_err(switch_password_job_failure)?;
+
+        service.admit_known_switch_job_scopes(&job, scopes)?;
 
         let target_is_endpoint_user =
             input.endpoint_username.as_str() == input.username.as_ref();
@@ -533,13 +549,32 @@ async fn run_switch_password_update_job(
         // Initialize transport before mutating the switch. If factory reset
         // replaced NVUE credentials or TLS material, admin recovery can still
         // proceed through the switch's expired-password SSH prompt.
-        if let Err(error) = service
+        let initialization = service
             .initialize_nvue_client(switch.optional_nvue_client(), None)
-            .await
-        {
-            if target_is_admin_endpoint {
+            .await;
+
+        let nvue_ready = initialization.is_ok();
+
+        // Transport setup does not authenticate insecure-switch requests.
+        // Resolve resumable credentials before discovering physical ownership.
+        let mut candidate_nvue = None;
+
+        let authentication = if nvue_ready {
+            switch
+                .authenticate_system_user_password_update(
+                    input.username.as_ref(),
+                    input.password.as_ref(),
+                )
+                .await
+                .map(|candidate| candidate_nvue = candidate)
+        } else {
+            initialization
+        };
+
+        if let Err(error) = authentication {
+            if target_is_admin_endpoint && (!nvue_ready || error.code == ErrorCode::Unauthenticated) {
                 if cancel.is_cancelled() {
-                    return Err(RmsError::internal(
+                    return Err(JobFailure::new(JobError::Other,
                         "switch password update job cancelled before factory-default admin recovery",
                     ));
                 }
@@ -548,13 +583,14 @@ async fn run_switch_password_update_job(
 
                 switch
                     .recover_admin_password_after_boot(input.password.as_ref())
-                    .await?;
+                    .await
+                    .map_err(switch_password_job_failure)?;
 
                 return Ok(SwitchSystemPasswordUpdateOutcome::RecoveredFactoryDefault);
             }
 
-            if error.code != ErrorCode::Unauthenticated || !target_is_endpoint_user {
-                return Err(error);
+            if nvue_ready || error.code != ErrorCode::Unauthenticated || !target_is_endpoint_user {
+                return Err(switch_password_job_failure(error));
             }
 
             tracing::debug!(
@@ -565,8 +601,22 @@ async fn run_switch_password_update_job(
             );
         }
 
+        // Known aliases are already reserved. Missing chassis metadata must not
+        // block password recovery, but a discovered ownership conflict must.
+        if nvue_ready
+            && let Some(client) = candidate_nvue.as_ref().or(switch.optional_nvue_client())
+            && let Ok(scopes) = crate::api::grpc::switch_scope::discover_switch_scopes(
+                client,
+                &input.rack_id,
+                &input.node_id,
+            )
+            .await
+        {
+            service.admit_known_switch_job_scopes(&job, scopes)?;
+        }
+
         if cancel.is_cancelled() {
-            return Err(RmsError::internal(
+            return Err(JobFailure::new(JobError::Other,
                 "switch password update job cancelled before updating password",
             ));
         }
@@ -579,9 +629,10 @@ async fn run_switch_password_update_job(
             .update_system_user_password_persisted_resumable(
                 input.username.as_ref(),
                 input.password.as_ref(),
-                None,
+                candidate_nvue,
             )
             .await
+            .map_err(switch_password_job_failure)
     }
     .await;
 
@@ -620,7 +671,7 @@ mod tests {
     use crate::orchestrator::job_tracker::{JobTracker, JobType};
     use crate::orchestrator::rack_manager::RackManager;
     use crate::persistence::Backends;
-    use crate::transport::ssh::SftpUploadOptions;
+    use crate::transport::ssh::SshUploadOptions;
 
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -674,13 +725,26 @@ mod tests {
             firmware_download_cancellations: Arc::new(Mutex::new(HashMap::new())),
             backends: Backends::memory(),
             firmware_dir: PathBuf::from("firmware"),
+            artifact_require_sha256: false,
+            insecure_bmc: true,
+            artifact_download_policy:
+                crate::api::grpc::artifact_download::ArtifactDownloadPolicy::default(),
             switch_tls_roots: SwitchTlsRoots {
                 insecure_switch: true,
                 ..SwitchTlsRoots::default()
             },
-            sftp_upload_options: SftpUploadOptions::default(),
+            sftp_upload_options: SshUploadOptions::default(),
             nmx_gateway_id: crate::libnmxc::DEFAULT_NMX_C_GATEWAY_ID.to_owned(),
             expected_inventory_catalog: crate::config::ExpectedInventoryCatalog::default(),
+            workflow_timings: crate::config::WorkflowTimings::default(),
+            recovery_profiles: crate::config::RecoveryProfiles::default(),
+            fabric_layout_catalog: std::sync::Arc::new(
+                crate::config::fabric_layout::FabricLayoutCatalog::default(),
+            ),
+            hardware_profiles: Arc::new(
+                crate::config::hardware_profiles::HardwareProfileCatalog::built_in().unwrap(),
+            ),
+            fabric_operations: std::sync::Arc::new(Default::default()),
         }
     }
 
@@ -992,6 +1056,170 @@ mod tests {
             serde_json::from_str(&job.result_json).expect("parse password update result");
 
         assert_eq!(result["phase"], "factory_default_admin_password_recovered");
+    }
+
+    #[tokio::test]
+    async fn password_update_allows_missing_identity_but_rejects_reservation_conflicts() {
+        use crate::api::grpc::switch_handlers::tests::WiremockHttpsProxy;
+        use crate::orchestrator::job_lifecycle::JobScope;
+
+        for (location_status, location, conflict) in [
+            (404, serde_json::json!({}), None),
+            (200, serde_json::json!({}), None),
+            (
+                404,
+                serde_json::json!({}),
+                Some(JobScope::endpoint("192.0.2.70", 443)),
+            ),
+            (
+                404,
+                serde_json::json!({}),
+                Some(JobScope::endpoint("127.0.0.1", 22)),
+            ),
+            (
+                200,
+                serde_json::json!({"chassis-sn": "password-chassis", "tray-index": "1"}),
+                Some(JobScope::PhysicalSwitch {
+                    chassis_serial_number: "password-chassis".into(),
+                    tray_index: 1,
+                }),
+            ),
+        ] {
+            let nvue = MockServer::start().await;
+            let proxy = WiremockHttpsProxy::start(*nvue.address()).await;
+            let tracker = Arc::new(JobTracker::new());
+            let service = test_service_with_tracker(Arc::clone(&tracker));
+            let mutation_count = usize::from(conflict.is_none());
+
+            let discovery_count = u64::from(
+                conflict
+                    .as_ref()
+                    .is_none_or(|scope| matches!(scope, JobScope::PhysicalSwitch { .. })),
+            );
+
+            let _reservation = conflict.map(|scope| tracker.reserve_mutation(vec![scope]).unwrap());
+
+            Mock::given(method("GET"))
+                .and(path("/nvue_v1/platform/chassis-location"))
+                .respond_with(ResponseTemplate::new(location_status).set_body_json(location))
+                .expect(discovery_count)
+                .mount(&nvue)
+                .await;
+
+            for (verb, route, body) in [
+                ("GET", "/nvue_v1/system", serde_json::json!({})),
+                ("POST", "/nvue_v1/revision", serde_json::json!("55")),
+                ("PATCH", "/nvue_v1/revision/55", serde_json::json!({})),
+                (
+                    "GET",
+                    "/nvue_v1/revision/55",
+                    serde_json::json!({"state": "applied"}),
+                ),
+                ("PATCH", "/nvue_v1/revision/applied", serde_json::json!({})),
+            ] {
+                Mock::given(method(verb))
+                    .and(path(route))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                    .mount(&nvue)
+                    .await;
+            }
+
+            let mut node_info =
+                switch_password_node_info_with_port("rack-01", "sw-01", proxy.port.into());
+
+            node_info.bmc_endpoint = node_info.host_endpoint.clone();
+
+            node_info
+                .bmc_endpoint
+                .as_mut()
+                .unwrap()
+                .interface
+                .as_mut()
+                .unwrap()
+                .ip_address = "192.0.2.70".into();
+
+            node_info.bmc_endpoint.as_mut().unwrap().port = 443;
+
+            let switch = service
+                .prepare_switch_password_job(&node_info, "admin")
+                .unwrap()
+                .switch;
+
+            let endpoint = switch.optional_nvue_client().unwrap().endpoint();
+            let observed_tracker = Arc::clone(&tracker);
+
+            Mock::given(method("PATCH"))
+                .and(path("/nvue_v1/system/aaa/user/admin"))
+                .respond_with(move |_: &wiremock::Request| {
+                    assert!(
+                        observed_tracker
+                            .reserve_mutation(vec![JobScope::endpoint(
+                                &endpoint.connect_host,
+                                endpoint.port,
+                            )])
+                            .is_err()
+                    );
+
+                    for scope in [
+                        JobScope::endpoint("192.0.2.70", 443),
+                        JobScope::endpoint("127.0.0.1", 22),
+                    ] {
+                        assert!(observed_tracker.reserve_mutation(vec![scope]).is_err());
+                    }
+
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({}))
+                })
+                .expect(mutation_count as u64)
+                .mount(&nvue)
+                .await;
+
+            let pending = tracker
+                .create_job("rack-01", "sw-01", JobType::SwitchSystemPasswordUpdate)
+                .unwrap();
+
+            let job_id = pending.id().to_string();
+
+            let input = SwitchPasswordJobInput {
+                endpoint_username: "admin".into(),
+                endpoint_password: "current-password".into(),
+                username: Arc::from("admin"),
+                password: Arc::from("next-password"),
+                rack_id: "rack-01".into(),
+                node_id: "sw-01".into(),
+            };
+
+            let worker = tracker.spawn_job(pending, move |job| async move {
+                run_switch_password_update_job(job, service, switch, input).await;
+            });
+
+            worker.wait().await.unwrap();
+
+            let job = tracker.get_job(&job_id).unwrap();
+
+            if mutation_count == 1 {
+                assert_eq!(job.state, JobState::Completed, "{}", job.error_message);
+            } else {
+                assert_eq!(job.state, JobState::Failed);
+
+                assert_eq!(job.error_code, JobError::UpdateInProgress);
+
+                assert!(
+                    !nvue
+                        .received_requests()
+                        .await
+                        .unwrap()
+                        .iter()
+                        .any(|request| {
+                            matches!(
+                                request.method,
+                                wiremock::http::Method::Post | wiremock::http::Method::Patch
+                            )
+                        })
+                );
+            }
+
+            nvue.verify().await;
+        }
     }
 
     #[tokio::test]

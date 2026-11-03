@@ -239,6 +239,14 @@ impl SystemImageInstallRequest {
     }
 }
 
+/// NVUE system-image reboot policy, encoded as `"yes"` or `"no"`, not a boolean.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SystemImageReboot {
+    Yes,
+    No,
+}
+
 /// Parameters for system-image install.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SystemImageInstallParameters {
@@ -248,7 +256,7 @@ pub struct SystemImageInstallParameters {
 
     /// Reboot behavior.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reboot: Option<bool>,
+    pub reboot: Option<SystemImageReboot>,
 
     /// ISSU behavior.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -276,11 +284,25 @@ pub struct SystemImageUninstallRequest {
 }
 
 impl SystemImageUninstallRequest {
-    /// Create a system-image uninstall request.
-    pub fn new(force: bool) -> Self {
+    /// Non-force uninstall. Automatic cleanup uses this.
+    pub fn new() -> Self {
         Self {
-            uninstall: SimpleAction::start(SystemImageUninstallParameters { force: Some(force) }),
+            uninstall: SimpleAction::start(SystemImageUninstallParameters { force: Some(false) }),
         }
+    }
+
+    /// Force uninstall. Callers must have explicit intent; RMS image
+    /// cleanup never uses this.
+    pub fn forced() -> Self {
+        Self {
+            uninstall: SimpleAction::start(SystemImageUninstallParameters { force: Some(true) }),
+        }
+    }
+}
+
+impl Default for SystemImageUninstallRequest {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -495,6 +517,202 @@ fn resolve_layered_field<'a>(
     direct.or(operational).or(applied)
 }
 
+/// The `status` line of `GET /system`. NVOS writes one of four constants,
+/// and `Failed` is terminal: the boot will not recover on its own. The line
+/// is free text on the wire, so a line outside the four, such as one a later
+/// NVOS adds, is kept as the switch wrote it and treated as not ready.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(from = "String")]
+pub enum SystemStatus {
+    /// `System is initializing`: services are still coming up.
+    Initializing,
+    /// `System is ready`.
+    Ready,
+    /// `System is not ready`.
+    NotReady,
+    /// `System is not ready (failed)`: the boot failed, waiting will not
+    /// change it.
+    Failed,
+    /// A line outside the four NVOS constants, as the switch wrote it.
+    Unknown(String),
+}
+
+impl SystemStatus {
+    /// The line NVOS writes while services start.
+    pub const INITIALIZING: &'static str = "System is initializing";
+    /// The line NVOS writes once startup has finished.
+    pub const READY: &'static str = "System is ready";
+    /// The line NVOS writes for a system that is up but not ready.
+    pub const NOT_READY: &'static str = "System is not ready";
+    /// The line NVOS writes when the boot failed.
+    pub const FAILED: &'static str = "System is not ready (failed)";
+
+    /// The NVOS line, for messages.
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Initializing => Self::INITIALIZING,
+            Self::Ready => Self::READY,
+            Self::NotReady => Self::NOT_READY,
+            Self::Failed => Self::FAILED,
+            Self::Unknown(line) => line,
+        }
+    }
+}
+
+impl From<String> for SystemStatus {
+    fn from(line: String) -> Self {
+        match line.as_str() {
+            Self::INITIALIZING => Self::Initializing,
+            Self::READY => Self::Ready,
+            Self::NOT_READY => Self::NotReady,
+            Self::FAILED => Self::Failed,
+            _ => Self::Unknown(line),
+        }
+    }
+}
+
+impl std::fmt::Display for SystemStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The health value of `GET /system`, the same closed set on every NVOS
+/// generation. A word outside the set fails the decode with serde's
+/// "unknown variant" and the expected list, so a vocabulary change on the
+/// switch shows up as a decode error, not as a switch that never becomes
+/// ready.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub enum SystemHealth {
+    /// `OK`.
+    #[serde(rename = "OK")]
+    Ok,
+    /// `Not OK`: a component reports a problem.
+    #[serde(rename = "Not OK")]
+    NotOk,
+    /// `FATAL`.
+    #[serde(rename = "FATAL")]
+    Fatal,
+    /// `N/A`: reported for a short while after boot, before the health
+    /// monitor has run. The reason the readiness check polls.
+    #[serde(rename = "N/A")]
+    NotAvailable,
+}
+
+impl SystemHealth {
+    /// Returns the NVUE string spelling.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "OK",
+            Self::NotOk => "Not OK",
+            Self::Fatal => "FATAL",
+            Self::NotAvailable => "N/A",
+        }
+    }
+}
+
+impl std::fmt::Display for SystemHealth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Readiness and health of a switch, decoded from `GET /system`.
+///
+/// Two NVOS generations spell the health field differently; both decode
+/// into this type through the private `SystemRootJson`. The rest of the body is
+/// ignored. Decode failures are serde's: a body without `status`, a body
+/// with neither health spelling (`missing field`), or a health word
+/// outside [`SystemHealth`] (`unknown variant`). Such a body is not a
+/// switch saying "not ready" but a resource of another shape or version.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "SystemRootJson")]
+pub struct SystemRoot {
+    /// Boot progress.
+    pub status: SystemStatus,
+    /// Overall health.
+    pub health: SystemHealth,
+}
+
+impl SystemRoot {
+    /// Startup finished and no health issue is reported.
+    pub fn is_ready(&self) -> bool {
+        self.status == SystemStatus::Ready && self.health == SystemHealth::Ok
+    }
+
+    /// The switch reports a boot that failed. Waiting will not change it,
+    /// so a caller polling for readiness stops here. Health is not part of
+    /// it: NVOS remediates `FATAL` on its own (a service restart, a monitor
+    /// window, one reboot) and the value returns to `OK` when that works.
+    pub fn is_failed(&self) -> bool {
+        self.status == SystemStatus::Failed
+    }
+}
+
+impl std::fmt::Display for SystemRoot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "status={}, health={}", self.status, self.health)
+    }
+}
+
+/// Wire shape of `GET /system`: the fields the readiness check reads, in
+/// both spellings NVOS has used.
+///
+/// NVOS 25.02.4300 (the Common OM alignment) turned the flat
+/// `health-status` string into a `health` object. Before it, GB200 NVL72
+/// 1.3.x ships NVOS 25.02.25xx and answers, trimmed to these fields:
+///
+/// ```json
+/// { "status": "System is ready", "health-status": "OK" }
+/// ```
+///
+/// From it on, GB200 2.0, GB300 1.0.x, and VR NVL72 0.6 (NVOS 25.02.43xx
+/// and 25.03.x) answer:
+///
+/// ```json
+/// { "status": "System is ready", "health": { "status": "OK" } }
+/// ```
+///
+/// An explicit struct instead of serde attributes on [`SystemRoot`]: the
+/// two spellings differ in value type, string against object, which no
+/// `alias` covers, and the fact that two shapes exist deserves a named
+/// place rather than an attribute. Exactly one of the two health fields
+/// is present on a real switch; [`SystemRoot::try_from`] picks it.
+#[derive(Deserialize)]
+struct SystemRootJson {
+    status: SystemStatus,
+
+    /// NVOS 25.02.4300 and later.
+    #[serde(default)]
+    health: Option<SystemHealthJson>,
+
+    /// NVOS before 25.02.4300.
+    #[serde(default, rename = "health-status")]
+    health_status: Option<SystemHealth>,
+}
+
+/// The `health` object of the current spelling.
+#[derive(Deserialize)]
+struct SystemHealthJson {
+    status: SystemHealth,
+}
+
+impl TryFrom<SystemRootJson> for SystemRoot {
+    type Error = serde::de::value::Error;
+
+    fn try_from(json: SystemRootJson) -> Result<Self, Self::Error> {
+        let health = json
+            .health
+            .map(|health| health.status)
+            .or(json.health_status)
+            .ok_or_else(|| serde::de::Error::missing_field("health"))?;
+        Ok(Self {
+            status: json.status,
+            health,
+        })
+    }
+}
+
 /// NVUE API certificate configuration.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct SystemApi {
@@ -645,6 +863,133 @@ mod tests {
         );
     }
 
+    fn system_from(body: serde_json::Value) -> SystemRoot {
+        serde_json::from_value(body).unwrap()
+    }
+
+    #[test]
+    fn system_decodes_both_wire_shapes() {
+        let current = system_from(serde_json::json!({
+            "hostname": "switch",
+            "status": "System is ready",
+            "health": {"status": "OK"},
+            "uptime": 11659
+        }));
+        assert!(current.is_ready());
+
+        let legacy = system_from(serde_json::json!({
+            "build": "NVOS Debian GNU/Linux 11 (bullseye)",
+            "status": "System is ready",
+            "health-status": "OK",
+            "uptime": 2620098
+        }));
+        assert_eq!(legacy, current);
+    }
+
+    #[test]
+    fn system_reduces_status_and_keeps_health() {
+        let booting = system_from(serde_json::json!({
+            "status": "System is booting",
+            "health": {"status": "N/A"}
+        }));
+        assert_eq!(
+            booting,
+            SystemRoot {
+                status: SystemStatus::Unknown("System is booting".to_owned()),
+                health: SystemHealth::NotAvailable,
+            }
+        );
+        assert!(!booting.is_ready());
+        assert!(
+            !booting.is_failed(),
+            "an unknown line is not ready, not failed"
+        );
+        assert_eq!(booting.to_string(), "status=System is booting, health=N/A");
+
+        let unhealthy = system_from(serde_json::json!({
+            "status": "System is ready",
+            "health-status": "Not OK"
+        }));
+        assert!(!unhealthy.is_ready());
+        assert_eq!(
+            unhealthy.to_string(),
+            "status=System is ready, health=Not OK"
+        );
+    }
+
+    #[test]
+    fn system_names_the_four_nvos_status_lines() {
+        let lines = [
+            ("System is initializing", SystemStatus::Initializing),
+            ("System is ready", SystemStatus::Ready),
+            ("System is not ready", SystemStatus::NotReady),
+            ("System is not ready (failed)", SystemStatus::Failed),
+        ];
+        for (line, expected) in lines {
+            let system = system_from(serde_json::json!({
+                "status": line,
+                "health": {"status": "OK"}
+            }));
+            assert_eq!(system.status, expected, "{line}");
+            assert_eq!(system.status.as_str(), line);
+        }
+    }
+
+    #[test]
+    fn system_is_failed_only_on_a_failed_boot() {
+        let failed_boot = system_from(serde_json::json!({
+            "status": "System is not ready (failed)",
+            "health": {"status": "OK"}
+        }));
+        assert!(failed_boot.is_failed());
+        assert!(!failed_boot.is_ready());
+
+        let fatal = system_from(serde_json::json!({
+            "status": "System is ready",
+            "health-status": "FATAL"
+        }));
+        assert!(!fatal.is_failed(), "NVOS remediates FATAL; the poll waits");
+        assert!(!fatal.is_ready());
+
+        let not_ready = system_from(serde_json::json!({
+            "status": "System is not ready",
+            "health": {"status": "Not OK"}
+        }));
+        assert!(!not_ready.is_failed(), "not ready and Not OK are retried");
+    }
+
+    #[test]
+    fn system_rejects_an_unknown_health_word() {
+        let error = serde_json::from_value::<SystemRoot>(
+            serde_json::json!({ "status": "System is ready", "health": {"status": "Degraded"} }),
+        )
+        .expect_err("an unknown health word must not decode");
+        assert!(
+            error.to_string().contains("unknown variant `Degraded`"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn system_rejects_a_body_without_readiness_fields() {
+        let error =
+            serde_json::from_value::<SystemRoot>(serde_json::json!({ "health": {"status": "OK"} }))
+                .expect_err("a body without status must not decode");
+        assert!(
+            error.to_string().contains("missing field `status`"),
+            "unexpected error: {error}"
+        );
+
+        let error = serde_json::from_value::<SystemRoot>(
+            serde_json::json!({ "status": "System is ready" }),
+        )
+        .expect_err("a body without health must not decode");
+        assert!(
+            error.to_string().contains("missing field `health`"),
+            "unexpected error: {error}"
+        );
+    }
+
     #[test]
     fn endpoints_use_nvue_v1_server() {
         assert_eq!(SYSTEM_ENDPOINT, "/nvue_v1/system");
@@ -734,6 +1079,28 @@ mod tests {
     }
 
     #[test]
+    fn system_image_reboot_policy_uses_nvue_strings() {
+        let mut request = SystemImageInstallRequest::with_image_file(true, "nvos.bin");
+        assert!(
+            serde_json::to_value(&request).unwrap()["@install"]["parameters"]
+                .get("reboot")
+                .is_none()
+        );
+        for (policy, wire_value) in [
+            (SystemImageReboot::No, "no"),
+            (SystemImageReboot::Yes, "yes"),
+        ] {
+            request.install.parameters.as_mut().unwrap().reboot = Some(policy);
+            let value = serde_json::to_value(&request).unwrap();
+            assert_eq!(value["@install"]["parameters"]["reboot"], wire_value);
+            assert_eq!(
+                serde_json::from_value::<SystemImageInstallRequest>(value).unwrap(),
+                request
+            );
+        }
+    }
+
+    #[test]
     fn action_payloads_match_nvue_action_keys() {
         let power_cycle = serde_json::to_string(&SystemPowerCycleRequest::new(true)).unwrap();
 
@@ -744,7 +1111,9 @@ mod tests {
             serde_json::to_string(&SystemImageInstallRequest::with_image_file(true, "a.bin"))
                 .unwrap();
 
-        let uninstall = serde_json::to_string(&SystemImageUninstallRequest::new(true)).unwrap();
+        let uninstall = serde_json::to_string(&SystemImageUninstallRequest::new()).unwrap();
+        let uninstall_forced =
+            serde_json::to_string(&SystemImageUninstallRequest::forced()).unwrap();
 
         let spdm_generate = serde_json::to_string(&SpdmGenerateRequest::new("deadbeef")).unwrap();
 
@@ -754,6 +1123,9 @@ mod tests {
         assert!(install.contains(r#""@install""#));
         assert!(install.contains(r#""image-file":"a.bin""#));
         assert!(uninstall.contains(r#""@uninstall""#));
+        assert!(uninstall.contains(r#""force":false"#));
+        assert!(!uninstall.contains(r#""force":true"#));
+        assert!(uninstall_forced.contains(r#""force":true"#));
 
         assert_eq!(
             spdm_generate,

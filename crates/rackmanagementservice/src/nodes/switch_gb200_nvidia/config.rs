@@ -21,7 +21,7 @@
 //! workflows and their API handlers.
 
 pub const MIN_FIRMWARE_FILE_SIZE: u64 = 1024;
-pub const SFTP_BUFFER_SIZE: usize = crate::transport::ssh::SFTP_UPLOAD_BUFFER_SIZE_BYTES;
+pub const SFTP_BUFFER_SIZE: usize = crate::transport::ssh::SSH_UPLOAD_BUFFER_SIZE_BYTES;
 pub const DEFAULT_JOB_TIMEOUT_SECONDS: u64 = 1800;
 pub const DEFAULT_POLL_INTERVAL_SECONDS: u64 = 5;
 /// Maximum time to wait for NMX Controller control-plane convergence.

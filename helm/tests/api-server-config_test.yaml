@@ -40,7 +40,34 @@ tests:
           pattern: "sftp_step_timeout_seconds = 30"
       - matchRegex:
           path: data["config.toml"]
+          pattern: "firmware_task_timeout_seconds = 10800"
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: "firmware_task_poll_interval_seconds = 30"
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: "firmware_task_transient_error_timeout_seconds = 900"
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: "artifact_require_sha256 = false"
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: "insecure_bmc = true"
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'artifact_https_hosts = \[\]'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: "artifact_allow_private_targets = true"
+      - matchRegex:
+          path: data["config.toml"]
           pattern: "enable_timestamps = false"
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: "\\[tracing\\]\\nprotocol = \"grpc\""
+      - notMatchRegex:
+          path: data["config.toml"]
+          pattern: "endpoint ="
       - notMatchRegex:
           path: data["config.toml"]
           pattern: "\\[workflows.expected_inventory_profiles\\]"
@@ -56,6 +83,10 @@ tests:
         gb200-compute-variant-a:
           - FW_BMC_0
           - HGX_FW_GPU_0
+        vrnvl72-compute:
+          - FW_BMC_0
+          - HGX_FW_BMC_0
+          - HGX_FW_GPU_0
     asserts:
       - matchRegex:
           path: data["config.toml"]
@@ -66,6 +97,12 @@ tests:
       - matchRegex:
           path: data["config.toml"]
           pattern: "\\[workflows.expected_inventory_profiles.\"gb200-compute-variant-b\"\\]"
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: "\\[workflows.expected_inventory_profiles.\"vrnvl72-compute\"\\]"
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'ap_names = \["FW_BMC_0","HGX_FW_BMC_0","HGX_FW_GPU_0"\]'
 
   - it: renders expected Flint device counts into config.toml
     set:
@@ -133,6 +170,27 @@ tests:
       - matchRegex:
           path: data["config.toml"]
           pattern: 'ca = "/var/run/secrets/rms-api/ca.crt"'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: "cert_reload_interval_seconds = 300"
+
+  - it: renders a configured certificate reload interval
+    set:
+      global.image.tag: test
+      apiServer.tls.certReloadIntervalSeconds: 60
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: "cert_reload_interval_seconds = 60"
+
+  - it: defaults a missing certificate reload interval to 300
+    set:
+      global.image.tag: test
+      apiServer.tls.certReloadIntervalSeconds: null
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: "cert_reload_interval_seconds = 300"
 
   - it: renders overridable scalars from values
     set:
@@ -143,8 +201,16 @@ tests:
       apiServer.dbPoolMax: 42
       apiServer.maxTrackedJobs: 500
       apiServer.terminalJobTtlSeconds: 600
+      apiServer.firmwareTaskTimeoutSeconds: 7200
+      apiServer.onieRecoveryTimeoutSeconds: 1200
+      apiServer.recoveredCredentialSaveTimeoutSeconds: 420
+      apiServer.firmwareTaskPollIntervalSeconds: 45
+      apiServer.firmwareTaskTransientErrorTimeoutSeconds: 300
+      apiServer.computePowerOnTimeoutSeconds: 90
+      apiServer.computePowerOnPollIntervalSeconds: 10
       apiServer.logLevel: "info,carbide=debug"
       apiServer.enableTimestamps: true
+      apiServer.insecureBmc: false
     asserts:
       - matchRegex:
           path: data["config.toml"]
@@ -160,7 +226,382 @@ tests:
           pattern: "terminal_job_ttl_seconds = 600"
       - matchRegex:
           path: data["config.toml"]
+          pattern: "firmware_task_timeout_seconds = 7200"
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: "onie_recovery_timeout_seconds = 1200"
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: "recovered_credential_save_timeout_seconds = 420"
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: "firmware_task_poll_interval_seconds = 45"
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: "compute_power_on_timeout_seconds = 90"
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: "compute_power_on_poll_interval_seconds = 10"
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: "firmware_task_transient_error_timeout_seconds = 300"
+      - matchRegex:
+          path: data["config.toml"]
           pattern: 'log_level = "info,carbide=debug"'
       - matchRegex:
           path: data["config.toml"]
           pattern: "enable_timestamps = true"
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: "insecure_bmc = false"
+
+  - it: renders OTLP HTTP protobuf tracing settings over HTTPS
+    set:
+      global.image.tag: test
+      apiServer.tracing:
+        endpoint: "https://otel-collector:4318/v1/traces"
+        protocol: http_protobuf
+        samplingRatio: 0.25
+        maxQueueSize: 128
+        maxExportBatchSize: 64
+        scheduledDelayMs: 250
+        exportAttemptTimeoutMs: 1000
+        exportTimeoutMs: 2000
+        shutdownTimeoutMs: 1000
+        maxRetries: 2
+        retryInitialDelayMs: 10
+        retryMaxDelayMs: 100
+        retryJitterMs: 5
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: '(?m)^endpoint = "https://otel-collector:4318/v1/traces"$'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: '(?m)^protocol = "http_protobuf"$'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: '(?m)^sampling_ratio = 2\.50000000000000000e-01$'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: '(?m)^max_queue_size = 128$'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: '(?m)^max_export_batch_size = 64$'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: '(?m)^scheduled_delay_ms = 250$'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: '(?m)^export_attempt_timeout_ms = 1000$'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: '(?m)^export_timeout_ms = 2000$'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: '(?m)^shutdown_timeout_ms = 1000$'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: '(?m)^max_retries = 2$'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: '(?m)^retry_initial_delay_ms = 10$'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: '(?m)^retry_max_delay_ms = 100$'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: '(?m)^retry_jitter_ms = 5$'
+
+  - it: defaults tracing when reused release values omit the new map
+    set:
+      global.image.tag: test
+      apiServer.tracing: null
+    asserts:
+      - notMatchRegex:
+          path: data["config.toml"]
+          pattern: "endpoint ="
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'protocol = "grpc"'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: "max_queue_size = 2048"
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: "shutdown_timeout_ms = 5000"
+
+  - it: preserves a small nonzero tracing sampling ratio
+    set:
+      global.image.tag: test
+      apiServer.tracing.samplingRatio: 0.0000001
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'sampling_ratio = [1-9]\.[0-9]+e-0[78]'
+
+  - it: rejects a tracing batch larger than its queue
+    set:
+      global.image.tag: test
+      apiServer.tracing.maxQueueSize: 1
+      apiServer.tracing.maxExportBatchSize: 2
+    asserts:
+      - failedTemplate:
+          errorMessage: apiServer.tracing.maxExportBatchSize must be <= apiServer.tracing.maxQueueSize
+
+  - it: rejects plaintext gRPC trace export
+    set:
+      global.image.tag: test
+      apiServer.tracing.endpoint: "http://otel-collector:4317"
+    asserts:
+      - failedTemplate:
+          errorMessage: apiServer.tracing.endpoint scheme must be https; plaintext http is allowed only for a loopback IP address such as 127.0.0.1 or [::1]
+
+  - it: rejects plaintext HTTP protobuf trace export
+    set:
+      global.image.tag: test
+      apiServer.tracing.protocol: http_protobuf
+      apiServer.tracing.endpoint: "http://otel-collector:4318/v1/traces"
+    asserts:
+      - failedTemplate:
+          errorMessage: apiServer.tracing.endpoint scheme must be https; plaintext http is allowed only for a loopback IP address such as 127.0.0.1 or [::1]
+
+  - it: accepts plaintext gRPC trace export to an IPv4 loopback address
+    set:
+      global.image.tag: test
+      apiServer.tracing.endpoint: "http://127.0.0.1:4317"
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'endpoint = "http://127\.0\.0\.1:4317"'
+
+  - it: accepts plaintext HTTP protobuf trace export to the IPv6 loopback address
+    set:
+      global.image.tag: test
+      apiServer.tracing.protocol: http_protobuf
+      apiServer.tracing.endpoint: "http://[::1]:4318/v1/traces"
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'endpoint = "http://\[::1\]:4318/v1/traces"'
+
+  - it: rejects plaintext trace export to localhost
+    set:
+      global.image.tag: test
+      apiServer.tracing.endpoint: "http://localhost:4317"
+    asserts:
+      - failedTemplate:
+          errorMessage: apiServer.tracing.endpoint scheme must be https; plaintext http is allowed only for a loopback IP address such as 127.0.0.1 or [::1]
+
+  - it: rejects plaintext trace export to a shorthand loopback address
+    set:
+      global.image.tag: test
+      apiServer.tracing.endpoint: "http://127.1:4317"
+    asserts:
+      - failedTemplate:
+          errorMessage: apiServer.tracing.endpoint scheme must be https; plaintext http is allowed only for a loopback IP address such as 127.0.0.1 or [::1]
+
+  - it: accepts plaintext trace export to any address in 127.0.0.0/8
+    set:
+      global.image.tag: test
+      apiServer.tracing.endpoint: "http://127.255.255.254:4317"
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'endpoint = "http://127\.255\.255\.254:4317"'
+
+  - it: rejects plaintext trace export to a loopback address with an out-of-range octet
+    set:
+      global.image.tag: test
+      apiServer.tracing.endpoint: "http://127.0.0.256:4317"
+    asserts:
+      - failedTemplate:
+          errorMessage: apiServer.tracing.endpoint scheme must be https; plaintext http is allowed only for a loopback IP address such as 127.0.0.1 or [::1]
+
+  - it: rejects plaintext trace export to a loopback address with a leading zero
+    set:
+      global.image.tag: test
+      apiServer.tracing.endpoint: "http://127.0.0.01:4317"
+    asserts:
+      - failedTemplate:
+          errorMessage: apiServer.tracing.endpoint scheme must be https; plaintext http is allowed only for a loopback IP address such as 127.0.0.1 or [::1]
+
+  - it: rejects plaintext trace export to an IPv4-mapped IPv6 loopback address
+    set:
+      global.image.tag: test
+      apiServer.tracing.endpoint: "http://[::ffff:127.0.0.1]:4317"
+    asserts:
+      - failedTemplate:
+          errorMessage: apiServer.tracing.endpoint scheme must be https; plaintext http is allowed only for a loopback IP address such as 127.0.0.1 or [::1]
+
+  - it: rejects an HTTPS tracing endpoint without the signal path
+    set:
+      global.image.tag: test
+      apiServer.tracing.protocol: http_protobuf
+      apiServer.tracing.endpoint: "https://otel-collector:4318"
+    asserts:
+      - failedTemplate:
+          errorMessage: apiServer.tracing.endpoint must end with /v1/traces for http_protobuf
+
+  - it: accepts an absolute gRPC tracing endpoint without a path
+    set:
+      global.image.tag: test
+      apiServer.tracing.endpoint: "https://otel-collector.example:4317"
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'endpoint = "https://otel-collector.example:4317"'
+
+  - it: rejects a relative tracing endpoint
+    set:
+      global.image.tag: test
+      apiServer.tracing.endpoint: "otel-collector:4317"
+    asserts:
+      - failedTemplate:
+          errorMessage: apiServer.tracing.endpoint scheme must be https; plaintext http is allowed only for a loopback IP address such as 127.0.0.1 or [::1]
+
+  - it: rejects an unsupported tracing endpoint scheme
+    set:
+      global.image.tag: test
+      apiServer.tracing.endpoint: "ftp://otel-collector.example"
+    asserts:
+      - failedTemplate:
+          errorMessage: apiServer.tracing.endpoint scheme must be https; plaintext http is allowed only for a loopback IP address such as 127.0.0.1 or [::1]
+
+  - it: rejects a tracing endpoint without a host
+    set:
+      global.image.tag: test
+      apiServer.tracing.protocol: http_protobuf
+      apiServer.tracing.endpoint: "https:///v1/traces"
+    asserts:
+      - failedTemplate:
+          errorMessage: apiServer.tracing.endpoint must include a host
+
+  - it: rejects a tracing endpoint with only a port
+    set:
+      global.image.tag: test
+      apiServer.tracing.endpoint: "https://:4317"
+    asserts:
+      - failedTemplate:
+          errorMessage: apiServer.tracing.endpoint must include a host
+
+  - it: rejects tracing endpoint whitespace
+    set:
+      global.image.tag: test
+      apiServer.tracing.endpoint: " https://otel-collector.example:4317"
+    asserts:
+      - failedTemplate:
+          errorMessage: apiServer.tracing.endpoint must not contain whitespace
+
+  - it: rejects tracing endpoint user information
+    set:
+      global.image.tag: test
+      apiServer.tracing.endpoint: "https://user:secret@otel-collector.example:4317"
+    asserts:
+      - failedTemplate:
+          errorMessage: apiServer.tracing.endpoint must not contain user information
+
+  - it: rejects a tracing endpoint query
+    set:
+      global.image.tag: test
+      apiServer.tracing.endpoint: "https://otel-collector.example:4317?tenant=a"
+    asserts:
+      - failedTemplate:
+          errorMessage: apiServer.tracing.endpoint must not contain a query or fragment
+
+  - it: rejects a tracing endpoint fragment
+    set:
+      global.image.tag: test
+      apiServer.tracing.endpoint: "https://otel-collector.example:4317#fragment"
+    asserts:
+      - failedTemplate:
+          errorMessage: apiServer.tracing.endpoint must not contain a query or fragment
+
+  - it: rejects a gRPC tracing endpoint path
+    set:
+      global.image.tag: test
+      apiServer.tracing.endpoint: "https://otel-collector.example:4317/v1/traces"
+    asserts:
+      - failedTemplate:
+          errorMessage: apiServer.tracing.endpoint must not contain a path for grpc
+
+  - it: rejects an initial retry delay longer than the maximum
+    set:
+      global.image.tag: test
+      apiServer.tracing.retryInitialDelayMs: 20
+      apiServer.tracing.retryMaxDelayMs: 10
+    asserts:
+      - failedTemplate:
+          errorMessage: apiServer.tracing.retryInitialDelayMs must be <= apiServer.tracing.retryMaxDelayMs
+
+  - it: preserves disabled retries and jitter
+    set:
+      global.image.tag: test
+      apiServer.tracing.maxRetries: 0
+      apiServer.tracing.retryJitterMs: 0
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: "max_retries = 0"
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: "retry_jitter_ms = 0"
+
+  - it: rejects a trace attempt timeout longer than the total timeout
+    set:
+      global.image.tag: test
+      apiServer.tracing.exportAttemptTimeoutMs: 2000
+      apiServer.tracing.exportTimeoutMs: 1000
+    asserts:
+      - failedTemplate:
+          errorMessage: apiServer.tracing.exportAttemptTimeoutMs must be <= apiServer.tracing.exportTimeoutMs
+
+  - it: rejects a termination grace shorter than job drain and trace flush
+    set:
+      global.image.tag: test
+      apiServer.tracing.shutdownTimeoutMs: 30000
+      apiServer.terminationGracePeriodSeconds: 330
+    asserts:
+      - failedTemplate:
+          errorMessage: apiServer.terminationGracePeriodSeconds must be at least 335 for the RMS job drain, tracing shutdown timeout, and margin
+
+  - it: fails rendering when the firmware task poll interval exceeds the timeout
+    set:
+      global.image.tag: test
+      apiServer.firmwareTaskTimeoutSeconds: 30
+      apiServer.firmwareTaskPollIntervalSeconds: 31
+    asserts:
+      - failedTemplate:
+          errorMessage: apiServer.firmwareTaskPollIntervalSeconds must be <= apiServer.firmwareTaskTimeoutSeconds
+
+  - it: fails when the compute power-on interval exceeds its timeout
+    set:
+      global.image.tag: test
+      apiServer.computePowerOnTimeoutSeconds: 30
+      apiServer.computePowerOnPollIntervalSeconds: 31
+    asserts:
+      - failedTemplate:
+          errorMessage: apiServer.computePowerOnPollIntervalSeconds must be <= apiServer.computePowerOnTimeoutSeconds
+
+  - it: renders artifact require sha256 override
+    set:
+      global.image.tag: test
+      apiServer.artifactRequireSha256: true
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: "artifact_require_sha256 = true"
+  - it: renders artifact download policy overrides
+    set:
+      global.image.tag: test
+      apiServer.artifactHttpsHosts:
+        - artifactory.example.com
+        - "*.jfrog.io"
+      apiServer.artifactAllowPrivateTargets: false
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'artifact_https_hosts = \["artifactory.example.com","\*\.jfrog.io"\]'
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: "artifact_allow_private_targets = false"

@@ -15,12 +15,13 @@
  * limitations under the License.
  */
 
-//! SSH and SFTP transport support for switch workflows.
+//! SSH, SCP, and SFTP transport support for switch workflows.
 //!
 //! The public surface is intentionally small: callers use
 //! [`crate::transport::ssh::SshClient`] while this module keeps command
-//! parsing, SFTP setup, password-recovery prompting, log redaction, and
-//! error-code mapping private.
+//! parsing, SCP and SFTP setup, password-recovery prompting, log redaction,
+//! and error-code mapping private. ONIE recovery stages installers with SCP,
+//! while NVOS system-image staging uses SFTP.
 
 mod client;
 mod error;
@@ -28,10 +29,14 @@ mod exec;
 mod logging;
 mod password;
 mod request;
+mod scp;
 mod sftp;
 
 #[cfg(test)]
 mod tests;
 
-/// SSH client, endpoint settings, and SFTP upload tunables used by switch workflows.
-pub use client::{SFTP_UPLOAD_BUFFER_SIZE_BYTES, SftpUploadOptions, SshClient, SshEndpoint};
+/// SSH client, endpoint settings, and upload tunables used by switch workflows.
+pub use client::{SSH_UPLOAD_BUFFER_SIZE_BYTES, SshClient, SshEndpoint, SshUploadOptions};
+
+/// Strip a command from transport error text bound for a client.
+pub(crate) use logging::strip_ssh_command_text;

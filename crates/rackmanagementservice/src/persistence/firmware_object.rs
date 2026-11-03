@@ -148,6 +148,17 @@ pub trait FirmwareObjectStore: Send + Sync {
         parsed_components: serde_json::Value,
     ) -> Result<FirmwareObject>;
 
+    /// Publish preparation state and availability atomically, only for the
+    /// object incarnation that started the work (not a deleted/recreated ID).
+    /// Returns a `NotFound` error when no object matches both `id` and `created`.
+    async fn finish_preparation(
+        &self,
+        id: &str,
+        created: DateTime<Utc>,
+        metadata: serde_json::Value,
+        available: bool,
+    ) -> Result<FirmwareObject>;
+
     /// Mark `id` as the default bundle for its `rack_hardware_type`. Clears
     /// any previously-default bundle of the same hardware type. Atomic.
     ///
@@ -199,6 +210,20 @@ pub trait FirmwareObjectStore: Send + Sync {
     async fn record_apply(
         &self,
         object_id: &str,
+        rack_id: &str,
+        firmware_type: &str,
+        hw_type: RackHardwareType,
+        node_ids: &[String],
+    ) -> Result<()>;
+
+    /// Append history only if `(object_id, created)` is still the current
+    /// incarnation, atomically with respect to deletion/recreation. Returns
+    /// `RmsError::NotFound` without writing history for a stale/missing object.
+    /// Existing history retains the trait-level ID-reuse semantics.
+    async fn record_apply_for_incarnation(
+        &self,
+        object_id: &str,
+        created: DateTime<Utc>,
         rack_id: &str,
         firmware_type: &str,
         hw_type: RackHardwareType,

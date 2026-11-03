@@ -16,8 +16,9 @@
  */
 
 use super::ids::JobId;
+use super::registry::JobScope;
 
-/// Domain-specific policy for job failures.
+/// Domain-specific failure policy for job admission and termination.
 pub trait JobDomain: Send + Sync + 'static {
     /// Failure recorded when an owned handle is dropped before reaching a
     /// terminal state.
@@ -32,9 +33,24 @@ pub trait JobDomain: Send + Sync + 'static {
     /// `active_job_id` already targets `(rack_id, node_id)`.
     fn node_busy_failure(rack_id: &str, node_id: &str, active_job_id: &JobId) -> JobFailure;
 
+    /// Failure returned when a job or a direct mutation holds an overlapping alias.
+    ///
+    /// `owner_id` identifies the reservation owner, which may have no job record.
+    fn scope_busy_failure(scope: &JobScope, owner_id: &JobId) -> JobFailure;
+
+    /// Failure returned when a missing or terminal job cannot acquire aliases.
+    fn inactive_job_failure(job_id: &JobId) -> JobFailure {
+        Self::parent_unavailable_failure(job_id)
+    }
+
     /// Failure returned when a leaf create is refused because the registry
     /// has begun shutdown and no longer accepts new jobs.
     fn shutting_down_failure() -> JobFailure;
+
+    /// Terminal failure recorded when shutdown must abort an unresponsive job.
+    fn shutdown_failure() -> JobFailure {
+        Self::dropped_failure()
+    }
 
     /// Failure returned when a child cannot be created under the requested
     /// parent because that job is missing, terminal, or itself a child.

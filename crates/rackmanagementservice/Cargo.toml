@@ -20,15 +20,25 @@ figment = { workspace = true }
 futures = { workspace = true }
 hex = { workspace = true }
 http = { workspace = true }
+http-body = { workspace = true }
+hyper = { workspace = true }
 hyper-util = { workspace = true }
 librms = { workspace = true, features = ["serde", "server"] }
+macaddr = { workspace = true }
 mimalloc = { workspace = true }
 nvfwupd = { workspace = true }
+noyalib = { workspace = true }
+nvssvt = { workspace = true }
+nvswitch_cli = { workspace = true }
 nvue_client = { workspace = true }
+opentelemetry = { workspace = true }
+opentelemetry-http = { workspace = true }
+opentelemetry-otlp = { workspace = true }
+opentelemetry-proto = { workspace = true }
+opentelemetry_sdk = { workspace = true }
 prometheus = { workspace = true }
 prost = { workspace = true }
 prost-types = { workspace = true }
-rand = { workspace = true }
 redfish_client = { workspace = true }
 regex = { workspace = true }
 reqwest = { workspace = true }
@@ -40,6 +50,7 @@ secrecy = { workspace = true }
 serde = { workspace = true }
 serde_ignored = { workspace = true }
 serde_json = { workspace = true }
+serde_path_to_error = { workspace = true }
 sha2 = { workspace = true }
 sqlx = { workspace = true }
 tempfile = { workspace = true }
@@ -49,11 +60,14 @@ tokio-rustls = { workspace = true }
 tokio-util = { workspace = true, features = ["io", "rt"] }
 tonic = { workspace = true }
 tonic-prost = { workspace = true }
+tonic-types = { workspace = true }
 tonic_prometheus_layer = { workspace = true }
 tower = { workspace = true }
 common = { workspace = true }
 tracing = { workspace = true }
+tracing-opentelemetry = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }
+url = { workspace = true }
 uuid = { workspace = true }
 x509-parser = { workspace = true }
 
@@ -64,13 +78,15 @@ vergen-gitcl = { workspace = true }
 [dev-dependencies]
 criterion = { workspace = true }
 figment = { workspace = true, features = ["test"] }
-hyper = { workspace = true }
 hyper-util = { workspace = true, features = ["tokio", "server-auto"] }
 librms = { workspace = true, features = ["client", "serde"] }
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
 rcgen = { workspace = true }
 redfish_test_support = { workspace = true }
 tar = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 tokio-rustls = { workspace = true }
+tokio-stream = { workspace = true }
 wiremock = { workspace = true }
 
 [[bin]]

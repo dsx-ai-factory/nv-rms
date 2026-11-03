@@ -32,6 +32,9 @@ pub enum ErrorCode {
     Unimplemented,
     ConnectionRefused,
     DnsResolutionFailed,
+    /// The target reached a state that retrying will not change, such as a
+    /// switch reporting a failed boot. Polls stop on it.
+    Aborted,
 }
 
 impl fmt::Display for ErrorCode {
@@ -49,6 +52,7 @@ impl fmt::Display for ErrorCode {
             Self::Unimplemented => write!(f, "Unimplemented"),
             Self::ConnectionRefused => write!(f, "ConnectionRefused"),
             Self::DnsResolutionFailed => write!(f, "DnsResolutionFailed"),
+            Self::Aborted => write!(f, "Aborted"),
         }
     }
 }
@@ -94,6 +98,10 @@ impl RmsError {
 
     pub fn failed_precondition(message: impl Into<String>) -> Self {
         Self::new(ErrorCode::FailedPrecondition, message)
+    }
+
+    pub fn aborted(message: impl Into<String>) -> Self {
+        Self::new(ErrorCode::Aborted, message)
     }
 
     pub fn unauthenticated(message: impl Into<String>) -> Self {

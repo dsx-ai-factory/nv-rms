@@ -1,4 +1,5 @@
 /target
+.idea
 *.fwpkg
 crates/rust_nvfwupd/nvfwupd_log.txt
 crates/rust_nvfwupd/fwpkg_unpack_log.txt
@@ -8,3 +9,18 @@ crates/rust_nvfwupd/fwpkg_unpack_log.txt
 
 # Ignore generated Helm package files
 helm/*.tgz
+
+# Local-only Python gRPC client (hand-run dev tooling, not part of the build).
+# Kept on disk, deliberately untracked: it carries its own copies of the protos,
+# which drift from the real ones in nv-rms-client the moment either changes.
+scripts/python-client/
+
+# NVSSVT release bundles for docker/nvssvt/Dockerfile. Too large for git;
+# see docker/nvssvt/libs/README.md.
+docker/nvssvt/libs/*
+!docker/nvssvt/libs/README.md
+
+vendor/
+
+# Python bytecode from ci/ tooling.
+__pycache__/

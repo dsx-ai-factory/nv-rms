@@ -55,6 +55,7 @@ macro_rules! descriptor_rule {
 const DESCRIPTOR_RULES: &[DescriptorRule] = &[
     descriptor_rule!(ROLE_COMPUTE, "nvidia", Gb200, ComputeGb200Nvidia),
     descriptor_rule!(ROLE_COMPUTE, "wiwynn", Gb200, ComputeGb200Wiwynn),
+    descriptor_rule!(ROLE_COMPUTE, "dell", Gb200, ComputeGb200Dell),
     descriptor_rule!(ROLE_COMPUTE, "nvidia", Gb300, ComputeGb300Nvidia),
     descriptor_rule!(ROLE_COMPUTE, "lenovo", Gb300, ComputeGb300Lenovo),
     descriptor_rule!(ROLE_COMPUTE, "supermicro", Gb300, ComputeGb300Supermicro),
@@ -66,6 +67,8 @@ const DESCRIPTOR_RULES: &[DescriptorRule] = &[
     descriptor_rule!(ROLE_POWER_SHELF, "delta", Gb200, PowershelfGb200Delta),
     descriptor_rule!(ROLE_POWER_SHELF, "liteon", Gb300, PowershelfGb300Liteon),
     descriptor_rule!(ROLE_POWER_SHELF, "delta", Gb300, PowershelfGb300Delta),
+    descriptor_rule!(ROLE_POWER_SHELF, "liteon", Vrnvl72, PowershelfVrnvl72Liteon),
+    descriptor_rule!(ROLE_POWER_SHELF, "delta", Vrnvl72, PowershelfVrnvl72Delta),
 ];
 
 /// Error returned when a protobuf node selector cannot resolve to an RMS node type.
@@ -437,11 +440,16 @@ fn descriptor_vendor(node_type: DomainNodeType) -> &'static str {
         | DomainNodeType::SwitchGb300Nvidia
         | DomainNodeType::ComputeVrnvl72Nvidia
         | DomainNodeType::SwitchVrnvl72Nvidia => "nvidia",
-        DomainNodeType::PowershelfGb200Liteon | DomainNodeType::PowershelfGb300Liteon => "liteon",
-        DomainNodeType::PowershelfGb200Delta | DomainNodeType::PowershelfGb300Delta => "delta",
+        DomainNodeType::PowershelfGb200Liteon
+        | DomainNodeType::PowershelfGb300Liteon
+        | DomainNodeType::PowershelfVrnvl72Liteon => "liteon",
+        DomainNodeType::PowershelfGb200Delta
+        | DomainNodeType::PowershelfGb300Delta
+        | DomainNodeType::PowershelfVrnvl72Delta => "delta",
         DomainNodeType::ComputeGb300Lenovo => "lenovo",
         DomainNodeType::ComputeGb300Supermicro => "supermicro",
         DomainNodeType::ComputeGb200Wiwynn => "wiwynn",
+        DomainNodeType::ComputeGb200Dell => "dell",
     }
 }
 
@@ -476,6 +484,10 @@ mod tests {
             (
                 descriptor("compute", "Wiwynn", "gb200"),
                 DomainNodeType::ComputeGb200Wiwynn,
+            ),
+            (
+                descriptor("compute", "Dell", "gb200"),
+                DomainNodeType::ComputeGb200Dell,
             ),
             (
                 descriptor("compute", "NVIDIA", "gb300"),
@@ -521,6 +533,14 @@ mod tests {
                 descriptor("power_shelf", "Delta", "gb300"),
                 DomainNodeType::PowershelfGb300Delta,
             ),
+            (
+                descriptor("power_shelf", "Lite-On", "vrnvl72"),
+                DomainNodeType::PowershelfVrnvl72Liteon,
+            ),
+            (
+                descriptor("power_shelf", "Delta", "vrnvl72"),
+                DomainNodeType::PowershelfVrnvl72Delta,
+            ),
         ];
 
         for (descriptor, expected) in cases {
@@ -549,6 +569,120 @@ mod tests {
             let canonical = domain_node_type_to_descriptor(expected);
             assert_eq!(resolve_node_type(None, Some(&canonical)), Ok(expected));
         }
+    }
+
+    #[test]
+    fn vr_liteon_power_shelf_descriptor_accepts_vendor_and_family_spellings() {
+        for (role, vendor, product_family) in [
+            ("power_shelf", "liteon", "vrnvl72"),
+            ("powershelf", "Lite-On", "vr_nvl72"),
+            ("POWER SHELF", "LITEON", "VR-NVL72"),
+        ] {
+            assert_eq!(
+                resolve_node_type(None, Some(&descriptor(role, vendor, product_family))),
+                Ok(DomainNodeType::PowershelfVrnvl72Liteon),
+                "role {role}, vendor {vendor}, product_family {product_family}"
+            );
+        }
+
+        assert_eq!(
+            domain_node_type_to_descriptor(DomainNodeType::PowershelfVrnvl72Liteon),
+            descriptor("power_shelf", "liteon", "vrnvl72")
+        );
+    }
+
+    #[test]
+    fn descriptor_only_vr_liteon_power_shelf_selectors_remain_descriptor_keyed() {
+        let mut firmware_targets = HashMap::new();
+        let mut descriptor_targets = vec![pb::NodeDescriptorFirmwareTargetList {
+            node_descriptor: Some(descriptor("power_shelf", "Lite-On", "vrnvl72")),
+            firmware_targets: Some(pb::FirmwareTargetList::default()),
+        }];
+
+        normalize_firmware_target_selectors(&mut firmware_targets, &mut descriptor_targets)
+            .unwrap();
+
+        assert!(firmware_targets.is_empty());
+        assert_eq!(descriptor_targets.len(), 1);
+        assert!(
+            resolve_firmware_target_selectors(&firmware_targets, &descriptor_targets)
+                .unwrap()
+                .contains_key(&DomainNodeType::PowershelfVrnvl72Liteon)
+        );
+    }
+
+    #[test]
+    fn vr_delta_power_shelf_descriptor_accepts_vendor_and_family_spellings() {
+        for (role, vendor, product_family) in [
+            ("power_shelf", "delta", "vrnvl72"),
+            ("powershelf", "Delta", "vr_nvl72"),
+            ("POWER SHELF", "DELTA", "VR-NVL72"),
+        ] {
+            assert_eq!(
+                resolve_node_type(None, Some(&descriptor(role, vendor, product_family))),
+                Ok(DomainNodeType::PowershelfVrnvl72Delta),
+                "role {role}, vendor {vendor}, product_family {product_family}"
+            );
+        }
+
+        assert_eq!(
+            domain_node_type_to_descriptor(DomainNodeType::PowershelfVrnvl72Delta),
+            descriptor("power_shelf", "delta", "vrnvl72")
+        );
+    }
+
+    #[test]
+    fn vr_delta_and_liteon_power_shelves_resolve_to_distinct_node_types() {
+        assert_eq!(
+            resolve_node_type(None, Some(&descriptor("power_shelf", "delta", "vrnvl72"))),
+            Ok(DomainNodeType::PowershelfVrnvl72Delta)
+        );
+        assert_eq!(
+            resolve_node_type(None, Some(&descriptor("power_shelf", "liteon", "vrnvl72"))),
+            Ok(DomainNodeType::PowershelfVrnvl72Liteon)
+        );
+        // GB Delta descriptors must not be captured by the VR rule.
+        assert_eq!(
+            resolve_node_type(None, Some(&descriptor("power_shelf", "delta", "gb300"))),
+            Ok(DomainNodeType::PowershelfGb300Delta)
+        );
+    }
+
+    #[test]
+    fn descriptor_only_vr_delta_power_shelf_selectors_remain_descriptor_keyed() {
+        let mut firmware_targets = HashMap::new();
+        let mut descriptor_targets = vec![pb::NodeDescriptorFirmwareTargetList {
+            node_descriptor: Some(descriptor("power_shelf", "Delta", "vrnvl72")),
+            firmware_targets: Some(pb::FirmwareTargetList::default()),
+        }];
+
+        normalize_firmware_target_selectors(&mut firmware_targets, &mut descriptor_targets)
+            .unwrap();
+
+        assert!(firmware_targets.is_empty());
+        assert_eq!(descriptor_targets.len(), 1);
+        assert!(
+            resolve_firmware_target_selectors(&firmware_targets, &descriptor_targets)
+                .unwrap()
+                .contains_key(&DomainNodeType::PowershelfVrnvl72Delta)
+        );
+
+        let mut component_filters = HashMap::new();
+        let mut descriptor_filters = vec![pb::NodeDescriptorFirmwareObjectComponentFilter {
+            node_descriptor: Some(descriptor("power_shelf", "Delta", "vrnvl72")),
+            component_filter: Some(pb::FirmwareObjectComponentFilter::default()),
+        }];
+
+        normalize_component_filter_selectors(&mut component_filters, &mut descriptor_filters)
+            .unwrap();
+
+        assert!(component_filters.is_empty());
+        assert_eq!(descriptor_filters.len(), 1);
+        assert!(
+            resolve_component_filter_selectors(&component_filters, &descriptor_filters)
+                .unwrap()
+                .contains_key(&DomainNodeType::PowershelfVrnvl72Delta)
+        );
     }
 
     #[test]
@@ -846,5 +980,71 @@ mod tests {
                 .unwrap()
                 .contains_key(&DomainNodeType::ComputeGb200Wiwynn)
         );
+    }
+    #[test]
+    fn descriptor_only_dell_selectors_remain_descriptor_keyed() {
+        let mut firmware_targets = HashMap::new();
+        let mut descriptor_targets = vec![pb::NodeDescriptorFirmwareTargetList {
+            node_descriptor: Some(descriptor("compute", "Dell", "gb200")),
+            firmware_targets: Some(pb::FirmwareTargetList::default()),
+        }];
+
+        normalize_firmware_target_selectors(&mut firmware_targets, &mut descriptor_targets)
+            .unwrap();
+
+        assert!(firmware_targets.is_empty());
+        assert_eq!(descriptor_targets.len(), 1);
+        assert!(
+            resolve_firmware_target_selectors(&firmware_targets, &descriptor_targets)
+                .unwrap()
+                .contains_key(&DomainNodeType::ComputeGb200Dell)
+        );
+
+        let mut component_filters = HashMap::new();
+        let mut descriptor_filters = vec![pb::NodeDescriptorFirmwareObjectComponentFilter {
+            node_descriptor: Some(descriptor("compute", "Dell", "gb200")),
+            component_filter: Some(pb::FirmwareObjectComponentFilter::default()),
+        }];
+
+        normalize_component_filter_selectors(&mut component_filters, &mut descriptor_filters)
+            .unwrap();
+
+        assert!(component_filters.is_empty());
+        assert_eq!(descriptor_filters.len(), 1);
+        assert!(
+            resolve_component_filter_selectors(&component_filters, &descriptor_filters)
+                .unwrap()
+                .contains_key(&DomainNodeType::ComputeGb200Dell)
+        );
+    }
+    #[test]
+    fn dell_wiwynn_and_supermicro_descriptors_do_not_collide() {
+        let mut enums = HashMap::new();
+        let mut targets = [
+            ("Dell", "gb200"),
+            ("Wiwynn", "gb200"),
+            ("Supermicro", "gb300"),
+        ]
+        .into_iter()
+        .map(|(vendor, family)| pb::NodeDescriptorFirmwareTargetList {
+            node_descriptor: Some(descriptor("compute", vendor, family)),
+            firmware_targets: Some(pb::FirmwareTargetList::default()),
+        })
+        .collect();
+        normalize_firmware_target_selectors(&mut enums, &mut targets).unwrap();
+        assert!(enums.is_empty());
+        let resolved = resolve_firmware_target_selectors(&enums, &targets).unwrap();
+        assert_eq!(resolved.len(), 3);
+        for node_type in [
+            DomainNodeType::ComputeGb200Dell,
+            DomainNodeType::ComputeGb200Wiwynn,
+            DomainNodeType::ComputeGb300Supermicro,
+        ] {
+            assert!(resolved.contains_key(&node_type));
+            assert_eq!(
+                domain_node_type_to_proto(node_type),
+                pb::NodeType::Unspecified
+            );
+        }
     }
 }
