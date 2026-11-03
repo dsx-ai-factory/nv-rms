@@ -84,6 +84,26 @@ Credentials secret name for DB: standalone postgres secret, or external database
 {{- end }}
 
 {{/*
+Effective firmware PVC name: apiServer.firmwarePersistentVolumeClaim when set,
+otherwise "<fullname>-firmware" (only used when the chart creates the PVC).
+*/}}
+{{- define "rack-manager.firmwarePvcName" -}}
+{{- .Values.apiServer.firmwarePersistentVolumeClaim | default "" | trim | default (printf "%s-firmware" (include "rack-manager.fullname" .)) -}}
+{{- end -}}
+
+{{/*
+True when the firmware volume should be backed by a PVC rather than hostPath:
+either the chart is creating one (apiServer.firmwarePvc.create) or an existing
+claim name was supplied (apiServer.firmwarePersistentVolumeClaim).
+*/}}
+{{- define "rack-manager.firmwareUsePvc" -}}
+{{- $pvc := .Values.apiServer.firmwarePvc | default dict -}}
+{{- if or $pvc.create (.Values.apiServer.firmwarePersistentVolumeClaim | default "" | trim) -}}
+true
+{{- end -}}
+{{- end -}}
+
+{{/*
 Image pull secrets: global.imagePullSecrets (legacy apiServer.imagePullSecrets accepted).
 Use inline: {{ $s := .Values.global.imagePullSecrets | default .Values.apiServer.imagePullSecrets }}
 */}}
