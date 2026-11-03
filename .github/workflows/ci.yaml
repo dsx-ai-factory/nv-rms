@@ -652,6 +652,15 @@ jobs:
           post-pr-comment: 'false'
           fail-on-findings: 'true'
 
+      - name: Verify the excluded nvfwupd source archive
+        if: hashFiles('crates/rust_nvfwupd/OpenSourceSoftware/OpenSourceSoftware.tar.gz') != ''
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}:/workspace" \
+            -w /workspace \
+            rust:1.96-bookworm \
+            sh -ec 'export RUSTUP_TOOLCHAIN="$(rustup default | cut -d" " -f1)"; python3 ci/generate_nvfwupd_open_source_bundle.py --check'
+
   # Slack notification via nico's ported reusable workflow. Runs after every job
   # (always()), so it fires on all three triggers this workflow allows: PR
   # (pull-request/*), main, and tags. Overall status is computed from the needs
