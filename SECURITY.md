@@ -57,10 +57,10 @@ Key components and boundaries:
 | Boundary | Interface | Primary code | Security posture |
 | --- | --- | --- | --- |
 | Client to RMS gRPC | `RackManager` service on `0.0.0.0:<port>` | `crates/rackmanagementservice/src/api/grpc/server.rs`, `crates/rackmanagementservice/src/api/grpc/*_handlers.rs` | Production deployments are expected to use mTLS with the `[tls] cert`, `key`, and `ca` config keys. RMS does not implement application-level users, roles, per-RPC authorization, or in-process rate limiting; an mTLS-authenticated caller is treated as trusted for all RPCs. `[tls] insecure = true` is plaintext and unauthenticated, and is documented for development/testing only; RMS additionally requires the `RMS_ALLOW_INSECURE=1` environment gate (sourced outside the config file) before it will bind plaintext, so a stale config cannot by itself downgrade the API. |
-| RMS to BMC / Redfish / NVUE | HTTP(S) through `reqwest` and `rustls` | `crates/rackmanagementservice/src/transport/http_client.rs`, `crates/redfish_client/`, compute and powershelf node implementations, `crates/rackmanagementservice/src/nodes/switch_gb200_nvidia/`, `crates/nvue_client/` | Client-supplied endpoint configuration cannot change TLS certificate validation. BMC/Redfish uses HTTPS with Basic auth, but RMS disables BMC server certificate verification because current deployments do not provide BMC certificates that RMS can validate. Switch NVUE uses HTTPS with an RMS client certificate and validates the switch server certificate by default. With `[switches] insecure_switch = true`, NVUE remains HTTPS but uses no client certificate and does not verify the server certificate. These modes depend on trusted management-network controls. |
-| RMS to switch OS | SSH/SFTP for command execution and file transfer | `crates/rackmanagementservice/src/transport/ssh_client.rs`, `crates/rust_nvfwupd/src/ssh_transport.rs`, `crates/rackmanagementservice/src/nodes/switch_gb200_nvidia/` | SSH host-key verification is disabled on both RMS and `rust_nvfwupd` SSH paths; host identity is delegated to trusted management-network segmentation. |
+| RMS to BMC / Redfish / NVUE | HTTP(S) through `reqwest` and `rustls` | `crates/rackmanagementservice/src/transport/http_client.rs`, `crates/redfish_client/`, compute and powershelf node implementations, `crates/rackmanagementservice/src/nodes/switch_gb200_nvidia/`, `crates/nvue_client/` | Client-supplied endpoint configuration cannot change TLS certificate validation. BMC/Redfish uses HTTPS with Basic auth. With `[bmc] insecure_bmc = true` (historical default), RMS skips BMC server certificate verification because current deployments typically use self-signed BMC certificates. Set `[bmc] insecure_bmc = false` to verify BMC certificates against the process trust store. Switch NVUE uses HTTPS with an RMS client certificate and validates the switch server certificate by default. With `[switches] insecure_switch = true`, NVUE remains HTTPS but uses no client certificate and does not verify the server certificate. These modes depend on trusted management-network controls. |
+| RMS to switch OS | SSH for command execution and SCP/SFTP file transfer | `crates/rackmanagementservice/src/transport/ssh_client.rs`, `crates/rust_nvfwupd/src/ssh_transport.rs`, `crates/rackmanagementservice/src/nodes/switch_gb200_nvidia/` | SSH host-key verification is disabled on both RMS and `rust_nvfwupd` SSH paths; host identity is delegated to trusted management-network segmentation. SCP transfer invokes the legacy `scp -t` sink through an SSH exec channel. |
 | RMS to NMX-C | gRPC over HTTPS/mTLS by default, or plaintext HTTP when explicitly opted out | `crates/rackmanagementservice/src/libnmxc/`, `crates/rackmanagementservice/src/api/grpc/scaleupfabricmanager_handlers.rs` | The client requires HTTPS and client certificates by default. `[switches] insecure_switch = true` uses plaintext HTTP without client TLS. |
-| Firmware artifacts | Local paths, `file:` URLs, and HTTP(S) URLs from firmware-object JSON | `crates/rackmanagementservice/src/api/grpc/firmware_object_handlers.rs`, `crates/rackmanagementservice/src/api/grpc/firmware_artifact_paths.rs` | RMS validates object IDs, artifact basenames, cache subdirectories, and local firmware paths under the `[workflows] firmware_dir` config key. HTTP(S) artifact downloads can use a caller-supplied JFrog token via `X-JFrog-Art-Api`, but RMS does not enforce an artifact host allow-list or independent signature/hash verification at cache time. |
+| Firmware artifacts | Local paths, `file:` URLs, and HTTP(S) URLs from firmware-object JSON | `crates/rackmanagementservice/src/api/grpc/firmware_object_handlers.rs`, `crates/rackmanagementservice/src/api/grpc/artifact_download.rs`, `crates/rackmanagementservice/src/api/grpc/firmware_artifact_paths.rs` | RMS validates object IDs, artifact basenames, cache subdirectories, and local firmware paths under the `[workflows] firmware_dir` config key. HTTP(S) downloads can use a caller-supplied JFrog token via `X-JFrog-Art-Api` after the request host and effective port match the catalog origin (the token is not sent on cross-origin redirects). Catalog SHA-256 digests are verified when present. `[workflows] artifact_require_sha256` can require a catalog digest (default `false`), including for optional HTTP(S) switch images. Optional `[workflows] artifact_https_hosts` allow-lists hosts (including redirect hops, capped at 10); `[workflows] artifact_allow_private_targets` can reject IANA special-purpose addresses (loopback, RFC1918/ULA, CGNAT, NAT64, reserved). An empty allow-list preserves historical behavior. RMS does not verify signatures at cache time. |
 | Persistence | PostgreSQL or in-memory backend | `crates/rackmanagementservice/src/persistence/` | When `[postgres] db_url` (or the `DATABASE_URL` env override) is set, RMS connects to PostgreSQL with `sqlx` and runs embedded migrations; otherwise it logs a warning and uses in-memory storage. |
 | Kubernetes deployment | Helm-managed API server, secrets, and hostPath firmware cache | `helm/templates/api-server-deployment.yaml`, `helm/values.yaml` | The Helm chart defaults to `apiServer.allowInsecure: false` and `apiServer.tls.enabled: true`, mounts API server TLS material and optional switch/NMX-C client certificates from Kubernetes Secrets, and constructs `DATABASE_URL` from database credentials in a Secret or External Secrets Operator workflow. |
 | Metrics | Prometheus endpoint on a dedicated HTTP listener (default port 8802) | `crates/rackmanagementservice/src/metrics/server.rs`, `crates/rackmanagementservice/src/metrics/` | `/metrics` is served from an independent HTTP listener configured by the `[metrics]` section (`port`, default 8802). It is plaintext by default; with `[metrics] tls = true` it serves standard TLS using the API server certificate but requires no client certificate, so it sits outside the gRPC mTLS boundary in either mode. It exposes Prometheus metrics plus build metadata such as version and Git SHA. |
@@ -102,18 +102,26 @@ storage for endpoint credentials held in memory.
    a caller-supplied JFrog access token in the `X-JFrog-Art-Api` header. RMS
    canonicalizes local firmware paths under the firmware directory, validates
    artifact filenames and firmware object IDs, and compares received size to
-   `Content-Length` when present, but it does not enforce an artifact host
-   allow-list, artifact approval workflow, cryptographic hash check, or
-   signature verification at cache time. Artifact source control, release
-   approval, image signing, repository access control, and device-side firmware
-   verification remain critical to prevent malicious or wrong-version firmware
-   from being applied.
+   `Content-Length` when present. Catalog SHA-256 digests are verified when
+   present. `[workflows] artifact_require_sha256` can be configured to require
+   a catalog digest; it defaults to `false`. HTTP(S) downloads honor optional
+   `[workflows] artifact_https_hosts` and `artifact_allow_private_targets`.
+   Those keys default to an empty allow-list and private targets allowed.
+   That default is kept for compatibility. To protect against server-side
+   request forgery (CWE-918), set a host allow-list and
+   `artifact_allow_private_targets = false`.
+   RMS does not verify signatures at cache time.
+   Artifact source control, release approval, image signing, repository access
+   control, and device-side firmware verification remain critical, especially
+   when `artifact_require_sha256` is unset or the optional host controls are unset.
 
 4. **Compromised or spoofed management endpoints**:
    RMS communicates with BMCs and switches over Redfish/NVUE HTTP(S), SSH/SFTP,
-   and NMX-C gRPC. BMC/Redfish uses HTTPS with Basic auth, but RMS disables BMC
-   server certificate verification because current deployments do not provide
-   BMC certificates that RMS can validate. Secure NVUE traffic uses HTTPS with
+   and NMX-C gRPC. BMC/Redfish uses HTTPS with Basic auth. With
+   `[bmc] insecure_bmc = true` (historical default), RMS skips BMC
+   server certificate verification because current deployments typically use
+   self-signed BMC certificates. Set `[bmc] insecure_bmc = false` to verify BMC
+   certificates against the process trust store. Secure NVUE traffic uses HTTPS with
    Basic auth and validates the switch server certificate. With
    `[switches] insecure_switch = true`, NVUE remains encrypted with HTTPS but does not use a
    client certificate or authenticate the server certificate. An active
@@ -186,17 +194,22 @@ storage for endpoint credentials held in memory.
   NVUE, SSH/SFTP, and NMX-C endpoints are assumed to be reachable only from
   trusted infrastructure. SSH host-key verification is not enforced by RMS or
   `rust_nvfwupd`.
-- **BMC endpoint identity relies on management-network controls**:
-  BMC/Redfish remains HTTPS, but RMS does not validate BMC server certificates
-  in current deployments. Client endpoint request fields cannot change this
+- **BMC endpoint identity relies on management-network controls unless verification is enabled**:
+  BMC/Redfish remains HTTPS. With `[bmc] insecure_bmc = true` (historical
+  default), RMS does not validate BMC server certificates. Set
+  `[bmc] insecure_bmc = false` after BMC certificates are CA-verifiable.
+  Client endpoint request fields cannot change this
   behavior; it is an RMS-owned BMC-only policy.
 - **Firmware artifacts are approved before RMS applies them**: RMS validates
   paths, filenames, object IDs, and basic transfer size, and can authenticate
-  artifact repository downloads with a caller-supplied JFrog token. It assumes
-  release, signing, artifact repository, NVFWUPD, BMC, switch, or hardware
-  mechanisms establish firmware authenticity and target compatibility because
-  RMS does not independently enforce artifact host allow-lists, trusted
-  manifests, hashes, or signatures.
+  artifact repository downloads with a caller-supplied JFrog token. Catalog
+  SHA-256 digests are verified when present. `[workflows]
+  artifact_require_sha256` can be configured to require a digest on HTTP(S)
+  artifacts (default `false`). RMS can also enforce an optional HTTP(S) host
+  allow-list and reject private download targets; those controls default off.
+  It assumes release, signing, artifact repository, NVFWUPD, BMC, switch, or
+  hardware mechanisms establish firmware authenticity and target compatibility
+  because RMS does not independently enforce signatures.
 - **Resource limits are supplied by deployment infrastructure**: RMS assumes
   Kubernetes, hostPath/storage configuration, monitoring, and operational
   process constrain firmware-cache growth, high-volume artifact downloads, and
@@ -241,9 +254,15 @@ storage for endpoint credentials held in memory.
   firmware cache and any hostPath that backs it. Treat artifact download volume
   and job count as operational capacity controls.
 - Treat firmware-object URLs and local artifact paths as trusted operator input.
-  Prefer approved internal artifact repositories, restrict who can create
-  firmware objects, and enforce any site-specific URL allow-list or artifact
-  approval workflow outside RMS if required.
+  Prefer approved internal artifact repositories and restrict who can create
+  firmware objects. To refuse unpinned HTTP(S) catalogs, set
+  `[workflows] artifact_require_sha256 = true` (Helm:
+  `apiServer.artifactRequireSha256`). To refuse unexpected HTTP(S) origins,
+  enable `[workflows] artifact_https_hosts` and
+  `artifact_allow_private_targets = false` (Helm: `apiServer.artifactHttpsHosts`,
+  `artifactAllowPrivateTargets`). Those keys default to unrestricted downloads.
+  See
+  [Configuring RMS: Artifact download policy](docs/configuration/configuring-rms.md#artifact-download-policy).
 - Use PostgreSQL with TLS and managed credentials for any deployment where
   firmware object state or apply history must survive restarts.
 - Treat device endpoint credentials supplied through gRPC as sensitive. Avoid

@@ -19,11 +19,14 @@ use std::path::Path;
 use std::time::Duration;
 
 use futures::TryStreamExt;
-use secrecy::{ExposeSecret, SecretString};
+use nvfwupd::bmc_access::sensitive_header_value;
+use reqwest::header::HeaderValue;
+use secrecy::ExposeSecret;
 use serde_json::Value;
 use tokio::io::AsyncReadExt;
 use tokio_util::io::{ReaderStream, StreamReader};
 
+use crate::domain::rack::EndpointCredentials;
 use crate::utilities::error::{ErrorCode, Result, RmsError};
 use crate::utilities::url::http_target_uri;
 
@@ -47,10 +50,11 @@ pub const REDFISH_V1_ROOT: &str = "/redfish/v1";
 /// Async HTTP client for communicating with BMC / switch REST APIs over HTTP or HTTPS.
 ///
 /// Wraps `reqwest::Client` with Redfish conventions: JSON request/response,
-/// error code mapping, basic auth, TLS verify toggle, and firmware upload
-/// support. Used by the BMC/powershelf Redfish callers and for plain switch
-/// reachability probes; the switch NVUE API is driven by the separate
-/// `nvue_client` crate, not this client.
+/// error code mapping, endpoint authentication (basic auth or a BMC session
+/// token), TLS verify toggle, and firmware upload support. Used by the
+/// BMC/powershelf Redfish callers and for plain switch reachability probes;
+/// the switch NVUE API is driven by the separate `nvue_client` crate, not this
+/// client.
 ///
 /// The underlying reqwest client reuses TCP+TLS connections across calls,
 /// so repeated requests to the same BMC skip the TLS handshake.
@@ -59,8 +63,11 @@ pub struct HttpClient {
     base_url: String,
     host: String,
     port: u16,
-    username: String,
-    password: SecretString,
+    credentials: Option<EndpointCredentials>,
+    /// Session-token `X-Auth-Token` value, validated and marked sensitive
+    /// once at construction and reused on every request instead of
+    /// re-parsing the token from `credentials` each time.
+    session_token_header: Option<HeaderValue>,
     max_response_bytes: usize,
     /// Optional API tree every request must stay within (e.g. `/redfish/v1`).
     ///
@@ -84,12 +91,17 @@ impl HttpClient {
         dangerously_accept_invalid_certs: bool,
         https: bool,
     ) -> Result<Self> {
-        Self::new_with_connect_target(
+        let credentials = if username.is_empty() {
+            None
+        } else {
+            Some(EndpointCredentials::new(username, password))
+        };
+
+        Self::new_with_connect_target_credentials(
             host,
             host,
             port,
-            username,
-            password,
+            credentials,
             dangerously_accept_invalid_certs,
             https,
         )
@@ -105,16 +117,51 @@ impl HttpClient {
         dangerously_accept_invalid_certs: bool,
         https: bool,
     ) -> Result<Self> {
+        let credentials = if username.is_empty() {
+            None
+        } else {
+            Some(EndpointCredentials::new(username, password))
+        };
+
+        Self::new_with_connect_target_credentials(
+            tls_host,
+            connect_host,
+            port,
+            credentials,
+            dangerously_accept_invalid_certs,
+            https,
+        )
+    }
+
+    fn new_with_connect_target_credentials(
+        tls_host: &str,
+        connect_host: &str,
+        port: u16,
+        credentials: Option<EndpointCredentials>,
+        dangerously_accept_invalid_certs: bool,
+        https: bool,
+    ) -> Result<Self> {
         // Gate credential transmission on transport trust. Basic auth attaches the
         // BMC/switch admin password to every request, so refuse to construct a
         // credential-bearing client over plaintext HTTP where any network observer
         // could recover it. Cert-unverified TLS remains permitted (many BMCs ship
         // self-signed certs); that trade-off is opt-in via the insecure flags.
-        if !username.is_empty() && !https {
-            return Err(RmsError::invalid_argument(format!(
-                "refusing to send Basic auth credentials to {tls_host}:{port} over plaintext \
-                 HTTP; credentials would be recoverable by any network observer. Use HTTPS."
-            )));
+        if let Some(credentials) = credentials.as_ref().filter(|_| !https) {
+            match credentials {
+                EndpointCredentials::UserPass { username, .. } if !username.is_empty() => {
+                    return Err(RmsError::invalid_argument(format!(
+                        "refusing to send Basic auth credentials to {tls_host}:{port} over \
+                         plaintext HTTP; credentials would be recoverable by any network \
+                         observer. Use HTTPS."
+                    )));
+                }
+                EndpointCredentials::BmcSessionToken(_) => {
+                    return Err(RmsError::invalid_argument(
+                        "refusing to send a Redfish session token over plaintext HTTP; use HTTPS",
+                    ));
+                }
+                EndpointCredentials::UserPass { .. } => {}
+            }
         }
 
         let mut builder = reqwest::Client::builder()
@@ -133,6 +180,24 @@ impl HttpClient {
             builder = builder.resolve(tls_host, addr);
         }
 
+        let mut session_token_header = None;
+
+        if let Some(EndpointCredentials::BmcSessionToken(token)) = credentials.as_ref() {
+            HeaderValue::from_str(token.expose_secret()).map_err(|error| {
+                RmsError::invalid_argument(format!("invalid BMC session token header: {error}"))
+            })?;
+
+            session_token_header = Some(sensitive_header_value(token.expose_secret()));
+            builder = builder.redirect(reqwest::redirect::Policy::none());
+        }
+
+        tracing::debug!(
+            credential_auth_type = credentials
+                .as_ref()
+                .map_or("none", EndpointCredentials::auth_type),
+            "building HTTP management client"
+        );
+
         let client = builder
             .build()
             .map_err(|e| RmsError::internal(format!("failed to create HTTP client: {e}")))?;
@@ -142,8 +207,8 @@ impl HttpClient {
             base_url: http_target_uri(tls_host, port, https),
             host: connect_host.to_owned(),
             port,
-            username: username.to_owned(),
-            password: SecretString::from(password.to_owned()),
+            credentials,
+            session_token_header,
             max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
             required_path_prefix: None,
         })
@@ -167,6 +232,24 @@ impl HttpClient {
         };
         self.required_path_prefix = Some(normalized);
         self
+    }
+
+    /// Build a client from endpoint credentials.
+    pub fn new_with_endpoint_credentials(
+        host: &str,
+        port: u16,
+        credentials: Option<EndpointCredentials>,
+        dangerously_accept_invalid_certs: bool,
+        https: bool,
+    ) -> Result<Self> {
+        Self::new_with_connect_target_credentials(
+            host,
+            host,
+            port,
+            credentials,
+            dangerously_accept_invalid_certs,
+            https,
+        )
     }
 
     pub fn host(&self) -> &str {
@@ -352,11 +435,21 @@ impl HttpClient {
         })
     }
 
-    fn apply_auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        if self.username.is_empty() {
-            req
-        } else {
-            req.basic_auth(&self.username, Some(self.password.expose_secret()))
+    fn apply_auth(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        let Some(credentials) = self.credentials.as_ref() else {
+            return request;
+        };
+
+        match credentials {
+            EndpointCredentials::UserPass { username, password } => {
+                request.basic_auth(username, Some(password.expose_secret()))
+            }
+            EndpointCredentials::BmcSessionToken(token) => request.header(
+                "X-Auth-Token",
+                self.session_token_header
+                    .clone()
+                    .unwrap_or_else(|| sensitive_header_value(token.expose_secret())),
+            ),
         }
     }
 }
@@ -460,8 +553,8 @@ impl HttpClient {
             base_url: base_url.to_owned(),
             host: "test".to_owned(),
             port: 0,
-            username: String::new(),
-            password: SecretString::from(String::new()),
+            credentials: None,
+            session_token_header: None,
             max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
             required_path_prefix: None,
         }
@@ -473,11 +566,33 @@ impl HttpClient {
             base_url: base_url.to_owned(),
             host: "test".to_owned(),
             port: 0,
-            username: username.to_owned(),
-            password: SecretString::from(password.to_owned()),
+            credentials: Some(EndpointCredentials::new(username, password)),
+            session_token_header: None,
             max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
             required_path_prefix: None,
         }
+    }
+
+    pub fn for_test_with_session_token(base_url: &str, token: &str) -> Result<Self> {
+        let credentials = Some(EndpointCredentials::from_session_token(token));
+
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|error| {
+                RmsError::internal(format!("failed to create test HTTP client: {error}"))
+            })?;
+
+        Ok(Self {
+            client,
+            base_url: base_url.to_owned(),
+            host: "test".to_owned(),
+            port: 0,
+            credentials,
+            session_token_header: Some(sensitive_header_value(token)),
+            max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
+            required_path_prefix: None,
+        })
     }
 }
 
@@ -728,13 +843,21 @@ mod tests {
     #[test]
     fn auth_not_applied_when_username_empty() {
         let client = HttpClient::new("10.0.0.1", 443, "", "", false, true).unwrap();
-        assert!(client.username.is_empty());
+
+        assert!(client.credentials.is_none());
     }
 
     #[test]
     fn password_stored_as_secret() {
         let client = HttpClient::new("10.0.0.1", 443, "admin", "hunter2", false, true).unwrap();
-        assert_eq!(client.password.expose_secret(), "hunter2");
+
+        let (_, password) = client
+            .credentials
+            .as_ref()
+            .and_then(EndpointCredentials::user_pass_secret)
+            .unwrap();
+
+        assert_eq!(password.expose_secret(), "hunter2");
     }
 
     #[test]
@@ -772,6 +895,16 @@ mod tests {
         // are permitted rather than refused (opt-in via the insecure flags).
         let client = HttpClient::new("10.0.0.1", 443, "admin", "pass", true, true);
         assert!(client.is_ok());
+    }
+
+    #[test]
+    fn rejects_session_token_over_plaintext_http() {
+        let credentials = Some(EndpointCredentials::from_session_token("session-token"));
+
+        let result =
+            HttpClient::new_with_endpoint_credentials("10.0.0.1", 80, credentials, false, false);
+
+        assert!(result.is_err());
     }
 
     // ── Integration tests (wiremock server) ──
@@ -1010,6 +1143,50 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result["auth"], "ok");
+    }
+
+    #[tokio::test]
+    async fn session_token_header_sent_when_token_provided() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/auth"))
+            .and(header("X-Auth-Token", "session-token"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"auth": "ok"})),
+            )
+            .mount(&server)
+            .await;
+
+        let client =
+            HttpClient::for_test_with_session_token(&server.uri(), "session-token").unwrap();
+
+        let result = client
+            .get("/auth", HttpClient::DEFAULT_TIMEOUT)
+            .await
+            .unwrap();
+
+        assert_eq!(result["auth"], "ok");
+    }
+
+    #[tokio::test]
+    async fn session_token_request_does_not_follow_cross_origin_redirect() {
+        let destination = MockServer::start().await;
+        let source = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/redirect"))
+            .respond_with(
+                ResponseTemplate::new(302).insert_header("Location", destination.uri().as_str()),
+            )
+            .expect(1)
+            .mount(&source)
+            .await;
+
+        let client =
+            HttpClient::for_test_with_session_token(&source.uri(), "session-token").unwrap();
+
+        let _ = client.get("/redirect", HttpClient::DEFAULT_TIMEOUT).await;
+
+        assert!(destination.received_requests().await.unwrap().is_empty());
     }
 
     #[tokio::test]

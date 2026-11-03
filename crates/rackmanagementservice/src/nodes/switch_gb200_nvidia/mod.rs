@@ -21,6 +21,7 @@
 //! Redfish, and NVFWUPD.
 
 mod attestation;
+mod cli;
 mod cluster;
 mod factory_reset;
 mod firmware;
@@ -28,6 +29,7 @@ mod nvue;
 mod password;
 mod post_config_check;
 mod power;
+mod scale_up_links;
 mod ssh;
 mod system;
 mod system_image;
@@ -36,8 +38,11 @@ mod validation;
 pub mod config;
 pub mod mtls;
 
+pub(crate) use self::factory_reset::FactoryResetError;
 pub(crate) use self::password::SwitchSystemPasswordUpdateOutcome;
-pub(crate) use self::validation::{is_valid_identifier, shell_quote};
+pub(crate) use self::scale_up_links::ScaleUpLinkChange;
+pub(super) use self::validation::is_valid_firmware_inventory_component;
+pub(crate) use self::validation::is_valid_identifier;
 
 #[cfg(test)]
 pub(crate) use self::attestation::SwitchSpdmAttestationEvidence;
@@ -45,12 +50,12 @@ pub(crate) use self::attestation::{SpdmAttestationChallenge, SwitchSpdmComponent
 
 pub use self::cluster::grpc_port_for_app;
 pub use self::system_image::{
-    NVOS_PARTITION_1_ID, NVOS_PARTITION_2_ID, SwitchSystemImageState, describe_install_poll,
-    infer_target_build_id, is_http_unauthorized_error, is_install_handoff_to_reboot,
-    is_install_poll_success, is_install_progress_state, is_install_reboot_transition_state,
-    is_retryable_install_poll_error, is_retryable_nvue_transport_error,
-    is_retryable_steady_state_error, is_uninstall_poll_success, normalize_system_image_state,
-    system_image_listing_contains,
+    NVOS_PARTITION_1_ID, NVOS_PARTITION_2_ID, NvosInstallationState, SwitchSystemImageState,
+    UnusedPartitionCleanup, describe_install_poll, infer_target_build_id,
+    is_http_unauthorized_error, is_install_handoff_to_reboot, is_install_poll_success,
+    is_install_progress_state, is_install_reboot_transition_state, is_retryable_install_poll_error,
+    is_retryable_nvue_transport_error, is_retryable_steady_state_error, is_uninstall_poll_success,
+    normalize_system_image_state, plan_unused_partition_cleanup, system_image_listing_contains,
 };
 
 use std::collections::HashMap;
@@ -65,7 +70,7 @@ use nvue_client::{
     Client as NvueClient, ClientConfig as NvueConnectConfig, ClientCredentials as NvueCredentials,
     ClientEndpoint as NvueEndpoint,
 };
-use secrecy::ExposeSecret;
+use secrecy::{ExposeSecret, SecretString};
 
 #[cfg(test)]
 use redfish_client::BmcCredentials;
@@ -83,7 +88,7 @@ use self::power::switch_redfish_reset_type;
 #[cfg(test)]
 use self::validation::{
     firmware_inventory_endpoint_component, is_valid_component, is_valid_firmware_filename,
-    is_valid_firmware_inventory_component, is_valid_system_username,
+    is_valid_system_username,
 };
 use crate::domain::node::*;
 use crate::domain::rack::{Endpoint, EndpointConfig, EndpointCredentials, NodeConfig};
@@ -100,6 +105,9 @@ use crate::utilities::error::{Result, RmsError};
 type SshExecForTest = dyn Fn(&str) -> Result<String> + Send + Sync;
 
 #[cfg(test)]
+type ScpUploadForTest = dyn Fn(&str, &str) -> Result<()> + Send + Sync;
+
+#[cfg(test)]
 type SshPasswordRecoveryForTest = dyn Fn(&str, &str) -> Result<()> + Send + Sync;
 
 // ═══════════════════════════════════════════════════════════════════
@@ -108,10 +116,9 @@ type SshPasswordRecoveryForTest = dyn Fn(&str, &str) -> Result<()> + Send + Sync
 
 /// Concrete node for NVIDIA reference GB200 network switches (NVUE REST + SSH/SFTP).
 ///
-/// Power:     Redfish ComputerSystem.Reset when BMC details are available;
-///            legacy PowerCycle fallback via POST /nvue_v1/system
+/// Power:     BMC Redfish when available; NVUE PowerCycle fallback on GB200/GB300
 /// Firmware:  SFTP push then NVUE install, poll via /nvue_v1/action/{id}
-/// Activate:  power cycle
+/// Activate:  NVUE power cycle
 ///
 /// Credentials are stored at construction time. One shared NVUE client is
 /// kept for REST calls; SshClient instances are created on demand
@@ -125,13 +132,20 @@ pub struct SwitchGb200Nvidia {
     expected_inventory: Option<ExpectedInventoryPolicy>,
     nvue: Option<SharedNvueClient>,
     redfish: Option<RedfishClient>,
+    nvue_capabilities: tokio::sync::OnceCell<crate::nodes::nvos::GnmiClientCa>,
 
     // Serializes full node operations across shared NVUE, Redfish, and
     // NVFWUPD clients. The guard intentionally spans awaited protocol calls.
     pub(crate) op_lock: tokio::sync::Mutex<()>,
 
     #[cfg(test)]
+    pub(crate) factory_default_probe_for_test: Option<Arc<dyn Fn() -> Result<bool> + Send + Sync>>,
+
+    #[cfg(test)]
     pub(crate) ssh_exec_for_test: Option<Arc<SshExecForTest>>,
+
+    #[cfg(test)]
+    pub(crate) scp_upload_for_test: Option<Arc<ScpUploadForTest>>,
 
     #[cfg(test)]
     ssh_password_recovery_for_test: Option<Arc<SshPasswordRecoveryForTest>>,
@@ -144,8 +158,7 @@ fn redfish_from_endpoint(endpoint: &EndpointConfig) -> Result<Option<RedfishClie
 
     if endpoint.endpoint.ip_address.is_empty()
         || endpoint.endpoint.port == 0
-        || credentials.username.is_empty()
-        || credentials.password.expose_secret().is_empty()
+        || !credentials.has_auth_material()
     {
         return Ok(None);
     }
@@ -159,6 +172,18 @@ impl SwitchGb200Nvidia {
     /// Node identifier (inherent accessor — use this instead of the private `id` field).
     pub(crate) fn id(&self) -> &str {
         &self.id
+    }
+
+    /// Discover this switch's gNMI capabilities once and reuse the answers.
+    ///
+    /// Does not probe NVBridge; a secondary-node 5xx cannot fail this path.
+    pub(crate) async fn initialize_nvue_capabilities(
+        &self,
+    ) -> Result<crate::nodes::nvos::GnmiClientCa> {
+        self.nvue_capabilities
+            .get_or_try_init(|| async { crate::nodes::nvos::GnmiClientCa::discover(self).await })
+            .await
+            .copied()
     }
 
     pub(crate) fn rack_id(&self) -> &str {
@@ -217,9 +242,14 @@ impl SwitchGb200Nvidia {
             expected_inventory: None,
             nvue: Some(nvue),
             redfish: None,
+            nvue_capabilities: tokio::sync::OnceCell::new(),
             op_lock: tokio::sync::Mutex::new(()),
             #[cfg(test)]
+            factory_default_probe_for_test: None,
+            #[cfg(test)]
             ssh_exec_for_test: None,
+            #[cfg(test)]
+            scp_upload_for_test: None,
             #[cfg(test)]
             ssh_password_recovery_for_test: None,
         })
@@ -258,15 +288,35 @@ impl SwitchGb200Nvidia {
             host_endpoint: None,
             expected_inventory: None,
             nvue: None,
+            nvue_capabilities: tokio::sync::OnceCell::new(),
             op_lock: tokio::sync::Mutex::new(()),
             #[cfg(test)]
+            factory_default_probe_for_test: None,
+            #[cfg(test)]
             ssh_exec_for_test: None,
+            #[cfg(test)]
+            scp_upload_for_test: None,
             #[cfg(test)]
             ssh_password_recovery_for_test: None,
         })
     }
 
     pub fn from_config(config: &NodeConfig, rack_id: &str) -> Result<Self> {
+        if !matches!(
+            config.node_type,
+            NodeType::SwitchGb200Nvidia | NodeType::SwitchGb300Nvidia
+        ) {
+            return Err(RmsError::unimplemented(
+                "create_node",
+                config.node_type.as_str(),
+            ));
+        }
+        Self::from_shared_config(config, rack_id)
+    }
+
+    /// Construct shared transports without changing the caller's node identity.
+    /// VR policy is provided by `SwitchVrnvl72Nvidia`, not this shared implementation.
+    pub(super) fn from_shared_config(config: &NodeConfig, rack_id: &str) -> Result<Self> {
         if config.node_type.kind() != NodeKind::Switch {
             return Err(RmsError::unimplemented(
                 "create_node",
@@ -285,12 +335,10 @@ impl SwitchGb200Nvidia {
                 ));
             }
 
-            let http_credentials = host_endpoint.credentials.as_ref();
-            let username = http_credentials
-                .map(|credentials| credentials.username.as_str())
-                .unwrap_or_default();
-            let password = http_credentials
-                .map(|credentials| credentials.password.expose_secret())
+            let (username, password) = host_endpoint
+                .credentials
+                .as_ref()
+                .and_then(EndpointCredentials::user_pass)
                 .unwrap_or_default();
             let nvue_config = build_nvue_connect_config(host_endpoint, username, password)?;
             Some(build_nvue_api(nvue_config)?)
@@ -336,12 +384,52 @@ impl SwitchGb200Nvidia {
             expected_inventory: config.expected_inventory.clone(),
             nvue,
             redfish,
+            nvue_capabilities: tokio::sync::OnceCell::new(),
             op_lock: tokio::sync::Mutex::new(()),
+            #[cfg(test)]
+            factory_default_probe_for_test: None,
             #[cfg(test)]
             ssh_exec_for_test: None,
             #[cfg(test)]
+            scp_upload_for_test: None,
+            #[cfg(test)]
             ssh_password_recovery_for_test: None,
         })
+    }
+
+    /// Run the common NVUE upload/install workflow with the node's inventory source.
+    pub(super) async fn update_firmware_with_workflow(
+        &self,
+        target: &FirmwareTarget,
+        force_update: bool,
+        options: FirmwareUpdateOptions,
+        workflow: nvfwupd::workflow_api::WorkflowContext,
+    ) -> Result<FirmwareUpdateOutcome> {
+        let _op_guard = self.op_lock.lock().await;
+        let host_endpoint = self.require_host_endpoint()?;
+
+        tracing::info!(
+            node = %self.id,
+            host = %host_endpoint.ip_address,
+            component = %target.component,
+            file = %target.firmware_file,
+            force_update,
+            "update_firmware via NVFWUPD"
+        );
+        let request = nvfwupd_adapter::to_update_request(target, force_update, options);
+        let expected_inventory = self
+            .expected_inventory_policy()
+            .map(|policy| policy.ap_names.as_ref().to_vec());
+        let outcome = workflow
+            .update_firmware_with_expected_inventory(
+                self.nvfwupd_target_config()?,
+                request,
+                expected_inventory,
+            )
+            .await
+            .map_err(nvfwupd_adapter::map_error)?;
+
+        Ok(nvfwupd_adapter::map_outcome(outcome))
     }
 
     fn require_host_endpoint(&self) -> Result<&Endpoint> {
@@ -355,10 +443,15 @@ impl SwitchGb200Nvidia {
             })
     }
 
-    fn require_host_credentials(&self) -> Result<&EndpointCredentials> {
+    pub(super) fn bmc_connection(&self) -> Option<(&EndpointConfig, &RedfishClient)> {
+        self.bmc_endpoint.as_ref().zip(self.redfish.as_ref())
+    }
+
+    fn require_host_credentials(&self) -> Result<(&str, &SecretString)> {
         self.host_endpoint
             .as_ref()
             .and_then(|endpoint| endpoint.credentials.as_ref())
+            .and_then(EndpointCredentials::user_pass_secret)
             .ok_or_else(|| {
                 RmsError::failed_precondition(
                     "switch host credentials are required for NVUE/NVOS operations",
@@ -367,8 +460,19 @@ impl SwitchGb200Nvidia {
     }
 
     pub(crate) fn host_credentials(&self) -> Result<(&str, &str)> {
-        let credentials = self.require_host_credentials()?;
-        Ok((&credentials.username, credentials.password.expose_secret()))
+        let (username, password) = self.require_host_credentials()?;
+        Ok((username, password.expose_secret()))
+    }
+}
+
+#[async_trait]
+impl crate::nodes::nvos::NvosHost for SwitchGb200Nvidia {
+    async fn gnmi_mtls_resource_present(&self) -> Result<bool> {
+        Ok(self.get_gnmi_server_mtls_if_present().await?.is_some())
+    }
+
+    async fn secondary_cluster_node_present(&self) -> Result<bool> {
+        self.cluster_node_secondary_is_present().await
     }
 }
 
@@ -494,12 +598,11 @@ impl Node for SwitchGb200Nvidia {
 
     async fn get_firmware_inventory(&self) -> Result<Vec<FirmwareInfo>> {
         let _op_guard = self.op_lock.lock().await;
-        let host_endpoint = self.require_host_endpoint()?;
-        tracing::debug!(node = %self.id, host = %host_endpoint.ip_address, "get_firmware_inventory via NVFWUPD");
+        tracing::debug!(node = %self.id, "get_firmware_inventory via NVFWUPD");
 
-        let inventory = self
-            .nvfwupd_workflow()?
-            .get_firmware_inventory(self.nvfwupd_target_config()?)
+        let (workflow, target) = (self.nvfwupd_workflow()?, self.nvfwupd_target_config()?);
+        let inventory = workflow
+            .get_firmware_inventory(target)
             .await
             .map_err(nvfwupd_adapter::map_error)?;
 
@@ -514,16 +617,14 @@ impl Node for SwitchGb200Nvidia {
         targets: &[FirmwareTarget],
     ) -> Result<FirmwareVersionCheckSummary> {
         let _op_guard = self.op_lock.lock().await;
-        let host_endpoint = self.require_host_endpoint()?;
         tracing::info!(
             node = %self.id,
-            host = %host_endpoint.ip_address,
             "verify_firmware_package_versions via NVFWUPD"
         );
         let targets = nvfwupd_adapter::to_version_check_targets(targets);
-        let summary = self
-            .nvfwupd_workflow()?
-            .verify_firmware_target_versions(self.nvfwupd_target_config()?, targets)
+        let (workflow, target) = (self.nvfwupd_workflow()?, self.nvfwupd_target_config()?);
+        let summary = workflow
+            .verify_firmware_target_versions(target, targets)
             .await
             .map_err(nvfwupd_adapter::map_error)?;
         Ok(nvfwupd_adapter::map_version_check_summary(summary))
@@ -535,32 +636,8 @@ impl Node for SwitchGb200Nvidia {
         force_update: bool,
         options: FirmwareUpdateOptions,
     ) -> Result<FirmwareUpdateOutcome> {
-        let _op_guard = self.op_lock.lock().await;
-        let host_endpoint = self.require_host_endpoint()?;
-
-        tracing::info!(
-            node = %self.id,
-            host = %host_endpoint.ip_address,
-            component = %target.component,
-            file = %target.firmware_file,
-            force_update,
-            "update_firmware via NVFWUPD"
-        );
-        let request = nvfwupd_adapter::to_update_request(target, force_update, options);
-        let expected_inventory = self
-            .expected_inventory_policy()
-            .map(|policy| policy.ap_names.as_ref().to_vec());
-        let outcome = self
-            .nvfwupd_workflow()?
-            .update_firmware_with_expected_inventory(
-                self.nvfwupd_target_config()?,
-                request,
-                expected_inventory,
-            )
+        self.update_firmware_with_workflow(target, force_update, options, self.nvfwupd_workflow()?)
             .await
-            .map_err(nvfwupd_adapter::map_error)?;
-
-        Ok(nvfwupd_adapter::map_outcome(outcome))
     }
 
     async fn poll_firmware_task(&self, task_id: &str) -> Result<FirmwareTaskStatus> {
@@ -576,9 +653,9 @@ impl Node for SwitchGb200Nvidia {
         let _op_guard = self.op_lock.lock().await;
         tracing::info!(node = %self.id, "activate_firmware via NVFWUPD");
         let request = nvfwupd_adapter::to_activation_request(request);
-        let summary = self
-            .nvfwupd_workflow()?
-            .activate_firmware(self.nvfwupd_target_config()?, request)
+        let (workflow, target) = (self.nvfwupd_workflow()?, self.nvfwupd_target_config()?);
+        let summary = workflow
+            .activate_firmware(target, request)
             .await
             .map_err(nvfwupd_adapter::map_error)?;
 
@@ -594,15 +671,18 @@ impl Node for SwitchGb200Nvidia {
         .map(|_| ())
     }
 
+    async fn verify_system_ready(&self) -> Result<()> {
+        let _op_guard = self.op_lock.lock().await;
+        self.verify_nvos_ready().await
+    }
+
     /// Returns true if a Redfish client for the BMC is configured.
     fn supports_bmc_aux_powercycle(&self) -> bool {
         self.redfish.is_some()
     }
 
     /// Power-cycles the switch host (NVOS) through the BMC using the Redfish
-    /// `ComputerSystem.Reset` action.  This is used as a fallback when the
-    /// switch host is unreachable via the NVOS API and a hard reset is needed
-    /// to recover it.
+    /// `ComputerSystem.Reset` action when the switch host is unreachable via NVOS.
     ///
     /// Requires that a BMC Redfish endpoint is configured for this node.
     async fn bmc_aux_powercycle(&self) -> Result<()> {
@@ -672,12 +752,23 @@ impl SwitchGb200Nvidia {
             expected_inventory: None,
             nvue: Some(nvue),
             redfish: None,
+            nvue_capabilities: tokio::sync::OnceCell::new(),
             op_lock: tokio::sync::Mutex::new(()),
+            #[cfg(test)]
+            factory_default_probe_for_test: None,
             #[cfg(test)]
             ssh_exec_for_test: None,
             #[cfg(test)]
+            scp_upload_for_test: None,
+            #[cfg(test)]
             ssh_password_recovery_for_test: None,
         }
+    }
+
+    /// Select the switch-specific policy while retaining mock transports.
+    pub(crate) fn with_node_type_for_test(mut self, node_type: NodeType) -> Self {
+        self.node_type = node_type;
+        self
     }
 
     /// Replace test host credentials and rebuild the embedded NVUE mock client.
@@ -748,11 +839,25 @@ impl SwitchGb200Nvidia {
         self
     }
 
+    pub(super) fn without_host_endpoint_for_test(mut self) -> Self {
+        self.host_endpoint = None;
+        self.nvue = None;
+        self
+    }
+
     pub fn with_ssh_exec_for_test(
         mut self,
         exec: impl Fn(&str) -> Result<String> + Send + Sync + 'static,
     ) -> Self {
         self.ssh_exec_for_test = Some(Arc::new(exec));
+        self
+    }
+
+    pub fn with_scp_upload_for_test(
+        mut self,
+        upload: impl Fn(&str, &str) -> Result<()> + Send + Sync + 'static,
+    ) -> Self {
+        self.scp_upload_for_test = Some(Arc::new(upload));
         self
     }
 

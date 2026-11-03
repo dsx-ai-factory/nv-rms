@@ -1,0 +1,2279 @@
+{
+  "/redfish/v1/": {
+    "@odata.id": "/redfish/v1/",
+    "@odata.type": "#ServiceRoot.v1_17_0.ServiceRoot",
+    "Chassis": {
+      "@odata.id": "/redfish/v1/Chassis"
+    },
+    "Description": "The service root for all Redfish requests on this host",
+    "Id": "RootService",
+    "Managers": {
+      "@odata.id": "/redfish/v1/Managers"
+    },
+    "Name": "Root Service",
+    "Oem": {
+      "Ami": {
+        "@odata.type": "#AMIServiceRoot.v1_0_0.AMIServiceRoot",
+        "Configurations": {
+          "@odata.id": "/redfish/v1/Oem/Ami/Configurations"
+        },
+        "InventoryDataStatus": {
+          "@odata.id": "/redfish/v1/Oem/Ami/InventoryData/Status"
+        },
+        "MappingOut": {
+          "@odata.id": "/redfish/v1/Oem/Ami/MappingOut"
+        },
+        "RtpVersion": "13.09.1"
+      }
+    },
+    "Systems": {
+      "@odata.id": "/redfish/v1/Systems"
+    },
+    "UpdateService": {
+      "@odata.id": "/redfish/v1/UpdateService"
+    },
+    "Vendor": "AMI"
+  },
+  "/redfish/v1/Systems": {
+    "@odata.id": "/redfish/v1/Systems",
+    "@odata.type": "#ComputerSystemCollection.ComputerSystemCollection",
+    "Description": "Collection of Computer Systems",
+    "Members": [
+      {
+        "@odata.id": "/redfish/v1/Systems/HGX_Baseboard_0"
+      },
+      {
+        "@odata.id": "/redfish/v1/Systems/System_0"
+      }
+    ],
+    "Members@odata.count": 2,
+    "Name": "Systems Collection"
+  },
+  "/redfish/v1/Managers": {
+    "@odata.id": "/redfish/v1/Managers",
+    "@odata.type": "#ManagerCollection.ManagerCollection",
+    "Description": "The collection for Managers",
+    "Members": [
+      {
+        "@odata.id": "/redfish/v1/Managers/BMC_0"
+      },
+      {
+        "@odata.id": "/redfish/v1/Managers/HGX_BMC_0"
+      }
+    ],
+    "Members@odata.count": 2,
+    "Name": "Manager Collection"
+  },
+  "/redfish/v1/Chassis": {
+    "@odata.id": "/redfish/v1/Chassis",
+    "@odata.type": "#ChassisCollection.ChassisCollection",
+    "Description": "The Collection for Chassis",
+    "Members": [
+      {
+        "@odata.id": "/redfish/v1/Chassis/Chassis_0"
+      },
+      {
+        "@odata.id": "/redfish/v1/Chassis/HGX_BMC_0"
+      },
+      {
+        "@odata.id": "/redfish/v1/Chassis/HGX_CPLD_0"
+      },
+      {
+        "@odata.id": "/redfish/v1/Chassis/HGX_CPU_0"
+      },
+      {
+        "@odata.id": "/redfish/v1/Chassis/HGX_CPU_1"
+      },
+      {
+        "@odata.id": "/redfish/v1/Chassis/HGX_Chassis_0"
+      },
+      {
+        "@odata.id": "/redfish/v1/Chassis/HGX_ERoT_BMC_0"
+      },
+      {
+        "@odata.id": "/redfish/v1/Chassis/HGX_ERoT_CPU_0"
+      },
+      {
+        "@odata.id": "/redfish/v1/Chassis/HGX_ERoT_CPU_1"
+      },
+      {
+        "@odata.id": "/redfish/v1/Chassis/HGX_ERoT_FPGA_0"
+      },
+      {
+        "@odata.id": "/redfish/v1/Chassis/HGX_ERoT_FPGA_1"
+      },
+      {
+        "@odata.id": "/redfish/v1/Chassis/HGX_FPGA_0"
+      },
+      {
+        "@odata.id": "/redfish/v1/Chassis/HGX_FPGA_1"
+      },
+      {
+        "@odata.id": "/redfish/v1/Chassis/HGX_GPU_0"
+      },
+      {
+        "@odata.id": "/redfish/v1/Chassis/HGX_GPU_1"
+      },
+      {
+        "@odata.id": "/redfish/v1/Chassis/HGX_GPU_2"
+      },
+      {
+        "@odata.id": "/redfish/v1/Chassis/HGX_GPU_3"
+      },
+      {
+        "@odata.id": "/redfish/v1/Chassis/HGX_IRoT_GPU_0"
+      },
+      {
+        "@odata.id": "/redfish/v1/Chassis/HGX_IRoT_GPU_1"
+      },
+      {
+        "@odata.id": "/redfish/v1/Chassis/HGX_IRoT_GPU_2"
+      },
+      {
+        "@odata.id": "/redfish/v1/Chassis/HGX_IRoT_GPU_3"
+      },
+      {
+        "@odata.id": "/redfish/v1/Chassis/HGX_ProcessorModule_0"
+      },
+      {
+        "@odata.id": "/redfish/v1/Chassis/HGX_ProcessorModule_1"
+      },
+      {
+        "@odata.id": "/redfish/v1/Chassis/IO_board_0"
+      },
+      {
+        "@odata.id": "/redfish/v1/Chassis/IO_board_1"
+      },
+      {
+        "@odata.id": "/redfish/v1/Chassis/Riser_Slot1_BlueField_3_SmartNIC_Main_Card"
+      },
+      {
+        "@odata.id": "/redfish/v1/Chassis/Riser_Slot2_BlueField_3_SmartNIC_Main_Card"
+      }
+    ],
+    "Members@odata.count": 27,
+    "Name": "Chassis Collection"
+  },
+  "/redfish/v1/UpdateService": {
+    "@odata.id": "/redfish/v1/UpdateService",
+    "@odata.type": "#UpdateService.v1_15_0.UpdateService",
+    "Actions": {
+      "#UpdateService.SimpleUpdate": {
+        "@Redfish.ActionInfo": "/redfish/v1/UpdateService/SimpleUpdateActionInfo",
+        "target": "/redfish/v1/UpdateService/Actions/SimpleUpdate"
+      },
+      "Oem": {
+        "#AMIUpdateService.UploadCABundle": {
+          "@Redfish.ActionInfo": "/redfish/v1/UpdateService/UploadCABundleActionInfo",
+          "target": "/redfish/v1/UpdateService/Actions/Oem/UpdateService.UploadCABundle"
+        }
+      }
+    },
+    "Description": "Redfish Update Service",
+    "FirmwareInventory": {
+      "@odata.id": "/redfish/v1/UpdateService/FirmwareInventory"
+    },
+    "HttpPushUriOptions": {
+      "ForceUpdate": false
+    },
+    "Id": "UpdateService",
+    "MultipartHttpPushUri": "/redfish/v1/UpdateService/upload",
+    "Name": "Update Service",
+    "Oem": {
+      "AMIUpdateService": {
+        "@odata.type": "#AMIUpdateService.v1_0_0.AMIUpdateService",
+        "FlashPercentage": null,
+        "PreserveConfiguration": {
+          "Authentication": false,
+          "EXTLOG": false,
+          "FRU": false,
+          "IPMI": false,
+          "KVM": false,
+          "NTP": false,
+          "Network": false,
+          "REDFISH": false,
+          "SDR": false,
+          "SEL": false,
+          "SNMP": false,
+          "SSH": false,
+          "Syslog": false,
+          "WEB": false
+        },
+        "UpdateStatus": null,
+        "UpdateTarget": null
+      },
+      "BMC": {
+        "@odata.type": "#AMIUpdateService.v1_0_0.BMC"
+      }
+    },
+    "Status": {
+      "Health": "OK",
+      "State": "Enabled"
+    },
+    "ServiceEnabled": true
+  },
+  "/redfish/v1/UpdateService/FirmwareInventory": {
+    "@odata.id": "/redfish/v1/UpdateService/FirmwareInventory",
+    "@odata.type": "#SoftwareInventoryCollection.SoftwareInventoryCollection",
+    "Description": "Collection of Firmware Inventory resources available to the UpdateService",
+    "Members": [
+      {
+        "@odata.id": "/redfish/v1/UpdateService/FirmwareInventory/BMC"
+      },
+      {
+        "@odata.id": "/redfish/v1/UpdateService/FirmwareInventory/HGX_FW_BMC_0"
+      },
+      {
+        "@odata.id": "/redfish/v1/UpdateService/FirmwareInventory/HGX_FW_CPLD_0"
+      },
+      {
+        "@odata.id": "/redfish/v1/UpdateService/FirmwareInventory/HGX_FW_CPU_0"
+      },
+      {
+        "@odata.id": "/redfish/v1/UpdateService/FirmwareInventory/HGX_FW_CPU_1"
+      },
+      {
+        "@odata.id": "/redfish/v1/UpdateService/FirmwareInventory/HGX_FW_ERoT_BMC_0"
+      },
+      {
+        "@odata.id": "/redfish/v1/UpdateService/FirmwareInventory/HGX_FW_ERoT_CPU_0"
+      },
+      {
+        "@odata.id": "/redfish/v1/UpdateService/FirmwareInventory/HGX_FW_ERoT_CPU_1"
+      },
+      {
+        "@odata.id": "/redfish/v1/UpdateService/FirmwareInventory/HGX_FW_ERoT_FPGA_0"
+      },
+      {
+        "@odata.id": "/redfish/v1/UpdateService/FirmwareInventory/HGX_FW_ERoT_FPGA_1"
+      },
+      {
+        "@odata.id": "/redfish/v1/UpdateService/FirmwareInventory/HGX_FW_FPGA_0"
+      },
+      {
+        "@odata.id": "/redfish/v1/UpdateService/FirmwareInventory/HGX_FW_FPGA_1"
+      },
+      {
+        "@odata.id": "/redfish/v1/UpdateService/FirmwareInventory/HGX_FW_GPU_0"
+      },
+      {
+        "@odata.id": "/redfish/v1/UpdateService/FirmwareInventory/HGX_FW_GPU_1"
+      },
+      {
+        "@odata.id": "/redfish/v1/UpdateService/FirmwareInventory/HGX_FW_GPU_2"
+      },
+      {
+        "@odata.id": "/redfish/v1/UpdateService/FirmwareInventory/HGX_FW_GPU_3"
+      },
+      {
+        "@odata.id": "/redfish/v1/UpdateService/FirmwareInventory/HGX_InfoROM_GPU_0"
+      },
+      {
+        "@odata.id": "/redfish/v1/UpdateService/FirmwareInventory/HGX_InfoROM_GPU_1"
+      },
+      {
+        "@odata.id": "/redfish/v1/UpdateService/FirmwareInventory/HGX_InfoROM_GPU_2"
+      },
+      {
+        "@odata.id": "/redfish/v1/UpdateService/FirmwareInventory/HGX_InfoROM_GPU_3"
+      },
+      {
+        "@odata.id": "/redfish/v1/UpdateService/FirmwareInventory/HGX_PCIeSwitchConfig_0"
+      },
+      {
+        "@odata.id": "/redfish/v1/UpdateService/FirmwareInventory/StorageUnit_1"
+      },
+      {
+        "@odata.id": "/redfish/v1/UpdateService/FirmwareInventory/StorageUnit_2"
+      },
+      {
+        "@odata.id": "/redfish/v1/UpdateService/FirmwareInventory/StorageUnit_3"
+      },
+      {
+        "@odata.id": "/redfish/v1/UpdateService/FirmwareInventory/StorageUnit_4"
+      },
+      {
+        "@odata.id": "/redfish/v1/UpdateService/FirmwareInventory/StorageUnit_5"
+      },
+      {
+        "@odata.id": "/redfish/v1/UpdateService/FirmwareInventory/StorageUnit_6"
+      },
+      {
+        "@odata.id": "/redfish/v1/UpdateService/FirmwareInventory/StorageUnit_7"
+      },
+      {
+        "@odata.id": "/redfish/v1/UpdateService/FirmwareInventory/StorageUnit_8"
+      }
+    ],
+    "Members@odata.count": 29,
+    "Name": "Firmware Inventory Collection"
+  },
+  "/redfish/v1/Systems/HGX_Baseboard_0": {
+    "@odata.id": "/redfish/v1/Systems/HGX_Baseboard_0",
+    "@odata.type": "#ComputerSystem.v1_22_0.ComputerSystem",
+    "Description": "Computer System",
+    "Id": "HGX_Baseboard_0",
+    "Manufacturer": "NVIDIA",
+    "Model": "GB200 NVL",
+    "Name": "HGX_Baseboard_0",
+    "Oem": {
+      "Nvidia": {
+        "@odata.type": "#NvidiaComputerSystem.v1_2_0.NvidiaComputerSystem",
+        "CPUDebugToken": "[REDACTED]",
+        "ISTModeEnabled": false,
+        "ProcessorDebugCapabilities": {
+          "DeviceDebug": "Offline",
+          "InvasiveDebug": "Offline",
+          "JtagDebug": "Offline",
+          "NonInvasiveDebug": "Offline",
+          "SecurePrivilegeInvasiveDebug": "Offline",
+          "SecurePrivilegeNonInvasiveDebug": "Offline",
+          "Timeout": 30
+        }
+      }
+    },
+    "PowerState": "On",
+    "Status": {
+      "Conditions": [],
+      "Health": "OK",
+      "HealthRollup": "OK",
+      "State": "Enabled"
+    }
+  },
+  "/redfish/v1/Systems/System_0": {
+    "@odata.id": "/redfish/v1/Systems/System_0",
+    "@odata.type": "#ComputerSystem.v1_23_1.ComputerSystem",
+    "Actions": {
+      "#ComputerSystem.Reset": {
+        "@Redfish.ActionInfo": "/redfish/v1/Systems/System_0/ResetActionInfo",
+        "@Redfish.OperationApplyTimeSupport": {
+          "@odata.type": "#Settings.v1_4_0.OperationApplyTimeSupport",
+          "MaintenanceWindowDurationInSeconds": 600,
+          "MaintenanceWindowResource": {
+            "@odata.id": "/redfish/v1/Systems/System_0"
+          },
+          "SupportedValues": [
+            "Immediate",
+            "AtMaintenanceWindowStart"
+          ]
+        },
+        "target": "/redfish/v1/Systems/System_0/Actions/ComputerSystem.Reset"
+      }
+    },
+    "BiosVersion": "2.16",
+    "Description": "System Self",
+    "Id": "System_0",
+    "Manufacturer": "Dell Inc.",
+    "Model": "Dell Server 9712a",
+    "Name": "System",
+    "Oem": {
+      "Ami": {
+        "@odata.type": "#AMIBIOSInventoryCRC.v1_0_0.AMIBIOSInventoryCRC",
+        "Bios": {
+          "Inventory": {
+            "Crc": {
+              "@odata.id": "/redfish/v1/Systems/System_0/Oem/Ami/Inventory/Crc",
+              "GroupCrcList": [
+                {
+                  "PCIE": 3401224996
+                },
+                {
+                  "DIMM": 463452647
+                },
+                {
+                  "CERTIFICATE": 3147949049
+                },
+                {
+                  "BIOSATTRIBUTES": 1135031367
+                },
+                {
+                  "SECUREBOOT": 4265448904
+                },
+                {
+                  "CPU": 4235926451
+                }
+              ]
+            }
+          },
+          "RedfishVersion": "1.21.1",
+          "RtpVersion": "RB_1.0.21"
+        },
+        "ManagerBootConfiguration": {
+          "ManagerBootMode": "None",
+          "ManagerBootMode@Redfish.AllowableValues": [
+            "None",
+            "SoftReset",
+            "ResetTimeout"
+          ]
+        }
+      }
+    },
+    "PowerState": "On",
+    "Status": {
+      "Health": "OK",
+      "HealthRollup": "OK",
+      "State": "Enabled"
+    }
+  },
+  "/redfish/v1/Managers/BMC_0": {
+    "@odata.id": "/redfish/v1/Managers/BMC_0",
+    "@odata.type": "#Manager.v1_20_0.Manager",
+    "Actions": {
+      "#Manager.Reset": {
+        "@Redfish.ActionInfo": "/redfish/v1/Managers/BMC_0/ResetActionInfo",
+        "@Redfish.OperationApplyTimeSupport": {
+          "@odata.type": "#Settings.v1_4_0.OperationApplyTimeSupport",
+          "MaintenanceWindowDurationInSeconds": 600,
+          "MaintenanceWindowResource": {
+            "@odata.id": "/redfish/v1/Managers/BMC_0"
+          },
+          "SupportedValues": [
+            "Immediate",
+            "AtMaintenanceWindowStart"
+          ]
+        },
+        "target": "/redfish/v1/Managers/BMC_0/Actions/Manager.Reset"
+      },
+      "#Manager.ResetToDefaults": {
+        "@Redfish.ActionInfo": "/redfish/v1/Managers/BMC_0/ResetToDefaultsActionInfo",
+        "target": "/redfish/v1/Managers/BMC_0/Actions/Manager.ResetToDefaults"
+      },
+      "Oem": {
+        "#AMIManager.BackupConfig": {
+          "@Redfish.ActionInfo": "/redfish/v1/Managers/BMC_0/Oem/BackupConfigActionInfo",
+          "target": "/redfish/v1/Managers/BMC_0/Actions/Oem/AMIManager.BackupConfig"
+        },
+        "#AMIManager.RestoreConfig": {
+          "@Redfish.ActionInfo": "/redfish/v1/Managers/BMC_0/Oem/RestoreConfigActionInfo",
+          "target": "/redfish/v1/Managers/BMC_0/Actions/Oem/AMIManager.RestoreConfig"
+        },
+        "#AMIVirtualMedia.ConfigureCDInstance": {
+          "@Redfish.ActionInfo": "/redfish/v1/Managers/BMC_0/Oem/ConfigureCDInstanceActionInfo",
+          "target": "/redfish/v1/Managers/BMC_0/Actions/Oem/AMIVirtualMedia.ConfigureCDInstance"
+        },
+        "#AMIVirtualMedia.EnableRMedia": {
+          "@Redfish.ActionInfo": "/redfish/v1/Managers/BMC_0/Oem/EnableRMediaActionInfo",
+          "target": "/redfish/v1/Managers/BMC_0/Actions/Oem/AMIVirtualMedia.EnableRMedia"
+        },
+        "#PcieSwitch.FwUpdateEnable": {
+          "@Redfish.ActionInfo": "/redfish/v1/Managers/BMC_0/Oem/Dell/PcieSwitch.FwUpdateEnableActionInfo",
+          "target": "/redfish/v1/Managers/BMC_0/Actions/Oem/Dell/PcieSwitch.FwUpdateEnable"
+        }
+      }
+    },
+    "Description": "BMC",
+    "FirmwareVersion": "25.07.29001500",
+    "Id": "BMC_0",
+    "Model": "5145703",
+    "Name": "Manager",
+    "Oem": {
+      "Ami": {
+        "@odata.type": "#AMIManager.v1_0_0.AMIManager",
+        "ManagerServiceInfo": {
+          "CommandShellServiceInfo": {
+            "IPMI": {
+              "MaxConcurrentSessions": 36
+            },
+            "SSH": {
+              "MaxConcurrentSessions": 5
+            }
+          },
+          "Links": {
+            "NetworkProtocol": {
+              "@odata.id": "/redfish/v1/Managers/BMC_0/NetworkProtocol"
+            }
+          }
+        },
+        "VirtualMedia": {
+          "CDInstances": 4,
+          "HDInstances": 4,
+          "RMediaStatus": "Disabled",
+          "RemoteKVMCDInstances": 4,
+          "RemoteKVMHDInstances": 4
+        }
+      },
+      "Dell": {
+        "PcieSwitch.FwUpdateEnable": true
+      }
+    },
+    "PowerState": "On",
+    "Status": {
+      "Health": "OK",
+      "State": "Enabled"
+    }
+  },
+  "/redfish/v1/Managers/HGX_BMC_0": {
+    "@odata.id": "/redfish/v1/Managers/HGX_BMC_0",
+    "@odata.type": "#Manager.v1_15_0.Manager",
+    "Actions": {
+      "#Manager.Reset": {
+        "@Redfish.ActionInfo": "/redfish/v1/Managers/HGX_BMC_0/ResetActionInfo",
+        "target": "/redfish/v1/Managers/HGX_BMC_0/Actions/Manager.Reset"
+      },
+      "#Manager.ResetToDefaults": {
+        "ResetType@Redfish.AllowableValues": [
+          "ResetAll"
+        ],
+        "target": "/redfish/v1/Managers/HGX_BMC_0/Actions/Manager.ResetToDefaults"
+      },
+      "Oem": {
+        "#NvidiaManager.NSMRawCommand": {
+          "@Redfish.ActionInfo": "/redfish/v1/Managers/HGX_BMC_0/Oem/Nvidia/NSMRawCommandActionInfo",
+          "target": "/redfish/v1/Managers/HGX_BMC_0/Actions/Oem/NvidiaManager.NSMRawCommand"
+        },
+        "#NvidiaManager.ResetToDefaults": {
+          "target": "/redfish/v1/Managers/HGX_BMC_0/Actions/Oem/NvidiaManager.ResetToDefaults"
+        },
+        "#NvidiaManager.SWErrorInjection": {
+          "@Redfish.ActionInfo": "/redfish/v1/Managers/HGX_BMC_0/Oem/Nvidia/SWErrorInjectionActionInfo",
+          "target": "/redfish/v1/Managers/HGX_BMC_0/Actions/Oem/NvidiaManager.SWErrorInjection"
+        },
+        "#eMMC.SecureErase": {
+          "@Redfish.ActionInfo": "/redfish/v1/Managers/HGX_BMC_0/Oem/EmmcSecureEraseActionInfo",
+          "target": "/redfish/v1/Managers/HGX_BMC_0/Actions/Oem/eMMC.SecureErase"
+        }
+      }
+    },
+    "Description": "Baseboard Management Controller",
+    "FirmwareVersion": "GB200Nvl-25.06-A",
+    "Id": "HGX_BMC_0",
+    "Model": "OpenBmc",
+    "Name": "OpenBmc Manager",
+    "Oem": {
+      "Nvidia": {
+        "@odata.type": "#NvidiaManager.v1_6_0.NvidiaManager",
+        "AuthenticationTLSRequired": false,
+        "DebugTokenManagement": "[REDACTED]",
+        "FirmwareBuildType": "PlatformProduction",
+        "OTPProvisioned": true,
+        "PersistentStorageSettings": {
+          "Status": {
+            "State": "Enabled"
+          }
+        },
+        "UptimeSeconds": 8613488.59
+      }
+    },
+    "PowerState": "On",
+    "Status": {
+      "Conditions": [],
+      "Health": "OK",
+      "HealthRollup": "OK",
+      "State": "Enabled"
+    }
+  },
+  "/redfish/v1/Chassis/Chassis_0": {
+    "@odata.id": "/redfish/v1/Chassis/Chassis_0",
+    "@odata.type": "#Chassis.v1_26_0.Chassis",
+    "Actions": {
+      "#Chassis.Reset": {
+        "@Redfish.ActionInfo": "/redfish/v1/Chassis/Chassis_0/ResetActionInfo",
+        "@Redfish.OperationApplyTimeSupport": {
+          "@odata.type": "#Settings.v1_4_0.OperationApplyTimeSupport",
+          "MaintenanceWindowDurationInSeconds": 600,
+          "MaintenanceWindowResource": {
+            "@odata.id": "/redfish/v1/Chassis/Chassis_0"
+          },
+          "SupportedValues": [
+            "Immediate",
+            "AtMaintenanceWindowStart"
+          ]
+        },
+        "target": "/redfish/v1/Chassis/Chassis_0/Actions/Chassis.Reset"
+      },
+      "Oem": {
+        "#NvidiaChassis.AuxPowerReset": {
+          "@Redfish.ActionInfo": "/redfish/v1/Chassis/Chassis_0/Oem/Nvidia/AuxPowerResetActionInfo",
+          "target": "/redfish/v1/Chassis/Chassis_0/Actions/Oem/NvidiaChassis.AuxPowerReset"
+        }
+      }
+    },
+    "Description": "Chassis Self",
+    "Id": "Chassis_0",
+    "Manufacturer": "Dell Inc.",
+    "Model": "Dell 9712a",
+    "Name": "Computer System Chassis",
+    "Oem": {
+      "Nvidia": {
+        "@odata.type": "#NvidiaChassis.v1_0_0.NvidiaChassis",
+        "LeakDetectionPolicy": {
+          "@odata.id": "/redfish/v1/Chassis/Chassis_0/Oem/Nvidia/Policies/LeakDetectionPolicy"
+        }
+      }
+    },
+    "PowerState": "On",
+    "Status": {
+      "Health": "OK",
+      "HealthRollup": "OK",
+      "State": "Enabled"
+    }
+  },
+  "/redfish/v1/Chassis/HGX_BMC_0": {
+    "@odata.id": "/redfish/v1/Chassis/HGX_BMC_0",
+    "@odata.type": "#Chassis.v1_22_0.Chassis",
+    "Id": "HGX_BMC_0",
+    "Manufacturer": "NVIDIA",
+    "Model": "GB200 NVL",
+    "Name": "HGX_BMC_0",
+    "Oem": {
+      "Nvidia": {
+        "@odata.type": "#NvidiaChassis.v1_6_0.NvidiaChassis"
+      }
+    },
+    "PowerState": "On",
+    "Status": {
+      "Conditions": [],
+      "Health": "OK",
+      "HealthRollup": "OK",
+      "State": "Enabled"
+    }
+  },
+  "/redfish/v1/Chassis/HGX_CPLD_0": {
+    "@odata.id": "/redfish/v1/Chassis/HGX_CPLD_0",
+    "@odata.type": "#Chassis.v1_22_0.Chassis",
+    "Id": "HGX_CPLD_0",
+    "Manufacturer": "Intel",
+    "Model": "MAX10 10M08",
+    "Name": "HGX_CPLD_0",
+    "Oem": {
+      "Nvidia": {
+        "@odata.type": "#NvidiaChassis.v1_6_0.NvidiaChassis"
+      }
+    },
+    "PowerState": "On",
+    "Status": {
+      "Conditions": [],
+      "Health": "OK",
+      "HealthRollup": "OK",
+      "State": "Enabled"
+    }
+  },
+  "/redfish/v1/Chassis/HGX_CPU_0": {
+    "@odata.id": "/redfish/v1/Chassis/HGX_CPU_0",
+    "@odata.type": "#Chassis.v1_22_0.Chassis",
+    "Id": "HGX_CPU_0",
+    "Manufacturer": "NVIDIA",
+    "Model": "Grace A02P",
+    "Name": "HGX_CPU_0",
+    "Oem": {
+      "Nvidia": {
+        "@odata.type": "#NvidiaChassis.v1_6_0.NvidiaChassis"
+      }
+    },
+    "PowerState": "On",
+    "Status": {
+      "Conditions": [],
+      "Health": "OK",
+      "HealthRollup": "OK",
+      "State": "Enabled"
+    }
+  },
+  "/redfish/v1/Chassis/HGX_CPU_1": {
+    "@odata.id": "/redfish/v1/Chassis/HGX_CPU_1",
+    "@odata.type": "#Chassis.v1_22_0.Chassis",
+    "Id": "HGX_CPU_1",
+    "Manufacturer": "NVIDIA",
+    "Model": "Grace A02P",
+    "Name": "HGX_CPU_1",
+    "Oem": {
+      "Nvidia": {
+        "@odata.type": "#NvidiaChassis.v1_6_0.NvidiaChassis"
+      }
+    },
+    "PowerState": "On",
+    "Status": {
+      "Conditions": [],
+      "Health": "OK",
+      "HealthRollup": "OK",
+      "State": "Enabled"
+    }
+  },
+  "/redfish/v1/Chassis/HGX_Chassis_0": {
+    "@odata.id": "/redfish/v1/Chassis/HGX_Chassis_0",
+    "@odata.type": "#Chassis.v1_22_0.Chassis",
+    "Id": "HGX_Chassis_0",
+    "Manufacturer": "NVIDIA",
+    "Model": "GB200 NVL",
+    "Name": "HGX_Chassis_0",
+    "Oem": {
+      "Nvidia": {
+        "@odata.type": "#NvidiaChassis.v1_6_0.NvidiaChassis",
+        "StaticPowerHint": {
+          "CpuClockFrequencyHz": {
+            "AllowableMax": 3000000000,
+            "AllowableMin": 1000000000,
+            "SetPoint": 0
+          },
+          "PowerEstimationWatts": {
+            "Reading": 0,
+            "State": "Invalid"
+          },
+          "TemperatureCelsius": {
+            "AllowableMax": 85,
+            "AllowableMin": 0,
+            "SetPoint": 0
+          },
+          "WorkloadFactor": {
+            "AllowableMax": 1,
+            "AllowableMin": 0,
+            "SetPoint": 0
+          }
+        }
+      }
+    },
+    "PowerState": "On",
+    "Status": {
+      "Conditions": [],
+      "Health": "OK",
+      "HealthRollup": "OK",
+      "State": "Enabled"
+    }
+  },
+  "/redfish/v1/Chassis/HGX_ERoT_BMC_0": {
+    "@odata.id": "/redfish/v1/Chassis/HGX_ERoT_BMC_0",
+    "@odata.type": "#Chassis.v1_22_0.Chassis",
+    "Actions": {
+      "Oem": {
+        "#NvidiaRoTChassis.SetIrreversibleConfig": {
+          "@Redfish.ActionInfo": "/redfish/v1/Chassis/HGX_ERoT_BMC_0/Oem/NvidiaRoT/SetIrreversibleConfigActionInfo",
+          "target": "/redfish/v1/Chassis/HGX_ERoT_BMC_0/Actions/Oem/NvidiaRoTChassis.SetIrreversibleConfig"
+        }
+      }
+    },
+    "Id": "HGX_ERoT_BMC_0",
+    "Manufacturer": "NVIDIA",
+    "Name": "HGX_ERoT_BMC_0",
+    "Oem": {
+      "Nvidia": {
+        "@odata.type": "#NvidiaChassis.v1_3_0.NvidiaRoTChassis",
+        "AutomaticBackgroundCopyEnabled": true,
+        "BackgroundCopyStatus": "Completed",
+        "IrreversibleConfigEnabled": false,
+        "RoTProtectedComponents": {
+          "@odata.id": "/redfish/v1/Chassis/HGX_ERoT_BMC_0/Oem/NvidiaRoT/RoTProtectedComponents"
+        }
+      }
+    },
+    "Status": {
+      "Conditions": [],
+      "Health": "OK",
+      "HealthRollup": "OK",
+      "State": "Enabled"
+    }
+  },
+  "/redfish/v1/Chassis/HGX_ERoT_CPU_0": {
+    "@odata.id": "/redfish/v1/Chassis/HGX_ERoT_CPU_0",
+    "@odata.type": "#Chassis.v1_22_0.Chassis",
+    "Actions": {
+      "Oem": {
+        "#CAKInstall": {
+          "target": "/redfish/v1/Chassis/HGX_ERoT_CPU_0/Actions/Oem/CAKInstall"
+        },
+        "#CAKLock": {
+          "target": "/redfish/v1/Chassis/HGX_ERoT_CPU_0/Actions/Oem/CAKLock"
+        },
+        "#CAKTest": {
+          "target": "/redfish/v1/Chassis/HGX_ERoT_CPU_0/Actions/Oem/CAKTest"
+        },
+        "#DOTDisable": {
+          "target": "/redfish/v1/Chassis/HGX_ERoT_CPU_0/Actions/Oem/DOTDisable"
+        },
+        "#DOTTokenInstall": "[REDACTED]",
+        "#NvidiaChassis.BootProtectedDevice": {
+          "target": "/redfish/v1/Chassis/HGX_ERoT_CPU_0/Actions/Oem/NvidiaChassis.BootProtectedDevice"
+        },
+        "#NvidiaRoTChassis.SetIrreversibleConfig": {
+          "@Redfish.ActionInfo": "/redfish/v1/Chassis/HGX_ERoT_CPU_0/Oem/NvidiaRoT/SetIrreversibleConfigActionInfo",
+          "target": "/redfish/v1/Chassis/HGX_ERoT_CPU_0/Actions/Oem/NvidiaRoTChassis.SetIrreversibleConfig"
+        }
+      }
+    },
+    "Id": "HGX_ERoT_CPU_0",
+    "Manufacturer": "NVIDIA",
+    "Name": "HGX_ERoT_CPU_0",
+    "Oem": {
+      "Nvidia": {
+        "@odata.type": "#NvidiaChassis.v1_5_0.NvidiaRoTChassis",
+        "AutomaticBackgroundCopyEnabled": true,
+        "BackgroundCopyStatus": "Completed",
+        "IrreversibleConfigEnabled": false,
+        "ManualBootModeEnabled": false,
+        "RoTProtectedComponents": {
+          "@odata.id": "/redfish/v1/Chassis/HGX_ERoT_CPU_0/Oem/NvidiaRoT/RoTProtectedComponents"
+        }
+      }
+    },
+    "Status": {
+      "Conditions": [],
+      "Health": "OK",
+      "HealthRollup": "OK",
+      "State": "Enabled"
+    }
+  },
+  "/redfish/v1/Chassis/HGX_ERoT_CPU_1": {
+    "@odata.id": "/redfish/v1/Chassis/HGX_ERoT_CPU_1",
+    "@odata.type": "#Chassis.v1_22_0.Chassis",
+    "Actions": {
+      "Oem": {
+        "#CAKInstall": {
+          "target": "/redfish/v1/Chassis/HGX_ERoT_CPU_1/Actions/Oem/CAKInstall"
+        },
+        "#CAKLock": {
+          "target": "/redfish/v1/Chassis/HGX_ERoT_CPU_1/Actions/Oem/CAKLock"
+        },
+        "#CAKTest": {
+          "target": "/redfish/v1/Chassis/HGX_ERoT_CPU_1/Actions/Oem/CAKTest"
+        },
+        "#DOTDisable": {
+          "target": "/redfish/v1/Chassis/HGX_ERoT_CPU_1/Actions/Oem/DOTDisable"
+        },
+        "#DOTTokenInstall": "[REDACTED]",
+        "#NvidiaChassis.BootProtectedDevice": {
+          "target": "/redfish/v1/Chassis/HGX_ERoT_CPU_1/Actions/Oem/NvidiaChassis.BootProtectedDevice"
+        },
+        "#NvidiaRoTChassis.SetIrreversibleConfig": {
+          "@Redfish.ActionInfo": "/redfish/v1/Chassis/HGX_ERoT_CPU_1/Oem/NvidiaRoT/SetIrreversibleConfigActionInfo",
+          "target": "/redfish/v1/Chassis/HGX_ERoT_CPU_1/Actions/Oem/NvidiaRoTChassis.SetIrreversibleConfig"
+        }
+      }
+    },
+    "Id": "HGX_ERoT_CPU_1",
+    "Manufacturer": "NVIDIA",
+    "Name": "HGX_ERoT_CPU_1",
+    "Oem": {
+      "Nvidia": {
+        "@odata.type": "#NvidiaChassis.v1_5_0.NvidiaRoTChassis",
+        "AutomaticBackgroundCopyEnabled": true,
+        "BackgroundCopyStatus": "Completed",
+        "IrreversibleConfigEnabled": false,
+        "ManualBootModeEnabled": false,
+        "RoTProtectedComponents": {
+          "@odata.id": "/redfish/v1/Chassis/HGX_ERoT_CPU_1/Oem/NvidiaRoT/RoTProtectedComponents"
+        }
+      }
+    },
+    "Status": {
+      "Conditions": [],
+      "Health": "OK",
+      "HealthRollup": "OK",
+      "State": "Enabled"
+    }
+  },
+  "/redfish/v1/Chassis/HGX_ERoT_FPGA_0": {
+    "@odata.id": "/redfish/v1/Chassis/HGX_ERoT_FPGA_0",
+    "@odata.type": "#Chassis.v1_22_0.Chassis",
+    "Actions": {
+      "Oem": {
+        "#NvidiaRoTChassis.SetIrreversibleConfig": {
+          "@Redfish.ActionInfo": "/redfish/v1/Chassis/HGX_ERoT_FPGA_0/Oem/NvidiaRoT/SetIrreversibleConfigActionInfo",
+          "target": "/redfish/v1/Chassis/HGX_ERoT_FPGA_0/Actions/Oem/NvidiaRoTChassis.SetIrreversibleConfig"
+        }
+      }
+    },
+    "Id": "HGX_ERoT_FPGA_0",
+    "Manufacturer": "NVIDIA",
+    "Name": "HGX_ERoT_FPGA_0",
+    "Oem": {
+      "Nvidia": {
+        "@odata.type": "#NvidiaChassis.v1_3_0.NvidiaRoTChassis",
+        "AutomaticBackgroundCopyEnabled": true,
+        "BackgroundCopyStatus": "Completed",
+        "IrreversibleConfigEnabled": false,
+        "RoTProtectedComponents": {
+          "@odata.id": "/redfish/v1/Chassis/HGX_ERoT_FPGA_0/Oem/NvidiaRoT/RoTProtectedComponents"
+        }
+      }
+    },
+    "Status": {
+      "Conditions": [],
+      "Health": "OK",
+      "HealthRollup": "OK",
+      "State": "Enabled"
+    }
+  },
+  "/redfish/v1/Chassis/HGX_ERoT_FPGA_1": {
+    "@odata.id": "/redfish/v1/Chassis/HGX_ERoT_FPGA_1",
+    "@odata.type": "#Chassis.v1_22_0.Chassis",
+    "Actions": {
+      "Oem": {
+        "#NvidiaRoTChassis.SetIrreversibleConfig": {
+          "@Redfish.ActionInfo": "/redfish/v1/Chassis/HGX_ERoT_FPGA_1/Oem/NvidiaRoT/SetIrreversibleConfigActionInfo",
+          "target": "/redfish/v1/Chassis/HGX_ERoT_FPGA_1/Actions/Oem/NvidiaRoTChassis.SetIrreversibleConfig"
+        }
+      }
+    },
+    "Id": "HGX_ERoT_FPGA_1",
+    "Manufacturer": "NVIDIA",
+    "Name": "HGX_ERoT_FPGA_1",
+    "Oem": {
+      "Nvidia": {
+        "@odata.type": "#NvidiaChassis.v1_3_0.NvidiaRoTChassis",
+        "AutomaticBackgroundCopyEnabled": true,
+        "BackgroundCopyStatus": "Completed",
+        "IrreversibleConfigEnabled": false,
+        "RoTProtectedComponents": {
+          "@odata.id": "/redfish/v1/Chassis/HGX_ERoT_FPGA_1/Oem/NvidiaRoT/RoTProtectedComponents"
+        }
+      }
+    },
+    "Status": {
+      "Conditions": [],
+      "Health": "OK",
+      "HealthRollup": "OK",
+      "State": "Enabled"
+    }
+  },
+  "/redfish/v1/Chassis/HGX_FPGA_0": {
+    "@odata.id": "/redfish/v1/Chassis/HGX_FPGA_0",
+    "@odata.type": "#Chassis.v1_22_0.Chassis",
+    "Id": "HGX_FPGA_0",
+    "Manufacturer": "NVIDIA",
+    "Model": "NA",
+    "Name": "HGX_FPGA_0",
+    "Oem": {
+      "Nvidia": {
+        "@odata.type": "#NvidiaChassis.v1_6_0.NvidiaChassis"
+      }
+    },
+    "PowerState": "On",
+    "Status": {
+      "Conditions": [],
+      "Health": "OK",
+      "HealthRollup": "OK",
+      "State": "Enabled"
+    }
+  },
+  "/redfish/v1/Chassis/HGX_FPGA_1": {
+    "@odata.id": "/redfish/v1/Chassis/HGX_FPGA_1",
+    "@odata.type": "#Chassis.v1_22_0.Chassis",
+    "Id": "HGX_FPGA_1",
+    "Manufacturer": "NVIDIA",
+    "Model": "NA",
+    "Name": "HGX_FPGA_1",
+    "Oem": {
+      "Nvidia": {
+        "@odata.type": "#NvidiaChassis.v1_6_0.NvidiaChassis"
+      }
+    },
+    "PowerState": "On",
+    "Status": {
+      "Conditions": [],
+      "Health": "OK",
+      "HealthRollup": "OK",
+      "State": "Enabled"
+    }
+  },
+  "/redfish/v1/Chassis/HGX_GPU_0": {
+    "@odata.id": "/redfish/v1/Chassis/HGX_GPU_0",
+    "@odata.type": "#Chassis.v1_22_0.Chassis",
+    "Id": "HGX_GPU_0",
+    "Manufacturer": "NVIDIA",
+    "Model": "GB200 186GB HBM3e",
+    "Name": "HGX_GPU_0",
+    "Oem": {
+      "Nvidia": {
+        "@odata.type": "#NvidiaChassis.v1_6_0.NvidiaChassis"
+      }
+    },
+    "PowerState": "On",
+    "Status": {
+      "Conditions": [],
+      "Health": "OK",
+      "HealthRollup": "OK",
+      "State": "Enabled"
+    }
+  },
+  "/redfish/v1/Chassis/HGX_GPU_1": {
+    "@odata.id": "/redfish/v1/Chassis/HGX_GPU_1",
+    "@odata.type": "#Chassis.v1_22_0.Chassis",
+    "Id": "HGX_GPU_1",
+    "Manufacturer": "NVIDIA",
+    "Model": "GB200 186GB HBM3e",
+    "Name": "HGX_GPU_1",
+    "Oem": {
+      "Nvidia": {
+        "@odata.type": "#NvidiaChassis.v1_6_0.NvidiaChassis"
+      }
+    },
+    "PowerState": "On",
+    "Status": {
+      "Conditions": [],
+      "Health": "OK",
+      "HealthRollup": "OK",
+      "State": "Enabled"
+    }
+  },
+  "/redfish/v1/Chassis/HGX_GPU_2": {
+    "@odata.id": "/redfish/v1/Chassis/HGX_GPU_2",
+    "@odata.type": "#Chassis.v1_22_0.Chassis",
+    "Id": "HGX_GPU_2",
+    "Manufacturer": "NVIDIA",
+    "Model": "GB200 186GB HBM3e",
+    "Name": "HGX_GPU_2",
+    "Oem": {
+      "Nvidia": {
+        "@odata.type": "#NvidiaChassis.v1_6_0.NvidiaChassis"
+      }
+    },
+    "PowerState": "On",
+    "Status": {
+      "Conditions": [],
+      "Health": "OK",
+      "HealthRollup": "OK",
+      "State": "Enabled"
+    }
+  },
+  "/redfish/v1/Chassis/HGX_GPU_3": {
+    "@odata.id": "/redfish/v1/Chassis/HGX_GPU_3",
+    "@odata.type": "#Chassis.v1_22_0.Chassis",
+    "Id": "HGX_GPU_3",
+    "Manufacturer": "NVIDIA",
+    "Model": "GB200 186GB HBM3e",
+    "Name": "HGX_GPU_3",
+    "Oem": {
+      "Nvidia": {
+        "@odata.type": "#NvidiaChassis.v1_6_0.NvidiaChassis"
+      }
+    },
+    "PowerState": "On",
+    "Status": {
+      "Conditions": [],
+      "Health": "OK",
+      "HealthRollup": "OK",
+      "State": "Enabled"
+    }
+  },
+  "/redfish/v1/Chassis/HGX_IRoT_GPU_0": {
+    "@odata.id": "/redfish/v1/Chassis/HGX_IRoT_GPU_0",
+    "@odata.type": "#Chassis.v1_22_0.Chassis",
+    "Actions": {
+      "Oem": {
+        "#NvidiaRoTChassis.SetIrreversibleConfig": {
+          "@Redfish.ActionInfo": "/redfish/v1/Chassis/HGX_IRoT_GPU_0/Oem/NvidiaRoT/SetIrreversibleConfigActionInfo",
+          "target": "/redfish/v1/Chassis/HGX_IRoT_GPU_0/Actions/Oem/NvidiaRoTChassis.SetIrreversibleConfig"
+        }
+      }
+    },
+    "Id": "HGX_IRoT_GPU_0",
+    "Manufacturer": "NVIDIA",
+    "Name": "HGX_IRoT_GPU_0",
+    "Oem": {
+      "Nvidia": {
+        "@odata.type": "#NvidiaChassis.v1_3_0.NvidiaRoTChassis",
+        "AutomaticBackgroundCopyEnabled": true,
+        "BackgroundCopyStatus": "Completed",
+        "InbandUpdatePolicyEnabled": true,
+        "IrreversibleConfigEnabled": false,
+        "RoTProtectedComponents": {
+          "@odata.id": "/redfish/v1/Chassis/HGX_IRoT_GPU_0/Oem/NvidiaRoT/RoTProtectedComponents"
+        }
+      }
+    },
+    "Status": {
+      "Conditions": [],
+      "Health": "OK",
+      "HealthRollup": "OK",
+      "State": "Enabled"
+    }
+  },
+  "/redfish/v1/Chassis/HGX_IRoT_GPU_1": {
+    "@odata.id": "/redfish/v1/Chassis/HGX_IRoT_GPU_1",
+    "@odata.type": "#Chassis.v1_22_0.Chassis",
+    "Actions": {
+      "Oem": {
+        "#NvidiaRoTChassis.SetIrreversibleConfig": {
+          "@Redfish.ActionInfo": "/redfish/v1/Chassis/HGX_IRoT_GPU_1/Oem/NvidiaRoT/SetIrreversibleConfigActionInfo",
+          "target": "/redfish/v1/Chassis/HGX_IRoT_GPU_1/Actions/Oem/NvidiaRoTChassis.SetIrreversibleConfig"
+        }
+      }
+    },
+    "Id": "HGX_IRoT_GPU_1",
+    "Manufacturer": "NVIDIA",
+    "Name": "HGX_IRoT_GPU_1",
+    "Oem": {
+      "Nvidia": {
+        "@odata.type": "#NvidiaChassis.v1_3_0.NvidiaRoTChassis",
+        "AutomaticBackgroundCopyEnabled": true,
+        "BackgroundCopyStatus": "Completed",
+        "InbandUpdatePolicyEnabled": true,
+        "IrreversibleConfigEnabled": false,
+        "RoTProtectedComponents": {
+          "@odata.id": "/redfish/v1/Chassis/HGX_IRoT_GPU_1/Oem/NvidiaRoT/RoTProtectedComponents"
+        }
+      }
+    },
+    "Status": {
+      "Conditions": [],
+      "Health": "OK",
+      "HealthRollup": "OK",
+      "State": "Enabled"
+    }
+  },
+  "/redfish/v1/Chassis/HGX_IRoT_GPU_2": {
+    "@odata.id": "/redfish/v1/Chassis/HGX_IRoT_GPU_2",
+    "@odata.type": "#Chassis.v1_22_0.Chassis",
+    "Actions": {
+      "Oem": {
+        "#NvidiaRoTChassis.SetIrreversibleConfig": {
+          "@Redfish.ActionInfo": "/redfish/v1/Chassis/HGX_IRoT_GPU_2/Oem/NvidiaRoT/SetIrreversibleConfigActionInfo",
+          "target": "/redfish/v1/Chassis/HGX_IRoT_GPU_2/Actions/Oem/NvidiaRoTChassis.SetIrreversibleConfig"
+        }
+      }
+    },
+    "Id": "HGX_IRoT_GPU_2",
+    "Manufacturer": "NVIDIA",
+    "Name": "HGX_IRoT_GPU_2",
+    "Oem": {
+      "Nvidia": {
+        "@odata.type": "#NvidiaChassis.v1_3_0.NvidiaRoTChassis",
+        "AutomaticBackgroundCopyEnabled": true,
+        "BackgroundCopyStatus": "Completed",
+        "InbandUpdatePolicyEnabled": true,
+        "IrreversibleConfigEnabled": false,
+        "RoTProtectedComponents": {
+          "@odata.id": "/redfish/v1/Chassis/HGX_IRoT_GPU_2/Oem/NvidiaRoT/RoTProtectedComponents"
+        }
+      }
+    },
+    "Status": {
+      "Conditions": [],
+      "Health": "OK",
+      "HealthRollup": "OK",
+      "State": "Enabled"
+    }
+  },
+  "/redfish/v1/Chassis/HGX_IRoT_GPU_3": {
+    "@odata.id": "/redfish/v1/Chassis/HGX_IRoT_GPU_3",
+    "@odata.type": "#Chassis.v1_22_0.Chassis",
+    "Actions": {
+      "Oem": {
+        "#NvidiaRoTChassis.SetIrreversibleConfig": {
+          "@Redfish.ActionInfo": "/redfish/v1/Chassis/HGX_IRoT_GPU_3/Oem/NvidiaRoT/SetIrreversibleConfigActionInfo",
+          "target": "/redfish/v1/Chassis/HGX_IRoT_GPU_3/Actions/Oem/NvidiaRoTChassis.SetIrreversibleConfig"
+        }
+      }
+    },
+    "Id": "HGX_IRoT_GPU_3",
+    "Manufacturer": "NVIDIA",
+    "Name": "HGX_IRoT_GPU_3",
+    "Oem": {
+      "Nvidia": {
+        "@odata.type": "#NvidiaChassis.v1_3_0.NvidiaRoTChassis",
+        "AutomaticBackgroundCopyEnabled": true,
+        "BackgroundCopyStatus": "Completed",
+        "InbandUpdatePolicyEnabled": true,
+        "IrreversibleConfigEnabled": false,
+        "RoTProtectedComponents": {
+          "@odata.id": "/redfish/v1/Chassis/HGX_IRoT_GPU_3/Oem/NvidiaRoT/RoTProtectedComponents"
+        }
+      }
+    },
+    "Status": {
+      "Conditions": [],
+      "Health": "OK",
+      "HealthRollup": "OK",
+      "State": "Enabled"
+    }
+  },
+  "/redfish/v1/Chassis/HGX_ProcessorModule_0": {
+    "@odata.id": "/redfish/v1/Chassis/HGX_ProcessorModule_0",
+    "@odata.type": "#Chassis.v1_22_0.Chassis",
+    "Actions": {
+      "Oem": {
+        "#NvidiaProcessor.VariableSpiErase": {
+          "target": "/redfish/v1/Chassis/HGX_ProcessorModule_0/Actions/Oem/NvidiaProcessor.VariableSpiErase"
+        },
+        "#NvidiaProcessor.VariableSpiRead": {
+          "target": "/redfish/v1/Chassis/HGX_ProcessorModule_0/Actions/Oem/NvidiaProcessor.VariableSpiRead"
+        }
+      }
+    },
+    "Id": "HGX_ProcessorModule_0",
+    "Manufacturer": "NVIDIA",
+    "Model": "PG548",
+    "Name": "HGX_ProcessorModule_0",
+    "Oem": {
+      "Nvidia": {
+        "@odata.type": "#NvidiaChassis.v1_6_0.NvidiaChassis",
+        "HardwareWriteProtected": false,
+        "HardwareWriteProtectedControl": false
+      }
+    },
+    "PowerState": "On",
+    "Status": {
+      "Conditions": [],
+      "Health": "OK",
+      "HealthRollup": "OK",
+      "State": "Enabled"
+    }
+  },
+  "/redfish/v1/Chassis/HGX_ProcessorModule_1": {
+    "@odata.id": "/redfish/v1/Chassis/HGX_ProcessorModule_1",
+    "@odata.type": "#Chassis.v1_22_0.Chassis",
+    "Actions": {
+      "Oem": {
+        "#NvidiaProcessor.VariableSpiErase": {
+          "target": "/redfish/v1/Chassis/HGX_ProcessorModule_1/Actions/Oem/NvidiaProcessor.VariableSpiErase"
+        },
+        "#NvidiaProcessor.VariableSpiRead": {
+          "target": "/redfish/v1/Chassis/HGX_ProcessorModule_1/Actions/Oem/NvidiaProcessor.VariableSpiRead"
+        }
+      }
+    },
+    "Id": "HGX_ProcessorModule_1",
+    "Manufacturer": "NVIDIA",
+    "Model": "PG548",
+    "Name": "HGX_ProcessorModule_1",
+    "Oem": {
+      "Nvidia": {
+        "@odata.type": "#NvidiaChassis.v1_6_0.NvidiaChassis",
+        "HardwareWriteProtected": false,
+        "HardwareWriteProtectedControl": false
+      }
+    },
+    "PowerState": "On",
+    "Status": {
+      "Conditions": [],
+      "Health": "OK",
+      "HealthRollup": "OK",
+      "State": "Enabled"
+    }
+  },
+  "/redfish/v1/Chassis/IO_board_0": {
+    "@odata.id": "/redfish/v1/Chassis/IO_board_0",
+    "@odata.type": "#Chassis.v1_26_0.Chassis",
+    "Id": "IO_board_0",
+    "Manufacturer": "Nvidia                   ",
+    "Model": "2x ConnectX-7 Mezz",
+    "Name": "IO_board_0",
+    "Oem": {
+      "Nvidia": {
+        "@odata.type": "#NvidiaChassis.v1_0_0.NvidiaChassis",
+        "LeakDetectionPolicy": {
+          "@odata.id": "/redfish/v1/Chassis/IO_board_0/Oem/Nvidia/Policies/LeakDetectionPolicy"
+        }
+      }
+    },
+    "Status": {
+      "Health": "OK",
+      "State": "Enabled"
+    }
+  },
+  "/redfish/v1/Chassis/IO_board_1": {
+    "@odata.id": "/redfish/v1/Chassis/IO_board_1",
+    "@odata.type": "#Chassis.v1_26_0.Chassis",
+    "Id": "IO_board_1",
+    "Manufacturer": "Nvidia                   ",
+    "Model": "2x ConnectX-7 Mezz",
+    "Name": "IO_board_1",
+    "Oem": {
+      "Nvidia": {
+        "@odata.type": "#NvidiaChassis.v1_0_0.NvidiaChassis",
+        "LeakDetectionPolicy": {
+          "@odata.id": "/redfish/v1/Chassis/IO_board_1/Oem/Nvidia/Policies/LeakDetectionPolicy"
+        }
+      }
+    },
+    "Status": {
+      "Health": "OK",
+      "State": "Enabled"
+    }
+  },
+  "/redfish/v1/Chassis/Riser_Slot1_BlueField_3_SmartNIC_Main_Card": {
+    "@odata.id": "/redfish/v1/Chassis/Riser_Slot1_BlueField_3_SmartNIC_Main_Card",
+    "@odata.type": "#Chassis.v1_26_0.Chassis",
+    "Id": "Riser_Slot1_BlueField_3_SmartNIC_Main_Card",
+    "Manufacturer": "Nvidia                   ",
+    "Model": "BlueField-3 DPU                                   ",
+    "Name": "Riser_Slot1_BlueField_3_SmartNIC_Main_Card",
+    "Oem": {
+      "Nvidia": {
+        "@odata.type": "#NvidiaChassis.v1_0_0.NvidiaChassis",
+        "LeakDetectionPolicy": {
+          "@odata.id": "/redfish/v1/Chassis/Riser_Slot1_BlueField_3_SmartNIC_Main_Card/Oem/Nvidia/Policies/LeakDetectionPolicy"
+        }
+      }
+    },
+    "Status": {
+      "Health": "OK",
+      "State": "Enabled"
+    }
+  },
+  "/redfish/v1/Chassis/Riser_Slot2_BlueField_3_SmartNIC_Main_Card": {
+    "@odata.id": "/redfish/v1/Chassis/Riser_Slot2_BlueField_3_SmartNIC_Main_Card",
+    "@odata.type": "#Chassis.v1_26_0.Chassis",
+    "Id": "Riser_Slot2_BlueField_3_SmartNIC_Main_Card",
+    "Manufacturer": "Nvidia                   ",
+    "Model": "BlueField-3 DPU                                   ",
+    "Name": "Riser_Slot2_BlueField_3_SmartNIC_Main_Card",
+    "Oem": {
+      "Nvidia": {
+        "@odata.type": "#NvidiaChassis.v1_0_0.NvidiaChassis",
+        "LeakDetectionPolicy": {
+          "@odata.id": "/redfish/v1/Chassis/Riser_Slot2_BlueField_3_SmartNIC_Main_Card/Oem/Nvidia/Policies/LeakDetectionPolicy"
+        }
+      }
+    },
+    "Status": {
+      "Health": "OK",
+      "State": "Enabled"
+    }
+  },
+  "/redfish/v1/UpdateService/SoftwareInventory": {
+    "@odata.id": "/redfish/v1/UpdateService/SoftwareInventory",
+    "@odata.type": "#SoftwareInventoryCollection.SoftwareInventoryCollection",
+    "Description": "Collection of Software Inventory resources available to the UpdateService",
+    "Members": [
+      {
+        "@odata.id": "/redfish/v1/UpdateService/SoftwareInventory/HGX_Driver_GPU_0"
+      },
+      {
+        "@odata.id": "/redfish/v1/UpdateService/SoftwareInventory/HGX_Driver_GPU_1"
+      },
+      {
+        "@odata.id": "/redfish/v1/UpdateService/SoftwareInventory/HGX_Driver_GPU_2"
+      },
+      {
+        "@odata.id": "/redfish/v1/UpdateService/SoftwareInventory/HGX_Driver_GPU_3"
+      }
+    ],
+    "Members@odata.count": 4,
+    "Name": "Software Inventory Collection"
+  },
+  "/redfish/v1/UpdateService/SimpleUpdateActionInfo": {
+    "@odata.id": "/redfish/v1/UpdateService/SimpleUpdateActionInfo",
+    "@odata.type": "#ActionInfo.v1_4_2.ActionInfo",
+    "Description": "This action is used to perform BMC Firmware update",
+    "Id": "SimpleUpdateActionInfo",
+    "Name": "SimpleUpdate",
+    "Parameters": [
+      {
+        "DataType": "String",
+        "Name": "ImageURI",
+        "Required": true
+      },
+      {
+        "DataType": "String",
+        "Name": "TransferProtocol",
+        "Required": false
+      },
+      {
+        "DataType": "String",
+        "Name": "User",
+        "Required": false
+      },
+      {
+        "DataType": "String",
+        "Name": "Password",
+        "Required": false
+      }
+    ]
+  },
+  "/redfish/v1/UpdateService/UploadCABundleActionInfo": {
+    "@odata.id": "/redfish/v1/UpdateService/UploadCABundleActionInfo",
+    "@odata.type": "#ActionInfo.v1_4_2.ActionInfo",
+    "Description": "This action is used to upload CA bundle file in PEM format in multipart/form-data request body providing key name as ca_bundle and type as File.",
+    "Id": "UploadCABundleActionInfo",
+    "Name": "UploadCABundleActionInfo"
+  },
+  "/redfish/v1/UpdateService/FirmwareInventory/BMC": {
+    "@odata.id": "/redfish/v1/UpdateService/FirmwareInventory/BMC",
+    "@odata.type": "#SoftwareInventory.v1_10_2.SoftwareInventory",
+    "Id": "BMC",
+    "Name": "BMC",
+    "Updateable": true,
+    "Version": "25.07.29001500",
+    "WriteProtected": false
+  },
+  "/redfish/v1/UpdateService/FirmwareInventory/HGX_FW_BMC_0": {
+    "@odata.id": "/redfish/v1/UpdateService/FirmwareInventory/HGX_FW_BMC_0",
+    "@odata.type": "#SoftwareInventory.v1_4_0.SoftwareInventory",
+    "Description": "BMC image",
+    "Id": "HGX_FW_BMC_0",
+    "Manufacturer": "NVIDIA",
+    "Name": "Software Inventory",
+    "Oem": {
+      "Nvidia": {
+        "@odata.type": "#NvidiaSoftwareInventory.v1_2_0.NvidiaSoftwareInventory",
+        "ActiveFirmwareSlot": {
+          "BuildType": "Release",
+          "FirmwareComparisonNumber": 2426378,
+          "FirmwareState": "Activated",
+          "SlotId": 1,
+          "Version": "GB200Nvl-25.06-A"
+        },
+        "InactiveFirmwareSlot": {
+          "BuildType": "Release",
+          "FirmwareComparisonNumber": 2426378,
+          "FirmwareState": "Inactive",
+          "SlotId": 0,
+          "Version": "GB200Nvl-25.06-A"
+        },
+        "StageOnlyUpdateOptionSupported": true
+      }
+    },
+    "RelatedItem": [
+      {
+        "@odata.id": "/redfish/v1/Chassis/HGX_BMC_0"
+      }
+    ],
+    "SoftwareId": "0x0010",
+    "Status": {
+      "Conditions": [],
+      "Health": "OK",
+      "HealthRollup": "OK",
+      "State": "Enabled"
+    },
+    "Updateable": true,
+    "Version": "GB200Nvl-25.06-A"
+  },
+  "/redfish/v1/UpdateService/FirmwareInventory/HGX_FW_CPLD_0": {
+    "@odata.id": "/redfish/v1/UpdateService/FirmwareInventory/HGX_FW_CPLD_0",
+    "@odata.type": "#SoftwareInventory.v1_4_0.SoftwareInventory",
+    "Description": "Other image",
+    "Id": "HGX_FW_CPLD_0",
+    "Manufacturer": "Intel",
+    "Name": "Software Inventory",
+    "Oem": {
+      "Nvidia": {
+        "@odata.type": "#NvidiaSoftwareInventory.v1_2_0.NvidiaSoftwareInventory",
+        "StageOnlyUpdateOptionSupported": false
+      }
+    },
+    "RelatedItem": [
+      {
+        "@odata.id": "/redfish/v1/Chassis/HGX_Chassis_0"
+      }
+    ],
+    "Status": {
+      "Conditions": [],
+      "Health": "OK",
+      "HealthRollup": "OK",
+      "State": "Enabled"
+    },
+    "Updateable": true,
+    "Version": "0.22"
+  },
+  "/redfish/v1/UpdateService/FirmwareInventory/HGX_FW_CPU_0": {
+    "@odata.id": "/redfish/v1/UpdateService/FirmwareInventory/HGX_FW_CPU_0",
+    "@odata.type": "#SoftwareInventory.v1_4_0.SoftwareInventory",
+    "Description": "Other image",
+    "Id": "HGX_FW_CPU_0",
+    "Manufacturer": "NVIDIA",
+    "Name": "Software Inventory",
+    "Oem": {
+      "Nvidia": {
+        "@odata.type": "#NvidiaSoftwareInventory.v1_2_0.NvidiaSoftwareInventory",
+        "ActiveFirmwareSlot": {
+          "BuildType": "Release",
+          "FirmwareComparisonNumber": 534,
+          "FirmwareState": "Activated",
+          "SlotId": 0,
+          "Version": "216"
+        },
+        "InactiveFirmwareSlot": {
+          "BuildType": "Release",
+          "FirmwareComparisonNumber": 534,
+          "FirmwareState": "Inactive",
+          "SlotId": 1,
+          "Version": "216"
+        },
+        "StageOnlyUpdateOptionSupported": true
+      }
+    },
+    "RelatedItem": [],
+    "SoftwareId": "0x0038",
+    "Status": {
+      "Conditions": [],
+      "Health": "OK",
+      "HealthRollup": "OK",
+      "State": "Enabled"
+    },
+    "Updateable": true,
+    "Version": "216",
+    "WriteProtected": false
+  },
+  "/redfish/v1/UpdateService/FirmwareInventory/HGX_FW_CPU_1": {
+    "@odata.id": "/redfish/v1/UpdateService/FirmwareInventory/HGX_FW_CPU_1",
+    "@odata.type": "#SoftwareInventory.v1_4_0.SoftwareInventory",
+    "Description": "Other image",
+    "Id": "HGX_FW_CPU_1",
+    "Manufacturer": "NVIDIA",
+    "Name": "Software Inventory",
+    "Oem": {
+      "Nvidia": {
+        "@odata.type": "#NvidiaSoftwareInventory.v1_2_0.NvidiaSoftwareInventory",
+        "ActiveFirmwareSlot": {
+          "BuildType": "Release",
+          "FirmwareComparisonNumber": 534,
+          "FirmwareState": "Activated",
+          "SlotId": 0,
+          "Version": "216"
+        },
+        "InactiveFirmwareSlot": {
+          "BuildType": "Release",
+          "FirmwareComparisonNumber": 534,
+          "FirmwareState": "Inactive",
+          "SlotId": 1,
+          "Version": "216"
+        },
+        "StageOnlyUpdateOptionSupported": true
+      }
+    },
+    "RelatedItem": [],
+    "SoftwareId": "0x0038",
+    "Status": {
+      "Conditions": [],
+      "Health": "OK",
+      "HealthRollup": "OK",
+      "State": "Enabled"
+    },
+    "Updateable": true,
+    "Version": "216",
+    "WriteProtected": false
+  },
+  "/redfish/v1/UpdateService/FirmwareInventory/HGX_FW_ERoT_BMC_0": {
+    "@odata.id": "/redfish/v1/UpdateService/FirmwareInventory/HGX_FW_ERoT_BMC_0",
+    "@odata.type": "#SoftwareInventory.v1_4_0.SoftwareInventory",
+    "Description": "Other image",
+    "Id": "HGX_FW_ERoT_BMC_0",
+    "Manufacturer": "NVIDIA",
+    "Name": "Software Inventory",
+    "Oem": {
+      "Nvidia": {
+        "@odata.type": "#NvidiaSoftwareInventory.v1_2_0.NvidiaSoftwareInventory",
+        "ActiveFirmwareSlot": {
+          "BuildType": "Release",
+          "FirmwareComparisonNumber": 17047296,
+          "FirmwareState": "Activated",
+          "SlotId": 0,
+          "Version": "01.04.0031.0000_n04"
+        },
+        "InactiveFirmwareSlot": {
+          "BuildType": "Release",
+          "FirmwareComparisonNumber": 17047296,
+          "FirmwareState": "Inactive",
+          "SlotId": 1,
+          "Version": "01.04.0031.0000_n04"
+        },
+        "StageOnlyUpdateOptionSupported": true
+      }
+    },
+    "RelatedItem": [
+      {
+        "@odata.id": "/redfish/v1/Chassis/HGX_ERoT_BMC_0"
+      }
+    ],
+    "SoftwareId": "0xFF00",
+    "Status": {
+      "Conditions": [],
+      "Health": "OK",
+      "HealthRollup": "OK",
+      "State": "Enabled"
+    },
+    "Updateable": true,
+    "Version": "01.04.0031.0000_n04"
+  },
+  "/redfish/v1/UpdateService/FirmwareInventory/HGX_FW_ERoT_CPU_0": {
+    "@odata.id": "/redfish/v1/UpdateService/FirmwareInventory/HGX_FW_ERoT_CPU_0",
+    "@odata.type": "#SoftwareInventory.v1_4_0.SoftwareInventory",
+    "Description": "Other image",
+    "Id": "HGX_FW_ERoT_CPU_0",
+    "Manufacturer": "NVIDIA",
+    "Name": "Software Inventory",
+    "Oem": {
+      "Nvidia": {
+        "@odata.type": "#NvidiaSoftwareInventory.v1_2_0.NvidiaSoftwareInventory",
+        "ActiveFirmwareSlot": {
+          "BuildType": "Release",
+          "FirmwareComparisonNumber": 17047296,
+          "FirmwareState": "Activated",
+          "SlotId": 0,
+          "Version": "01.04.0031.0000_n04"
+        },
+        "InactiveFirmwareSlot": {
+          "BuildType": "Release",
+          "FirmwareComparisonNumber": 17047296,
+          "FirmwareState": "Inactive",
+          "SlotId": 1,
+          "Version": "01.04.0031.0000_n04"
+        },
+        "StageOnlyUpdateOptionSupported": true
+      }
+    },
+    "RelatedItem": [
+      {
+        "@odata.id": "/redfish/v1/Chassis/HGX_ERoT_CPU_0"
+      }
+    ],
+    "SoftwareId": "0xFF00",
+    "Status": {
+      "Conditions": [],
+      "Health": "OK",
+      "HealthRollup": "OK",
+      "State": "Enabled"
+    },
+    "Updateable": true,
+    "Version": "01.04.0031.0000_n04"
+  },
+  "/redfish/v1/UpdateService/FirmwareInventory/HGX_FW_ERoT_CPU_1": {
+    "@odata.id": "/redfish/v1/UpdateService/FirmwareInventory/HGX_FW_ERoT_CPU_1",
+    "@odata.type": "#SoftwareInventory.v1_4_0.SoftwareInventory",
+    "Description": "Other image",
+    "Id": "HGX_FW_ERoT_CPU_1",
+    "Manufacturer": "NVIDIA",
+    "Name": "Software Inventory",
+    "Oem": {
+      "Nvidia": {
+        "@odata.type": "#NvidiaSoftwareInventory.v1_2_0.NvidiaSoftwareInventory",
+        "ActiveFirmwareSlot": {
+          "BuildType": "Release",
+          "FirmwareComparisonNumber": 17047296,
+          "FirmwareState": "Activated",
+          "SlotId": 0,
+          "Version": "01.04.0031.0000_n04"
+        },
+        "InactiveFirmwareSlot": {
+          "BuildType": "Release",
+          "FirmwareComparisonNumber": 17047296,
+          "FirmwareState": "Inactive",
+          "SlotId": 1,
+          "Version": "01.04.0031.0000_n04"
+        },
+        "StageOnlyUpdateOptionSupported": true
+      }
+    },
+    "RelatedItem": [
+      {
+        "@odata.id": "/redfish/v1/Chassis/HGX_ERoT_CPU_1"
+      }
+    ],
+    "SoftwareId": "0xFF00",
+    "Status": {
+      "Conditions": [],
+      "Health": "OK",
+      "HealthRollup": "OK",
+      "State": "Enabled"
+    },
+    "Updateable": true,
+    "Version": "01.04.0031.0000_n04"
+  },
+  "/redfish/v1/UpdateService/FirmwareInventory/HGX_FW_ERoT_FPGA_0": {
+    "@odata.id": "/redfish/v1/UpdateService/FirmwareInventory/HGX_FW_ERoT_FPGA_0",
+    "@odata.type": "#SoftwareInventory.v1_4_0.SoftwareInventory",
+    "Description": "Other image",
+    "Id": "HGX_FW_ERoT_FPGA_0",
+    "Manufacturer": "NVIDIA",
+    "Name": "Software Inventory",
+    "Oem": {
+      "Nvidia": {
+        "@odata.type": "#NvidiaSoftwareInventory.v1_2_0.NvidiaSoftwareInventory",
+        "ActiveFirmwareSlot": {
+          "BuildType": "Release",
+          "FirmwareComparisonNumber": 17047296,
+          "FirmwareState": "Activated",
+          "SlotId": 0,
+          "Version": "01.04.0031.0000_n04"
+        },
+        "InactiveFirmwareSlot": {
+          "BuildType": "Release",
+          "FirmwareComparisonNumber": 17047296,
+          "FirmwareState": "Inactive",
+          "SlotId": 1,
+          "Version": "01.04.0031.0000_n04"
+        },
+        "StageOnlyUpdateOptionSupported": true
+      }
+    },
+    "RelatedItem": [
+      {
+        "@odata.id": "/redfish/v1/Chassis/HGX_ERoT_FPGA_0"
+      }
+    ],
+    "SoftwareId": "0xFF00",
+    "Status": {
+      "Conditions": [],
+      "Health": "OK",
+      "HealthRollup": "OK",
+      "State": "Enabled"
+    },
+    "Updateable": true,
+    "Version": "01.04.0031.0000_n04"
+  },
+  "/redfish/v1/UpdateService/FirmwareInventory/HGX_FW_ERoT_FPGA_1": {
+    "@odata.id": "/redfish/v1/UpdateService/FirmwareInventory/HGX_FW_ERoT_FPGA_1",
+    "@odata.type": "#SoftwareInventory.v1_4_0.SoftwareInventory",
+    "Description": "Other image",
+    "Id": "HGX_FW_ERoT_FPGA_1",
+    "Manufacturer": "NVIDIA",
+    "Name": "Software Inventory",
+    "Oem": {
+      "Nvidia": {
+        "@odata.type": "#NvidiaSoftwareInventory.v1_2_0.NvidiaSoftwareInventory",
+        "ActiveFirmwareSlot": {
+          "BuildType": "Release",
+          "FirmwareComparisonNumber": 17047296,
+          "FirmwareState": "Activated",
+          "SlotId": 0,
+          "Version": "01.04.0031.0000_n04"
+        },
+        "InactiveFirmwareSlot": {
+          "BuildType": "Release",
+          "FirmwareComparisonNumber": 17047296,
+          "FirmwareState": "Inactive",
+          "SlotId": 1,
+          "Version": "01.04.0031.0000_n04"
+        },
+        "StageOnlyUpdateOptionSupported": true
+      }
+    },
+    "RelatedItem": [
+      {
+        "@odata.id": "/redfish/v1/Chassis/HGX_ERoT_FPGA_1"
+      }
+    ],
+    "SoftwareId": "0xFF00",
+    "Status": {
+      "Conditions": [],
+      "Health": "OK",
+      "HealthRollup": "OK",
+      "State": "Enabled"
+    },
+    "Updateable": true,
+    "Version": "01.04.0031.0000_n04"
+  },
+  "/redfish/v1/UpdateService/FirmwareInventory/HGX_FW_FPGA_0": {
+    "@odata.id": "/redfish/v1/UpdateService/FirmwareInventory/HGX_FW_FPGA_0",
+    "@odata.type": "#SoftwareInventory.v1_4_0.SoftwareInventory",
+    "Description": "Other image",
+    "Id": "HGX_FW_FPGA_0",
+    "Manufacturer": "NVIDIA",
+    "Name": "Software Inventory",
+    "Oem": {
+      "Nvidia": {
+        "@odata.type": "#NvidiaSoftwareInventory.v1_2_0.NvidiaSoftwareInventory",
+        "ActiveFirmwareSlot": {
+          "BuildType": "Release",
+          "FirmwareComparisonNumber": 825112112,
+          "FirmwareState": "Activated",
+          "SlotId": 1,
+          "Version": "1.60"
+        },
+        "InactiveFirmwareSlot": {
+          "BuildType": "Release",
+          "FirmwareComparisonNumber": 825112112,
+          "FirmwareState": "Inactive",
+          "SlotId": 0,
+          "Version": "1.60"
+        },
+        "StageOnlyUpdateOptionSupported": true
+      }
+    },
+    "RelatedItem": [
+      {
+        "@odata.id": "/redfish/v1/Chassis/HGX_FPGA_0"
+      }
+    ],
+    "SoftwareId": "0x0050",
+    "Status": {
+      "Conditions": [],
+      "Health": "OK",
+      "HealthRollup": "OK",
+      "State": "Enabled"
+    },
+    "Updateable": true,
+    "Version": "1.60"
+  },
+  "/redfish/v1/UpdateService/FirmwareInventory/HGX_FW_FPGA_1": {
+    "@odata.id": "/redfish/v1/UpdateService/FirmwareInventory/HGX_FW_FPGA_1",
+    "@odata.type": "#SoftwareInventory.v1_4_0.SoftwareInventory",
+    "Description": "Other image",
+    "Id": "HGX_FW_FPGA_1",
+    "Manufacturer": "NVIDIA",
+    "Name": "Software Inventory",
+    "Oem": {
+      "Nvidia": {
+        "@odata.type": "#NvidiaSoftwareInventory.v1_2_0.NvidiaSoftwareInventory",
+        "ActiveFirmwareSlot": {
+          "BuildType": "Release",
+          "FirmwareComparisonNumber": 825112112,
+          "FirmwareState": "Activated",
+          "SlotId": 1,
+          "Version": "1.60"
+        },
+        "InactiveFirmwareSlot": {
+          "BuildType": "Release",
+          "FirmwareComparisonNumber": 825112112,
+          "FirmwareState": "Inactive",
+          "SlotId": 0,
+          "Version": "1.60"
+        },
+        "StageOnlyUpdateOptionSupported": true
+      }
+    },
+    "RelatedItem": [
+      {
+        "@odata.id": "/redfish/v1/Chassis/HGX_FPGA_1"
+      }
+    ],
+    "SoftwareId": "0x0050",
+    "Status": {
+      "Conditions": [],
+      "Health": "OK",
+      "HealthRollup": "OK",
+      "State": "Enabled"
+    },
+    "Updateable": true,
+    "Version": "1.60"
+  },
+  "/redfish/v1/UpdateService/FirmwareInventory/HGX_FW_GPU_0": {
+    "@odata.id": "/redfish/v1/UpdateService/FirmwareInventory/HGX_FW_GPU_0",
+    "@odata.type": "#SoftwareInventory.v1_4_0.SoftwareInventory",
+    "Description": "Other image",
+    "Id": "HGX_FW_GPU_0",
+    "Manufacturer": "NVIDIA",
+    "Name": "Software Inventory",
+    "Oem": {
+      "Nvidia": {
+        "@odata.type": "#NvidiaSoftwareInventory.v1_2_0.NvidiaSoftwareInventory",
+        "ActiveFirmwareSlot": {
+          "BuildType": "Release",
+          "FirmwareComparisonNumber": 193986713,
+          "FirmwareState": "Activated",
+          "SlotId": 0,
+          "Version": "97.00.B9.00.99"
+        },
+        "InactiveFirmwareSlot": {
+          "BuildType": "Release",
+          "FirmwareComparisonNumber": 193986713,
+          "FirmwareState": "Inactive",
+          "SlotId": 1,
+          "Version": "97.00.B9.00.99"
+        },
+        "StageOnlyUpdateOptionSupported": true
+      }
+    },
+    "RelatedItem": [
+      {
+        "@odata.id": "/redfish/v1/Chassis/HGX_GPU_0"
+      }
+    ],
+    "SoftwareId": "0xC000",
+    "Status": {
+      "Conditions": [],
+      "Health": "OK",
+      "HealthRollup": "OK",
+      "State": "Enabled"
+    },
+    "Updateable": true,
+    "Version": "97.00.B9.00.99",
+    "WriteProtected": false
+  },
+  "/redfish/v1/UpdateService/FirmwareInventory/HGX_FW_GPU_1": {
+    "@odata.id": "/redfish/v1/UpdateService/FirmwareInventory/HGX_FW_GPU_1",
+    "@odata.type": "#SoftwareInventory.v1_4_0.SoftwareInventory",
+    "Description": "Other image",
+    "Id": "HGX_FW_GPU_1",
+    "Manufacturer": "NVIDIA",
+    "Name": "Software Inventory",
+    "Oem": {
+      "Nvidia": {
+        "@odata.type": "#NvidiaSoftwareInventory.v1_2_0.NvidiaSoftwareInventory",
+        "ActiveFirmwareSlot": {
+          "BuildType": "Release",
+          "FirmwareComparisonNumber": 193986713,
+          "FirmwareState": "Activated",
+          "SlotId": 0,
+          "Version": "97.00.B9.00.99"
+        },
+        "InactiveFirmwareSlot": {
+          "BuildType": "Release",
+          "FirmwareComparisonNumber": 193986713,
+          "FirmwareState": "Inactive",
+          "SlotId": 1,
+          "Version": "97.00.B9.00.99"
+        },
+        "StageOnlyUpdateOptionSupported": true
+      }
+    },
+    "RelatedItem": [
+      {
+        "@odata.id": "/redfish/v1/Chassis/HGX_GPU_1"
+      }
+    ],
+    "SoftwareId": "0xC000",
+    "Status": {
+      "Conditions": [],
+      "Health": "OK",
+      "HealthRollup": "OK",
+      "State": "Enabled"
+    },
+    "Updateable": true,
+    "Version": "97.00.B9.00.99",
+    "WriteProtected": false
+  },
+  "/redfish/v1/UpdateService/FirmwareInventory/HGX_FW_GPU_2": {
+    "@odata.id": "/redfish/v1/UpdateService/FirmwareInventory/HGX_FW_GPU_2",
+    "@odata.type": "#SoftwareInventory.v1_4_0.SoftwareInventory",
+    "Description": "Other image",
+    "Id": "HGX_FW_GPU_2",
+    "Manufacturer": "NVIDIA",
+    "Name": "Software Inventory",
+    "Oem": {
+      "Nvidia": {
+        "@odata.type": "#NvidiaSoftwareInventory.v1_2_0.NvidiaSoftwareInventory",
+        "ActiveFirmwareSlot": {
+          "BuildType": "Release",
+          "FirmwareComparisonNumber": 193986713,
+          "FirmwareState": "Activated",
+          "SlotId": 0,
+          "Version": "97.00.B9.00.99"
+        },
+        "InactiveFirmwareSlot": {
+          "BuildType": "Release",
+          "FirmwareComparisonNumber": 193986713,
+          "FirmwareState": "Inactive",
+          "SlotId": 1,
+          "Version": "97.00.B9.00.99"
+        },
+        "StageOnlyUpdateOptionSupported": true
+      }
+    },
+    "RelatedItem": [
+      {
+        "@odata.id": "/redfish/v1/Chassis/HGX_GPU_2"
+      }
+    ],
+    "SoftwareId": "0xC000",
+    "Status": {
+      "Conditions": [],
+      "Health": "OK",
+      "HealthRollup": "OK",
+      "State": "Enabled"
+    },
+    "Updateable": true,
+    "Version": "97.00.B9.00.99",
+    "WriteProtected": false
+  },
+  "/redfish/v1/UpdateService/FirmwareInventory/HGX_FW_GPU_3": {
+    "@odata.id": "/redfish/v1/UpdateService/FirmwareInventory/HGX_FW_GPU_3",
+    "@odata.type": "#SoftwareInventory.v1_4_0.SoftwareInventory",
+    "Description": "Other image",
+    "Id": "HGX_FW_GPU_3",
+    "Manufacturer": "NVIDIA",
+    "Name": "Software Inventory",
+    "Oem": {
+      "Nvidia": {
+        "@odata.type": "#NvidiaSoftwareInventory.v1_2_0.NvidiaSoftwareInventory",
+        "ActiveFirmwareSlot": {
+          "BuildType": "Release",
+          "FirmwareComparisonNumber": 193986713,
+          "FirmwareState": "Activated",
+          "SlotId": 0,
+          "Version": "97.00.B9.00.99"
+        },
+        "InactiveFirmwareSlot": {
+          "BuildType": "Release",
+          "FirmwareComparisonNumber": 193986713,
+          "FirmwareState": "Inactive",
+          "SlotId": 1,
+          "Version": "97.00.B9.00.99"
+        },
+        "StageOnlyUpdateOptionSupported": true
+      }
+    },
+    "RelatedItem": [
+      {
+        "@odata.id": "/redfish/v1/Chassis/HGX_GPU_3"
+      }
+    ],
+    "SoftwareId": "0xC000",
+    "Status": {
+      "Conditions": [],
+      "Health": "OK",
+      "HealthRollup": "OK",
+      "State": "Enabled"
+    },
+    "Updateable": true,
+    "Version": "97.00.B9.00.99",
+    "WriteProtected": false
+  },
+  "/redfish/v1/UpdateService/FirmwareInventory/HGX_InfoROM_GPU_0": {
+    "@odata.id": "/redfish/v1/UpdateService/FirmwareInventory/HGX_InfoROM_GPU_0",
+    "@odata.type": "#SoftwareInventory.v1_4_0.SoftwareInventory",
+    "Description": "Other image",
+    "Id": "HGX_InfoROM_GPU_0",
+    "Manufacturer": "NVIDIA",
+    "Name": "Software Inventory",
+    "Oem": {
+      "Nvidia": {
+        "@odata.type": "#NvidiaSoftwareInventory.v1_2_0.NvidiaSoftwareInventory",
+        "StageOnlyUpdateOptionSupported": false
+      }
+    },
+    "RelatedItem": [
+      {
+        "@odata.id": "/redfish/v1/Chassis/HGX_GPU_0"
+      }
+    ],
+    "SoftwareId": "0xC010",
+    "Status": {
+      "Conditions": [],
+      "Health": "OK",
+      "HealthRollup": "OK",
+      "State": "Enabled"
+    },
+    "Updateable": true,
+    "Version": "G548.0201.00.06"
+  },
+  "/redfish/v1/UpdateService/FirmwareInventory/HGX_InfoROM_GPU_1": {
+    "@odata.id": "/redfish/v1/UpdateService/FirmwareInventory/HGX_InfoROM_GPU_1",
+    "@odata.type": "#SoftwareInventory.v1_4_0.SoftwareInventory",
+    "Description": "Other image",
+    "Id": "HGX_InfoROM_GPU_1",
+    "Manufacturer": "NVIDIA",
+    "Name": "Software Inventory",
+    "Oem": {
+      "Nvidia": {
+        "@odata.type": "#NvidiaSoftwareInventory.v1_2_0.NvidiaSoftwareInventory",
+        "StageOnlyUpdateOptionSupported": false
+      }
+    },
+    "RelatedItem": [
+      {
+        "@odata.id": "/redfish/v1/Chassis/HGX_GPU_1"
+      }
+    ],
+    "SoftwareId": "0xC010",
+    "Status": {
+      "Conditions": [],
+      "Health": "OK",
+      "HealthRollup": "OK",
+      "State": "Enabled"
+    },
+    "Updateable": true,
+    "Version": "G548.0201.00.06"
+  },
+  "/redfish/v1/UpdateService/FirmwareInventory/HGX_InfoROM_GPU_2": {
+    "@odata.id": "/redfish/v1/UpdateService/FirmwareInventory/HGX_InfoROM_GPU_2",
+    "@odata.type": "#SoftwareInventory.v1_4_0.SoftwareInventory",
+    "Description": "Other image",
+    "Id": "HGX_InfoROM_GPU_2",
+    "Manufacturer": "NVIDIA",
+    "Name": "Software Inventory",
+    "Oem": {
+      "Nvidia": {
+        "@odata.type": "#NvidiaSoftwareInventory.v1_2_0.NvidiaSoftwareInventory",
+        "StageOnlyUpdateOptionSupported": false
+      }
+    },
+    "RelatedItem": [
+      {
+        "@odata.id": "/redfish/v1/Chassis/HGX_GPU_2"
+      }
+    ],
+    "SoftwareId": "0xC010",
+    "Status": {
+      "Conditions": [],
+      "Health": "OK",
+      "HealthRollup": "OK",
+      "State": "Enabled"
+    },
+    "Updateable": true,
+    "Version": "G548.0201.00.06"
+  },
+  "/redfish/v1/UpdateService/FirmwareInventory/HGX_InfoROM_GPU_3": {
+    "@odata.id": "/redfish/v1/UpdateService/FirmwareInventory/HGX_InfoROM_GPU_3",
+    "@odata.type": "#SoftwareInventory.v1_4_0.SoftwareInventory",
+    "Description": "Other image",
+    "Id": "HGX_InfoROM_GPU_3",
+    "Manufacturer": "NVIDIA",
+    "Name": "Software Inventory",
+    "Oem": {
+      "Nvidia": {
+        "@odata.type": "#NvidiaSoftwareInventory.v1_2_0.NvidiaSoftwareInventory",
+        "StageOnlyUpdateOptionSupported": false
+      }
+    },
+    "RelatedItem": [
+      {
+        "@odata.id": "/redfish/v1/Chassis/HGX_GPU_3"
+      }
+    ],
+    "SoftwareId": "0xC010",
+    "Status": {
+      "Conditions": [],
+      "Health": "OK",
+      "HealthRollup": "OK",
+      "State": "Enabled"
+    },
+    "Updateable": true,
+    "Version": "G548.0201.00.06"
+  },
+  "/redfish/v1/UpdateService/FirmwareInventory/HGX_PCIeSwitchConfig_0": {
+    "@odata.id": "/redfish/v1/UpdateService/FirmwareInventory/HGX_PCIeSwitchConfig_0",
+    "@odata.type": "#SoftwareInventory.v1_4_0.SoftwareInventory",
+    "Description": "Other image",
+    "Id": "HGX_PCIeSwitchConfig_0",
+    "Manufacturer": "NVIDIA",
+    "Name": "Software Inventory",
+    "Oem": {
+      "Nvidia": {
+        "@odata.type": "#NvidiaSoftwareInventory.v1_2_0.NvidiaSoftwareInventory",
+        "StageOnlyUpdateOptionSupported": false
+      }
+    },
+    "RelatedItem": [],
+    "Status": {
+      "Conditions": [],
+      "Health": "OK",
+      "HealthRollup": "OK",
+      "State": "Enabled"
+    },
+    "Updateable": false,
+    "Version": "01151024",
+    "WriteProtected": false
+  },
+  "/redfish/v1/UpdateService/FirmwareInventory/StorageUnit_1": {
+    "@odata.id": "/redfish/v1/UpdateService/FirmwareInventory/StorageUnit_1",
+    "@odata.type": "#SoftwareInventory.v1_10_2.SoftwareInventory",
+    "Id": "StorageUnit_1",
+    "Name": "StorageUnit_1",
+    "Updateable": true,
+    "Version": "E2MU290"
+  },
+  "/redfish/v1/UpdateService/FirmwareInventory/StorageUnit_2": {
+    "@odata.id": "/redfish/v1/UpdateService/FirmwareInventory/StorageUnit_2",
+    "@odata.type": "#SoftwareInventory.v1_10_2.SoftwareInventory",
+    "Id": "StorageUnit_2",
+    "Name": "StorageUnit_2",
+    "Updateable": true,
+    "Version": "E2MU290"
+  },
+  "/redfish/v1/UpdateService/FirmwareInventory/StorageUnit_3": {
+    "@odata.id": "/redfish/v1/UpdateService/FirmwareInventory/StorageUnit_3",
+    "@odata.type": "#SoftwareInventory.v1_10_2.SoftwareInventory",
+    "Id": "StorageUnit_3",
+    "Name": "StorageUnit_3",
+    "Updateable": true,
+    "Version": "E2MU290"
+  },
+  "/redfish/v1/UpdateService/FirmwareInventory/StorageUnit_4": {
+    "@odata.id": "/redfish/v1/UpdateService/FirmwareInventory/StorageUnit_4",
+    "@odata.type": "#SoftwareInventory.v1_10_2.SoftwareInventory",
+    "Id": "StorageUnit_4",
+    "Name": "StorageUnit_4",
+    "Updateable": true,
+    "Version": "E2MU290"
+  },
+  "/redfish/v1/UpdateService/FirmwareInventory/StorageUnit_5": {
+    "@odata.id": "/redfish/v1/UpdateService/FirmwareInventory/StorageUnit_5",
+    "@odata.type": "#SoftwareInventory.v1_10_2.SoftwareInventory",
+    "Id": "StorageUnit_5",
+    "Name": "StorageUnit_5",
+    "Updateable": true,
+    "Version": "E2MU290"
+  },
+  "/redfish/v1/UpdateService/FirmwareInventory/StorageUnit_6": {
+    "@odata.id": "/redfish/v1/UpdateService/FirmwareInventory/StorageUnit_6",
+    "@odata.type": "#SoftwareInventory.v1_10_2.SoftwareInventory",
+    "Id": "StorageUnit_6",
+    "Name": "StorageUnit_6",
+    "Updateable": true,
+    "Version": "E2MU290"
+  },
+  "/redfish/v1/UpdateService/FirmwareInventory/StorageUnit_7": {
+    "@odata.id": "/redfish/v1/UpdateService/FirmwareInventory/StorageUnit_7",
+    "@odata.type": "#SoftwareInventory.v1_10_2.SoftwareInventory",
+    "Id": "StorageUnit_7",
+    "Name": "StorageUnit_7",
+    "Updateable": true,
+    "Version": "E2MU290"
+  },
+  "/redfish/v1/UpdateService/FirmwareInventory/StorageUnit_8": {
+    "@odata.id": "/redfish/v1/UpdateService/FirmwareInventory/StorageUnit_8",
+    "@odata.type": "#SoftwareInventory.v1_10_2.SoftwareInventory",
+    "Id": "StorageUnit_8",
+    "Name": "StorageUnit_8",
+    "Updateable": true,
+    "Version": "E2MU290"
+  },
+  "/redfish/v1/Systems/System_0/ResetActionInfo": {
+    "@odata.id": "/redfish/v1/Systems/System_0/ResetActionInfo",
+    "@odata.type": "#ActionInfo.v1_4_2.ActionInfo",
+    "Description": "This action is used to reset the Systems",
+    "Id": "ResetAction",
+    "Name": "ResetAction",
+    "Parameters": [
+      {
+        "AllowableValues": [
+          "ForceOff",
+          "ForceRestart",
+          "FullPowerCycle",
+          "GracefulShutdown",
+          "On",
+          "PowerCycle"
+        ],
+        "DataType": "String",
+        "Name": "ResetType",
+        "Required": true
+      }
+    ]
+  },
+  "/redfish/v1/Managers/BMC_0/ResetActionInfo": {
+    "@odata.id": "/redfish/v1/Managers/BMC_0/ResetActionInfo",
+    "@odata.type": "#ActionInfo.v1_4_2.ActionInfo",
+    "Description": "This action is used to reset the Managers",
+    "Id": "ResetAction",
+    "Name": "ResetAction",
+    "Parameters": [
+      {
+        "AllowableValues": [
+          "ForceRestart"
+        ],
+        "DataType": "String",
+        "Name": "ResetType",
+        "Required": true
+      }
+    ]
+  },
+  "/redfish/v1/Managers/HGX_BMC_0/ResetActionInfo": {
+    "@odata.id": "/redfish/v1/Managers/HGX_BMC_0/ResetActionInfo",
+    "@odata.type": "#ActionInfo.v1_1_2.ActionInfo",
+    "Id": "ResetActionInfo",
+    "Name": "Reset Action Info",
+    "Parameters": [
+      {
+        "AllowableValues": [
+          "GracefulRestart",
+          "ForceRestart",
+          "GracefulShutdown"
+        ],
+        "DataType": "String",
+        "Name": "ResetType",
+        "Required": true
+      }
+    ]
+  },
+  "/redfish/v1/Chassis/Chassis_0/Oem/Nvidia/AuxPowerResetActionInfo": {
+    "@odata.id": "/redfish/v1/Chassis/Chassis_0/Oem/Nvidia/AuxPowerResetActionInfo",
+    "@odata.type": "#ActionInfo.v1_2_0.ActionInfo",
+    "Id": "AuxPowerCycleActionInfo",
+    "Name": "AuxPowerCycleActionInfo",
+    "Parameters": [
+      {
+        "AllowableValues": [
+          "AuxPowerCycle",
+          "AuxPowerCycleForce"
+        ],
+        "ArraySizeMaximum": 0,
+        "ArraySizeMinimum": 0,
+        "DataType": "String",
+        "MaximumValue": 0,
+        "MinimumValue": 0,
+        "Name": "ResetType",
+        "Required": true
+      }
+    ]
+  }
+}

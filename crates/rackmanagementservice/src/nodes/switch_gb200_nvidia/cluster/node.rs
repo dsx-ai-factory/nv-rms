@@ -18,13 +18,16 @@
 //! NVUE node IP address reconciliation.
 
 use nvue_client::ClientError;
-use nvue_client::cluster::{ClusterNodeServerAddresses, InterfaceType, NMX_CONTROLLER_APP_NAME};
+use nvue_client::cluster::{
+    ClusterNodeServerAddresses, InterfaceType, NMX_CONTROLLER_APP_NAME, cluster_node_endpoint,
+};
 use nvue_client::revision::APPLIED_REVISION_ID;
 
 use super::super::{SwitchGb200Nvidia, config};
 use super::RETRY_WAIT_DELAY;
+use crate::nodes::nvos::NvBridge;
 use crate::transport::http_client::HttpClient;
-use crate::utilities::error::{Result, RmsError};
+use crate::utilities::error::{ErrorCode, Result, RmsError};
 
 impl SwitchGb200Nvidia {
     /// Reads the applied node IP addresses for one cluster interface.
@@ -132,14 +135,22 @@ impl SwitchGb200Nvidia {
     ///
     /// NVOS rejects cluster disable while cluster-node servers remain
     /// configured, so this method clears addresses before disabling the cluster.
-    pub(crate) async fn clear_node_ips_and_disable_cluster(&self) -> Result<()> {
+    /// Secondary/eth1 is cleared only when the switch capabilities report
+    /// NVBridge support.
+    pub(crate) async fn clear_node_ips_and_disable_cluster(
+        &self,
+        capabilities: NvBridge,
+    ) -> Result<()> {
         // Keep the address clears and shutdown convergence in one operation so
         // no cluster-state or node-IP update can interleave with the transition.
         let _op_guard = self.op_lock.lock().await;
         let empty = ClusterNodeServerAddresses::new();
 
-        for interface_type in [InterfaceType::Primary, InterfaceType::Secondary] {
-            self.reconcile_node_ips_unlocked(interface_type, &empty)
+        self.reconcile_node_ips_unlocked(InterfaceType::Primary, &empty)
+            .await?;
+
+        if capabilities.is_supported() {
+            self.reconcile_node_ips_unlocked(InterfaceType::Secondary, &empty)
                 .await?;
         }
 
@@ -204,6 +215,10 @@ impl SwitchGb200Nvidia {
         ))
     }
 
+    /// Reads the applied node IP addresses for one cluster interface.
+    ///
+    /// A 404 stays `NotFound`. Whether the secondary interface exists is
+    /// `GET /cluster/node/secondary`, not a 404 from this collection.
     async fn read_node_ips(
         &self,
         interface_type: InterfaceType,
@@ -216,5 +231,23 @@ impl SwitchGb200Nvidia {
             )
             .await
             .map_err(Into::into)
+    }
+
+    /// True when NVUE exposes `/cluster/node/secondary`.
+    ///
+    /// A 404 means this image has no secondary/eth1 (NVBridge) interface. 5xx
+    /// and transport errors are propagated.
+    pub(crate) async fn cluster_node_secondary_is_present(&self) -> Result<bool> {
+        match self
+            .nvue_http_get(
+                &cluster_node_endpoint(InterfaceType::Secondary),
+                HttpClient::DEFAULT_TIMEOUT,
+            )
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(error) if error.code == ErrorCode::NotFound => Ok(false),
+            Err(error) => Err(error),
+        }
     }
 }

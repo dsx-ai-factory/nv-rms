@@ -70,6 +70,15 @@ The orchestrator's runtime state is in-process memory, not Postgres:
 - Job state is a `RwLock<JobStore>` inside `JobRegistry`, bounded by
   `max_tracked_jobs` (default 10,000) with terminal jobs evicted after
   `terminal_job_ttl_seconds` (default 24h).
+- Managed fabric operations and controller activation proofs are process-local.
+  The fabric registry holds up to 256 active or unresolved operations and 1024
+  activation proofs. Failed operations release ownership after started work drains
+  and controller cleanup attempts finish. Unverified controller activations have
+  no valid proof; releasing ownership does not mark their configuration successful.
+  Unresolved operations are not evicted; the oldest proof
+  is evicted when proof capacity is exceeded. After restart, RMS rediscovers
+  device state and requires controller activation when no proof is available.
+  Neither operation ownership nor activation proofs are stored in Postgres.
 
 A restart therefore drops every tracked job, including in-flight ones. Work
 already dispatched to hardware - a firmware update running on a BMC, an image

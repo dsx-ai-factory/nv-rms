@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 
+pub(crate) mod managed_config;
 mod nmxc_api;
 mod response;
 mod switch_tls_store;
@@ -317,10 +318,52 @@ impl NmxcPool for NmxcClientPool {
     }
 }
 
+/// NMX controller observations and static configuration operations.
+/// Optional capability defaults return `Unimplemented` when a client lacks support.
 #[async_trait::async_trait]
 pub trait Nmxc: Send + Sync + 'static {
     /// Perform a Hello handshake with the NMX-C controller.
     async fn hello(&mut self, gateway_id: &str) -> Result<nmxc_model::NmxHelloResponse, NmxcError>;
+
+    /// Read control-plane state and independent controller health.
+    async fn get_domain_state_info(
+        &mut self,
+        _gateway_id: &str,
+    ) -> Result<nmxc_model::NmxDomainStateInfo, NmxcError> {
+        Err(NmxcError::Status(tonic::Status::unimplemented(
+            "GetDomainStateInfo is not supported by this NMX client",
+        )))
+    }
+
+    /// Read device identities, device health, and observed port states.
+    async fn get_topology_info(
+        &mut self,
+        _gateway_id: &str,
+    ) -> Result<nmxc_model::NmxFmTopologyInfo, NmxcError> {
+        Err(NmxcError::Status(tonic::Status::unimplemented(
+            "GetTopologyInfo is not supported by this NMX client",
+        )))
+    }
+
+    /// Read all discovered switch nodes and their reported health.
+    async fn get_switch_node_info_list(
+        &mut self,
+        _gateway_id: &str,
+    ) -> Result<nmxc_model::NmxGetSwitchNodeInfoListResponse, NmxcError> {
+        Err(NmxcError::Status(tonic::Status::unimplemented(
+            "GetSwitchNodeInfoList is not supported by this NMX client",
+        )))
+    }
+
+    /// Read all discovered compute nodes and their reported health.
+    async fn get_compute_node_info_list(
+        &mut self,
+        _gateway_id: &str,
+    ) -> Result<nmxc_model::NmxGetComputeNodeInfoListResponse, NmxcError> {
+        Err(NmxcError::Status(tonic::Status::unimplemented(
+            "GetComputeNodeInfoList is not supported by this NMX client",
+        )))
+    }
 
     /// Read one NMX-C static configuration value.
     async fn get_static_config(
@@ -344,11 +387,117 @@ pub trait Nmxc: Send + Sync + 'static {
         value: &str,
         gateway_id: &str,
     ) -> Result<nmxc_model::NmxReturnCode, NmxcError>;
+
+    /// Writes the supplied complete static configuration file without altering its content.
+    ///
+    /// Clients without file-content write support return `Unimplemented`.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # async fn example(client: &mut dyn rackmanagementservice::libnmxc::Nmxc)
+    /// # -> Result<(), rackmanagementservice::libnmxc::NmxcError> {
+    /// client
+    ///     .set_static_config_file("fm_config", "SETTING = value\n", "gateway")
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    async fn set_static_config_file(
+        &mut self,
+        _config_file_name: &str,
+        _content: &str,
+        _gateway_id: &str,
+    ) -> Result<nmxc_model::NmxReturnCode, NmxcError> {
+        Err(NmxcError::Status(tonic::Status::unimplemented(
+            "SetStaticConfig file-content writes are not supported by this NMX client",
+        )))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct LegacyNmxc(test_support::FakeNmxc);
+
+    #[async_trait::async_trait]
+    impl Nmxc for LegacyNmxc {
+        async fn hello(
+            &mut self,
+            gateway_id: &str,
+        ) -> Result<nmxc_model::NmxHelloResponse, NmxcError> {
+            self.0.hello(gateway_id).await
+        }
+
+        async fn get_static_config(
+            &mut self,
+            config_file_name: &str,
+            key: &str,
+            gateway_id: &str,
+        ) -> Result<nmxc_model::NmxGetStaticConfigResponse, NmxcError> {
+            self.0
+                .get_static_config(config_file_name, key, gateway_id)
+                .await
+        }
+
+        async fn get_static_config_files(
+            &mut self,
+            config_file_names: &[&str],
+            gateway_id: &str,
+        ) -> Result<nmxc_model::NmxGetStaticConfigResponse, NmxcError> {
+            self.0
+                .get_static_config_files(config_file_names, gateway_id)
+                .await
+        }
+
+        async fn set_static_config(
+            &mut self,
+            config_file_name: &str,
+            key: &str,
+            value: &str,
+            gateway_id: &str,
+        ) -> Result<nmxc_model::NmxReturnCode, NmxcError> {
+            self.0
+                .set_static_config(config_file_name, key, value, gateway_id)
+                .await
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_client_retains_key_writes_and_rejects_file_writes() {
+        let success = test_support::FakeNmxc::success_return_code();
+
+        let mut client = LegacyNmxc(test_support::FakeNmxc {
+            set_results: std::collections::VecDeque::from([Ok(success.clone())]),
+            ..Default::default()
+        });
+
+        let response = client
+            .set_static_config("fm_config", "SETTING", "value", "gateway")
+            .await
+            .unwrap();
+
+        assert_eq!(response, success);
+
+        let error = client
+            .set_static_config_file("fm_config", "SETTING = value\n", "gateway")
+            .await
+            .unwrap_err();
+
+        let NmxcError::Status(status) = error else {
+            panic!("expected an unsupported-capability status");
+        };
+
+        assert_eq!(status.code(), tonic::Code::Unimplemented);
+
+        assert_eq!(
+            status.message(),
+            "SetStaticConfig file-content writes are not supported by this NMX client"
+        );
+
+        assert!(client.0.set_file_calls.is_empty());
+    }
 
     #[test]
     fn endpoint_new_accepts_valid_uri() {

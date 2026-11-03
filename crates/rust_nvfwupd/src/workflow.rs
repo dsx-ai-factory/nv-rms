@@ -108,6 +108,13 @@ pub enum NvFwUpdError {
         /// Sanitized task failure summary.
         message: String,
     },
+    /// Firmware submission failed or returned no usable task reference.
+    #[error("firmware submission failed: {details}")]
+    SubmissionFailed {
+        /// Bounded, redacted diagnostics retained through the library and adapter.
+        /// RMS job summaries are capped separately; longer text is kept in raw_error.
+        details: Value,
+    },
     /// Operation exceeded its configured timeout.
     #[error("operation {operation} timed out after {seconds}s")]
     Timeout {
@@ -171,9 +178,14 @@ pub struct TargetConfig {
     /// BMC or switch management endpoint.
     pub ip: String,
     /// Username used for Redfish, NVUE, SSH, or IPMI as needed by the target.
+    /// Cleared by [`Self::with_bmc_session_token`].
     pub username: String,
-    /// Password for the target credentials. Redacted from `Debug`.
+    /// Basic-auth password. Cleared by [`Self::with_bmc_session_token`],
+    /// which sets `session_token` instead. Redacted from `Debug`.
     pub password: String,
+    /// Redfish session token set by [`Self::with_bmc_session_token`]. Use
+    /// `bmc_session_token()` to read it. Redacted from `Debug`.
+    pub session_token: Option<String>,
     /// Optional management port override.
     pub port: Option<u16>,
     /// Platform family that selects the NVFWUPD target implementation.
@@ -309,6 +321,10 @@ impl fmt::Debug for TargetConfig {
             .field("ip", &self.ip)
             .field("username", &self.username)
             .field("password", &"<redacted>")
+            .field(
+                "session_token",
+                &self.session_token.as_ref().map(|_| "<redacted>"),
+            )
             .field("port", &self.port)
             .field("server_type", &self.server_type)
             .field("verify_tls", &self.verify_tls)
@@ -316,6 +332,29 @@ impl fmt::Debug for TargetConfig {
             .field("ssh_known_hosts", &self.ssh_known_hosts)
             .field("ssh_host_key_mode", &self.ssh_host_key_mode)
             .finish()
+    }
+}
+
+impl TargetConfig {
+    /// Configure this BMC target to use a Redfish session token.
+    ///
+    /// Session-token authentication is valid only for BMC Redfish targets.
+    /// Direct NVOS switch targets still require username/password credentials.
+    #[must_use]
+    pub fn with_bmc_session_token(mut self, session_token: impl Into<String>) -> Self {
+        self.username.clear();
+        self.password.clear();
+        self.session_token = Some(session_token.into());
+        self
+    }
+
+    // An empty (or whitespace-only) token is treated as absent so callers
+    // fall back to the "credentials must not be empty" validation instead of
+    // building a half-configured session-token client.
+    pub(crate) fn bmc_session_token(&self) -> Option<&str> {
+        self.session_token
+            .as_deref()
+            .filter(|token| !token.trim().is_empty())
     }
 }
 
@@ -344,6 +383,8 @@ pub enum ServerType {
     GB300,
     /// VR NVL72 compute Redfish target.
     VRNVL72,
+    /// LP30 compute Redfish target.
+    LP30,
     /// GB200 switch NVUE/Redfish target.
     GB200Switch,
     /// GB300 switch NVUE/Redfish target.
@@ -468,7 +509,7 @@ pub enum ActivationCommand {
 
 impl ActivationCommand {
     /// Return the CLI command string used by the existing NVFWUPD command path.
-    pub fn as_cli_command(self) -> &'static str {
+    pub const fn as_cli_command(self) -> &'static str {
         match self {
             Self::PowerOn => "RF_PWR_ON",
             Self::PowerOff => "RF_PWR_OFF",

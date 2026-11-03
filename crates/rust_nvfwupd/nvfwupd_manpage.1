@@ -1,0 +1,202 @@
+.TH nvfwupd 1
+.SH NAME
+nvfwupd \- Out-of-Band Tool to update NVIDIA DGX, HGX, MGX platforms. 
+.SH SYNOPSIS
+.B nvfwupd
+[global options]
+[command]
+.SH DESCRIPTION
+.B nvfwupd
+This tool performs out-of-band firmware update of the entire DGX, HGX, MGX, PowerShelf, and switch platforms. It can also update an individual component of these platforms. For supported switch targets, it can display and install NVOS image versions. Additionally, it supports in-band operations for flint-based firmware queries and updates on the Host OS.
+.PP
+Redfish connections use HTTPS by default. Cleartext HTTP connections are disabled by default; use \fBallow_http=true\fR only for trusted HTTP-only Redfish targets or port-forwarding cases.
+.SH GLOBAL OPTIONS
+.TP
+.BR "-t/--target < sub-options >"
+Specify target platform BMC or NVOS IP address and login credentials.
+.RS
+.IP SUB-OPTIONS
+<key=value> pairs of input parameters that describe the target machine.
+.TP "ip=<value> user=<value> password=<value> port=<value> servertype=<value>"
+.RS
+.IP ip 0.20i
+IP address/FQDN of target BMC or NVOS service.
+.IP user
+Username to login to the target BMC or NVOS service.
+.IP password
+Password to login to the target BMC or NVOS service.
+.IP port
+TCP port with port-forwarding to use to connect with BMC service (optional)
+.IP servertype
+Users can provide the servertype value from the [DGX | DGXRUBIN | HGX | MGX | GH200 | HGXB100 | HGXB300 | HGXRUBIN | GB200 | GB300 | VRNVL72 | LP30 | GB200Switch | GB300Switch | VRNVL72Switch | PowerShelf] options based on the type of the target system type. This is optional and is recommended only if you experience unknown platform errors.
+.RE
+.RE
+.TP
+.BR "-o/--os_target < sub-options >"
+Specify target Host OS IP address and login credentials for in-band operations. 
+.RS
+.IP SUB-OPTIONS
+<key=value> pairs of input parameters that describe the target Host OS.
+.TP "ip=<value> user=<value> password=<value> port=<value> servertype=<value>"
+.RS
+.IP ip 0.20i
+IP address/FQDN of target Host OS.
+.IP user
+Username to login to the target Host OS.
+.IP password
+Password to login to the target Host OS.
+.IP port
+SSH port number (optional).
+.IP servertype
+Server type (optional).
+.RE
+.RE
+.TP
+.BR "-c/--config < config YAML path >"
+A YAML config file can be used to define the behavior of few commands. This option takes the path of such YAML config file (optional).
+.TP
+.BR "-v/--verbose < logfile path >"
+Increase verbosity. Provide chosen path for logfile (optional). Default path is current working directory.
+.SH COMMAND
+.TP
+.BR "show_version <command options>"
+Show AP components that can be updated out-of-band along with current running firmware versions. If -p option is specified, then show firmware versions from the firmware package, firmware tar file, or supported switch NVOS .bin image, and whether each AP component is up-to-date or needs updating. Global option -t/--target required.
+.IP "COMMAND OPTIONS"
+.RS
+.IP -p/--package 0.20i
+PLDM firmware package, firmware tar file, or supported switch NVOS .bin image. (optional)
+.IP -j/--json 0.20i
+Display package comparison in JSON format. (optional)
+.IP -s/--staged 0.20i
+Display staged firmware versions. (optional)
+.IP -i/--inventory 0.20i
+Include Software Inventory in the output (e.g. IST test vector versions). Queries the Redfish UpdateService SoftwareInventory collection and displays version information in the same table as firmware inventory. (optional)
+.RE
+.TP
+.BR "update_fw <command options>"
+Perform firmware update of the entire server out-of-band using a PLDM package or firmware tarball. Supported switch targets also accept one NVOS .bin image. If -s option is specified, firmware update only the AP component(s) mentioned in the JSON file. Global option -t/--target required.
+.IP "COMMAND OPTIONS"
+.RS
+.IP -p/--package 0.20i
+PLDM firmware package, firmware tar file, or one supported switch NVOS .bin image (mandatory).
+.IP -b/--background
+Perform firmware update asynchronously in the background.
+.IP -s/--special
+Special Update json file.
+.IP -o/--oem_parameters
+Oem Parameters json file.
+.IP -t/--timeout
+API request timeout value in seconds. For NVOS .bin updates, this also controls SFTP upload timeout.
+.IP -e/--expected_inventory
+JSON file listing FirmwareInventory AP names that must be present before update. If omitted, expected inventory validation is skipped.
+.IP -y/--yes
+Bypass firmware update confirmation prompt.
+.IP -d/--details
+Show update progress in table format.
+.IP -j/--json
+Show output in JSON. Must be paired with the -b background option, and always bypasses update confirmation prompt.
+.IP -u/--staged_update
+Run a SPI staged update for components that support it. (optional)
+.IP -a/--staged_activate_update
+Run a SPI staged and activate update for components that support it. (optional)
+.IP -k/--skip_pre_flight_checks
+Skip pre-flight checks before firmware update, such as update task status, BackgroundCopy, and write-protect checks where supported. Use with caution. Can also be set in the YAML config file using SkipPreFlightChecks parameter. This option does not disable expected inventory validation when -e/--expected_inventory is provided. (optional)
+.RE
+.TP
+.BR "activate_fw <command options>"
+Perform firmware activation using IPMI commands . Global option -t/--target required.
+.IP "COMMAND OPTIONS"
+.RS
+.IP -c/--cmd 0.20i
+Activation command to run. Supported values ['PWR_STATUS', 'PWR_OFF', 'PWR_ON', 'PWR_CYCLE', 'RESET_COLD', 'RESET_WARM', 'NVUE_PWR_CYCLE', 'RF_AUX_PWR_CYCLE', 'RF_PWR_ON', 'RF_PWR_OFF', 'RF_PWR_CYCLE', 'RF_PWR_STATUS', 'RF_PWRSHELF_RESET', 'RF_PWRSHELF_RESET_FORCE'] (mandatory).
+.RE
+.TP
+.BR "background_copy <command options>"
+Initiate background copy of the component identified in JSON file given with -s. Global option -t/--target required.
+.IP "COMMAND OPTIONS"
+.RS
+.IP -s/--special 0.20i
+JSON file used to select the background copy target component. (mandatory)
+.IP -i/--interactive
+Interactive mode - poll until Active and Inactive firmware slots match
+.IP -t/--timeout
+Maximum wait time in seconds for interactive mode polling (default 600)
+.IP -p/--poll_interval
+Poll interval in seconds for interactive mode (default 20)
+.RE
+.TP
+.BR "force_update <option_value> <command options>"
+Command to check/enable/disable the force update flag on target system. Used for downgrades. Global option -t/--target required.
+.IP "OPTION VALUE"
+.RS
+.IP enable 0.20i
+Enable force update on target.
+.IP disable
+disable force update on target.
+.IP status
+Show status of force update on target.
+.RE
+.IP "COMMAND OPTIONS"
+.RS
+.IP -j/--json
+show output in JSON
+.RE
+.TP
+.BR "show_update_progress <command options>"
+Show current status of an update task running on target. Global option -t/--target required.
+.IP "COMMAND OPTIONS"
+.RS
+.IP -i/--id 0.20i
+Task ID of the update task to monitor.
+.IP -j/--json
+show output in JSON
+.RE
+.TP
+.BR "make_upd_targets <command options>"
+Create all update parameter JSON files for given target. Global option -t/--target required.
+.IP "COMMAND OPTIONS"
+.RS
+.IP -o/--outdir 0.20i
+Path for output directory to store the JSON files (optional). Default location is current working directory. If given directory path does not exist, the tool will try to create it.
+.RE
+.TP
+.BR "perform_factory_reset"
+Perform factory reset on target system. This is not supported on the NVSwitch trays. Global option -t/--target required.
+.TP
+.BR "show_pkg_content <command options>"
+Show PLDM metadata for all firmware devices in a fwpkg file. -p/--package is mandatory. Global options not required. 
+.IP "COMMAND OPTIONS"
+.RS
+.IP -p/--package 0.20i
+PLDM firmware package file. Not supported with tar files.
+.RE
+.TP
+.BR "unpack <command options>"
+Unpack all firmware images from a PLDM package and show associated metadata for all firmware devices. -p/--package is mandatory. Global options not required. 
+.IP "COMMAND OPTIONS"
+.RS
+.IP -p/--package 0.20i
+PLDM firmware package file. Not supported with tar files.
+.IP -o/--outdir
+Path for output directory to store the unpacked firmware files (optional). Default location of unpacked files is current working directory. If given directory path does not exist, the tool will try to create it.
+.RE
+.TP
+.BR "flint_update <command options>"
+Execute flint queries and firmware updates on the Host OS. This command connects to the target system's Host OS via SSH and performs flint-based firmware operations. Global option -o/--os_target required.
+.IP "COMMAND OPTIONS"
+.RS
+.IP -i/--image 0.20i
+Image file(s) for firmware flashing and version comparison. Can specify multiple image files.
+.IP -d/--device_type
+Device type for firmware flashing and version query (e.g., BlueField3, ConnectX).
+.IP -j/--json
+Show output in JSON format for automation and parsing.
+.IP -v/--version
+Query firmware version only without performing updates.
+.IP -t/--timeout
+Query timeout in seconds for OS commands. Flashing operation timeout is 20x the query timeout. (default 60 for queries, 1200 for flash operations) This can be set higher for slow networks.
+.RE
+.SH AUTHOR
+NVIDIA Corporation
+.SH COPYRIGHT
+Copyright 2023-2026 NVIDIA Corporation.

@@ -21,9 +21,9 @@ use std::time::Duration;
 
 use nv_redfish::Bmc as _;
 use nv_redfish::ServiceRoot;
-use nv_redfish::bmc_http::reqwest::{BmcError, Client, ClientParams};
+use nv_redfish::bmc_http::reqwest::{BmcError, Client};
 use nv_redfish::bmc_http::{BmcCredentials, CacheSettings, HttpBmc};
-use nv_redfish::core::{DataStream, EntityTypeRef, NavProperty, ODataId, UploadReader};
+use nv_redfish::core::{Action, DataStream, EntityTypeRef, NavProperty, ODataId, UploadReader};
 use nv_redfish::resource::{PowerState as RedfishPowerState, ResetType};
 use nv_redfish::schema::computer_system::{
     ComputerSystem as ComputerSystemSchema, ComputerSystemResetAction,
@@ -35,6 +35,7 @@ use nv_redfish::schema::processor::Processor as ProcessorSchema;
 use nv_redfish::schema::processor_collection::ProcessorCollection as ProcessorCollectionSchema;
 use nv_redfish::update_service::MultipartUpdateParameters;
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio_util::compat::TokioAsyncReadCompatExt as _;
 use url::Url;
@@ -42,6 +43,11 @@ use url::Url;
 use crate::error::{RedfishError, Result};
 use crate::task::{RedfishTaskResponse, task_id_from_modification_response};
 use crate::types::NvidiaMnnvlinkTopology;
+
+mod json;
+
+use json::RedfishJson;
+pub use json::{ODataLink, ResourceCollection};
 
 type NvRedfishBmc = HttpBmc<Client>;
 type NvRedfishServiceRoot = ServiceRoot<NvRedfishBmc>;
@@ -79,17 +85,51 @@ impl RedfishClient {
         dangerously_accept_invalid_certs: bool,
         https: bool,
     ) -> Result<Self> {
-        let endpoint_url = redfish_endpoint_url(host, port, https)?;
-
-        let bmc = HttpBmc::new(
-            cached_http_client(dangerously_accept_invalid_certs)?,
-            endpoint_url,
+        Self::new_with_timeouts(
+            host,
+            port,
             credentials,
-            CacheSettings::with_capacity(0),
-        );
+            dangerously_accept_invalid_certs,
+            https,
+            Self::CONNECT_TIMEOUT,
+            Self::REQUEST_TIMEOUT,
+        )
+    }
 
+    /// Build with per-instance transport limits, without changing shared defaults.
+    pub fn new_with_timeouts(
+        host: &str,
+        port: u16,
+        credentials: BmcCredentials,
+        dangerously_accept_invalid_certs: bool,
+        https: bool,
+        connect_timeout: Duration,
+        request_timeout: Duration,
+    ) -> Result<Self> {
+        if connect_timeout.is_zero() || request_timeout.is_zero() {
+            return Err(RedfishError::InvalidArgument(
+                "Redfish timeouts must be greater than zero".to_owned(),
+            ));
+        }
+        let endpoint_url = redfish_endpoint_url(host, port, https)?;
+        let client = if connect_timeout == Self::CONNECT_TIMEOUT
+            && request_timeout == Self::REQUEST_TIMEOUT
+        {
+            cached_http_client(dangerously_accept_invalid_certs)?
+        } else {
+            http_client(
+                dangerously_accept_invalid_certs,
+                connect_timeout,
+                request_timeout,
+            )?
+        };
         Ok(Self {
-            bmc: Arc::new(bmc),
+            bmc: Arc::new(HttpBmc::new(
+                client,
+                endpoint_url,
+                credentials,
+                CacheSettings::with_capacity(0),
+            )),
             root: Arc::new(AsyncMutex::new(None)),
         })
     }
@@ -103,13 +143,95 @@ impl RedfishClient {
         *self.root.lock().await = None;
     }
 
+    /// GET a Redfish resource and deserialize the body into `T`.
+    ///
+    /// The path must be origin-relative (`/redfish/v1/...`). Absolute and
+    /// protocol-relative URIs are rejected so BMC-supplied `@odata.id` values
+    /// cannot send credentials off-box. nv-redfish then resolves the remaining
+    /// path against the configured BMC origin.
+    ///
+    /// `@odata.id` and `@odata.etag` are taken by the nv-redfish entity
+    /// envelope and are not deserialized into `T`. Do not require those
+    /// fields on `T`; a normal Redfish payload will then fail to decode.
+    pub async fn get_resource<T>(&self, path: &str) -> Result<T>
+    where
+        T: DeserializeOwned + Clone + Send + Sync + 'static,
+    {
+        let path = bmc_relative_uri(path)?;
+        let document: Arc<RedfishJson<T>> = self
+            .resource_schema_at(&ODataId::from(path.to_owned()))
+            .await?;
+        Ok(Arc::unwrap_or_clone(document).into_body())
+    }
+
+    /// GET a Redfish resource as untyped JSON through nv-redfish.
+    ///
+    /// Prefer [`Self::get_resource`] with a struct when the fields are known.
+    /// Use this for one-off vendor keys that are not worth modeling yet.
+    ///
+    /// Same envelope as [`Self::get_resource`]: `@odata.id` and `@odata.etag`
+    /// are not deserialized into the returned [`serde_json::Value`]. Do not
+    /// require those fields on a typed `T`; a normal Redfish payload will then
+    /// fail to decode.
+    pub async fn get_json(&self, path: &str) -> Result<serde_json::Value> {
+        self.get_resource(path).await
+    }
+
+    /// POST a Redfish action whose `target` was advertised by the BMC.
+    ///
+    /// The target is resolved and origin-checked by nv-redfish `HttpBmc` before
+    /// credentials are attached. Absolute and protocol-relative URIs are
+    /// rejected here as well so a BMC cannot redirect credentials off-box.
+    pub async fn post_action(&self, target: &str, payload: &serde_json::Value) -> Result<()> {
+        let target = bmc_relative_uri(target)?;
+
+        let action: Action<serde_json::Value, serde_json::Value> =
+            serde_json::from_value(serde_json::json!({ "target": target })).map_err(|error| {
+                RedfishError::InvalidArgument(format!(
+                    "invalid Redfish action target {target}: {error}"
+                ))
+            })?;
+
+        map_action_result(
+            format!("POST {target} via nv-redfish"),
+            action.run(self.bmc.as_ref(), payload).await,
+        )
+    }
+
     /// Read a ComputerSystem power state through nv-redfish resource navigation.
     pub async fn computer_system_power_state(
         &self,
         system_id: &str,
     ) -> Result<Option<RedfishPowerState>> {
-        let system = self.computer_system_schema(system_id).await?;
+        self.computer_system_power_state_with_path(system_id, None)
+            .await
+    }
+
+    /// Read host power state from an override, or retain ID-based discovery.
+    ///
+    /// An explicit path is authoritative: failures do not fall back to discovery.
+    pub async fn computer_system_power_state_with_path(
+        &self,
+        system_id: &str,
+        system_path: Option<&str>,
+    ) -> Result<Option<RedfishPowerState>> {
+        let system = self.power_system_schema(system_id, system_path).await?;
         Ok(system.power_state.flatten())
+    }
+
+    async fn power_system_schema(
+        &self,
+        system_id: &str,
+        system_path: Option<&str>,
+    ) -> Result<Arc<ComputerSystemSchema>> {
+        match system_path {
+            Some(path) => {
+                validate_configured_power_path(path)?;
+                self.resource_schema_at(&ODataId::from(path.to_owned()))
+                    .await
+            }
+            None => self.computer_system_schema(system_id).await,
+        }
     }
 
     /// Reset a ComputerSystem using the resource-provided action target.
@@ -118,21 +240,42 @@ impl RedfishClient {
         system_id: &str,
         reset_type: ResetType,
     ) -> Result<()> {
-        let system = self.computer_system_schema(system_id).await?;
-        let reset = system
-            .actions
-            .as_ref()
-            .and_then(|actions| actions.reset.as_ref())
-            .ok_or_else(|| {
-                RedfishError::FailedPrecondition(format!(
-                    "ComputerSystem {system_id} Reset action is not available"
-                ))
-            })?;
+        self.reset_computer_system_with_paths(system_id, None, None, reset_type)
+            .await
+    }
+
+    /// Reset a host using an explicit action, a configured resource's action,
+    /// or the existing ID-based discovery, in that order.
+    pub async fn reset_computer_system_with_paths(
+        &self,
+        system_id: &str,
+        system_path: Option<&str>,
+        reset_path: Option<&str>,
+        reset_type: ResetType,
+    ) -> Result<()> {
+        let system;
+        let configured_reset;
+        let reset = if let Some(path) = reset_path {
+            configured_reset = configured_reset_action::<ComputerSystemResetAction>(path)?;
+            &configured_reset
+        } else {
+            system = self.power_system_schema(system_id, system_path).await?;
+            system
+                .actions
+                .as_ref()
+                .and_then(|actions| actions.reset.as_ref())
+                .ok_or_else(|| {
+                    RedfishError::FailedPrecondition(format!(
+                        "ComputerSystem {system_id} Reset action is not available"
+                    ))
+                })?
+        };
 
         let result = reset
             .run(
                 self.bmc.as_ref(),
                 &ComputerSystemResetAction {
+                    redfish_annotations: Default::default(),
                     reset_type: Some(reset_type),
                 },
             )
@@ -143,21 +286,42 @@ impl RedfishClient {
 
     /// Reset a Manager using the resource-provided action target.
     pub async fn reset_manager(&self, manager_id: &str, reset_type: ResetType) -> Result<()> {
-        let manager = self.manager_schema(manager_id).await?;
-        let reset = manager
-            .actions
-            .as_ref()
-            .and_then(|actions| actions.reset.as_ref())
-            .ok_or_else(|| {
-                RedfishError::FailedPrecondition(format!(
-                    "Manager {manager_id} Reset action is not available"
-                ))
-            })?;
+        self.reset_manager_with_path(manager_id, None, reset_type)
+            .await
+    }
+
+    /// Reset a manager at a configured action path, or discover its action by ID.
+    ///
+    /// An explicit path is authoritative: failures do not fall back to discovery.
+    pub async fn reset_manager_with_path(
+        &self,
+        manager_id: &str,
+        reset_path: Option<&str>,
+        reset_type: ResetType,
+    ) -> Result<()> {
+        let manager;
+        let configured_reset;
+        let reset = if let Some(path) = reset_path {
+            configured_reset = configured_reset_action::<ManagerResetAction>(path)?;
+            &configured_reset
+        } else {
+            manager = self.manager_schema(manager_id).await?;
+            manager
+                .actions
+                .as_ref()
+                .and_then(|actions| actions.reset.as_ref())
+                .ok_or_else(|| {
+                    RedfishError::FailedPrecondition(format!(
+                        "Manager {manager_id} Reset action is not available"
+                    ))
+                })?
+        };
 
         let result = reset
             .run(
                 self.bmc.as_ref(),
                 &ManagerResetAction {
+                    redfish_annotations: Default::default(),
                     reset_type: Some(reset_type),
                 },
             )
@@ -669,19 +833,173 @@ fn cached_http_client(dangerously_accept_invalid_certs: bool) -> Result<Client> 
         return Ok(client.clone());
     }
 
-    let client = Client::with_params(client_params(dangerously_accept_invalid_certs))
-        .map_err(|source| RedfishError::CreateHttpClient { source })?;
+    let client = http_client(
+        dangerously_accept_invalid_certs,
+        RedfishClient::CONNECT_TIMEOUT,
+        RedfishClient::REQUEST_TIMEOUT,
+    )?;
 
     *cache = Some(client.clone());
 
     Ok(client)
 }
 
-fn client_params(dangerously_accept_invalid_certs: bool) -> ClientParams {
-    ClientParams::new()
-        .timeout(RedfishClient::REQUEST_TIMEOUT)
-        .connect_timeout(RedfishClient::CONNECT_TIMEOUT)
-        .accept_invalid_certs(dangerously_accept_invalid_certs)
+/// Accept only origin-relative Redfish paths so BMC-supplied URIs cannot leave
+/// the configured host.
+fn bmc_relative_uri(uri: &str) -> Result<&str> {
+    let uri = uri.trim();
+    if uri.is_empty() {
+        return Err(RedfishError::InvalidArgument(
+            "Redfish URI must not be empty".to_owned(),
+        ));
+    }
+    if uri.contains("://") || uri.starts_with("//") || !uri.starts_with('/') {
+        return Err(RedfishError::InvalidArgument(format!(
+            "Redfish URI must be an origin-relative path, not {uri}"
+        )));
+    }
+    Ok(uri)
+}
+
+/// The BMC HTTP client: nv-redfish's defaults, on a TLS config of our own.
+///
+/// nv-redfish lets reqwest build the TLS config, and reqwest has no switch for
+/// session resumption. `Client::with_client` takes a client built here, but
+/// skips nv-redfish's redirect guard, so the guard is rebuilt below.
+fn http_client(
+    dangerously_accept_invalid_certs: bool,
+    connect_timeout: Duration,
+    request_timeout: Duration,
+) -> Result<Client> {
+    let client = reqwest::Client::builder()
+        .use_preconfigured_tls(bmc_tls_config(dangerously_accept_invalid_certs)?)
+        .user_agent("nv-redfish/v1")
+        .connect_timeout(connect_timeout)
+        .timeout(request_timeout)
+        .tcp_keepalive(Duration::from_secs(60))
+        .redirect(same_origin_redirects())
+        // BMCs and the test server close idle sockets without a clean
+        // Connection: close. Reusing one turns the next GET into
+        // "error sending request" even though the server is answering.
+        .pool_max_idle_per_host(0)
+        .build()
+        .map_err(|source| RedfishError::CreateHttpClient { source })?;
+
+    Ok(Client::with_client(client))
+}
+
+/// TLS as reqwest builds it for this workspace, with session resumption off.
+///
+/// Some BMCs request an optional client certificate and abort a resumed
+/// handshake with alert 80 (internal error), as an OpenSSL server without a
+/// session ID context does. Every request opens its own connection, so a
+/// client that resumes fails every request after the first on such a BMC.
+fn bmc_tls_config(dangerously_accept_invalid_certs: bool) -> Result<rustls::ClientConfig> {
+    // RMS installs aws-lc-rs at startup. Without that, rustls cannot pick a
+    // provider on its own, because aws-lc-rs and ring are both linked.
+    let provider = rustls::crypto::CryptoProvider::get_default()
+        .cloned()
+        .unwrap_or_else(|| Arc::new(rustls::crypto::aws_lc_rs::default_provider()));
+    let builder = rustls::ClientConfig::builder_with_provider(provider)
+        .with_protocol_versions(rustls::ALL_VERSIONS)
+        .map_err(|error| RedfishError::Internal(format!("BMC TLS versions: {error}")))?;
+
+    let mut config = if dangerously_accept_invalid_certs {
+        builder
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(AcceptAnyServerCert))
+            .with_no_client_auth()
+    } else {
+        builder
+            .with_root_certificates(trusted_roots())
+            .with_no_client_auth()
+    };
+
+    config.resumption = rustls::client::Resumption::disabled();
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Ok(config)
+}
+
+/// The roots reqwest trusts with this workspace's features: the bundled
+/// webpki roots and the platform store. Platform certificates that rustls
+/// cannot parse are skipped, as reqwest skips them.
+fn trusted_roots() -> rustls::RootCertStore {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    roots.add_parsable_certificates(rustls_native_certs::load_native_certs().certs);
+    roots
+}
+
+/// The `insecure_bmc` policy: any server certificate and any handshake
+/// signature, the same contract as reqwest's `danger_accept_invalid_certs`.
+#[derive(Debug)]
+struct AcceptAnyServerCert;
+
+impl rustls::client::danger::ServerCertVerifier for AcceptAnyServerCert {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    // reqwest's list. Old BMCs still sign TLS 1.2 handshakes with SHA-1.
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        vec![
+            rustls::SignatureScheme::RSA_PKCS1_SHA1,
+            rustls::SignatureScheme::ECDSA_SHA1_Legacy,
+            rustls::SignatureScheme::RSA_PKCS1_SHA256,
+            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+            rustls::SignatureScheme::RSA_PKCS1_SHA384,
+            rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
+            rustls::SignatureScheme::RSA_PKCS1_SHA512,
+            rustls::SignatureScheme::ECDSA_NISTP521_SHA512,
+            rustls::SignatureScheme::RSA_PSS_SHA256,
+            rustls::SignatureScheme::RSA_PSS_SHA384,
+            rustls::SignatureScheme::RSA_PSS_SHA512,
+            rustls::SignatureScheme::ED25519,
+            rustls::SignatureScheme::ED448,
+        ]
+    }
+}
+
+/// nv-redfish's redirect guard: a redirect to another origin would carry the
+/// BMC credentials there. Same-origin redirects keep reqwest's limit of 10.
+fn same_origin_redirects() -> reqwest::redirect::Policy {
+    let limited = reqwest::redirect::Policy::default();
+    reqwest::redirect::Policy::custom(move |attempt| {
+        let Some(original_url) = attempt.previous().first() else {
+            return attempt.error("redirect attempt is missing the original URL");
+        };
+
+        if attempt.url().origin() != original_url.origin() {
+            return attempt.error("cross-origin redirects are not allowed");
+        }
+
+        limited.redirect(attempt)
+    })
 }
 
 fn redfish_endpoint_url(host: &str, port: u16, https: bool) -> Result<Url> {
@@ -703,15 +1021,15 @@ fn redfish_endpoint_url(host: &str, port: u16, https: bool) -> Result<Url> {
 }
 
 fn computer_system_schema_matches(system: &ComputerSystemSchema, expected_id: &str) -> bool {
-    system.base.id == expected_id || system.odata_id().last_segment() == Some(expected_id)
+    system.id == expected_id || system.odata_id().last_segment() == Some(expected_id)
 }
 
 fn manager_schema_matches(manager: &ManagerSchema, expected_id: &str) -> bool {
-    manager.base.id == expected_id || manager.odata_id().last_segment() == Some(expected_id)
+    manager.id == expected_id || manager.odata_id().last_segment() == Some(expected_id)
 }
 
 fn processor_schema_matches(processor: &ProcessorSchema, expected_id: &str) -> bool {
-    processor.base.id == expected_id || processor.odata_id().last_segment() == Some(expected_id)
+    processor.id == expected_id || processor.odata_id().last_segment() == Some(expected_id)
 }
 
 fn nvidia_mnnvlink_topology_from_processor(
@@ -719,8 +1037,6 @@ fn nvidia_mnnvlink_topology_from_processor(
     context: &str,
 ) -> Result<Option<NvidiaMnnvlinkTopology>> {
     let Some(topology) = processor
-        .base
-        .base
         .oem
         .as_ref()
         .and_then(|oem| oem.additional_properties.get("Nvidia"))
@@ -733,6 +1049,29 @@ fn nvidia_mnnvlink_topology_from_processor(
     serde_json::from_value(topology).map(Some).map_err(|error| {
         RedfishError::InvalidArgument(format!("MNNVLinkTopology invalid in {context}: {error}"))
     })
+}
+
+fn validate_configured_power_path(path: &str) -> Result<()> {
+    if !(path == "/redfish/v1" || path.starts_with("/redfish/v1/"))
+        || path.contains("//")
+        || path.split('/').any(|segment| matches!(segment, "." | ".."))
+        || !path
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'_' | b'-' | b'.'))
+    {
+        return Err(RedfishError::InvalidArgument(
+            "power override must be a plain same-origin /redfish/v1 path without traversal"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn configured_reset_action<T>(path: &str) -> Result<nv_redfish::core::Action<T, ()>> {
+    validate_configured_power_path(path)?;
+    // nv-redfish actions expose only a deserialization constructor.
+    serde_json::from_value(serde_json::json!({"target": path}))
+        .map_err(|error| RedfishError::InvalidArgument(format!("invalid reset action: {error}")))
 }
 
 fn map_action_result<T>(context: String, result: std::result::Result<T, BmcError>) -> Result<()> {

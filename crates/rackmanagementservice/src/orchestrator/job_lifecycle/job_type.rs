@@ -28,6 +28,8 @@ pub enum JobType {
     ConfigureScaleUpFabricManagerV2,
     /// Coordinator and per-node reservation holds for a rack cold reboot.
     ColdRebootSequence,
+    /// NVSSVT system validation scan launched as a subprocess.
+    SystemValidation,
 }
 
 impl JobType {
@@ -42,6 +44,7 @@ impl JobType {
             Self::SwitchSystemImageUpdate => "switch_system_image_update",
             Self::ConfigureScaleUpFabricManagerV2 => "configure_scale_up_fabric_manager_v2",
             Self::ColdRebootSequence => "cold_reboot_sequence",
+            Self::SystemValidation => "system_validation",
         }
     }
 
@@ -58,6 +61,7 @@ impl JobType {
             Self::SwitchSystemImageUpdate => "switch system image update",
             Self::ConfigureScaleUpFabricManagerV2 => "scale-up fabric configuration",
             Self::ColdRebootSequence => "cold reboot",
+            Self::SystemValidation => "system validation",
         }
     }
 
@@ -74,6 +78,7 @@ impl JobType {
             Self::SwitchSystemImageUpdate => "switch system image updates",
             Self::ConfigureScaleUpFabricManagerV2 => "scale-up fabric configurations",
             Self::ColdRebootSequence => "cold reboots",
+            Self::SystemValidation => "system validations",
         }
     }
 }

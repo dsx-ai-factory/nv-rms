@@ -28,8 +28,8 @@ use secrecy::{ExposeSecret, SecretString};
 use super::error::SshError;
 use crate::utilities::error::{Result, RmsError};
 
-/// Fixed reusable buffer size for firmware-sized SFTP uploads.
-pub const SFTP_UPLOAD_BUFFER_SIZE_BYTES: usize = 512 * 1024;
+/// Fixed reusable buffer size for firmware-sized SSH file uploads.
+pub const SSH_UPLOAD_BUFFER_SIZE_BYTES: usize = 512 * 1024;
 
 /// Minimal SSH client handler that accepts all host keys.
 ///
@@ -49,12 +49,13 @@ impl client::Handler for SshHandler {
     }
 }
 
-/// Async SSH/SFTP client for communicating with network switches.
+/// Async SSH client for communicating with network switches.
 ///
 /// Created per operation. The switch node builds a connected client with
 /// [`SshClient::connect`] when it needs to execute a remote command or transfer
-/// firmware via SFTP, then uses [`SshClient::exec`],
-/// [`SshClient::sftp_upload`], or [`SshClient::sftp_file_size`].
+/// firmware via SCP or SFTP, then uses [`SshClient::exec`],
+/// [`SshClient::scp_upload`], [`SshClient::sftp_upload`], or
+/// [`SshClient::sftp_file_size`].
 ///
 /// Like `HttpClient`, this is not thread-safe on its own. Concrete node types
 /// wrap access in a `tokio::sync::Mutex` when sharing a client is required.
@@ -66,17 +67,17 @@ pub struct SshClient {
     pub(super) handle: Option<client::Handle<SshHandler>>,
 }
 
-/// Timeout tunables for switch NVOS image SFTP uploads.
+/// Timeout tunables for SSH file uploads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SftpUploadOptions {
+pub struct SshUploadOptions {
     /// Maximum wall-clock time allowed for the whole upload.
     pub overall_timeout: Duration,
 
-    /// Maximum time allowed for one SFTP setup/read/write/flush step.
+    /// Maximum time allowed for one transfer setup/read/write/flush step.
     pub step_timeout: Duration,
 }
 
-impl SftpUploadOptions {
+impl SshUploadOptions {
     pub fn new(overall_timeout: Duration, step_timeout: Duration) -> Result<Self> {
         let options = Self {
             overall_timeout,
@@ -91,19 +92,19 @@ impl SftpUploadOptions {
     pub fn validate(&self) -> Result<()> {
         if self.overall_timeout.is_zero() {
             return Err(RmsError::invalid_argument(
-                "SFTP upload timeout must be greater than 0 seconds",
+                "SSH upload timeout must be greater than 0 seconds",
             ));
         }
 
         if self.step_timeout.is_zero() {
             return Err(RmsError::invalid_argument(
-                "SFTP step timeout must be greater than 0 seconds",
+                "SSH step timeout must be greater than 0 seconds",
             ));
         }
 
         if self.step_timeout > self.overall_timeout {
             return Err(RmsError::invalid_argument(
-                "SFTP step timeout must be less than or equal to upload timeout",
+                "SSH step timeout must be less than or equal to upload timeout",
             ));
         }
 
@@ -111,7 +112,7 @@ impl SftpUploadOptions {
     }
 }
 
-impl Default for SftpUploadOptions {
+impl Default for SshUploadOptions {
     fn default() -> Self {
         Self {
             overall_timeout: Duration::from_secs(3600),
@@ -152,11 +153,12 @@ impl SshClient {
     /// Default timeout for short SSH operations such as connect and exec.
     pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
-    /// Default overall timeout for firmware-sized SFTP uploads.
+    /// Default overall timeout for firmware-sized SSH uploads.
     pub const UPLOAD_TIMEOUT: Duration = Duration::from_secs(1800);
 
     /// Test-only: build a client with no active session, so remote operations
-    /// (`exec`, `sftp_upload`, `sftp_file_size`, ...) fail as if disconnected.
+    /// (`exec`, `scp_upload`, `sftp_upload`, `sftp_file_size`, ...) fail as if
+    /// disconnected.
     #[cfg(test)]
     pub(crate) fn disconnected_for_test(host: impl Into<String>) -> Self {
         Self {
@@ -168,8 +170,9 @@ impl SshClient {
     /// Open an SSH connection and return an authenticated client.
     ///
     /// The client connects to port 22 on the endpoint host. On success, later
-    /// calls to [`SshClient::exec`], [`SshClient::sftp_upload`], and
-    /// [`SshClient::sftp_file_size`] use the established session.
+    /// calls to [`SshClient::exec`], [`SshClient::scp_upload`],
+    /// [`SshClient::sftp_upload`], and [`SshClient::sftp_file_size`] use the
+    /// established session.
     ///
     /// # Errors
     ///

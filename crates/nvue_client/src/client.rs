@@ -36,24 +36,21 @@ use crate::cluster::{
 };
 use crate::platform::{CHASSIS_LOCATION_ENDPOINT, ChassisLocation};
 use crate::system::{
-    GNMI_SERVER_MTLS_ENDPOINT, MtlsConfiguration, SYSTEM_API_ENDPOINT, SYSTEM_API_MTLS_ENDPOINT,
-    SystemApi,
+    MtlsConfiguration, SYSTEM_API_ENDPOINT, SYSTEM_API_MTLS_ENDPOINT, SYSTEM_ENDPOINT, SystemApi,
+    SystemRoot,
 };
 use crate::tls::{TlsSnapshot, load_stable_snapshot};
 use crate::{ClientTls, NVUE_V1_SERVER};
 
 const DEFAULT_MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_HTTP_ERROR_BODY_CHARS: usize = 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Plain-HTTP NVUE requests open a fresh connection instead of reusing pooled
-/// keep-alive connections. Control-plane HTTP servers (NVOS/NVUE, and the
-/// wiremock servers used in tests) routinely close idle connections; reusing a
-/// half-closed pooled connection surfaces as a spurious `error sending request`
-/// transient failure — a notable source of test flakiness under a loaded
-/// runtime. The extra TCP connect per plain request is negligible, and there is
-/// no TLS handshake to amortize on this path (the client-TLS transports keep
-/// their pools).
-const PLAIN_POOL_MAX_IDLE_PER_HOST: usize = 0;
+/// Internally built NVUE transports open a fresh connection instead of reusing
+/// pooled keep-alive connections. NVOS routinely reloads its control-plane
+/// server during mutations, so a pooled connection can become invalid between
+/// two steps of one workflow and fail before the next request reaches NVUE.
+const POOL_MAX_IDLE_PER_HOST: usize = 0;
 
 /// Default timeout for ordinary NVUE control-plane requests.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -86,6 +83,7 @@ impl TransportScheme {
 enum ServerVerification {
     Configured,
     Required,
+    Unverified,
 }
 
 /// NVUE URL authority and TCP connection target.
@@ -459,7 +457,10 @@ pub enum ClientError {
     },
 
     /// A JSON convenience method received a non-success response.
-    #[error("HTTP {method} {path} returned {status}")]
+    ///
+    /// Display includes a redacted body excerpt of at most 1024 characters,
+    /// plus an ellipsis when truncated. The raw body remains available below.
+    #[error("HTTP {method} {path} returned {status}{}", http_error_body_excerpt(.body))]
     HttpStatus {
         /// HTTP method.
         method: &'static str,
@@ -878,6 +879,21 @@ impl Client {
         })
     }
 
+    /// Reads and decodes the NVUE system readiness and health summary.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request fails or the body does not decode
+    /// as [`SystemRoot`]: no `status`, neither health spelling, or a health
+    /// word outside the known set.
+    pub async fn get_system(&self, timeout: Duration) -> Result<SystemRoot, ClientError> {
+        let response = self.get_json(SYSTEM_ENDPOINT, timeout).await?;
+
+        serde_json::from_value(response).map_err(|error| {
+            ClientError::invalid_response(format!("invalid NVUE system response: {error}"))
+        })
+    }
+
     /// Reads and decodes the NVUE API mTLS configuration.
     ///
     /// # Errors
@@ -892,25 +908,6 @@ impl Client {
 
         serde_json::from_value(response).map_err(|error| {
             ClientError::invalid_response(format!("invalid NVUE system API mTLS response: {error}"))
-        })
-    }
-
-    /// Reads and decodes the NVUE gNMI server mTLS configuration.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the request fails or the successful response does
-    /// not match the NVUE gNMI server mTLS schema.
-    pub async fn get_gnmi_server_mtls(
-        &self,
-        timeout: Duration,
-    ) -> Result<MtlsConfiguration, ClientError> {
-        let response = self.get_json(GNMI_SERVER_MTLS_ENDPOINT, timeout).await?;
-
-        serde_json::from_value(response).map_err(|error| {
-            ClientError::invalid_response(format!(
-                "invalid NVUE gNMI server mTLS response: {error}"
-            ))
         })
     }
 
@@ -1186,6 +1183,33 @@ impl Client {
         Ok(prepared.expect("forced client-TLS preparation must produce a candidate"))
     }
 
+    /// Build a client-TLS candidate that presents the client certificate while
+    /// accepting an invalid server certificate during certificate bootstrap.
+    ///
+    /// The active transport remains unchanged until the candidate succeeds in
+    /// `activate_prepared_client_tls`. Callers must restrict this to a trusted
+    /// management path and restore server verification after installation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the endpoint or TLS material is invalid, or when
+    /// the unverified transport cannot be built.
+    pub async fn prepare_unverified_client_tls(
+        &self,
+        tls: ClientTls,
+        server_name: Option<&str>,
+    ) -> Result<PreparedClientTls, ClientError> {
+        let prepared = self
+            .prepare_client_tls_candidate(tls, server_name, false, ServerVerification::Unverified)
+            .await?;
+
+        prepared.ok_or_else(|| {
+            ClientError::InvalidRequest(
+                "forced client-TLS preparation returned no candidate".into(),
+            )
+        })
+    }
+
     /// Build a client-TLS candidate only when material or TLS authority changed.
     pub async fn prepare_client_tls_if_changed(
         &self,
@@ -1217,8 +1241,10 @@ impl Client {
             config.endpoint.validate()?;
         }
 
-        if matches!(server_verification, ServerVerification::Required) {
-            config.dangerously_accept_invalid_certs = false;
+        match server_verification {
+            ServerVerification::Configured => {}
+            ServerVerification::Required => config.dangerously_accept_invalid_certs = false,
+            ServerVerification::Unverified => config.dangerously_accept_invalid_certs = true,
         }
 
         let snapshot = load_stable_snapshot(&tls).await?;
@@ -1378,6 +1404,18 @@ impl Client {
         )
     }
 
+    /// Return whether the active generation presents a client certificate and
+    /// validates the server certificate.
+    pub fn uses_verified_client_tls(&self) -> bool {
+        matches!(
+            self.state.lock().unwrap().generation,
+            ClientGeneration::ClientTls {
+                dangerously_accept_invalid_certs: false,
+                ..
+            }
+        )
+    }
+
     /// Return whether the active client uses the supplied basic-auth credentials.
     pub fn credentials_match(&self, username: &str, password: &str) -> bool {
         let state = self.state.lock().unwrap();
@@ -1446,7 +1484,7 @@ fn build_plain_transport(
         disable_proxies(reqwest::Client::builder())
             .danger_accept_invalid_certs(config.dangerously_accept_invalid_certs)
             .connect_timeout(CONNECT_TIMEOUT)
-            .pool_max_idle_per_host(PLAIN_POOL_MAX_IDLE_PER_HOST)
+            .pool_max_idle_per_host(POOL_MAX_IDLE_PER_HOST)
             .resolve(normalize_host(&config.endpoint.host), socket_addr)
             .build()
             .map_err(|source| ClientError::Request {
@@ -1489,7 +1527,7 @@ fn shared_plain_client(accept_invalid_certs: bool) -> Result<reqwest::Client, Cl
     let client = disable_proxies(reqwest::Client::builder())
         .danger_accept_invalid_certs(accept_invalid_certs)
         .connect_timeout(CONNECT_TIMEOUT)
-        .pool_max_idle_per_host(PLAIN_POOL_MAX_IDLE_PER_HOST)
+        .pool_max_idle_per_host(POOL_MAX_IDLE_PER_HOST)
         .build()
         .map_err(|source| ClientError::Request {
             operation: "failed to create NVUE HTTP client".into(),
@@ -1525,6 +1563,7 @@ async fn build_client_tls_transport(
         .connect_timeout(CONNECT_TIMEOUT)
         .identity(identity)
         .add_root_certificate(ca_cert)
+        .pool_max_idle_per_host(POOL_MAX_IDLE_PER_HOST)
         .resolve(server_name, socket_addr)
         .build()
         .map_err(|source| ClientError::Request {
@@ -1611,6 +1650,44 @@ fn format_url_host(host: &str) -> String {
         format!("[{host}]")
     } else {
         host.to_owned()
+    }
+}
+
+// Error bodies have no fixed schema. Preserve their dynamic JSON shape while
+// masking nested secret fields and credentials in text. Bound the sanitized
+// result before it becomes an RMS message or log entry.
+fn http_error_body_excerpt(body: &str) -> String {
+    let redacted = match serde_json::from_str::<Value>(body) {
+        Ok(value) => common::redaction::redact_secret_json_value(&value).to_string(),
+        Err(_) => common::redaction::redact_secret_fields(body),
+    };
+
+    let single_line: String = redacted
+        .chars()
+        .map(|character| {
+            if character.is_control() || matches!(character, '\u{2028}' | '\u{2029}') {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect();
+
+    let mut characters = single_line.trim().chars();
+
+    let mut excerpt: String = characters
+        .by_ref()
+        .take(MAX_HTTP_ERROR_BODY_CHARS)
+        .collect();
+
+    if characters.next().is_some() {
+        excerpt.push('…');
+    }
+
+    if excerpt.is_empty() {
+        String::new()
+    } else {
+        format!(": {excerpt}")
     }
 }
 
@@ -1742,12 +1819,17 @@ fn response_from_bytes(status: u16, bytes: Vec<u8>) -> NvueResponse {
 mod tests {
     use std::{io, path::Path};
 
+    use super::*;
+
     use rcgen::generate_simple_self_signed;
     use reqwest::header::{HeaderMap, HeaderValue};
+    use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::TcpListener;
+    use tokio::task::JoinSet;
+    use tokio_rustls::TlsAcceptor;
     use wiremock::matchers::{body_json, header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
-
-    use super::*;
 
     fn test_config(host: &str, port: u16) -> ClientConfig {
         ClientConfig {
@@ -2177,7 +2259,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn json_helper_rejects_http_error_without_replay() {
+    async fn json_helper_preserves_http_error_body_without_replay() {
         let server = MockServer::start().await;
 
         Mock::given(method("POST"))
@@ -2202,7 +2284,85 @@ mod tests {
         let message = error.to_string();
 
         assert!(matches!(error, ClientError::HttpStatus { status: 503, .. }));
-        assert_eq!(message, "HTTP POST /nvue_v1/action returned 503");
+        assert_eq!(message, "HTTP POST /nvue_v1/action returned 503: not ready");
+    }
+
+    #[test]
+    fn http_error_display_preserves_details_and_redacts_secrets() {
+        let cases = [
+            ("", ""),
+            (" \r\n\t", ""),
+            ("configuration conflict", ": configuration conflict"),
+            ("invalid JSON: {", ": invalid JSON: {"),
+            ("not ready\nretry\r\nnow\u{001b}", ": not ready retry  now"),
+            ("password=hunter2", ": password=XXXX"),
+            (
+                "password=hunter2\nanother line",
+                ": password=XXXX another line",
+            ),
+            ("password=a\npassword=b", ": password=XXXX password=XXXX"),
+            ("not ready\u{2028}retry\u{2029}now", ": not ready retry now"),
+            (
+                r#"{"message":"invalid target","password":{"value":"hunter2"}}"#,
+                r#": {"message":"invalid target","password":"XXXX"}"#,
+            ),
+            (
+                r#"{"error":{"message":"conflict","token":["hunter2"]}}"#,
+                r#": {"error":{"message":"conflict","token":"XXXX"}}"#,
+            ),
+            (
+                r#"{"message":"authorization=Bearer hunter2"}"#,
+                r#": {"message":"authorization=XXXX"}"#,
+            ),
+        ];
+
+        for (body, expected_excerpt) in cases {
+            let error = response_from_bytes(409, body.as_bytes().to_vec())
+                .into_json("POST", "/nvue_v1/action")
+                .unwrap_err();
+
+            assert_eq!(
+                error.to_string(),
+                format!("HTTP POST /nvue_v1/action returned 409{expected_excerpt}"),
+                "body: {body:?}"
+            );
+
+            assert!(matches!(error, ClientError::HttpStatus { body: raw, .. } if raw == body));
+        }
+    }
+
+    #[test]
+    fn http_error_display_bounds_unicode_after_redaction() {
+        let body = "é".repeat(1100);
+
+        let error = response_from_bytes(500, body.into_bytes())
+            .into_json("POST", "/nvue_v1/action")
+            .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "HTTP POST /nvue_v1/action returned 500: {}…",
+                "é".repeat(1024)
+            )
+        );
+    }
+
+    #[test]
+    fn http_error_display_redacts_before_truncation() {
+        let body = format!("{} password={}", "é".repeat(1000), "secret".repeat(100));
+
+        let error = response_from_bytes(500, body.into_bytes())
+            .into_json("POST", "/nvue_v1/action")
+            .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "HTTP POST /nvue_v1/action returned 500: {} password=XXXX",
+                "é".repeat(1000)
+            )
+        );
     }
 
     #[test]
@@ -2278,6 +2438,11 @@ mod tests {
 
         client.configure_insecure_https().await.unwrap();
 
+        let unverified = client
+            .prepare_unverified_client_tls(tls.clone(), None)
+            .await
+            .unwrap();
+
         let prepared = client.prepare_verified_client_tls(tls, None).await.unwrap();
 
         let active_accepts_invalid_certs = client
@@ -2288,8 +2453,16 @@ mod tests {
             .dangerously_accept_invalid_certs;
 
         assert!(active_accepts_invalid_certs);
+        assert!(unverified.config.dangerously_accept_invalid_certs);
+
+        assert!(matches!(
+            unverified.generation,
+            ClientGeneration::ClientTls { .. }
+        ));
+
         assert!(!prepared.config.dangerously_accept_invalid_certs);
         assert!(!client.uses_client_tls());
+        assert!(!client.uses_verified_client_tls());
     }
 
     #[tokio::test]
@@ -2300,6 +2473,7 @@ mod tests {
             client.clone_with_credentials(ClientCredentials::new("admin", "replacement-pass"));
 
         assert!(client.uses_client_tls());
+        assert!(!client.uses_verified_client_tls());
         assert!(cloned.uses_client_tls());
 
         cloned.configure_insecure_https().await.unwrap();
@@ -2396,6 +2570,115 @@ mod tests {
                 .status()
                 .is_success()
         );
+    }
+
+    #[tokio::test]
+    async fn client_tls_requests_use_fresh_connections() -> Result<(), Box<dyn std::error::Error>> {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+        let server_certificate =
+            generate_simple_self_signed(vec!["localhost".into(), "127.0.0.1".into()])?;
+
+        let server_certificate_der = CertificateDer::from(server_certificate.cert.der().to_vec());
+        let server_key_der = PrivatePkcs8KeyDer::from(server_certificate.key_pair.serialize_der());
+
+        let mut server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![server_certificate_der], server_key_der.into())?;
+
+        server_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+
+        let tls_acceptor = TlsAcceptor::from(Arc::new(server_config));
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let port = listener.local_addr()?.port();
+        let (request_ids_tx, mut request_ids_rx) = tokio::sync::mpsc::channel(2);
+
+        let server_task = tokio::spawn(async move {
+            let mut connections = JoinSet::new();
+
+            for connection_id in 1..=2 {
+                let (tcp_stream, _) = listener.accept().await?;
+                let tls_acceptor = tls_acceptor.clone();
+                let request_ids_tx = request_ids_tx.clone();
+
+                connections.spawn(async move {
+                    let tls_stream = tls_acceptor.accept(tcp_stream).await?;
+                    let (reader, mut writer) = tokio::io::split(tls_stream);
+                    let mut reader = BufReader::new(reader);
+
+                    loop {
+                        let mut request_line = String::new();
+
+                        if reader.read_line(&mut request_line).await? == 0 {
+                            break;
+                        }
+
+                        loop {
+                            let mut header = String::new();
+
+                            if reader.read_line(&mut header).await? == 0 {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::UnexpectedEof,
+                                    "request headers ended before the empty line",
+                                ));
+                            }
+
+                            if header == "\r\n" {
+                                break;
+                            }
+                        }
+
+                        request_ids_tx
+                            .send(connection_id)
+                            .await
+                            .map_err(|error| io::Error::other(error.to_string()))?;
+
+                        writer
+                            .write_all(
+                                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}",
+                            )
+                            .await?;
+                    }
+
+                    Ok::<(), io::Error>(())
+                });
+            }
+
+            while let Some(result) = connections.join_next().await {
+                result.map_err(io::Error::other)??;
+            }
+
+            Ok::<(), io::Error>(())
+        });
+
+        let directory = tempfile::tempdir()?;
+        let client_tls = write_test_tls_material(directory.path()).await;
+        let mut config = test_config("localhost", port);
+
+        config.endpoint.connect_host = "127.0.0.1".into();
+
+        let client = Client::connect(config, Some(client_tls)).await?;
+
+        client.get("/nvue_v1/first", Duration::from_secs(1)).await?;
+        client
+            .get("/nvue_v1/second", Duration::from_secs(1))
+            .await?;
+
+        let first_connection = request_ids_rx
+            .recv()
+            .await
+            .ok_or_else(|| io::Error::other("first request connection was not observed"))?;
+
+        let second_connection = request_ids_rx
+            .recv()
+            .await
+            .ok_or_else(|| io::Error::other("second request connection was not observed"))?;
+
+        server_task.abort();
+
+        assert_ne!(first_connection, second_connection);
+
+        Ok(())
     }
 
     #[tokio::test]

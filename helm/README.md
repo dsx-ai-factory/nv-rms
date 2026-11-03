@@ -64,20 +64,10 @@ bump and suggests the bump kind from the staged diff. Skip it once with
 
 ### Publishing (CI)
 
-A chart version is published exactly once, and only when the chart itself
-changes. `push-helm-chart-to-ngc` runs when `Chart.yaml` changes on the default
-branch or on a `release/*` branch, and it still checks NGC for that version
-first and skips when it is already there. Whatever plain semver is in
-`Chart.yaml` is published as `rack-manager-<chart-version>.tgz`.
-
-RMS release tags do not publish the chart. The chart is versioned independently,
-so a tag normally carries no chart change, and GitLab cannot filter on that in
-tag pipelines because `rules:changes` always evaluates true there. Land the
-version bump on the default branch or a `release/*` branch to ship it.
-
-Published versions are immutable: the push does not force-overwrite. To ship a
-chart change, bump `version` in `Chart.yaml` (CI already fails a chart change
-that leaves it untouched).
+The chart is versioned independently of RMS. Published versions are immutable:
+CI skips a version that is already published and never force-overwrites it. To
+ship a chart change, bump `version` in `Chart.yaml` (CI already fails a chart
+change that leaves it untouched).
 
 ## Chart components
 
@@ -85,6 +75,34 @@ that leaves it untouched).
 | ------------------ | ---------------------------------------------------------------------------------- |
 | **RMS API Server** | gRPC API for rack management (default port 8801); runs sqlx migrations on startup. |
 | **PostgreSQL**     | Optional in-cluster Postgres or external PostgreSQL.                               |
+| **NVSSVT**         | Optional scan launcher (`nvssvt.enabled`), run as a sidecar in the API server pod so RMS reaches it on `127.0.0.1`. |
+
+### NVSSVT sidecar
+
+`StartSystemValidation` drives NVSSVT's launcher API. RMS expects it on
+loopback, so the chart runs it as a second container in the API server pod
+rather than as its own Deployment -- containers in a pod share a network
+namespace, and no Service or cross-pod networking is involved. RMS always
+targets the launcher at `127.0.0.1:8000`; there is no `config.toml` setting
+for it.
+
+It is off by default because the image is site-specific. Build the image
+from the NVSSVT release bundles with `docker/nvssvt/Dockerfile` (see
+[Build the NVSSVT sidecar image](../docs/deployment/kubernetes.md#build-the-nvssvt-sidecar-image)),
+then enable it with an image the cluster can pull:
+
+```yaml
+nvssvt:
+  enabled: true
+  image:
+    repository: <registry>/nvssvt-server
+    tag: <tag>
+```
+
+With `nvssvt.enabled: false`, RMS starts normally and only
+`StartSystemValidation` is affected: each node's scan fails to launch with
+an unreachable-launcher error, reported in that node's `NodeOperationResult`
+rather than failing the RPC itself.
 
 ## Prerequisites
 
@@ -102,7 +120,7 @@ For the default **external database** mode:
 
 Replace `<NGC_TOKEN>` with your [NGC API key](https://ngc.nvidia.com/setup/api-key),
 `<CHART_VERSION>` with the chart semver (e.g. `1.0.0`), and `<APP_TAG>` with the RMS
-image tag (e.g. `v0.8.0-rc4`):
+image tag (e.g. `v0.11.0-rc1-0-g9c01a464`):
 
 ```bash
 helm pull https://helm.ngc.nvidia.com/0837451325059433/rms-dev/charts/rack-manager-<CHART_VERSION>.tgz \
@@ -239,7 +257,7 @@ Use a file such as `upgrade-values.yaml`:
 ```yaml
 global:
   image:
-    tag: v0.8.0-rc4
+    tag: v0.11.0-rc1-0-g9c01a464
 ```
 
 Or set the tag on the API server only:
@@ -247,7 +265,7 @@ Or set the tag on the API server only:
 ```yaml
 apiServer:
   image:
-    tag: v0.8.8-rc4
+    tag: v0.11.0-rc1-0-g9c01a464
 ```
 
 Then run:
@@ -270,6 +288,12 @@ kubectl rollout restart deployment/rms-api-server -n rack-manager
 ```
 
 This is a one-time step. Later upgrades can use `--reuse-values` as usual.
+
+Helm's default five-minute wait is shorter than the chart's 330-second Pod
+termination grace. Upgrades using `--wait` or `--atomic` should set
+`--timeout 10m`. If `apiServer.terminationGracePeriodSeconds` is increased,
+choose a timeout above that value with additional image-pull and startup
+margin.
 
 ## Configuration
 
@@ -297,8 +321,8 @@ Deployment carries a `checksum/config` annotation so config changes trigger a
 rollout.
 
 Beyond the top-level `port`, the rendered `config.toml` groups keys into sections
-matching the Rust config structs: `[metrics]`, `[tls]`, `[switches]`, `[postgres]`,
-`[workflows]`, and `[logging]`.
+matching the Rust config structs: `[metrics]`, `[tls]`, `[switches]`, `[bmc]`,
+`[postgres]`, `[workflows]`, `[logging]`, and `[tracing]`.
 
 By default, `apiServer.allowInsecure` is `false` and `apiServer.tls.enabled` is `true`.
 The RMS binary requires mTLS (server cert/key plus client CA) unless `insecure` is set
@@ -312,6 +336,7 @@ your values or via `--set-file`; see the site and insecure-mode examples below.
 - `defaultSwitchDomain` - default when switch RPCs omit domain (config.toml `[switches] default_switch_domain`)
 - `dnsDomain` - optional DNS domain used as the NVUE TLS authority and for switch gRPC server-name verification, not the NVLink domain (config.toml `[switches] dns_domain`)
 - `insecureSwitch` - sets config.toml `[switches] insecure_switch = true`; `nvue_api` remains HTTPS without client mTLS or server certificate verification, `scale_up_fabric_manager` uses plaintext HTTP, and secure-only gNMI connectivity checks are skipped.
+- `insecureBmc` - sets config.toml `[bmc] insecure_bmc` (historical default `true`); RMS skips BMC/Redfish HTTPS server certificate verification. Set `false` after BMC certificates are CA-verifiable.
 - `nmxGatewayId` — `gateway_id` sent on NMX-C gRPC requests (config.toml `[switches] nmx_gateway_id`). Default: `rack-manager-grpc-client`.
 - `dbPoolMax` — maximum Postgres connection pool size (config.toml `[postgres] db_pool_max`). Must be greater than 0. Default: `20`.
 - `maxTrackedJobs` — maximum async job records retained (config.toml `[workflows] max_tracked_jobs`). Default: `10000`.
@@ -324,9 +349,46 @@ your values or via `--set-file`; see the site and insecure-mode examples below.
   `NodeDescriptor.attributes["inventory_profile"]`. Default: `{}`.
 - `logLevel` — optional log level / filter directive replacing `RUST_LOG` (config.toml `[logging] log_level`). Empty uses the default `info` level plus dependency caps.
 - `enableTimestamps` — assuming a logging collector is adding its own timestamps, so this is disabled by default to prevent duplicate timestamp fields. If no logging collector is being used, set true to output timestamps natively (config.toml `[logging] enable_timestamps`). Default: `false`.
+- `tracing` — backend-neutral OTLP endpoint, transport, sampling, bounded batch,
+  retry, and shutdown settings (config.toml `[tracing]`). The empty endpoint
+  default keeps real local trace/span IDs without remote export. Point this at
+  an OpenTelemetry Collector using HTTPS with a certificate trusted by RMS.
+  Both `grpc` and `http_protobuf` use TLS, except to a Collector on a loopback
+  IP address such as a sidecar (`http://127.0.0.1:4317`); plaintext to any other
+  host is rejected. See [Collector configuration](../docs/configuration/configuring-rms.md#collector-configuration)
+  for private-CA provisioning and migration from plaintext receivers.
+- `terminationGracePeriodSeconds` — pod shutdown budget. Default `330` covers
+  the five-minute RMS job drain plus trace flush and scheduling margin.
+- `podAnnotations` — extra annotations on the RMS Pod, such as
+  `sidecar.opentelemetry.io/inject` for an OpenTelemetry Operator sidecar
+  Collector reached at a loopback `tracing.endpoint`. Values must be strings;
+  the chart keeps its own `checksum/config`. Default: `{}`.
 - `firmwarePersistentVolumeClaim` — existing PVC to mount at `firmwareMountPath` for firmware downloads. Leave empty to use the default `firmwareStoragePath` hostPath.
 - `sftpUploadTimeoutSeconds` — overall SFTP upload wall-clock timeout (seconds); config.toml `[workflows] sftp_upload_timeout_seconds`. Default: `3600`.
 - `sftpStepTimeoutSeconds` — per-step SFTP stall timeout (seconds); config.toml `[workflows] sftp_step_timeout_seconds`. Must be <= `sftpUploadTimeoutSeconds`. Default: `30`.
+- `firmwareTaskTimeoutSeconds` — upper bound (seconds) on polling one firmware task for completion; config.toml `[workflows] firmware_task_timeout_seconds`. Default: `10800`.
+- `onieRecoveryTimeoutSeconds` — wait (seconds) after ONIE starts installing until NVOS SSH is ready; config.toml `[workflows] onie_recovery_timeout_seconds`. Default: `900`.
+- `recoveredCredentialSaveTimeoutSeconds` — wait (seconds) for NVUE to save recovered credentials; config.toml `[workflows] recovered_credential_save_timeout_seconds`. Default: `300`.
+- `firmwareTaskPollIntervalSeconds` — delay (seconds) between polls of an in-flight firmware task; config.toml `[workflows] firmware_task_poll_interval_seconds`. Each poll emits one log line. Must be <= `firmwareTaskTimeoutSeconds`. Default: `30`.
+- `firmwareTaskTransientErrorTimeoutSeconds` — how long (seconds) to tolerate consecutive firmware task-status read failures before failing the update; config.toml `[workflows] firmware_task_transient_error_timeout_seconds`. Default: `900`.
+- `computePowerOnTimeoutSeconds` — how long (seconds) a compute firmware update waits for the tray to report power On after the power-on that opens the flow; config.toml `[workflows] compute_power_on_timeout_seconds`. Default: `60`.
+- `computePowerOnPollIntervalSeconds` — delay (seconds) between power-state reads during that wait; config.toml `[workflows] compute_power_on_poll_interval_seconds`. Must be <= `computePowerOnTimeoutSeconds`. Default: `5`. The power-on step that reads both values arrives in a following change. Until it lands, RMS validates and stores them and nothing reads them.
+- `artifactRequireSha256` — when `true`, HTTP(S) firmware artifacts must include a SHA-256 digest (config.toml `[workflows] artifact_require_sha256`). Default: `false`.
+- `artifactHttpsHosts` — HTTP(S) firmware artifact host allow-list (config.toml `[workflows] artifact_https_hosts`). Default: `[]` (unrestricted). Pattern and RPC scope: `docs/configuration/configuring-rms.md#artifact-download-policy`.
+- `artifactAllowPrivateTargets` — when `false`, reject IANA special-purpose HTTP(S) artifact targets (loopback, private, CGNAT, NAT64, reserved), including redirects (config.toml `[workflows] artifact_allow_private_targets`). Default: `true`.
+
+These default to unrestricted downloads. To require digests or restrict origins in a site overlay:
+
+```yaml
+apiServer:
+  artifactRequireSha256: true
+  artifactHttpsHosts:
+    - artifactory.example.com
+    - "*.jfrog.io"
+  artifactAllowPrivateTargets: false
+```
+
+See [Configuring RMS: Artifact download policy](../docs/configuration/configuring-rms.md#artifact-download-policy).
 
 See [INSECURE_SWITCH_TESTING.md](INSECURE_SWITCH_TESTING.md) for values overrides and manual test cases for `insecureSwitch: false` and `true`.
 
@@ -360,7 +422,19 @@ apiServer:
     enabled: true
     caEnabled: true
     existingSecret: rms-api-server-tls
+  # Optional: restrict firmware-object HTTP(S) downloads. Defaults are unrestricted.
+  # artifactHttpsHosts:
+  #   - artifactory.example.com
+  #   - "*.jfrog.io"
+  # artifactAllowPrivateTargets: false
 ```
+
+When `patchExternalCluster.enabled` is true, the pre-install job adds that
+database to the Zalando PostgreSQL cluster and a `LOGIN` role that owns it.
+The role flag list is empty, so the user is not `SUPERUSER` and does not have
+`CREATEDB`. Migrations only create tables in the database the operator already
+created. The hook does not run again on upgrade, so a cluster already patched
+with `superuser` keeps that role until its PostgreSQL user flags are cleared.
 
 Install or upgrade:
 
@@ -449,19 +523,20 @@ files, but only one of the three consumers picks the new material up on its own:
 
 | Material | On renewal | To take effect |
 | --- | --- | --- |
-| API server certificate | Files update; the process keeps using the certificate it read at startup | Restart the pod |
+| API server leaf certificate and key | Re-read every `apiServer.tls.certReloadIntervalSeconds` (default 300 seconds). New handshakes present the new identity. Connections already open keep the identity from their handshake. | Nothing, unless the new leaf is needed sooner than one interval |
+| API server client CA | Still read once, at process startup | Restart the pod |
 | Switch client mTLS | Picked up automatically, no restart | Nothing |
 | Switch server material | Files update; the copy on each switch is untouched | Re-run `ConfigureSwitchCertificate` |
 
 Two consequences follow, and both are load-bearing when choosing `duration`:
 
-- **The API server does not reload its own certificate.** RMS reads the cert,
-  key, and client CA once at startup and holds the parsed material for the life
-  of the process. When the mounted certificate expires, the pod keeps serving
-  the expired one — the Deployment has no probe and no rotation-triggered
-  rollout — until something restarts it. Use `kubectl rollout restart
-  deployment/rms-api-server -n <namespace>`, a controller such as
-  [Reloader](https://github.com/stakater/Reloader), or a scheduled restart.
+- **The API server reloads its own leaf certificate and key.** RMS reads them
+  again on `[tls] cert_reload_interval_seconds` (Helm
+  `apiServer.tls.certReloadIntervalSeconds`, default 300). A matching pair
+  replaces the identity used for new handshakes. A read, parse, or
+  key-mismatch error is logged and the previous identity stays. The client CA
+  is not part of that reload; rotating it still requires a pod restart.
+  Already-established connections keep the identity from their handshake.
 - **Switches keep the certificate that was pushed to them.** Renewing the
   Secret changes the material inside the RMS pod, not the copy in the switch's
   NVOS store. Only `ConfigureSwitchCertificate` installs it, and each run mints
@@ -470,9 +545,33 @@ Two consequences follow, and both are load-bearing when choosing `duration`:
   expiry it was issued with, and RMS rejects an expired switch certificate on
   its outbound connections.
 
-So `certificates.duration` sets a hard deadline for a redistribution step that
-nothing in this chart performs. The 30-day default (`720h0m0s`, renewing at
-`360h0m0s`) suits sites that restart the API server and re-push to switches at
+Each re-push imports one entity certificate and one CA certificate into the
+switch's NVOS certificate stores, even when the CA has not changed. NVOS limits
+each store to 25 imported entries. With the 30-day default and one re-push per
+renewal, an empty store would fill in about a year, and retries or
+operator-created entries fill it sooner. RMS keeps superseded entries until a
+store is full. A re-push into a full store first deletes that store's oldest
+RMS-created entries (`rms-` IDs) that no switch service is bound to, only as
+many as the import needs. RMS checks the NVUE API, gNMI server, NMX Controller,
+and NMX Telemetry bindings, including services the re-push does not name, so a
+service left on older material keeps it. Entries RMS did not create are never
+deleted but count toward the limit.
+
+When RMS cannot make room safely, the re-push fails at its
+`reclaim_certificate_capacity` stage before it imports anything or changes a
+binding. That happens when too few entries are unused RMS entries, a service
+binding cannot be read, or the switch rejects a deletion, and the job error
+says which. Entries left by a failed re-push are deleted by a later one once
+they are unused. To recover, delete entries no service needs from the switch,
+then retry. Naming more services in the re-push does not free space, because
+the stage runs before any binding changes. See
+[Certificate store capacity](../docs/operations/switch-management.md#certificate-store-capacity)
+for the full rules and error messages.
+
+So `certificates.duration` still sets a hard deadline for the switch
+redistribution step that nothing in this chart performs. The API server leaf
+no longer needs a restart to observe its own renewal. The 30-day default
+(`720h0m0s`, renewing at `360h0m0s`) suits sites that re-push to switches at
 least monthly; sites that do not should raise it — `8760h0m0s` for a yearly
 cadence — rather than rely on renewal alone. Both are settable per group, so the
 API server and the switch-side certificates can run on different clocks.
@@ -481,9 +580,9 @@ API server and the switch-side certificates can run on different clocks.
 mints a new private key. The chart sets this explicitly because cert-manager
 changed its own default from `Never` to `Always` in v1.18; without it the same
 values would rotate keys on one cluster and reuse them on another. Note that key
-rotation reaches a consumer only where certificate rotation does — for the API
-server and the switches, a reused key and a rotated one are equally stale until
-the restart or re-push happens.
+rotation reaches a consumer only where certificate rotation does — the API
+server leaf is picked up on the next reload, while the client CA and the
+switches stay stale until the restart or re-push happens.
 
 ### Firmware PVC
 
@@ -586,7 +685,7 @@ Example overrides (shared tag):
 ```yaml
 global:
   image:
-    tag: v0.8.0-rc4
+    tag: v0.11.0-rc1-0-g9c01a464
 
 # Keep database on uninstall
 dropDatabaseOnUninstall: false
@@ -610,7 +709,7 @@ Per-component image tag (overrides `global.image.tag`):
 ```yaml
 apiServer:
   image:
-    tag: v0.8.0-rc4
+    tag: v0.11.0-rc1-0-g9c01a464
 ```
 
 ## Access the API in-cluster
@@ -675,9 +774,12 @@ a `checksum/config` annotation so config changes trigger a rollout. See
 [Configuration via Helm](../docs/configuration/via-helm.md) for the
 full value → `config.toml` key mapping.
 
-`apiServer` values that map to the `config.toml` `[switches]`, `[postgres]`,
-`[workflows]`, and `[logging]` sections:
+`apiServer` values that map to the `config.toml` `[tls]`, `[switches]`,
+`[postgres]`, `[workflows]`, `[logging]`, and `[tracing]` sections:
 
+- `tls.certReloadIntervalSeconds` — how often the API server re-reads its leaf
+  certificate and key (`[tls] cert_reload_interval_seconds`; default `300`,
+  must be greater than 0). The client CA is not reloaded.
 - `switchCertCertificates` / `switchCertRoot` — switch-side cert material
   (`[switches] switch_cert_root`).
 - `clientTlsCertificates` / `clientTlsRoot` — RMS client mTLS for switch NVUE,
@@ -690,6 +792,9 @@ full value → `config.toml` key mapping.
 - `insecureSwitch` — sets `[switches] insecure_switch = true`; NVUE stays HTTPS
   without client mTLS or server-cert verification, NMX-C uses plaintext HTTP,
   secure-only gNMI checks are skipped.
+- `insecureBmc` — sets `[bmc] insecure_bmc` (historical default `true`); RMS
+  skips BMC/Redfish HTTPS server certificate verification. Set `false` after
+  BMC certificates are CA-verifiable.
 - `nmxGatewayId` — `gateway_id` on NMX-C gRPC requests
   (`[switches] nmx_gateway_id`; default `rack-manager-grpc-client`).
 - `dbPoolMax` — Postgres pool size (`[postgres] db_pool_max`; default `20`, must
@@ -700,8 +805,22 @@ full value → `config.toml` key mapping.
   (`[workflows] terminal_job_ttl_seconds`; default `86400`).
 - `expectedInventoryProfiles` — opaque expected-inventory profile map
   (`[workflows.expected_inventory_profiles]`; default `{}`).
+- `artifactRequireSha256` — require catalog SHA-256 on HTTP(S) artifacts
+  (`[workflows] artifact_require_sha256`; default `false`). Set `true` to refuse
+  unpinned HTTP(S) catalogs. Present digests are always verified.
+- `artifactHttpsHosts` — HTTP(S) firmware artifact host allow-list
+  (`[workflows] artifact_https_hosts`; default `[]`, unrestricted). Pattern
+  and RPC scope: `docs/configuration/configuring-rms.md#artifact-download-policy`.
+- `artifactAllowPrivateTargets` — allow private/loopback/CGNAT artifact HTTP(S)
+  targets (`[workflows] artifact_allow_private_targets`; default `true`). Set
+  `false` to reject IANA special-purpose addresses, including after redirects.
 - `logLevel` — log level / filter directive (`[logging] log_level`; empty →
   `info` plus caps).
+- `tracing` — backend-neutral OTLP endpoint, transport, sampling, batching,
+  retries, and flush limits (`[tracing]`; HTTPS required except to a loopback IP
+  address; empty endpoint disables export).
+- `terminationGracePeriodSeconds` — Kubernetes shutdown budget (default `330`).
+- `podAnnotations` — extra RMS Pod annotations (default `{}`).
 - `firmwarePersistentVolumeClaim` — existing PVC mounted at
   `firmwareMountPath`; empty uses the `firmwareStoragePath` hostPath.
 - `sftpUploadTimeoutSeconds` — overall SFTP upload timeout
@@ -709,6 +828,26 @@ full value → `config.toml` key mapping.
 - `sftpStepTimeoutSeconds` — per-step SFTP stall timeout
   (`[workflows] sftp_step_timeout_seconds`; default `30`, must be ≤ upload
   timeout).
+- `firmwareTaskTimeoutSeconds` — firmware task poll timeout
+  (`[workflows] firmware_task_timeout_seconds`; default `10800`).
+- `onieRecoveryTimeoutSeconds` — ONIE install and reboot wait
+  (`[workflows] onie_recovery_timeout_seconds`; default `900`).
+- `recoveredCredentialSaveTimeoutSeconds` — recovered credential save wait
+  (`[workflows] recovered_credential_save_timeout_seconds`; default `300`).
+- `firmwareTaskPollIntervalSeconds` — firmware task poll interval
+  (`[workflows] firmware_task_poll_interval_seconds`; default `30`, must be ≤
+  the firmware task timeout).
+- `firmwareTaskTransientErrorTimeoutSeconds` — firmware task-status transient
+  error window (`[workflows] firmware_task_transient_error_timeout_seconds`;
+  default `900`).
+- `computePowerOnTimeoutSeconds` — compute tray power-on wait at the start of
+  a firmware update (`[workflows] compute_power_on_timeout_seconds`; default
+  `60`).
+- `computePowerOnPollIntervalSeconds` — power-state read interval during that
+  wait (`[workflows] compute_power_on_poll_interval_seconds`; default `5`,
+  must be ≤ the compute power-on timeout). The power-on step that reads both
+  values arrives in a following change. Until it lands, RMS validates and
+  stores them and nothing reads them.
 
 The chart defaults to **mTLS** (`apiServer.allowInsecure: false`,
 `apiServer.tls.enabled: true`). See

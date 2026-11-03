@@ -24,10 +24,12 @@ use serde_json::Value;
 
 use crate::domain::node::{
     ExpectedInventoryPolicy, FirmwareActivationRequest, FirmwareActivationSummary, FirmwareInfo,
-    FirmwareTarget, FirmwareTaskStatus, FirmwareUpdateOptions, FirmwareUpdateOutcome,
-    FirmwareVersionCheckSummary, Node, NodeKind, NodeType, PowerOp, PowerState, PowerTargetType,
+    FirmwareTarget, FirmwareTaskCleanup, FirmwareTaskStatus, FirmwareUpdateOptions,
+    FirmwareUpdateOutcome, FirmwareVersionCheckSummary, Node, NodeKind, NodeType, PowerOp,
+    PowerState, PowerTargetType, Recoverable,
 };
 use crate::domain::rack::NodeConfig;
+use crate::nodes::compute_gb200_dell::DellGb200Compute;
 use crate::nodes::compute_gb200_nvidia::NvidiaGb200Compute;
 use crate::nodes::compute_gb200_wiwynn::WiwynnGb200Compute;
 use crate::nodes::compute_gb300_lenovo::LenovoGb300Compute;
@@ -38,8 +40,11 @@ use crate::nodes::powershelf_gb200_delta::PowershelfGb200Delta;
 use crate::nodes::powershelf_gb200_liteon::PowershelfGb200Liteon;
 use crate::nodes::powershelf_gb300_delta::PowershelfGb300Delta;
 use crate::nodes::powershelf_gb300_liteon::PowershelfGb300Liteon;
-use crate::nodes::switch_gb200_nvidia::SwitchGb200Nvidia;
+use crate::nodes::powershelf_vrnvl72_delta::PowershelfVrnvl72Delta;
+use crate::nodes::powershelf_vrnvl72_liteon::PowershelfVrnvl72Liteon;
+use crate::nodes::switch_gb200_nvidia::{ScaleUpLinkChange, SwitchGb200Nvidia};
 use crate::nodes::switch_gb300_nvidia::SwitchGb300Nvidia;
+use crate::nodes::switch_vrnvl72_nvidia::SwitchVrnvl72Nvidia;
 use crate::transport::redfish_client::NvidiaMnnvlinkTopology;
 use crate::utilities::error::{Result, RmsError};
 
@@ -48,6 +53,7 @@ macro_rules! match_node_instance {
         match $self {
             NodeInstance::ComputeGb200Nvidia($node) => $body,
             NodeInstance::ComputeGb200Wiwynn($node) => $body,
+            NodeInstance::ComputeGb200Dell($node) => $body,
             NodeInstance::PowershelfGb200Liteon($node) => $body,
             NodeInstance::SwitchGb200Nvidia($node) => $body,
             NodeInstance::PowershelfGb200Delta($node) => $body,
@@ -59,6 +65,8 @@ macro_rules! match_node_instance {
             NodeInstance::ComputeGb300Supermicro($node) => $body,
             NodeInstance::ComputeVrnvl72Nvidia($node) => $body,
             NodeInstance::SwitchVrnvl72Nvidia($node) => $body,
+            NodeInstance::PowershelfVrnvl72Liteon($node) => $body,
+            NodeInstance::PowershelfVrnvl72Delta($node) => $body,
             #[cfg(test)]
             NodeInstance::Test($node) => $body,
         }
@@ -79,6 +87,19 @@ pub(crate) trait SwitchFirmwareManagement: Node {
     async fn list_system_images(&self) -> Result<Value>;
 }
 
+/// Administrative interface state from independent NVUE configuration views.
+#[derive(Clone, Debug)]
+pub(crate) struct ScaleUpLinkSnapshot {
+    /// Effective administrative state including device defaults.
+    pub(crate) effective: nvue_client::interface::InterfaceCollection,
+
+    /// Explicit currently applied overrides.
+    pub(crate) applied: nvue_client::interface::InterfaceCollection,
+
+    /// Explicit overrides saved for the next startup.
+    pub(crate) startup: nvue_client::interface::InterfaceCollection,
+}
+
 /// Switch scale-up fabric capability used by request-scoped ScaleUp RPCs.
 #[async_trait]
 pub(crate) trait SwitchScaleUpManagement: Node {
@@ -91,6 +112,32 @@ pub(crate) trait SwitchScaleUpManagement: Node {
 
     async fn set_cluster_state(&self, enabled: bool) -> Result<()>;
     async fn get_cluster_state(&self) -> Result<Value>;
+
+    /// Persists cluster disable and verifies controller shutdown before link changes.
+    /// Unsupported node types return an explicit capability error.
+    async fn stop_cluster_controller(&self) -> Result<()> {
+        Err(RmsError::unimplemented(
+            "stop_cluster_controller",
+            self.node_type(),
+        ))
+    }
+
+    /// Reconciles administrative link configuration on supported switches.
+    async fn set_scale_up_link_config(&self, _changes: &[ScaleUpLinkChange]) -> Result<()> {
+        Err(RmsError::unimplemented(
+            "set_scale_up_link_config",
+            self.node_type(),
+        ))
+    }
+
+    /// Reads effective, applied, and startup state for saved-target verification.
+    async fn get_scale_up_link_snapshot(&self) -> Result<ScaleUpLinkSnapshot> {
+        Err(RmsError::unimplemented(
+            "get_scale_up_link_snapshot",
+            self.node_type(),
+        ))
+    }
+
     async fn nvue_hello(&self) -> Result<()>;
     async fn get_cluster_apps_status(&self, app_name: &str) -> Result<Value>;
     async fn enable_grpc_for_external_clients(
@@ -109,15 +156,16 @@ trait SwitchDeviceInfo: Node {
     async fn get_chassis_location_info(&self) -> Result<Value>;
 }
 
-/// Closed set of node implementations supported by RMS.
+/// Closed set of concrete node implementations supported by RMS.
 ///
 /// `NodeType` is the identity source, and this enum is the corresponding
-/// concrete runtime value. Keeping inventory nodes as this closed enum makes
-/// per-node dispatch exhaustive instead of relying on trait-object node storage
-/// plus downcasts.
+/// concrete runtime value. Hardware profiles may configure these
+/// implementations but never replace type-directed construction or platform
+/// behavior.
 pub enum NodeInstance {
     ComputeGb200Nvidia(Box<NvidiaGb200Compute>),
     ComputeGb200Wiwynn(Box<WiwynnGb200Compute>),
+    ComputeGb200Dell(Box<DellGb200Compute>),
     PowershelfGb200Liteon(Box<PowershelfGb200Liteon>),
     SwitchGb200Nvidia(Box<SwitchGb200Nvidia>),
     PowershelfGb200Delta(Box<PowershelfGb200Delta>),
@@ -128,7 +176,9 @@ pub enum NodeInstance {
     ComputeGb300Lenovo(Box<LenovoGb300Compute>),
     ComputeGb300Supermicro(Box<SupermicroGb300Compute>),
     ComputeVrnvl72Nvidia(Box<NvidiaVrnvl72Compute>),
-    SwitchVrnvl72Nvidia(Box<SwitchGb200Nvidia>),
+    SwitchVrnvl72Nvidia(Box<SwitchVrnvl72Nvidia>),
+    PowershelfVrnvl72Liteon(Box<PowershelfVrnvl72Liteon>),
+    PowershelfVrnvl72Delta(Box<PowershelfVrnvl72Delta>),
     #[cfg(test)]
     Test(Box<dyn Node>),
 }
@@ -137,9 +187,8 @@ impl NodeInstance {
     /// Returns the shared NVOS implementation for a supported NVIDIA switch.
     pub(crate) fn require_nvidia_switch(&self) -> Result<&SwitchGb200Nvidia> {
         match self {
-            Self::SwitchGb200Nvidia(node)
-            | Self::SwitchGb300Nvidia(node)
-            | Self::SwitchVrnvl72Nvidia(node) => Ok(node),
+            Self::SwitchGb200Nvidia(node) | Self::SwitchGb300Nvidia(node) => Ok(node),
+            Self::SwitchVrnvl72Nvidia(node) => Ok(node.shared_switch()),
             _ => Err(RmsError::invalid_argument("node type is not a switch")),
         }
     }
@@ -154,9 +203,15 @@ impl NodeInstance {
     /// Build the concrete node implementation selected by `config.node_type`.
     ///
     /// This is the only place that maps the canonical [`NodeType`] identity to
-    /// a runtime node value. New concrete node types should be added here and
-    /// to the [`NodeInstance`] enum together so dispatch stays exhaustive.
+    /// a runtime node value. Profile-derived runtime parameters are carried by
+    /// [`NodeConfig`] and consumed by the selected concrete implementation.
     pub fn from_config(config: &NodeConfig, rack_id: &str) -> Result<Self> {
+        if config.recovery.is_some() && !config.node_type.has_recovery_flow() {
+            return Err(RmsError::invalid_argument(format!(
+                "node type {} has no recovery flow; its profile must not carry a recovery table",
+                config.node_type
+            )));
+        }
         match config.node_type {
             NodeType::ComputeGb200Nvidia => NvidiaGb200Compute::from_config(config, rack_id)
                 .map(Box::new)
@@ -164,6 +219,9 @@ impl NodeInstance {
             NodeType::ComputeGb200Wiwynn => WiwynnGb200Compute::from_config(config, rack_id)
                 .map(Box::new)
                 .map(Self::ComputeGb200Wiwynn),
+            NodeType::ComputeGb200Dell => DellGb200Compute::from_config(config, rack_id)
+                .map(Box::new)
+                .map(Self::ComputeGb200Dell),
             NodeType::PowershelfGb200Liteon => PowershelfGb200Liteon::from_config(config, rack_id)
                 .map(Box::new)
                 .map(Self::PowershelfGb200Liteon),
@@ -196,9 +254,19 @@ impl NodeInstance {
             NodeType::ComputeVrnvl72Nvidia => NvidiaVrnvl72Compute::from_config(config, rack_id)
                 .map(Box::new)
                 .map(Self::ComputeVrnvl72Nvidia),
-            NodeType::SwitchVrnvl72Nvidia => SwitchGb200Nvidia::from_config(config, rack_id)
+            NodeType::SwitchVrnvl72Nvidia => SwitchVrnvl72Nvidia::from_config(config, rack_id)
                 .map(Box::new)
                 .map(Self::SwitchVrnvl72Nvidia),
+            NodeType::PowershelfVrnvl72Liteon => {
+                PowershelfVrnvl72Liteon::from_config(config, rack_id)
+                    .map(Box::new)
+                    .map(Self::PowershelfVrnvl72Liteon)
+            }
+            NodeType::PowershelfVrnvl72Delta => {
+                PowershelfVrnvl72Delta::from_config(config, rack_id)
+                    .map(Box::new)
+                    .map(Self::PowershelfVrnvl72Delta)
+            }
         }
     }
 
@@ -227,9 +295,8 @@ impl NodeInstance {
     ) -> Result<Box<SwitchGb200Nvidia>> {
         let node_type = config.node_type;
         match Self::from_switch_config(config, rack_id)? {
-            Self::SwitchGb200Nvidia(node)
-            | Self::SwitchGb300Nvidia(node)
-            | Self::SwitchVrnvl72Nvidia(node) => Ok(node),
+            Self::SwitchGb200Nvidia(node) | Self::SwitchGb300Nvidia(node) => Ok(node),
+            Self::SwitchVrnvl72Nvidia(node) => Ok(Box::new(node.into_shared_switch())),
             _ => Err(RmsError::invalid_argument(format!(
                 "node type {node_type} is not a switch"
             ))),
@@ -260,6 +327,11 @@ impl NodeInstance {
                 .await
                 .and_then(mnnvlink_topology_to_value)
                 .map(Some),
+            Self::ComputeGb200Dell(node) => node
+                .get_mnnvlink_topology()
+                .await
+                .and_then(mnnvlink_topology_to_value)
+                .map(Some),
             Self::ComputeGb200Wiwynn(node) => node
                 .get_mnnvlink_topology()
                 .await
@@ -285,17 +357,22 @@ impl NodeInstance {
                 .await
                 .and_then(mnnvlink_topology_to_value)
                 .map(Some),
-            Self::SwitchGb200Nvidia(node)
-            | Self::SwitchGb300Nvidia(node)
-            | Self::SwitchVrnvl72Nvidia(node) => {
+            Self::SwitchGb200Nvidia(node) | Self::SwitchGb300Nvidia(node) => {
                 let value = SwitchDeviceInfo::get_chassis_location_info(node.as_ref()).await?;
 
                 Ok(Some(value))
             }
+            Self::SwitchVrnvl72Nvidia(node) => {
+                SwitchDeviceInfo::get_chassis_location_info(node.shared_switch())
+                    .await
+                    .map(Some)
+            }
             Self::PowershelfGb200Liteon(_)
             | Self::PowershelfGb200Delta(_)
             | Self::PowershelfGb300Liteon(_)
-            | Self::PowershelfGb300Delta(_) => Ok(None),
+            | Self::PowershelfGb300Delta(_)
+            | Self::PowershelfVrnvl72Liteon(_)
+            | Self::PowershelfVrnvl72Delta(_) => Ok(None),
             #[cfg(test)]
             Self::Test(node) => {
                 // Real nodes bound their device-info I/O inside the leaf (after
@@ -321,9 +398,10 @@ impl NodeInstance {
     /// Return the shared NVUE client for a host-backed switch.
     pub(crate) fn nvue_client(&self) -> Option<&nvue_client::SharedClient> {
         match self {
-            Self::SwitchGb200Nvidia(node)
-            | Self::SwitchGb300Nvidia(node)
-            | Self::SwitchVrnvl72Nvidia(node) => node.optional_nvue_client(),
+            Self::SwitchGb200Nvidia(node) | Self::SwitchGb300Nvidia(node) => {
+                node.optional_nvue_client()
+            }
+            Self::SwitchVrnvl72Nvidia(node) => node.shared_switch().optional_nvue_client(),
             _ => None,
         }
     }
@@ -343,7 +421,8 @@ impl NodeInstance {
         match self {
             Self::SwitchGb200Nvidia(node) => Some(node),
             Self::SwitchGb300Nvidia(node) => Some(node),
-            Self::SwitchVrnvl72Nvidia(node) => Some(node),
+            // Fabric operations share NVUE/SSH behavior, not the VR firmware policy.
+            Self::SwitchVrnvl72Nvidia(node) => Some(Box::new(node.into_shared_switch())),
             #[cfg(test)]
             Self::Test(_) => None,
             _ => None,
@@ -396,6 +475,25 @@ impl SwitchScaleUpManagement for SwitchGb200Nvidia {
     async fn get_cluster_state(&self) -> Result<Value> {
         let _op_guard = self.op_lock.lock().await;
         SwitchGb200Nvidia::get_cluster_state(self).await
+    }
+
+    async fn stop_cluster_controller(&self) -> Result<()> {
+        SwitchGb200Nvidia::stop_cluster_controller(self).await
+    }
+
+    async fn set_scale_up_link_config(&self, changes: &[ScaleUpLinkChange]) -> Result<()> {
+        let _op_guard = self.op_lock.lock().await;
+        SwitchGb200Nvidia::set_scale_up_link_config(self, changes).await
+    }
+
+    async fn get_scale_up_link_snapshot(&self) -> Result<ScaleUpLinkSnapshot> {
+        let _op_guard = self.op_lock.lock().await;
+
+        Ok(ScaleUpLinkSnapshot {
+            effective: SwitchGb200Nvidia::get_scale_up_link_config(self).await?,
+            applied: self.get_applied_scale_up_link_config().await?,
+            startup: self.get_startup_scale_up_link_config().await?,
+        })
     }
 
     async fn nvue_hello(&self) -> Result<()> {
@@ -480,6 +578,14 @@ impl Node for NodeInstance {
         match_node_instance!(self, node => node.expected_inventory_policy())
     }
 
+    fn recovery(&self) -> Option<&dyn Recoverable> {
+        match_node_instance!(self, node => node.recovery())
+    }
+
+    fn firmware_task_cleanup(&self) -> Option<&dyn FirmwareTaskCleanup> {
+        match_node_instance!(self, node => node.firmware_task_cleanup())
+    }
+
     async fn get_power_state(&self) -> Result<PowerState> {
         match_node_instance!(self, node => node.get_power_state().await)
     }
@@ -547,6 +653,14 @@ impl Node for NodeInstance {
     async fn bmc_aux_powercycle(&self) -> Result<()> {
         match_node_instance!(self, node => node.bmc_aux_powercycle().await)
     }
+
+    async fn verify_management_api_reachable(&self) -> Result<()> {
+        match_node_instance!(self, node => node.verify_management_api_reachable().await)
+    }
+
+    async fn verify_system_ready(&self) -> Result<()> {
+        match_node_instance!(self, node => node.verify_system_ready().await)
+    }
 }
 
 #[cfg(test)]
@@ -559,6 +673,47 @@ mod tests {
     use tokio::sync::Barrier;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    // Pins the enum forwarding: without it the `Node` default answers `Ok(())`
+    // and the readiness check silently disappears for every switch.
+    #[tokio::test]
+    async fn switch_instances_forward_verify_system_ready() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/nvue_v1/system"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "status": "System is ready",
+                "health": {"status": "OK"}
+            })))
+            .mount(&server)
+            .await;
+        let node = NodeInstance::SwitchVrnvl72Nvidia(Box::new(SwitchVrnvl72Nvidia::for_test(
+            &server.uri(),
+        )));
+
+        node.verify_system_ready()
+            .await
+            .expect("switch instances forward the readiness check");
+    }
+
+    // Pins the enum forwarding for the NVUE wait: the VR variant probes, so a
+    // dropped arm would silently return the `Node` default.
+    #[tokio::test]
+    async fn vr_switch_instance_forwards_the_management_api_probe() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/nvue_v1/system"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        let node = NodeInstance::SwitchVrnvl72Nvidia(Box::new(SwitchVrnvl72Nvidia::for_test(
+            &server.uri(),
+        )));
+
+        let err = node.verify_management_api_reachable().await.unwrap_err();
+
+        assert_eq!(err.code, crate::utilities::error::ErrorCode::Unavailable);
+    }
 
     struct BmcPowercycleTestNode {
         calls: Arc<AtomicUsize>,
@@ -626,6 +781,57 @@ mod tests {
     }
 
     #[test]
+    fn from_config_rejects_a_recovery_profile_on_a_node_type_without_a_flow() {
+        // VR NVL72 builds through the GB200 constructor; the gate must fire
+        // before that constructor can parse a GB200-shaped table for it.
+        let config = NodeConfig {
+            runtime_config: None,
+            id: "vr-01".to_owned(),
+            node_type: NodeType::ComputeVrnvl72Nvidia,
+            bmc_endpoint: Some(endpoint_config("10.0.0.10", "aa:bb:cc:dd:ee:ff")),
+            host_endpoint: None,
+            expected_inventory: None,
+            recovery: Some(
+                serde_json::from_value(serde_json::json!({
+                    "presence": ["HGX_FW_BMC_0"],
+                    "push_then_cycle": ["HGX_FW_FPGA_0"],
+                    "push_only": ["HGX_FW_GPU_0"],
+                }))
+                .unwrap(),
+            ),
+        };
+
+        let error = NodeInstance::from_config(&config, "rack-01")
+            .err()
+            .expect("a recovery table on a VR node must be rejected");
+        assert!(
+            error.message.contains("has no recovery flow"),
+            "{}",
+            error.message
+        );
+    }
+
+    #[tokio::test]
+    async fn vrnvl72_delta_powershelf_builds_dedicated_variant_without_device_info() {
+        let config = NodeConfig {
+            id: "ps-01".to_owned(),
+            node_type: NodeType::PowershelfVrnvl72Delta,
+            bmc_endpoint: Some(endpoint_config("10.0.0.12", "aa:bb:cc:dd:ee:01")),
+            host_endpoint: None,
+            expected_inventory: None,
+            recovery: None,
+            runtime_config: None,
+        };
+
+        let node = NodeInstance::from_config(&config, "rack-01").unwrap();
+
+        assert!(matches!(node, NodeInstance::PowershelfVrnvl72Delta(_)));
+        assert_eq!(node.node_type(), NodeType::PowershelfVrnvl72Delta);
+        assert_eq!(node.get_info()["type"], "powershelf_vrnvl72_delta");
+        assert!(node.get_device_info().await.unwrap().is_none());
+    }
+
+    #[test]
     fn create_switch_scale_up_accepts_gb300_switch_type() {
         let config = NodeConfig {
             id: "sw-01".to_owned(),
@@ -633,6 +839,8 @@ mod tests {
             bmc_endpoint: None,
             host_endpoint: Some(endpoint_config("10.0.0.11", "11:22:33:44:55:66")),
             expected_inventory: None,
+            recovery: None,
+            runtime_config: None,
         };
 
         let switch = NodeInstance::create_switch_scale_up(&config, "rack-01").unwrap();
@@ -648,6 +856,8 @@ mod tests {
             bmc_endpoint: Some(endpoint_config("10.0.0.10", "aa:bb:cc:dd:ee:ff")),
             host_endpoint: None,
             expected_inventory: None,
+            recovery: None,
+            runtime_config: None,
         };
 
         let Err(err) = NodeInstance::create_switch_scale_up(&config, "rack-01") else {
@@ -655,6 +865,115 @@ mod tests {
         };
 
         assert!(err.message.contains("is not a switch"));
+    }
+
+    #[test]
+    fn profile_parameters_configure_the_concrete_compute_variant() {
+        let catalog = crate::config::hardware_profiles::HardwareProfileCatalog::built_in()
+            .expect("built-in hardware profiles");
+        let config = NodeConfig {
+            recovery: None,
+            id: "c-01".to_owned(),
+            node_type: NodeType::ComputeGb200Nvidia,
+            bmc_endpoint: Some(endpoint_config("10.0.0.10", "aa:bb:cc:dd:ee:ff")),
+            host_endpoint: None,
+            expected_inventory: None,
+            runtime_config: catalog.runtime_config_for_request(NodeType::ComputeGb200Nvidia),
+        };
+
+        let node = NodeInstance::from_config(&config, "rack-01").expect("GB200 compute node");
+
+        let NodeInstance::ComputeGb200Nvidia(compute) = &node else {
+            panic!("GB200 profile must retain the concrete GB200 implementation");
+        };
+        assert_eq!(node.node_type(), NodeType::ComputeGb200Nvidia);
+        assert_eq!(
+            compute.nvfwupd_target_config().server_type,
+            nvfwupd::workflow::ServerType::GB200
+        );
+    }
+
+    #[test]
+    fn profile_parameters_do_not_replace_vendor_specific_compute_variant() {
+        let catalog = crate::config::hardware_profiles::HardwareProfileCatalog::built_in()
+            .expect("built-in compute profiles");
+        let runtime_config = catalog
+            .runtime_config_for_request(NodeType::ComputeGb300Supermicro)
+            .expect("active compute runtime configuration");
+        let config = NodeConfig {
+            recovery: None,
+            id: "c-01".to_owned(),
+            node_type: NodeType::ComputeGb300Supermicro,
+            bmc_endpoint: Some(endpoint_config("10.0.0.10", "aa:bb:cc:dd:ee:ff")),
+            host_endpoint: None,
+            expected_inventory: None,
+            runtime_config: Some(runtime_config),
+        };
+
+        let node = NodeInstance::from_config(&config, "rack-01").expect("Supermicro compute node");
+
+        assert!(matches!(&node, NodeInstance::ComputeGb300Supermicro(_)));
+        assert_eq!(node.node_type(), NodeType::ComputeGb300Supermicro);
+    }
+
+    #[test]
+    fn all_builtin_compute_profiles_keep_their_concrete_node_identity() {
+        let catalog = crate::config::hardware_profiles::HardwareProfileCatalog::built_in().unwrap();
+        for node_type in [
+            NodeType::ComputeGb200Nvidia,
+            NodeType::ComputeGb200Wiwynn,
+            NodeType::ComputeGb200Dell,
+            NodeType::ComputeGb300Nvidia,
+            NodeType::ComputeGb300Lenovo,
+            NodeType::ComputeGb300Supermicro,
+            NodeType::ComputeVrnvl72Nvidia,
+        ] {
+            let config = NodeConfig {
+                recovery: None,
+                id: "compute-01".to_owned(),
+                node_type,
+                bmc_endpoint: Some(endpoint_config("10.0.0.10", "00:00")),
+                host_endpoint: None,
+                expected_inventory: None,
+                runtime_config: Some(
+                    catalog
+                        .runtime_config_for_request(node_type)
+                        .unwrap_or_else(|| panic!("missing profile for {node_type:?}")),
+                ),
+            };
+            let node = NodeInstance::from_config(&config, "rack-01").unwrap();
+            assert_eq!(node.node_type(), node_type);
+        }
+    }
+
+    #[test]
+    fn legacy_compute_types_use_code_defaults_without_a_profile() {
+        let catalog = crate::config::hardware_profiles::HardwareProfileCatalog::default();
+        for node_type in [
+            NodeType::ComputeGb200Nvidia,
+            NodeType::ComputeGb200Wiwynn,
+            NodeType::ComputeGb300Nvidia,
+            NodeType::ComputeGb300Lenovo,
+            NodeType::ComputeGb300Supermicro,
+            NodeType::ComputeVrnvl72Nvidia,
+        ] {
+            let runtime_config = catalog.runtime_config_for_request(node_type);
+            assert!(runtime_config.is_none(), "{node_type:?}");
+            let config = NodeConfig {
+                recovery: None,
+                id: "compute-01".to_owned(),
+                node_type,
+                bmc_endpoint: Some(endpoint_config("10.0.0.10", "00:00")),
+                host_endpoint: None,
+                expected_inventory: None,
+                runtime_config,
+            };
+
+            let node = NodeInstance::from_config(&config, "rack-01")
+                .expect("concrete implementation must not require a profile");
+
+            assert_eq!(node.node_type(), node_type);
+        }
     }
 
     #[tokio::test]

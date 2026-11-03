@@ -42,7 +42,9 @@ use librms::protos::rack_manager::rack_manager_client::RackManagerClient;
 use librms::protos::rack_manager_v2;
 use librms::protos::rack_manager_v2::rack_manager_v2_client::RackManagerV2Client;
 use rackmanagementservice::api::grpc::server::{GrpcServer, SwitchTlsRoots, TlsMode};
-use rackmanagementservice::config::{ExpectedInventoryCatalog, ExpectedInventoryProfiles};
+use rackmanagementservice::config::{
+    ExpectedInventoryCatalog, ExpectedInventoryProfiles, FirmwareTaskPollOptions, WorkflowTimings,
+};
 use rackmanagementservice::libnmxc::TlsMaterialStore;
 use rackmanagementservice::metrics;
 use rackmanagementservice::orchestrator::job_tracker::JobTracker;
@@ -53,6 +55,9 @@ use tempfile::TempDir;
 
 use rack_manager::*;
 
+#[path = "grpc_e2e/hardware_profile_startup.rs"]
+mod hardware_profile_startup;
+
 // ApplyFirmwareObject always activates; the GB200 SOP includes a three-minute
 // stabilization plus recovery and post-activation inventory verification.
 const GB200_FIRMWARE_OBJECT_APPLY_TIMEOUT: Duration = Duration::from_secs(6 * 60);
@@ -62,14 +67,16 @@ const GB200_FIRMWARE_OBJECT_APPLY_TIMEOUT: Duration = Duration::from_secs(6 * 60
 // ══════════════════════════════════════════════════════════════════════════════
 
 fn write_synthetic_compute_fwpkg(path: &Path) {
+    write_synthetic_fwpkg(path, b"BMC", b"GB200Nvl-25.02-9");
+}
+
+fn write_synthetic_fwpkg(path: &Path, device_version: &[u8], component_version: &[u8]) {
     const EXPECTED_UUID: [u8; 16] = [
         0xf0, 0x18, 0x87, 0x8c, 0xcb, 0x7d, 0x49, 0x43, 0x98, 0x00, 0xa0, 0x2f, 0x05, 0x9a, 0xca,
         0x02,
     ];
 
     let version = b"GB200-P4978_TEST";
-    let device_version = b"BMC";
-    let component_version = b"GB200Nvl-25.02-9";
     let bitmap_bit_length = 8u16;
     let mut pkg = Vec::new();
 
@@ -108,7 +115,7 @@ fn write_synthetic_compute_fwpkg(path: &Path) {
     pkg.extend_from_slice(component_version);
     pkg.extend_from_slice(b"FWFW");
 
-    std::fs::write(path, pkg).expect("write synthetic compute fwpkg");
+    std::fs::write(path, pkg).expect("write synthetic fwpkg");
 }
 
 fn write_synthetic_powershelf_tar(path: &Path) {
@@ -227,6 +234,16 @@ async fn start_server_with_manager_catalog_and_switch_tls_roots(
     let mut grpc_server = GrpcServer::new(0, rm, jt, Backends::memory())
         .with_firmware_dir(firmware_dir.path())
         .with_expected_inventory_catalog(expected_inventory_catalog)
+        .with_workflow_timings(WorkflowTimings {
+            // The mock BMCs complete a task in milliseconds, so the production
+            // 30s poll interval would push every firmware job past the
+            // `wait_for_job_terminal` deadline.
+            firmware_task_poll: FirmwareTaskPollOptions {
+                interval: Duration::from_millis(10),
+                ..FirmwareTaskPollOptions::default()
+            },
+            ..WorkflowTimings::default()
+        })
         .with_insecure_listener()
         .with_switch_tls_roots(switch_tls_roots);
 
@@ -841,6 +858,162 @@ async fn vrnvl72_compute_node_round_trips_inventory_type() {
 }
 
 #[tokio::test]
+async fn descriptor_only_vrnvl72_delta_powershelf_round_trips_inventory_descriptor() {
+    let (mut server, mut client) = start_server().await;
+    let mut node = mk_node_info(
+        "vr-ps-delta-01",
+        "vr-rack-01",
+        "10.0.0.20",
+        "aa:bb:cc:00:00:20",
+        443,
+        Some("admin"),
+        Some("pass"),
+        NodeType::Unspecified,
+        vec![],
+        vec![],
+    );
+    node.r#type = None;
+    node.node_descriptor = Some(node_descriptor("Power Shelf", "Delta", "VR-NVL72"));
+
+    add_nodes(&mut client, vec![node]).await;
+
+    let inventory = client
+        .list_node_inventory(ListNodeInventoryRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+
+    let node = inventory
+        .nodes
+        .iter()
+        .find(|node| node.node_id == "vr-ps-delta-01")
+        .expect("descriptor-only VR Delta shelf should be present in inventory");
+    assert_eq!(node.rack_id, "vr-rack-01");
+    assert_eq!(node.r#type, NodeType::Unspecified as i32);
+    assert_eq!(
+        node.node_descriptor.as_ref(),
+        Some(&node_descriptor("power_shelf", "delta", "vrnvl72"))
+    );
+
+    server.stop();
+}
+
+#[tokio::test]
+async fn vrnvl72_delta_powershelf_power_uses_chassis_reset() {
+    use wiremock::matchers::{body_json, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const RESET_TARGET: &str = "/redfish/v1/Chassis/PowerShelf_0/Actions/Chassis.Reset";
+
+    // AHE54V2037A shelves on an NVIDIA PMC expose no Delta OEM PSU actions,
+    // so power control must not depend on /redfish/v1/PowerEquipment.
+    let bmc = MockServer::start().await;
+    let bmc_https = WiremockHttpsProxy::start(*bmc.address()).await;
+    Mock::given(method("GET"))
+        .and(path("/redfish/v1/PowerEquipment/PowerShelves"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&bmc)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/redfish/v1/Chassis"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "Members": [{ "@odata.id": "/redfish/v1/Chassis/PowerShelf_0" }]
+        })))
+        .mount(&bmc)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/redfish/v1/Chassis/PowerShelf_0"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "Id": "PowerShelf_0",
+            "Manufacturer": "DELTA",
+            "PowerState": "On",
+            "Actions": {
+                "#Chassis.Reset": {
+                    "@Redfish.ActionInfo": "/redfish/v1/Chassis/PowerShelf_0/ResetActionInfo",
+                    "target": RESET_TARGET
+                }
+            }
+        })))
+        .mount(&bmc)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/redfish/v1/Chassis/PowerShelf_0/ResetActionInfo"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "Parameters": [{
+                "Name": "ResetType",
+                "Required": true,
+                "DataType": "String",
+                "AllowableValues": ["On", "ForceOn", "ForceOff"]
+            }]
+        })))
+        .mount(&bmc)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(RESET_TARGET))
+        .and(body_json(serde_json::json!({ "ResetType": "ForceOff" })))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&bmc)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(RESET_TARGET))
+        .and(body_json(serde_json::json!({ "ResetType": "On" })))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&bmc)
+        .await;
+
+    let (mut server, mut client) = start_server().await;
+    let mut node = NodeInfo {
+        node_id: "vr-ps-delta-01".into(),
+        rack_id: "vr-rack-01".into(),
+        r#type: None,
+        bmc_endpoint: Some(bmc_endpoint(
+            "127.0.0.1",
+            "aa:bb:cc:00:00:20",
+            bmc_https.port(),
+        )),
+        ..Default::default()
+    };
+    node.node_descriptor = Some(node_descriptor("power_shelf", "delta", "vrnvl72"));
+
+    // Inline mode: no registration.
+    let inline = client
+        .batch_set_power_state(BatchSetPowerStateRequest {
+            nodes: Some(NodeSet {
+                nodes: vec![node.clone()],
+            }),
+            operation: PowerOperation::ForceOff as i32,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let response = batch_response(&inline.response);
+    assert_eq!(
+        response.status,
+        ReturnCode::Success as i32,
+        "{:?}",
+        response.node_results
+    );
+
+    // Registered mode.
+    add_nodes(&mut client, vec![node]).await;
+    let registered = client
+        .set_power_state(SetPowerStateRequest {
+            node_id: "vr-ps-delta-01".into(),
+            operation: PowerOperation::On as i32,
+            rack_id: "vr-rack-01".into(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(registered.status, ReturnCode::Success as i32);
+
+    server.stop();
+}
+
+#[tokio::test]
 async fn descriptor_only_nodes_support_inventory_and_power() {
     let mockup = start_mockup().await;
     let (mut server, mut client) = start_server().await;
@@ -853,7 +1026,14 @@ async fn descriptor_only_nodes_support_inventory_and_power() {
     wiwynn.r#type = None;
     wiwynn.node_descriptor = Some(node_descriptor("compute", "Wiwynn", "gb200"));
 
-    add_nodes(&mut client, vec![nvidia.clone(), wiwynn.clone()]).await;
+    let mut dell = compute_node("c-03", "rack-01", mockup.ports()[0]);
+    dell.r#type = None;
+    dell.node_descriptor = Some(node_descriptor("compute", "Dell", "gb200"));
+    add_nodes(
+        &mut client,
+        vec![nvidia.clone(), wiwynn.clone(), dell.clone()],
+    )
+    .await;
 
     let inventory = client
         .list_node_inventory(ListNodeInventoryRequest {})
@@ -886,10 +1066,21 @@ async fn descriptor_only_nodes_support_inventory_and_power() {
         Some(&node_descriptor("compute", "wiwynn", "gb200"))
     );
 
+    let dell_inventory = inventory
+        .nodes
+        .iter()
+        .find(|node| node.node_id == "c-03")
+        .unwrap();
+    assert_eq!(dell_inventory.r#type, NodeType::Unspecified as i32);
+    assert_eq!(
+        dell_inventory.node_descriptor.as_ref(),
+        Some(&node_descriptor("compute", "dell", "gb200"))
+    );
+
     let power = client
         .batch_get_power_state(BatchGetPowerStateRequest {
             nodes: Some(NodeSet {
-                nodes: vec![nvidia, wiwynn],
+                nodes: vec![nvidia, wiwynn, dell],
             }),
         })
         .await
@@ -1314,7 +1505,243 @@ async fn batch_get_firmware_inventory_rejects_empty_node_set()
     Ok(())
 }
 
+#[tokio::test]
+async fn compare_firmware_object_infers_type_and_reports_version_drift_as_data()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mockup = start_mockup().await;
+    let (mut server, mut client) = start_server().await;
+    let device = compute_node("c-01", "rack-01", mockup.ports()[0]);
+    let config_json = firmware_object_release_catalog_json(
+        "e2e-compare-fw",
+        serde_json::json!([{
+            "SKUID": "699-24764-0001-TS3",
+            "Name": "GB200-Compute",
+            "Type": "Compute Tray",
+            "Components": {
+                "Firmware": [{
+                    "Component": "BMC",
+                    "Version": "proposed-version",
+                    "Type": "Prod",
+                    "Locations": [{
+                        "Location": "https://example.test/compute-bmc.fwpkg",
+                        "LocationType": "HTTPS",
+                        "Type": "Firmware"
+                    }]
+                }]
+            }
+        }]),
+    );
+
+    let resp = client
+        .compare_firmware_object(CompareFirmwareObjectRequest {
+            config_json,
+            firmware_type: String::new(),
+            nodes: Some(NodeSet {
+                nodes: vec![device],
+            }),
+            component_filters: HashMap::from([(
+                NodeType::ComputeGb200Nvidia as i32,
+                FirmwareObjectComponentFilter {
+                    components: vec!["BMC".to_owned()],
+                },
+            )]),
+            ..Default::default()
+        })
+        .await?
+        .into_inner();
+
+    let response = batch_response(&resp.response);
+    assert_eq!(response.status, ReturnCode::Success as i32);
+    assert_batch_stats(response, 1, 1, 0);
+    assert_eq!(resp.object_id, "e2e-compare-fw_test");
+    assert!(!resp.matches_manifest);
+    assert_eq!(resp.nodes.len(), 1);
+    assert!(!resp.nodes[0].matches_manifest);
+    assert_eq!(resp.nodes[0].components.len(), 1);
+    let comparison = &resp.nodes[0].components[0];
+    assert_eq!(comparison.component, "BMC");
+    assert_eq!(comparison.installed_component, "FW_BMC_0");
+    assert_eq!(comparison.proposed_version, "proposed-version");
+    assert_eq!(
+        comparison.status,
+        FirmwareComparisonStatus::Mismatched as i32
+    );
+
+    server.stop();
+    Ok(())
+}
+
+#[tokio::test]
+async fn vrnvl72_inventory_and_manifest_comparison_do_not_require_nvue()
+-> Result<(), Box<dyn std::error::Error>> {
+    let bmc = wiremock::MockServer::start().await;
+    let bmc_https = WiremockHttpsProxy::start(*bmc.address()).await;
+    let host = wiremock::MockServer::start().await;
+    let host_https = WiremockHttpsProxy::start(*host.address()).await;
+    mount_switch_bmc_inventory(&bmc, &[("MGX_FW_BMC_0", "88.1")]).await;
+    let (mut server, mut client) = start_server().await;
+    let mut device = switch_password_device("sw-01", "rack-01", host_https.port());
+    device.r#type = Some(NodeType::SwitchVrnvl72Nvidia as i32);
+    device.bmc_endpoint = Some(bmc_endpoint(
+        "127.0.0.1",
+        "aa:bb:cc:00:20:01",
+        bmc_https.port(),
+    ));
+
+    // Even a registered switch with an unusable NVUE endpoint must remain readable.
+    add_nodes(&mut client, vec![device.clone()]).await;
+    let node_inventory = client
+        .get_node_firmware_inventory(GetNodeFirmwareInventoryRequest {
+            rack_id: "rack-01".to_owned(),
+            node_id: "sw-01".to_owned(),
+        })
+        .await?
+        .into_inner();
+    assert_eq!(node_inventory.status, ReturnCode::Success as i32);
+    assert_eq!(node_inventory.firmware_list[0].name, "MGX_FW_BMC_0");
+    let rack_inventory = client
+        .get_rack_firmware_inventory(GetRackFirmwareInventoryRequest {
+            rack_id: "rack-01".to_owned(),
+        })
+        .await?
+        .into_inner();
+    assert_eq!(rack_inventory.status, ReturnCode::Success as i32);
+    assert_eq!(rack_inventory.nodes.len(), 1);
+
+    {
+        let node_type = NodeType::SwitchVrnvl72Nvidia;
+        let manifest_component = "BMC+CPLD+SMA+ERoT+SBIOS";
+        device.r#type = Some(node_type as i32);
+        device.host_endpoint = None;
+        let inventory = client
+            .batch_get_firmware_inventory(BatchGetFirmwareInventoryRequest {
+                nodes: Some(NodeSet {
+                    nodes: vec![device.clone()],
+                }),
+            })
+            .await?
+            .into_inner();
+        assert_eq!(
+            batch_response(&inventory.response).status,
+            ReturnCode::Success as i32
+        );
+        assert_eq!(inventory.nodes[0].firmware_list[0].version, "88.1");
+
+        for (version, status) in [
+            ("88.1", FirmwareComparisonStatus::Matched),
+            ("88.2", FirmwareComparisonStatus::Mismatched),
+        ] {
+            let comparison = client.compare_firmware_object(CompareFirmwareObjectRequest {
+                config_json: firmware_object_release_catalog_json("switch-compare", serde_json::json!([{
+                    "Name":"Switch", "Type":"Switch Tray", "Components":{"Firmware":[{
+                        "Component":manifest_component, "Type":"Prod",
+                        "SubComponents":[{"Component":"BMC", "Version":version}],
+                        "Locations":[{"Location":"https://example.test/switch.fwpkg", "LocationType":"HTTPS", "Type":"Firmware"}]
+                    }]}
+                }])),
+                component_filters: HashMap::from([(node_type as i32, FirmwareObjectComponentFilter { components:vec!["BMC".to_owned()] })]),
+                nodes: Some(NodeSet { nodes: vec![device.clone()] }),
+                ..Default::default()
+            }).await?.into_inner();
+            assert_eq!(
+                batch_response(&comparison.response).status,
+                ReturnCode::Success as i32,
+                "{comparison:?}"
+            );
+            assert_eq!(
+                comparison.nodes[0].components[0].installed_component,
+                "MGX_FW_BMC_0"
+            );
+            assert_eq!(comparison.nodes[0].components[0].status, status as i32);
+            assert_eq!(
+                comparison.matches_manifest,
+                status == FirmwareComparisonStatus::Matched
+            );
+        }
+    }
+    assert!(host.received_requests().await.unwrap().is_empty());
+    server.stop();
+    Ok(())
+}
+
 // ── Compute rack-level firmware inventory ──
+
+#[tokio::test]
+async fn gb_switch_inventory_and_manifest_comparison_keep_using_nvue() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let host = MockServer::start().await;
+    let https = WiremockHttpsProxy::start(*host.address()).await;
+    let bmc = MockServer::start().await;
+    let bmc_https = WiremockHttpsProxy::start(*bmc.address()).await;
+    Mock::given(method("GET"))
+        .and(path("/nvue_v1/platform/firmware"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "BMC":{"actual-firmware":"88.1"}
+        })))
+        .expect(4)
+        .mount(&host)
+        .await;
+    let (mut server, mut client) = start_server().await;
+    for node_type in [NodeType::SwitchGb200Nvidia, NodeType::SwitchGb300Nvidia] {
+        let mut device = switch_password_device("gb-switch", "rack-01", https.port());
+        device.r#type = Some(node_type as i32);
+        device.bmc_endpoint = Some(bmc_endpoint(
+            "127.0.0.1",
+            "aa:bb:cc:00:20:01",
+            bmc_https.port(),
+        ));
+        let response = client
+            .batch_get_firmware_inventory(BatchGetFirmwareInventoryRequest {
+                nodes: Some(NodeSet {
+                    nodes: vec![device.clone()],
+                }),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            batch_response(&response.response).status,
+            ReturnCode::Success as i32
+        );
+        assert_eq!(response.nodes[0].firmware_list[0].version, "88.1");
+        let comparison = client.compare_firmware_object(CompareFirmwareObjectRequest {
+            config_json: firmware_object_release_catalog_json("gb-compare", serde_json::json!([{
+                "Name":"Switch", "Type":"Switch Tray", "Components":{"Firmware":[{
+                    "Component":"BMC+FPGA+EROT", "Type":"Prod",
+                    "SubComponents":[{"Component":"BMC", "Version":"88.1"}],
+                    "Locations":[{"Location":"https://example.test/switch.fwpkg", "LocationType":"HTTPS", "Type":"Firmware"}]
+                }]}
+            }])),
+            component_filters:HashMap::from([(node_type as i32, FirmwareObjectComponentFilter { components:vec!["BMC".to_owned()] })]),
+            nodes:Some(NodeSet { nodes:vec![device.clone()] }),
+            ..Default::default()
+        }).await.unwrap().into_inner();
+        assert_eq!(
+            batch_response(&comparison.response).status,
+            ReturnCode::Success as i32,
+            "{comparison:?}"
+        );
+        assert!(comparison.matches_manifest);
+        device.host_endpoint = None;
+        let response = client
+            .batch_get_firmware_inventory(BatchGetFirmwareInventoryRequest {
+                nodes: Some(NodeSet {
+                    nodes: vec![device],
+                }),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            batch_response(&response.response).status,
+            ReturnCode::Failure as i32
+        );
+    }
+    assert!(bmc.received_requests().await.unwrap().is_empty());
+    server.stop();
+}
 
 #[tokio::test]
 async fn compute_get_rack_firmware_inventory() {
@@ -1377,14 +1804,15 @@ async fn powershelf_set_power_state() {
     )
     .await;
 
-    // The powershelf maps ForceOn to On (no separate hardware surface), but a
-    // graceful Off stays graceful (ResetType GracefulShutdown) and is never
-    // silently upgraded to a hard ForceOff. All four are honored by a shelf
-    // that advertises the corresponding ResetType.
+    // The powershelf maps ForceOn to On (no separate hardware surface). Graceful
+    // requests (Off, GracefulShutdown) use a graceful path when the shelf
+    // advertises one (the mockup advertises ResetType GracefulShutdown) and fall
+    // back to ForceOff otherwise.
     for op in [
         PowerOperation::ForceOff,
         PowerOperation::On,
         PowerOperation::Off,
+        PowerOperation::GracefulShutdown,
         PowerOperation::ForceOn,
     ] {
         let resp = client
@@ -1405,7 +1833,6 @@ async fn powershelf_set_power_state() {
 
     for op in [
         PowerOperation::Reset,
-        PowerOperation::GracefulShutdown,
         PowerOperation::GracefulRestart,
         PowerOperation::ForceRestart,
     ] {
@@ -1628,6 +2055,14 @@ async fn powershelf_firmware_upload_async() {
         FirmwareJobState::Completed as i32,
         "job should complete (failure_rate=0)"
     );
+    let result: serde_json::Value = serde_json::from_str(&job.result_json).unwrap();
+    assert_eq!(result["hardware_config_source"], "code_defaults");
+    assert!(result.get("hardware_profile").is_none());
+    assert!(result.get("hardware_profile_sha256").is_none());
+    assert_eq!(
+        result["rms_build"]["git_sha"],
+        serde_json::json!(option_env!("VERGEN_GIT_SHA"))
+    );
 
     server.stop();
 }
@@ -1710,7 +2145,7 @@ async fn compute_firmware_upload_async() {
             node_id: "c-01".into(),
             rack_id: "rack-01".into(),
             filename: tmp.to_str().unwrap().into(),
-            target: String::new(),
+            target: "BMC".into(),
             activate: false,
             force_update: false,
             firmware_targets: vec![],
@@ -1732,6 +2167,23 @@ async fn compute_firmware_upload_async() {
         job.job_state,
         FirmwareJobState::Completed as i32,
         "job should complete (failure_rate=0)"
+    );
+    let result: serde_json::Value = serde_json::from_str(&job.result_json).unwrap();
+    let profile =
+        rackmanagementservice::config::hardware_profiles::HardwareUpdatePlan::from_yaml_str(
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../hardware-profiles/v1/compute_gb200_nvidia.yaml"
+            )),
+        )
+        .unwrap();
+    assert_eq!(result["hardware_config_source"], "profile");
+    assert_eq!(result["hardware_profile_sha256"], profile.source_sha256());
+    assert_eq!(result["hardware_profile_schema_version"], 1);
+    assert_eq!(result["hardware_profile"], profile.profile_id());
+    assert_eq!(
+        result["rms_build"]["git_sha"],
+        serde_json::json!(option_env!("VERGEN_GIT_SHA"))
     );
 
     server.stop();
@@ -2199,7 +2651,7 @@ async fn batch_update_firmware_creates_jobs_for_compute_nodes() {
 
     let targets = firmware_targets(
         NodeType::ComputeGb200Nvidia,
-        &[("HGX_0", tmp.to_str().unwrap())],
+        &[("HMC", tmp.to_str().unwrap())],
     );
 
     let resp = client
@@ -2285,7 +2737,192 @@ fn apply_firmware_object_http_config_json(artifact_url: &str) -> String {
 }
 
 #[tokio::test]
-async fn apply_firmware_object_downloads_without_access_token() {
+async fn firmware_object_prefetch_accepts_placeholders_and_multiple_nvos_images() {
+    let (mut server, mut client) = start_server().await;
+    let source = server.make_synthetic_compute_fwpkg("catalog.fwpkg");
+    let config_json = firmware_object_release_catalog_json(
+        "e2e-prefetch",
+        serde_json::json!([
+            {"Type": "Compute Tray", "Components": {"Firmware": [{
+                "Component": "BMC", "Type": "Prod", "Locations": [
+                    {"Location": source, "LocationType": "file", "Type": "Firmware"},
+                    {"FileName": "placeholder.fwpkg", "Location": null, "Type": "Firmware"}
+                ]
+            }]}},
+            {"Type": "Switch Tray", "Components": {"Software": [{
+                "Component": "NVOS", "Type": "Prod", "Locations": [
+                    {"FileName": "notes.bin", "Location": null, "Required": false},
+                    {"FileName": "nvos-amd64-25.02.4440.bin", "Location": source, "LocationType": "file"},
+                    {"FileName": "nvos-amd64-25.02.4441.bin", "Location": source, "LocationType": "file"}
+                ]
+            }]}}
+        ]),
+    );
+    let object = client
+        .add_firmware_object(AddFirmwareObjectRequest {
+            config_json,
+            hardware_type: "gb200".to_owned(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .object
+        .unwrap();
+    let ready = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let current = client
+                .get_firmware_object(GetFirmwareObjectRequest {
+                    id: object.id.clone(),
+                })
+                .await
+                .unwrap()
+                .into_inner()
+                .object
+                .unwrap();
+            if current.available {
+                break current;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("metadata placeholders and NVOS ambiguity must not fail prefetch");
+    let metadata = ready.metadata.unwrap();
+    assert_eq!(metadata.switch_system_images.len(), 3);
+    assert!(!metadata.switch_system_images[0].required);
+    server.stop();
+}
+
+#[tokio::test]
+async fn firmware_object_metadata_recognizes_liteon_hyphen_and_space_names() {
+    let (mut server, mut client) = start_server().await;
+    // Catalog/metadata test only: these synthetic bytes are never sent to hardware.
+    let source = server.make_synthetic_compute_fwpkg("powershelf-catalog.fwpkg");
+    for (index, separator) in [" ", "-"].into_iter().enumerate() {
+        let firmware: Vec<_> = ["PMC", "PSU"].into_iter().map(|part| serde_json::json!({
+            "Component": format!("LiteOn{separator}{part}"), "Version": "1.0", "Type": "Prod",
+            "Locations": [{"Location": source, "LocationType": "file", "Type": "Firmware",
+                "FileName": format!("liteon-{part}.fwpkg")}]
+        })).collect();
+        let object = client.add_firmware_object(AddFirmwareObjectRequest {
+            config_json: firmware_object_release_catalog_json(&format!("liteon-alias-{index}"),
+                serde_json::json!([{"Type": "Power Shelf", "Components": {"Firmware": firmware}}])),
+            hardware_type: "gb200".to_owned(),
+            ..Default::default()
+        }).await.unwrap().into_inner().object.unwrap();
+        let ready = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let current = client
+                    .get_firmware_object(GetFirmwareObjectRequest {
+                        id: object.id.clone(),
+                    })
+                    .await
+                    .unwrap()
+                    .into_inner()
+                    .object
+                    .unwrap();
+                if current.available {
+                    break current;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("LiteOn catalog preparation must complete");
+        let devices = ready.metadata.unwrap().device_components;
+        assert_eq!(
+            devices.len(),
+            3,
+            "GB200 and GB300 LiteOn plus the VR LiteOn shelf, no Delta or compute platforms"
+        );
+        for device in devices {
+            assert_eq!(device.device_type, "Power Shelf");
+            let names = device
+                .components
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(names, ["LiteOnPMC", "LiteOnPSU"]);
+            let parts = ["PMC", "PSU"];
+            for (component, part) in device.components.iter().zip(parts) {
+                assert_eq!(
+                    component.source_component,
+                    format!("LiteOn{separator}{part}")
+                );
+                assert_eq!(component.artifacts.len(), 1);
+            }
+        }
+    }
+    server.stop();
+}
+
+#[tokio::test]
+async fn apply_firmware_object_rejects_missing_channel_before_download() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let artifacts = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"must not download"))
+        .expect(0)
+        .mount(&artifacts)
+        .await;
+    let config_json = firmware_object_release_catalog_json(
+        "missing-channel",
+        serde_json::json!([{
+            "Type": "Compute Tray",
+            "Components": {"Firmware": [
+                {"Component": "BMC", "Type": "Prod", "Locations": [{
+                    "Location": format!("{}/bmc.fwpkg", artifacts.uri()),
+                    "LocationType": "HTTPS", "Type": "Firmware"
+                }]},
+                {"Component": "HMC", "Locations": [{
+                    "Location": format!("{}/hmc.fwpkg", artifacts.uri()),
+                    "LocationType": "HTTPS", "Type": "Firmware"
+                }]}
+            ]}
+        }]),
+    );
+    let (mut server, mut client) = start_server().await;
+    let response = client
+        .apply_firmware_object(ApplyFirmwareObjectRequest {
+            rack_id: "rack-01".into(),
+            config_json,
+            firmware_type: String::new(),
+            hardware_type: "gb200".into(),
+            nodes: Some(NodeSet {
+                nodes: vec![compute_node("c-01", "rack-01", 1)],
+            }),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(response.jobs.len(), 1);
+    let child = poll_job_until_terminal_within(
+        &mut client,
+        &response.jobs[0].job_id,
+        Duration::from_secs(10),
+    )
+    .await;
+    assert_eq!(child.job_state, FirmwareJobState::Failed as i32);
+    assert!(
+        child.error_message.contains("Firmware[1].Type"),
+        "{}",
+        child.error_message
+    );
+    assert!(
+        child.error_message.contains("HMC"),
+        "{}",
+        child.error_message
+    );
+    artifacts.verify().await;
+    server.stop();
+}
+
+#[tokio::test]
+async fn apply_firmware_object_defaults_type_and_downloads_without_access_token() {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -2315,7 +2952,7 @@ async fn apply_firmware_object_downloads_without_access_token() {
             rack_id: "rack-01".into(),
             config_json,
             access_token: None,
-            firmware_type: "prod".into(),
+            firmware_type: String::new(),
             hardware_type: "gb200".into(),
             nodes: Some(NodeSet {
                 nodes: vec![device],
@@ -2390,6 +3027,136 @@ async fn apply_firmware_object_downloads_without_access_token() {
     server.stop();
 }
 
+#[tokio::test]
+async fn apply_firmware_object_retries_a_transient_artifact_failure() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let artifact_path = "/compute-bmc.fwpkg";
+    let temp = TempDir::new().expect("create temp dir for fwpkg fixture");
+    let fwpkg_path = temp.path().join("compute-bmc.fwpkg");
+    write_synthetic_compute_fwpkg(&fwpkg_path);
+    let fwpkg_bytes = std::fs::read(&fwpkg_path).expect("read synthetic compute fwpkg");
+
+    let http_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(artifact_path))
+        .respond_with(ResponseTemplate::new(503))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .expect(1)
+        .mount(&http_server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(artifact_path))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(fwpkg_bytes))
+        .expect(1)
+        .mount(&http_server)
+        .await;
+
+    let artifact_url = format!("{}{}", http_server.uri(), artifact_path);
+    let mockup = start_mockup().await;
+    let (mut server, mut client) = start_server().await;
+    let device = compute_node("c-01", "rack-01", mockup.ports()[0]);
+    add_nodes(&mut client, vec![device.clone()]).await;
+
+    let resp = client
+        .apply_firmware_object(ApplyFirmwareObjectRequest {
+            rack_id: "rack-01".into(),
+            config_json: apply_firmware_object_http_config_json(&artifact_url),
+            hardware_type: "gb200".into(),
+            nodes: Some(NodeSet {
+                nodes: vec![device],
+            }),
+            component_filters: HashMap::from([(
+                NodeType::ComputeGb200Nvidia as i32,
+                FirmwareObjectComponentFilter {
+                    components: vec!["BMC".into()],
+                },
+            )]),
+            ..Default::default()
+        })
+        .await
+        .expect("apply_firmware_object RPC should succeed")
+        .into_inner();
+    let response = batch_response(&resp.response);
+    assert_eq!(response.status, ReturnCode::Success as i32);
+
+    let parent_job = poll_job_until_terminal_within(
+        &mut client,
+        &response.job_id,
+        GB200_FIRMWARE_OBJECT_APPLY_TIMEOUT,
+    )
+    .await;
+    assert_eq!(
+        parent_job.job_state,
+        FirmwareJobState::Completed as i32,
+        "one 503 must not fail the apply: {}",
+        parent_job.error_message
+    );
+    http_server.verify().await;
+    server.stop();
+}
+
+#[tokio::test]
+async fn apply_firmware_object_stops_before_the_device_when_downloads_keep_failing() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    // Three attempts, then the job fails during artifact preparation.
+    let artifacts = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(503))
+        .expect(3)
+        .mount(&artifacts)
+        .await;
+    // Any connection to this port is a device contact, whatever the protocol.
+    let bmc = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind BMC listener");
+    let bmc_port = bmc.local_addr().expect("BMC address").port();
+
+    let artifact_url = format!("{}/compute-bmc.fwpkg", artifacts.uri());
+    let (mut server, mut client) = start_server().await;
+    let response = client
+        .apply_firmware_object(ApplyFirmwareObjectRequest {
+            rack_id: "rack-01".into(),
+            config_json: apply_firmware_object_http_config_json(&artifact_url),
+            hardware_type: "gb200".into(),
+            nodes: Some(NodeSet {
+                nodes: vec![compute_node("c-01", "rack-01", bmc_port)],
+            }),
+            component_filters: HashMap::from([(
+                NodeType::ComputeGb200Nvidia as i32,
+                FirmwareObjectComponentFilter {
+                    components: vec!["BMC".into()],
+                },
+            )]),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(response.jobs.len(), 1);
+
+    let child = poll_job_until_terminal_within(
+        &mut client,
+        &response.jobs[0].job_id,
+        Duration::from_secs(30),
+    )
+    .await;
+    assert_eq!(child.job_state, FirmwareJobState::Failed as i32);
+    assert_eq!(child.error_code, FirmwareUpdateError::ServerError as i32);
+    artifacts.verify().await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), bmc.accept())
+            .await
+            .is_err(),
+        "a failed preparation must not reach the device"
+    );
+    server.stop();
+}
+
 fn apply_firmware_object_artifactory_config_json(artifact_url: &str) -> String {
     firmware_object_release_catalog_json(
         "e2e-artifactory-fw",
@@ -2459,21 +3226,16 @@ fn apply_switch_system_image_http_config_json(artifact_url: &str) -> String {
 }
 
 #[tokio::test]
-async fn apply_firmware_object_downloads_from_artifactory_with_access_token() {
-    use wiremock::matchers::{header, method, path};
+async fn apply_firmware_object_rejects_authenticated_http_without_transmitting_credentials() {
+    use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     let artifact_path = "/compute-bmc.fwpkg";
-    let temp = TempDir::new().expect("create temp dir for fwpkg fixture");
-    let fwpkg_path = temp.path().join("compute-bmc.fwpkg");
-    write_synthetic_compute_fwpkg(&fwpkg_path);
-    let fwpkg_bytes = std::fs::read(&fwpkg_path).expect("read synthetic compute fwpkg");
-
     let http_server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path(artifact_path))
-        .and(header("X-JFrog-Art-Api", "secret-token"))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(fwpkg_bytes))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
         .mount(&http_server)
         .await;
 
@@ -2519,10 +3281,188 @@ async fn apply_firmware_object_downloads_from_artifactory_with_access_token() {
     .await;
     assert_eq!(
         parent_job.job_state,
-        FirmwareJobState::Completed as i32,
-        "artifactory download apply should complete: {}",
+        FirmwareJobState::Failed as i32,
+        "authenticated HTTP apply must fail: {}",
         parent_job.error_message
     );
+
+    assert!(http_server.received_requests().await.unwrap().is_empty());
+    let child =
+        poll_job_until_terminal_within(&mut client, &resp.jobs[0].job_id, Duration::from_secs(10))
+            .await;
+    assert!(child.error_message.contains("require HTTPS"));
+    assert_eq!(child.error_code, FirmwareUpdateError::ClientFailure as i32);
+    let generic = client
+        .get_job_status(GetJobStatusRequest {
+            job_id: child.job_id,
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        generic.job_states[0].error_code,
+        rack_manager::JobError::InvalidArgument as i32
+    );
+    server.stop();
+}
+
+#[tokio::test]
+async fn signed_artifact_redirect_failure_redacts_job_errors_and_logs() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use wiremock::matchers::path;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const TEST_NAME: &str = "signed_artifact_redirect_failure_redacts_job_errors_and_logs";
+
+    // Isolate tracing's process-wide callsite cache from parallel gRPC tests.
+    if std::env::var("RMS_ISOLATED_TRACING_TEST").as_deref() != Ok(TEST_NAME) {
+        let output = tokio::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST_NAME, "--nocapture"])
+            .env("RMS_ISOLATED_TRACING_TEST", TEST_NAME)
+            .kill_on_drop(true)
+            .output()
+            .await
+            .unwrap();
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        assert!(
+            output.status.success() && stdout.contains("test result: ok. 1 passed; 0 failed;"),
+            "{stdout}\n{stderr}"
+        );
+
+        return;
+    }
+
+    let logs = tempfile::NamedTempFile::new().unwrap();
+
+    let subscriber = tracing_subscriber::fmt()
+        .with_env_filter("rackmanagementservice=debug")
+        .with_ansi(false)
+        .without_time()
+        .with_writer(Arc::new(logs.reopen().unwrap()))
+        .finish();
+
+    tracing::subscriber::set_global_default(subscriber).unwrap();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+
+    let signed_url = format!(
+        "http://{}/fw.fwpkg?token=SECRET&X-Amz-Signature=SIGNATURE",
+        listener.local_addr().unwrap()
+    );
+
+    let broken_server = tokio::spawn(async move {
+        // Retry an interrupted body, then stop on malformed HTTP. Both URLs
+        // and the retained first failure must stay redacted in status and logs.
+        for response in [
+            b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\npartial"
+                .as_slice(),
+            b"HTTP/1.1 invalid\r\n\r\n".as_slice(),
+        ] {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+
+            while !request.ends_with(b"\r\n\r\n") {
+                assert_ne!(socket.read_buf(&mut request).await.unwrap(), 0);
+            }
+
+            socket.write_all(response).await.unwrap();
+        }
+    });
+
+    let redirect = MockServer::start().await;
+    Mock::given(path("/fw.fwpkg"))
+        .respond_with(ResponseTemplate::new(302).insert_header("location", signed_url.as_str()))
+        .expect(2)
+        .mount(&redirect)
+        .await;
+
+    let mockup = start_mockup().await;
+    let (mut server, mut client) = start_server().await;
+    let node = compute_node("c-01", "rack-01", mockup.ports()[0]);
+
+    add_nodes(&mut client, vec![node.clone()]).await;
+
+    let response = client
+        .apply_firmware_object(ApplyFirmwareObjectRequest {
+            rack_id: "rack-01".to_owned(),
+            config_json: apply_firmware_object_artifactory_config_json(&format!(
+                "{}/fw.fwpkg?token=INITIAL_SECRET",
+                redirect.uri()
+            )),
+            firmware_type: "prod".to_owned(),
+            hardware_type: "gb200".to_owned(),
+            nodes: Some(NodeSet { nodes: vec![node] }),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+
+    let status =
+        poll_generic_job_until_terminal(&mut client, &batch_response(&response.response).job_id)
+            .await;
+
+    broken_server.await.unwrap();
+
+    assert_eq!(
+        batch_response(&response.response).status,
+        ReturnCode::Success as i32
+    );
+
+    assert!(
+        status.job_states.len() >= 2,
+        "parent and child must be returned"
+    );
+
+    for job in &status.job_states {
+        assert_eq!(job.execution_state, JobExecutionState::Failed as i32);
+
+        for secret in ["INITIAL_SECRET", "SECRET", "SIGNATURE"] {
+            assert!(!job.error_message.contains(secret), "{}", job.error_message);
+        }
+    }
+
+    let child = status
+        .job_states
+        .iter()
+        .find(|job| job.job_id == response.jobs[0].job_id)
+        .expect("GetJobStatus must include the firmware child");
+
+    assert_eq!(child.error_code, rack_manager::JobError::ClientError as i32);
+
+    assert!(
+        child
+            .error_message
+            .contains("artifact request failed for http://")
+    );
+
+    assert!(child.error_message.contains("artifact transport failed"));
+    assert!(
+        child
+            .error_message
+            .contains("after 2 attempts (first failure:")
+    );
+    assert!(
+        child
+            .error_message
+            .contains("failed to read artifact response body")
+    );
+
+    let output = std::fs::read_to_string(logs.path()).unwrap();
+
+    assert!(output.contains("WARN"), "{output}");
+    assert!(output.contains("retrying"), "{output}");
+    assert!(output.contains("ERROR"), "{output}");
+    assert!(output.contains("required artifact unavailable"), "{output}");
+    assert!(output.contains("artifact transport failed"), "{output}");
+
+    for secret in ["INITIAL_SECRET", "SECRET", "SIGNATURE"] {
+        assert!(!output.contains(secret), "{output}");
+    }
 
     server.stop();
 }
@@ -2576,6 +3516,78 @@ async fn apply_firmware_object_downloads_local_file_artifact() {
         parent_job.error_message
     );
 
+    server.stop();
+}
+
+#[tokio::test]
+async fn apply_firmware_object_applies_all_component_locations_in_order() {
+    let mockup = start_mockup().await;
+    let (mut server, mut client) = start_server().await;
+    let device = compute_node("c-01", "rack-01", mockup.ports()[0]);
+    add_nodes(&mut client, vec![device.clone()]).await;
+    let filenames = ["bmc-3.fwpkg", "bmc-1.fwpkg", "bmc-2.fwpkg"];
+    let locations: Vec<_> = filenames
+        .iter()
+        .map(|filename| {
+            let path = server.make_synthetic_compute_fwpkg(filename);
+            serde_json::json!({"Location": path, "LocationType": "file", "Type": "Firmware"})
+        })
+        .collect();
+    let config_json = firmware_object_release_catalog_json(
+        "e2e-all-locations",
+        serde_json::json!([{
+            "Type": "Compute Tray", "Components": {"Firmware": [{
+                "Component": "BMC", "Type": "Prod", "Locations": locations
+            }]}
+        }]),
+    );
+
+    let response = client
+        .apply_firmware_object(ApplyFirmwareObjectRequest {
+            rack_id: "rack-01".to_owned(),
+            config_json,
+            firmware_type: "prod".to_owned(),
+            hardware_type: "gb200".to_owned(),
+            nodes: Some(NodeSet {
+                nodes: vec![device],
+            }),
+            force_update: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        batch_response(&response.response).status,
+        ReturnCode::Success as i32
+    );
+    let node_job = poll_job_until_terminal_within(
+        &mut client,
+        &response.jobs[0].job_id,
+        GB200_FIRMWARE_OBJECT_APPLY_TIMEOUT,
+    )
+    .await;
+
+    assert_eq!(
+        node_job.job_state,
+        FirmwareJobState::Completed as i32,
+        "{}",
+        node_job.error_message
+    );
+    let result: serde_json::Value = serde_json::from_str(&node_job.result_json).unwrap();
+    assert_eq!(result["targets_completed"], 3);
+    assert_eq!(result["activated"], true);
+    let targets = result["targets"].as_array().unwrap();
+    assert_eq!(targets.len(), filenames.len());
+    for (target, filename) in targets.iter().zip(filenames) {
+        assert!(
+            target["firmware_file"]
+                .as_str()
+                .unwrap()
+                .ends_with(filename)
+        );
+        assert_eq!(target["status"], "completed");
+    }
     server.stop();
 }
 
@@ -2634,6 +3646,10 @@ async fn apply_firmware_object_download_failure_marks_job_failed() {
         FirmwareJobState::Failed as i32,
         "missing artifact should fail the child job"
     );
+    assert_eq!(
+        child_job.error_code,
+        FirmwareUpdateError::FileNotFound as i32
+    );
     assert!(
         child_job.error_message.to_lowercase().contains("download")
             || child_job.error_message.contains("404")
@@ -2646,7 +3662,7 @@ async fn apply_firmware_object_download_failure_marks_job_failed() {
 }
 
 #[tokio::test]
-async fn apply_switch_system_image_downloads_remote_artifact() {
+async fn apply_switch_system_image_defaults_type_downloads_and_propagates_recovery_flag() {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -2662,21 +3678,24 @@ async fn apply_switch_system_image_downloads_remote_artifact() {
     let config_json = apply_switch_system_image_http_config_json(&artifact_url);
 
     let (mut server, mut client) = start_server().await;
-    let devices = vec![switch_device(
-        "sw-01",
-        "rack-01",
+
+    let mut device = with_onie_recovery_endpoint(
+        switch_device("sw-01", "rack-01", "127.0.0.1", "aa:bb:cc:00:00:11"),
         "127.0.0.1",
-        "aa:bb:cc:00:00:11",
-    )];
+    );
+
+    device.host_endpoint.as_mut().unwrap().port = 1;
+    let devices = vec![device];
 
     let resp = client
         .apply_switch_system_image(ApplySwitchSystemImageRequest {
             rack_id: "rack-01".into(),
             config_json,
             access_token: None,
-            software_type: "prod".into(),
+            software_type: String::new(),
             hardware_type: "gb200".into(),
             nodes: Some(NodeSet { nodes: devices }),
+            allow_onie_recovery: true,
         })
         .await
         .expect("apply_switch_system_image RPC should succeed")
@@ -2687,7 +3706,8 @@ async fn apply_switch_system_image_downloads_remote_artifact() {
     assert_eq!(resp.jobs.len(), 1);
     let child_job_id = resp.jobs[0].job_id.clone();
 
-    let mut saw_terminal = false;
+    let mut terminal_status = None;
+
     for _ in 0..150 {
         let status = client
             .get_switch_system_image_job_status(GetSwitchSystemImageJobStatusRequest {
@@ -2696,13 +3716,21 @@ async fn apply_switch_system_image_downloads_remote_artifact() {
             .await
             .unwrap()
             .into_inner();
+
         if status.state == "completed" || status.state == "failed" {
-            saw_terminal = true;
+            terminal_status = Some(status);
             break;
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    assert!(saw_terminal, "switch image job should reach terminal state");
+
+    let terminal_status = terminal_status.expect("switch image job should reach terminal state");
+
+    let result: serde_json::Value = serde_json::from_str(&terminal_status.result_json)
+        .expect("switch image job result_json should be valid JSON");
+
+    assert_eq!(result["allow_onie_recovery"], true);
+    assert_eq!(result["onie_recovery_endpoint_configured"], true);
 
     let requests = http_server
         .received_requests()
@@ -2798,6 +3826,24 @@ fn switch_device(id: &str, rack_id: &str, ip: &str, mac: &str) -> NodeInfo {
     }
 }
 
+fn with_onie_recovery_endpoint(mut node: NodeInfo, ip_address: &str) -> NodeInfo {
+    node.additional_host_endpoints = vec![Endpoint {
+        interface: Some(NetworkInterface {
+            ip_address: ip_address.to_owned(),
+            ..Default::default()
+        }),
+        port: 22,
+        credentials: Some(Credentials {
+            auth: Some(credentials::Auth::UserPass(UsernamePassword {
+                username: "onie".to_owned(),
+                password: "recovery-password".to_owned(),
+            })),
+        }),
+    }];
+
+    node
+}
+
 fn switch_password_device(id: &str, rack_id: &str, port: u16) -> NodeInfo {
     NodeInfo {
         node_id: id.into(),
@@ -2819,6 +3865,35 @@ fn switch_password_device(id: &str, rack_id: &str, port: u16) -> NodeInfo {
             }),
         }),
         ..Default::default()
+    }
+}
+
+async fn mount_switch_bmc_inventory(server: &wiremock::MockServer, entries: &[(&str, &str)]) {
+    use wiremock::matchers::{basic_auth, method, path};
+    use wiremock::{Mock, ResponseTemplate};
+
+    let root = "/redfish/v1/UpdateService/FirmwareInventory";
+    let members: Vec<_> = entries
+        .iter()
+        .map(|(id, _)| serde_json::json!({"@odata.id":format!("{root}/{id}")}))
+        .collect();
+    Mock::given(method("GET"))
+        .and(path(root))
+        .and(basic_auth("admin", "password"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"Members":members})),
+        )
+        .mount(server)
+        .await;
+    for (id, version) in entries {
+        Mock::given(method("GET"))
+            .and(path(format!("{root}/{id}")))
+            .and(basic_auth("admin", "password"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Id":id, "Version":version, "Updateable":true
+            })))
+            .mount(server)
+            .await;
     }
 }
 
@@ -3002,6 +4077,7 @@ async fn update_switch_system_image_rejects_empty_nodes() {
             nodes: Some(NodeSet { nodes: vec![] }),
             image_filename: "nvos.bin".into(),
             local_file_path: "/tmp/nvos.bin".into(),
+            allow_onie_recovery: false,
         })
         .await
         .unwrap()
@@ -3036,6 +4112,7 @@ async fn update_switch_system_image_rejects_empty_filename() {
             }),
             image_filename: String::new(),
             local_file_path: "/tmp/nvos.bin".into(),
+            allow_onie_recovery: false,
         })
         .await
         .unwrap()
@@ -3068,6 +4145,7 @@ async fn update_switch_system_image_rejects_empty_local_path() {
             }),
             image_filename: "nvos.bin".into(),
             local_file_path: String::new(),
+            allow_onie_recovery: false,
         })
         .await
         .unwrap()
@@ -3100,6 +4178,7 @@ async fn update_switch_system_image_rejects_nonexistent_local_file() {
             }),
             image_filename: "nvos-1.2.3.bin".into(),
             local_file_path: "/tmp/this_file_definitely_does_not_exist_12345.bin".into(),
+            allow_onie_recovery: false,
         })
         .await
         .unwrap()
@@ -3138,6 +4217,7 @@ async fn update_switch_system_image_rejects_existing_file_outside_firmware_dir()
             }),
             image_filename: "nvos-1.2.3.bin".into(),
             local_file_path: image.to_str().unwrap().into(),
+            allow_onie_recovery: false,
         })
         .await
         .unwrap()
@@ -3174,6 +4254,7 @@ async fn update_switch_system_image_rejects_filename_without_version() {
             }),
             image_filename: "nvos-latest.bin".into(),
             local_file_path: image.to_str().unwrap().into(),
+            allow_onie_recovery: false,
         })
         .await
         .unwrap()
@@ -3203,6 +4284,7 @@ async fn update_switch_system_image_skips_non_switch_nodes() {
             nodes: Some(NodeSet { nodes: devices }),
             image_filename: "nvos-1.2.3.bin".into(),
             local_file_path: image.to_str().unwrap().into(),
+            allow_onie_recovery: false,
         })
         .await
         .unwrap()
@@ -3234,16 +4316,22 @@ async fn update_switch_system_image_creates_jobs_for_switches() {
     let (mut server, mut client) = start_server().await;
 
     let image = server.make_fake_firmware_file("rms_test_switch_sys_image_create.bin");
-    let devices = vec![
-        switch_device("sw-01", "rack-01", "10.0.0.11", "aa:bb:cc:00:00:11"),
-        switch_device("sw-02", "rack-01", "10.0.0.12", "aa:bb:cc:00:00:12"),
+
+    let mut devices = vec![
+        switch_device("sw-01", "rack-01", "127.0.0.1", "aa:bb:cc:00:00:11"),
+        switch_device("sw-02", "rack-01", "127.0.0.1", "aa:bb:cc:00:00:12"),
     ];
+
+    for device in &mut devices {
+        device.host_endpoint.as_mut().unwrap().port = 1;
+    }
 
     let resp = client
         .update_switch_system_image(UpdateSwitchSystemImageRequest {
             nodes: Some(NodeSet { nodes: devices }),
             image_filename: "nvos-1.2.3.bin".into(),
             local_file_path: image.to_str().unwrap().into(),
+            allow_onie_recovery: false,
         })
         .await
         .unwrap()
@@ -3261,12 +4349,145 @@ async fn update_switch_system_image_creates_jobs_for_switches() {
     assert!(!response.job_id.is_empty(), "parent job_id must be set");
     assert_eq!(resp.jobs.len(), 2);
 
-    let mut ids: Vec<&str> = resp.jobs.iter().map(|j| j.node_id.as_str()).collect();
+    let mut ids: Vec<&str> = resp.jobs.iter().map(|job| job.node_id.as_str()).collect();
     ids.sort();
+
     assert_eq!(ids, vec!["sw-01", "sw-02"]);
-    for nj in &resp.jobs {
-        assert!(!nj.job_id.is_empty());
+
+    for job in &resp.jobs {
+        assert!(!job.job_id.is_empty());
     }
+
+    server.stop();
+}
+
+#[tokio::test]
+async fn update_switch_system_image_accepts_nvue_without_ssh_detection() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    for allow_onie_recovery in [false, true] {
+        let (mut server, mut client) = start_server().await;
+        let nvue = MockServer::start().await;
+        let https = WiremockHttpsProxy::start(*nvue.address()).await;
+
+        Mock::given(method("GET"))
+            .and(path("/nvue_v1/system"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "status": "System is ready", "health-status": "OK"
+            })))
+            .expect(1)
+            .mount(&nvue)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/nvue_v1/system/image"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "current": "nvos-1.2.3", "next": "nvos-1.2.3"
+            })))
+            .expect(1)
+            .mount(&nvue)
+            .await;
+
+        let image = server.make_fake_firmware_file("rms_test_nvue_image_probe.bin");
+        let device = switch_password_device("nvue-probe", "rack-01", https.port());
+
+        let device = if allow_onie_recovery {
+            with_onie_recovery_endpoint(device, "192.0.2.50")
+        } else {
+            device
+        };
+
+        let response = client
+            .update_switch_system_image(UpdateSwitchSystemImageRequest {
+                nodes: Some(NodeSet {
+                    nodes: vec![device],
+                }),
+                image_filename: "nvos-1.2.3.bin".to_owned(),
+                local_file_path: image.to_str().unwrap().to_owned(),
+                allow_onie_recovery,
+            })
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert_eq!(response.jobs.len(), 1);
+
+        let child = poll_job_until_terminal(&mut client, &response.jobs[0].job_id).await;
+
+        assert_eq!(
+            child.job_state,
+            FirmwareJobState::Completed as i32,
+            "{}",
+            child.error_message
+        );
+
+        let status = client
+            .get_switch_system_image_job_status(GetSwitchSystemImageJobStatusRequest {
+                job_id: response.jobs[0].job_id.clone(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+
+        let result: serde_json::Value = serde_json::from_str(&status.result_json).unwrap();
+
+        assert_eq!(result["status"], "already_up_to_date");
+        assert_eq!(result["allow_onie_recovery"], allow_onie_recovery);
+
+        server.stop();
+    }
+}
+
+#[tokio::test]
+async fn update_switch_system_image_tracks_an_unreachable_switch_setup_failure() {
+    let (mut server, mut client) = start_server().await;
+
+    let image = server.make_fake_firmware_file("rms_test_switch_sys_image_create.bin");
+    let mut device = switch_device("sw-01", "rack-01", "127.0.0.1", "aa:bb:cc:00:00:11");
+
+    device.host_endpoint.as_mut().unwrap().port = 1;
+
+    let resp = client
+        .update_switch_system_image(UpdateSwitchSystemImageRequest {
+            nodes: Some(NodeSet {
+                nodes: vec![device],
+            }),
+            image_filename: "nvos-1.2.3.bin".into(),
+            local_file_path: image.to_str().unwrap().into(),
+            allow_onie_recovery: false,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+
+    let response = batch_response(&resp.response);
+
+    assert_eq!(response.status, ReturnCode::Success as i32);
+    assert_batch_stats(response, 1, 1, 0);
+
+    assert!(!response.job_id.is_empty(), "parent job_id must be set");
+    assert_eq!(resp.jobs.len(), 1);
+    assert!(response.node_results.is_empty());
+
+    let child =
+        poll_job_until_terminal_within(&mut client, &resp.jobs[0].job_id, Duration::from_secs(30))
+            .await;
+
+    assert_eq!(child.job_state, FirmwareJobState::Failed as i32);
+
+    assert!(
+        child.error_message.contains("/nvue_v1/system"),
+        "NVOS verification should preserve the REST error when recovery is disabled: {}",
+        child.error_message
+    );
+
+    let parent_job = poll_generic_job_until_terminal(&mut client, &response.job_id).await;
+
+    assert_eq!(
+        parent_job.job_states[0].execution_state,
+        JobExecutionState::Failed as i32
+    );
 
     server.stop();
 }
@@ -3276,7 +4497,10 @@ async fn update_switch_system_image_admits_one_job_per_switch() {
     let (mut server, mut client) = start_server().await;
 
     let image = server.make_fake_firmware_file("rms_test_switch_sys_image_dup.bin");
-    let device = switch_device("sw-01", "rack-01", "10.0.0.11", "aa:bb:cc:00:00:11");
+
+    let mut device = switch_device("sw-01", "rack-01", "127.0.0.1", "aa:bb:cc:00:00:11");
+
+    device.host_endpoint.as_mut().unwrap().port = 1;
 
     // A repeated switch must not get two concurrent image installs: the second
     // occurrence is refused and reported, not silently dropped.
@@ -3287,6 +4511,7 @@ async fn update_switch_system_image_admits_one_job_per_switch() {
             }),
             image_filename: "nvos-1.2.3.bin".into(),
             local_file_path: image.to_str().unwrap().into(),
+            allow_onie_recovery: false,
         })
         .await
         .unwrap()
@@ -3348,6 +4573,11 @@ async fn update_switch_system_password_completes_parent_and_child_jobs() {
     let nvue_https = WiremockHttpsProxy::start(*nvue.address()).await;
 
     let responses = [
+        (
+            "GET",
+            "/nvue_v1/platform/chassis-location",
+            serde_json::json!({"chassis-sn": "password-test-chassis", "tray-index": "1"}),
+        ),
         ("GET", "/nvue_v1/system", serde_json::json!({})),
         ("POST", "/nvue_v1/revision", serde_json::json!("55")),
         (
@@ -3406,10 +4636,12 @@ async fn update_switch_system_password_completes_parent_and_child_jobs() {
     assert_eq!(status.job_states.len(), 2);
 
     assert_eq!(status.job_states[0].job_id, response.job_id);
+
     assert_eq!(
         status.job_states[0].execution_state,
         JobExecutionState::Completed as i32
     );
+
     assert_eq!(status.job_states[0].child_job_ids.len(), 1);
     assert!(!status.job_states[0].child_job_ids[0].is_empty());
 
@@ -3417,14 +4649,17 @@ async fn update_switch_system_password_completes_parent_and_child_jobs() {
 
     assert_eq!(status.job_states[1].job_id, *child_job_id);
     assert_eq!(status.job_states[1].node_id.as_deref(), Some("sw-01"));
+
     assert_eq!(
         status.job_states[1].execution_state,
         JobExecutionState::Completed as i32
     );
+
     assert!(status.job_states[1].error_message.is_empty());
 
     let result: serde_json::Value = serde_json::from_str(&status.job_states[1].result_json)
         .expect("password update result must be valid JSON");
+
     assert_eq!(result["status"], "completed");
     assert_eq!(result["phase"], "password_update_persisted");
     assert_eq!(result["revision_id"], "55");
@@ -3758,18 +4993,18 @@ async fn get_switch_system_image_job_status_returns_known_job() {
     let (mut server, mut client) = start_server().await;
 
     let image = server.make_fake_firmware_file("rms_test_switch_sys_image_status.bin");
-    let devices = vec![switch_device(
-        "sw-01",
-        "rack-01",
-        "10.0.0.11",
-        "aa:bb:cc:00:00:11",
-    )];
+
+    let mut device = switch_device("sw-01", "rack-01", "127.0.0.1", "aa:bb:cc:00:00:11");
+
+    device.host_endpoint.as_mut().unwrap().port = 1;
+    let devices = vec![device];
 
     let create_resp = client
         .update_switch_system_image(UpdateSwitchSystemImageRequest {
             nodes: Some(NodeSet { nodes: devices }),
             image_filename: "nvos-1.2.3.bin".into(),
             local_file_path: image.to_str().unwrap().into(),
+            allow_onie_recovery: false,
         })
         .await
         .unwrap()
@@ -3826,27 +5061,70 @@ async fn get_switch_system_image_job_status_unknown_job_fails_gracefully() {
 }
 
 #[tokio::test]
-async fn switch_system_image_job_result_json_includes_timing_summary() {
-    // Failure path (the switch-OS background task reaches the inspect_state
-    // stage, fails there because the bogus IP can't be reached, and writes
-    // the stage timeline into `result_json`). This asserts the observability
-    // contract: callers can read `timing_summary.stages[*].{name,status,duration_ms}`
-    // out of GetSwitchSystemImageJobStatus.result_json for any completed job.
+async fn vrnvl72_system_image_rpc_rejects_missing_bmc_before_switch_io() {
+    let host = wiremock::MockServer::start().await;
+    let host_https = WiremockHttpsProxy::start(*host.address()).await;
+    let (mut server, mut client) = start_server().await;
+    let image = server.make_fake_firmware_file("rms_test_vr_nvos.bin");
+    let mut device = switch_password_device("vr-sw-01", "rack-01", host_https.port());
+    device.r#type = Some(NodeType::SwitchVrnvl72Nvidia as i32);
+
+    for bmc in [
+        None,
+        Some(Endpoint {
+            credentials: None,
+            ..bmc_endpoint("127.0.0.1", "aa:bb:cc:00:20:01", 443)
+        }),
+    ] {
+        device.bmc_endpoint = bmc;
+        let response = client
+            .update_switch_system_image(UpdateSwitchSystemImageRequest {
+                nodes: Some(NodeSet {
+                    nodes: vec![device.clone()],
+                }),
+                image_filename: "nvos-1.2.3.bin".into(),
+                local_file_path: image.to_str().unwrap().into(),
+                allow_onie_recovery: false,
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(response.jobs.is_empty());
+        let batch = batch_response(&response.response);
+        assert_eq!(batch.status, ReturnCode::Failure as i32);
+        assert_eq!(batch.node_results.len(), 1);
+        assert!(
+            batch.node_results[0]
+                .error_message
+                .contains("BMC endpoint and credentials")
+        );
+        assert!(host.received_requests().await.unwrap().is_empty());
+    }
+    server.stop();
+}
+
+#[tokio::test]
+async fn switch_system_image_job_result_json_includes_timing_and_recovery_authorization() {
+    // An unreachable loopback switch fails the real SSH installation probe.
+    // The terminal job must still preserve the result-json observability contract.
     let (mut server, mut client) = start_server().await;
 
     let image = server.make_fake_firmware_file("rms_test_switch_sys_image_timing.bin");
-    let devices = vec![switch_device(
-        "sw-01",
-        "rack-01",
-        "127.0.0.1", // local host endpoint will refuse quickly
-        "aa:bb:cc:00:00:11",
-    )];
+
+    let mut device = with_onie_recovery_endpoint(
+        switch_device("sw-01", "rack-01", "127.0.0.1", "aa:bb:cc:00:00:11"),
+        "127.0.0.1",
+    );
+
+    device.host_endpoint.as_mut().unwrap().port = 1;
+    let devices = vec![device];
 
     let create = client
         .update_switch_system_image(UpdateSwitchSystemImageRequest {
             nodes: Some(NodeSet { nodes: devices }),
             image_filename: "nvos-1.2.3.bin".into(),
             local_file_path: image.to_str().unwrap().into(),
+            allow_onie_recovery: true,
         })
         .await
         .unwrap()
@@ -3854,27 +5132,29 @@ async fn switch_system_image_job_result_json_includes_timing_summary() {
     assert_eq!(create.jobs.len(), 1);
     let child_job_id = create.jobs[0].job_id.clone();
 
-    // Poll GetSwitchSystemImageJobStatus until the child job leaves running/queued
-    // (up to ~30s). Failure path is quick since the BMC/NVUE connection refuses.
     let mut status = None;
+
     for _ in 0..150 {
-        let s = client
+        let current = client
             .get_switch_system_image_job_status(GetSwitchSystemImageJobStatusRequest {
                 job_id: child_job_id.clone(),
             })
             .await
             .unwrap()
             .into_inner();
-        if s.state == "completed" || s.state == "failed" {
-            status = Some(s);
+
+        if current.state == "completed" || current.state == "failed" {
+            status = Some(current);
             break;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
     }
+
     let status = status.expect("job should reach a terminal state within 30s");
     assert_eq!(
         status.state, "failed",
-        "expected the bogus-IP job to fail in inspect_state"
+        "expected the unreachable switch to fail the SSH installation probe"
     );
     assert!(
         !status.result_json.is_empty(),
@@ -3883,23 +5163,32 @@ async fn switch_system_image_job_result_json_includes_timing_summary() {
 
     let result: serde_json::Value =
         serde_json::from_str(&status.result_json).expect("result_json must be valid JSON");
+
+    assert_eq!(result["allow_onie_recovery"], true);
+    assert_eq!(result["onie_recovery_endpoint_configured"], true);
+
     let timing = result
         .get("timing_summary")
         .expect("timing_summary must be present in result_json");
+
     assert!(timing.is_object(), "timing_summary must be an object");
     assert!(timing.get("started_at_ms").is_some());
     assert!(timing.get("total_duration_ms").is_some());
 
     let stages = timing
         .get("stages")
-        .and_then(|v| v.as_array())
+        .and_then(|value| value.as_array())
         .expect("timing_summary.stages must be an array");
-    // The first stage (inspect_state) must be present and marked failed.
+
     assert!(!stages.is_empty(), "expected at least one stage entry");
-    let first = &stages[0];
-    assert_eq!(first["name"].as_str().unwrap(), "inspect_state");
-    assert_eq!(first["status"].as_str().unwrap(), "failed");
-    assert!(first["duration_ms"].as_i64().unwrap() >= 0);
+
+    let probe = stages
+        .iter()
+        .find(|stage| stage["name"] == "verify_nvos_installation")
+        .expect("verify_nvos_installation stage must be present");
+
+    assert_eq!(probe["status"].as_str().unwrap(), "failed");
+    assert!(probe["duration_ms"].as_i64().unwrap() >= 0);
 
     server.stop();
 }
@@ -3928,7 +5217,7 @@ async fn update_firmware_with_force_update_true_succeeds() {
             node_id: "c-01".into(),
             rack_id: "rack-01".into(),
             filename: tmp.to_str().unwrap().into(),
-            target: String::new(),
+            target: "BMC".into(),
             activate: false,
             firmware_targets: vec![],
             force_update: true,
@@ -3965,7 +5254,7 @@ async fn batch_update_firmware_with_force_update_true_creates_jobs() {
     let devices = vec![compute_node("c-01", "rack-01", mockup.ports()[0])];
     let targets = firmware_targets(
         NodeType::ComputeGb200Nvidia,
-        &[("HGX_0", tmp.to_str().unwrap())],
+        &[("HMC", tmp.to_str().unwrap())],
     );
 
     let resp = client
@@ -4010,6 +5299,297 @@ async fn batch_update_firmware_with_force_update_true_creates_jobs() {
 //  be rejected as missing host credentials; a switch with only host_endpoint
 //  credentials should be accepted.
 // ══════════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn switch_firmware_preflight_skips_matching_packages_over_grpc() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let nvue = MockServer::start().await;
+    let https = WiremockHttpsProxy::start(*nvue.address()).await;
+
+    Mock::given(method("GET"))
+        .and(path("/nvue_v1/platform/chassis-location"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "chassis-sn": "preflight-test-chassis", "tray-index": "1"
+        })))
+        .expect(2)
+        .mount(&nvue)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/nvue_v1/platform/firmware"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "BMC": {"actual-firmware": "GB200Nvl-25.02-9"},
+            "BIOS": {"actual-firmware": "unrelated-version"}
+        })))
+        .expect(2)
+        .mount(&nvue)
+        .await;
+
+    let (mut server, mut client) = start_server().await;
+    // This fixture is a PLDM package with one BMC record. Its component version
+    // is read from the payload, independent of the local filename.
+    let file = server.make_synthetic_compute_fwpkg("switch-preflight.fwpkg");
+    let device = switch_password_device("preflight-switch", "rack-01", https.port());
+
+    for firmware_object in [false, true] {
+        let (parent_id, child_id) = if firmware_object {
+            let response = client
+                .apply_firmware_object(ApplyFirmwareObjectRequest {
+                    rack_id: "rack-01".to_owned(),
+                    config_json: firmware_object_release_catalog_json(
+                        "switch-preflight",
+                        serde_json::json!([{
+                            "Name": "GB200-Switch",
+                            "Type": "Switch Tray",
+                            "Components": {"Firmware": [{
+                                "Component": "BMC+FPGA+EROT",
+                                "Type": "Prod",
+                                "Locations": [{
+                                    "Name": "Production_Package",
+                                    "Location": file.to_str().unwrap(),
+                                    "LocationType": "file",
+                                    "Type": "Firmware"
+                                }]
+                            }]}
+                        }]),
+                    ),
+                    hardware_type: "gb200".to_owned(),
+                    firmware_type: "prod".to_owned(),
+                    component_filters: HashMap::from([(
+                        NodeType::SwitchGb200Nvidia as i32,
+                        FirmwareObjectComponentFilter {
+                            components: vec!["BMC".to_owned()],
+                        },
+                    )]),
+                    nodes: Some(NodeSet {
+                        nodes: vec![device.clone()],
+                    }),
+                    ..Default::default()
+                })
+                .await
+                .unwrap()
+                .into_inner();
+
+            let batch = batch_response(&response.response);
+
+            assert_eq!(batch.status, ReturnCode::Success as i32);
+
+            (batch.job_id.clone(), response.jobs[0].job_id.clone())
+        } else {
+            let response = client
+                .batch_update_firmware(BatchUpdateFirmwareRequest {
+                    nodes: Some(NodeSet {
+                        nodes: vec![device.clone()],
+                    }),
+                    firmware_targets: firmware_targets(
+                        NodeType::SwitchGb200Nvidia,
+                        &[("BMC", file.to_str().unwrap())],
+                    ),
+                    activate: true,
+                    force_update: false,
+                    ..Default::default()
+                })
+                .await
+                .unwrap()
+                .into_inner();
+
+            let batch = batch_response(&response.response);
+
+            assert_eq!(batch.status, ReturnCode::Success as i32);
+
+            (batch.job_id.clone(), response.jobs[0].job_id.clone())
+        };
+
+        let child =
+            poll_job_until_terminal_within(&mut client, &child_id, Duration::from_secs(10)).await;
+
+        assert_eq!(
+            child.job_state,
+            FirmwareJobState::Completed as i32,
+            "{}",
+            child.error_message
+        );
+
+        let result: serde_json::Value = serde_json::from_str(&child.result_json).unwrap();
+
+        assert_eq!(result["status"], "already_up_to_date");
+        assert_eq!(result["targets_skipped"], 1);
+        assert_eq!(result["activated"], false);
+
+        assert_eq!(
+            result["pre_update_version_check"]["components"][0]["package_version"],
+            "GB200Nvl-25.02-9"
+        );
+
+        let parent =
+            poll_job_until_terminal_within(&mut client, &parent_id, Duration::from_secs(10)).await;
+
+        assert_eq!(
+            parent.job_state,
+            FirmwareJobState::Completed as i32,
+            "{}",
+            parent.error_message
+        );
+    }
+
+    let requests = nvue.received_requests().await.unwrap();
+
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.method == wiremock::http::Method::Get)
+    );
+
+    server.stop();
+}
+
+#[tokio::test]
+async fn switch_erot_apply_skips_using_bios_bundle_version_over_grpc() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let nvue = MockServer::start().await;
+    let https = WiremockHttpsProxy::start(*nvue.address()).await;
+
+    Mock::given(method("GET"))
+        .and(path("/nvue_v1/platform/chassis-location"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "chassis-sn": "erot-test-chassis", "tray-index": "1"
+        })))
+        .expect(2)
+        .mount(&nvue)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/nvue_v1/platform/firmware"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "EROT-BMC": {"actual-firmware": "1.5"},
+            "EROT-ASIC1": {"actual-firmware": "1.5"}
+        })))
+        .expect(2)
+        .mount(&nvue)
+        .await;
+
+    let (mut server, mut client) = start_server().await;
+    let old_file = server.firmware_dir.path().join("alpha.fwpkg");
+    let preferred_file = server.firmware_dir.path().join("beta.fwpkg");
+
+    write_synthetic_fwpkg(&old_file, b"ERoT", b"2.0");
+    write_synthetic_fwpkg(&preferred_file, b"ERoT", b"1.5");
+
+    for reverse in [false, true] {
+        let mut components = vec![
+            serde_json::json!({
+                "Component": "BMC+FPGA+EROT", "Type": "Prod",
+                "Locations": [{"Location": old_file, "LocationType": "file", "Type": "Firmware"}]
+            }),
+            serde_json::json!({
+                "Component": "SBIOS+EROT", "Type": "Prod",
+                "Locations": [{"Location": preferred_file, "LocationType": "file", "Type": "Firmware"}]
+            }),
+        ];
+
+        if reverse {
+            components.reverse();
+        }
+
+        let response = client
+            .apply_firmware_object(ApplyFirmwareObjectRequest {
+                rack_id: "rack-01".to_owned(),
+                config_json: firmware_object_release_catalog_json(
+                    "erot-precedence",
+                    serde_json::json!([{
+                        "Name": "Switch", "Type": "Switch Tray",
+                        "Components": {"Firmware": components}
+                    }]),
+                ),
+                hardware_type: "gb200".to_owned(),
+                firmware_type: "prod".to_owned(),
+                component_filters: HashMap::from([(
+                    NodeType::SwitchGb200Nvidia as i32,
+                    FirmwareObjectComponentFilter {
+                        components: vec!["EROT".to_owned()],
+                    },
+                )]),
+                nodes: Some(NodeSet {
+                    nodes: vec![switch_password_device(
+                        "erot-switch",
+                        "rack-01",
+                        https.port(),
+                    )],
+                }),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert_eq!(
+            batch_response(&response.response).status,
+            ReturnCode::Success as i32
+        );
+
+        let child = poll_job_until_terminal_within(
+            &mut client,
+            &response.jobs[0].job_id,
+            Duration::from_secs(10),
+        )
+        .await;
+
+        assert_eq!(
+            child.job_state,
+            FirmwareJobState::Completed as i32,
+            "{}",
+            child.error_message
+        );
+
+        let result: serde_json::Value = serde_json::from_str(&child.result_json).unwrap();
+
+        assert_eq!(result["status"], "already_up_to_date");
+        assert_eq!(result["targets_skipped"], 1);
+        assert_eq!(result["activated"], false);
+
+        assert!(
+            result["targets"][0]["firmware_file"]
+                .as_str()
+                .unwrap()
+                .ends_with("/beta.fwpkg")
+        );
+
+        let compared = result["pre_update_version_check"]["components"]
+            .as_array()
+            .unwrap();
+
+        assert_eq!(compared.len(), 2);
+
+        assert!(
+            compared
+                .iter()
+                .all(|entry| entry["package_version"] == "1.5")
+        );
+
+        let parent = poll_job_until_terminal_within(
+            &mut client,
+            &batch_response(&response.response).job_id,
+            Duration::from_secs(10),
+        )
+        .await;
+
+        assert_eq!(parent.job_state, FirmwareJobState::Completed as i32);
+    }
+
+    assert!(
+        nvue.received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .all(|request| { request.method == wiremock::http::Method::Get })
+    );
+
+    server.stop();
+}
 
 #[tokio::test]
 async fn batch_update_firmware_rejects_switch_with_bmc_only_credentials() {
@@ -4067,12 +5647,27 @@ async fn batch_update_firmware_rejects_switch_with_bmc_only_credentials() {
 
 #[tokio::test]
 async fn batch_update_firmware_accepts_switch_with_host_only_credentials() {
+    use wiremock::matchers::{basic_auth, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let nvue = MockServer::start().await;
+    let https = WiremockHttpsProxy::start(*nvue.address()).await;
+
+    let discovery = Mock::given(method("GET"))
+        .and(path("/nvue_v1/platform/chassis-location"))
+        .and(basic_auth("host_user", "host_pass"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "chassis-sn": "host-credentials-test-chassis", "tray-index": "1"
+        })))
+        .expect(1)
+        .mount_as_scoped(&nvue)
+        .await;
+
     let (mut server, mut client) = start_server().await;
 
     let tmp = server.make_fake_firmware_file("rms_test_host_creds_switch_host_only.bin");
 
-    // Switch with ONLY host_endpoint credentials (no bmc_endpoint). Under the
-    // new host-creds contract this is the canonical case for switch NVOS.
+    // NVUE authenticates with host credentials without a BMC endpoint.
     let device = NodeInfo {
         node_id: "sw-01".into(),
         rack_id: "rack-01".into(),
@@ -4080,11 +5675,11 @@ async fn batch_update_firmware_accepts_switch_with_host_only_credentials() {
         bmc_endpoint: None,
         host_endpoint: Some(Endpoint {
             interface: Some(NetworkInterface {
-                ip_address: "10.0.0.11".into(),
+                ip_address: "127.0.0.1".into(),
                 mac_address: "aa:bb:cc:00:00:11".into(),
                 host_name: None,
             }),
-            port: 22,
+            port: u32::from(https.port()),
             credentials: Some(Credentials {
                 auth: Some(credentials::Auth::UserPass(UsernamePassword {
                     username: "host_user".into(),
@@ -4115,15 +5710,23 @@ async fn batch_update_firmware_accepts_switch_with_host_only_credentials() {
         .into_inner();
 
     let response = batch_response(&resp.response);
+
     assert_eq!(
         response.status,
         ReturnCode::Success as i32,
         "switch with only host creds should be accepted, got: {}",
         response.message
     );
+
     assert_batch_stats(response, 1, 1, 0);
+
     assert_eq!(resp.jobs.len(), 1);
     assert_eq!(resp.jobs[0].node_id, "sw-01");
+
+    // RPC acceptance does not wait for the worker's authenticated discovery.
+    tokio::time::timeout(Duration::from_secs(5), discovery.wait_until_satisfied())
+        .await
+        .expect("the worker must discover the switch before fixture teardown");
 
     server.stop();
 }
@@ -4145,6 +5748,7 @@ async fn update_switch_system_image_rejects_switch_with_bmc_only_credentials() {
             nodes: Some(NodeSet { nodes: devices }),
             image_filename: "nvos-1.2.3.bin".into(),
             local_file_path: image.to_str().unwrap().into(),
+            allow_onie_recovery: false,
         })
         .await
         .unwrap()
@@ -4372,6 +5976,37 @@ async fn rack_manager_v2_configure_scale_up_fabric_manager_rejects_invalid_reque
             },
             expected_message: "duplicate host endpoint ip address",
         },
+        TestCase {
+            name: "duplicate ID across switch and compute roles",
+            request: rack_manager_v2::ConfigureScaleUpFabricManagerRequest {
+                nodes: Some(NodeSet {
+                    nodes: vec![
+                        switch_newnodeinfo_host_only("shared-id", "10.0.0.11", "aa:bb:cc:00:00:11"),
+                        NodeInfo {
+                            node_id: "shared-id".into(),
+                            r#type: Some(NodeType::ComputeGb200Nvidia.into()),
+                            ..Default::default()
+                        },
+                    ],
+                }),
+                ..valid_request.clone()
+            },
+            expected_message: "nonempty and unique",
+        },
+        TestCase {
+            name: "inventory contains no switches",
+            request: rack_manager_v2::ConfigureScaleUpFabricManagerRequest {
+                nodes: Some(NodeSet {
+                    nodes: vec![NodeInfo {
+                        node_id: "compute-only".into(),
+                        r#type: Some(NodeType::ComputeGb200Nvidia.into()),
+                        ..Default::default()
+                    }],
+                }),
+                ..valid_request.clone()
+            },
+            expected_message: "must contain at least one switch",
+        },
     ];
 
     for case in cases {
@@ -4395,6 +6030,397 @@ async fn rack_manager_v2_configure_scale_up_fabric_manager_rejects_invalid_reque
     server.stop();
 }
 
+async fn mount_disabled_fabric_inspection_fixture(nvue: &wiremock::MockServer) {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+
+    Mock::given(method("GET"))
+        .and(path("/nvue_v1/platform/chassis-location"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "chassis-sn": "inspection-chassis", "tray-index": "1", "slot-number": "2"
+        })))
+        .mount(nvue)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/nvue_v1/cluster"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"state":"disabled"})),
+        )
+        .mount(nvue)
+        .await;
+}
+
+/// Exposes the NVUE fixture on a non-loopback address accepted by switch validation.
+async fn switch_inspection_proxy(
+    upstream: SocketAddr,
+) -> (IpAddr, WiremockHttpsProxy, WiremockHttpsProxy) {
+    use tokio::io::copy_bidirectional;
+    use tokio::net::{TcpListener, TcpStream};
+
+    let switch_ip =
+        non_loopback_local_ip().expect("test requires a non-loopback local IPv4 address");
+
+    let https = WiremockHttpsProxy::start(upstream).await;
+
+    let listener = TcpListener::bind(SocketAddr::new(switch_ip, 0))
+        .await
+        .unwrap();
+
+    let port = listener.local_addr().unwrap().port();
+    let upstream_port = https.port();
+
+    let task = tokio::spawn(async move {
+        while let Ok((mut downstream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut upstream = TcpStream::connect((Ipv4Addr::LOCALHOST, upstream_port))
+                    .await
+                    .unwrap();
+
+                let _ = copy_bidirectional(&mut downstream, &mut upstream).await;
+            });
+        }
+    });
+
+    (switch_ip, https, WiremockHttpsProxy { port, task })
+}
+
+#[tokio::test]
+async fn fabric_inspection_reads_all_switches_without_jobs_or_mutations() {
+    use librms::protos::rack_manager::InspectScaleUpFabricsRequest;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let nvue = MockServer::start().await;
+    let (switch_ip, _https, management_proxy) = switch_inspection_proxy(*nvue.address()).await;
+    let port = management_proxy.port;
+
+    mount_disabled_fabric_inspection_fixture(&nvue).await;
+
+    let nodes = ["switch-a", "switch-b", "unassigned"].map(|id| {
+        let mut node = switch_device(id, "rack-01", &switch_ip.to_string(), "aa:bb:cc:00:00:11");
+        let endpoint = node.host_endpoint.as_mut().unwrap();
+
+        endpoint.port = u32::from(port);
+        endpoint.interface.as_mut().unwrap().host_name = None;
+
+        node
+    });
+
+    let request = InspectScaleUpFabricsRequest {
+        nodes: Some(NodeSet {
+            nodes: nodes.into(),
+        }),
+        ..Default::default()
+    };
+
+    let (mut server, mut client) = start_server().await;
+
+    let response = client
+        .inspect_scale_up_fabrics(request.clone())
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert_eq!(response.status, ReturnCode::Success as i32, "{response:?}");
+
+    // Disabled controllers do not create fabric observations.
+    assert!(response.fabrics.is_empty());
+    assert!(response.discovery_errors.is_empty());
+
+    Mock::given(method("GET"))
+        .and(path("/nvue_v1/platform/chassis-location"))
+        .respond_with(ResponseTemplate::new(503).set_body_string("private upstream diagnostic"))
+        .with_priority(1)
+        .mount(&nvue)
+        .await;
+
+    let partial = client
+        .inspect_scale_up_fabrics(request.clone())
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert_eq!(partial.status, ReturnCode::Failure as i32);
+
+    assert!(partial.fabrics.is_empty());
+
+    assert_eq!(
+        partial
+            .discovery_errors
+            .iter()
+            .map(|issue| issue.node_id.as_str())
+            .collect::<Vec<_>>(),
+        ["switch-a", "switch-b", "unassigned"]
+    );
+
+    assert!(
+        partial
+            .discovery_errors
+            .iter()
+            .all(|issue| issue.message == "identity: resource read failed")
+    );
+
+    let requests = nvue.received_requests().await.unwrap();
+
+    assert!(!requests.is_empty());
+
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.method == wiremock::http::Method::Get
+                && matches!(
+                    request.url.path(),
+                    "/nvue_v1/cluster" | "/nvue_v1/platform/chassis-location"
+                ))
+    );
+
+    server.stop();
+}
+
+#[tokio::test]
+async fn fabric_inspection_returns_partial_results_before_the_transport_deadline() {
+    use wiremock::matchers::basic_auth;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let nvue = MockServer::start().await;
+    let (switch_ip, _https, management_proxy) = switch_inspection_proxy(*nvue.address()).await;
+
+    mount_disabled_fabric_inspection_fixture(&nvue).await;
+
+    Mock::given(basic_auth("stalled", "test-password"))
+        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(30)))
+        .with_priority(1)
+        .mount(&nvue)
+        .await;
+
+    // Four stalled switches precede the responsive switch. Every switch must
+    // start collection without waiting for an earlier switch to finish.
+    let nodes = (0..5)
+        .map(|index| {
+            let mut node = switch_device(
+                &format!("switch-{index}"),
+                "rack-01",
+                &switch_ip.to_string(),
+                "aa:bb:cc:00:00:11",
+            );
+
+            let endpoint = node.host_endpoint.as_mut().unwrap();
+
+            endpoint.port = u32::from(management_proxy.port);
+            endpoint.interface.as_mut().unwrap().host_name = None;
+
+            if index < 4 {
+                endpoint.credentials = Some(Credentials {
+                    auth: Some(credentials::Auth::UserPass(UsernamePassword {
+                        username: "stalled".into(),
+                        password: "test-password".into(),
+                    })),
+                });
+            }
+
+            node
+        })
+        .collect();
+
+    let mut request = tonic::Request::new(InspectScaleUpFabricsRequest {
+        nodes: Some(NodeSet { nodes }),
+        ..Default::default()
+    });
+
+    request.set_timeout(Duration::from_secs(10));
+
+    let (mut server, mut client) = start_server().await;
+
+    let response = client
+        .inspect_scale_up_fabrics(request)
+        .await
+        .expect("partial inspection results must arrive before transport cancellation")
+        .into_inner();
+
+    assert_eq!(response.status, ReturnCode::Failure as i32);
+    assert!(response.fabrics.is_empty());
+    assert_eq!(response.discovery_errors.len(), 8);
+
+    for (index, error) in response.discovery_errors.iter().enumerate() {
+        assert_eq!(error.node_id, format!("switch-{}", index / 2));
+        assert!(error.message.contains("collection deadline exceeded"));
+    }
+
+    assert!(
+        !response
+            .discovery_errors
+            .iter()
+            .any(|error| error.node_id == "switch-4")
+    );
+
+    server.stop();
+}
+
+#[tokio::test]
+async fn fabric_inspection_validation_returns_collection_errors() {
+    let (mut server, mut client) = start_server().await;
+
+    let response = client
+        .inspect_scale_up_fabrics(
+            librms::protos::rack_manager::InspectScaleUpFabricsRequest::default(),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert_eq!(response.status, ReturnCode::Failure as i32);
+    assert!(response.fabrics.is_empty());
+    assert_eq!(response.discovery_errors.len(), 1);
+    assert!(response.discovery_errors[0].node_id.is_empty());
+
+    assert_eq!(response.discovery_errors[0].message, response.error_message);
+
+    assert_eq!(
+        response.error_message,
+        "inspection requires at least one switch"
+    );
+
+    let mut node = switch_newnodeinfo_host_only("sw-01", "10.0.0.11", "aa:bb:cc:00:00:11");
+    node.r#type = None;
+    node.node_descriptor = Some(node_descriptor("switch", "NVIDIA", ""));
+
+    // Inspection returns descriptor errors in discovery_errors rather than as gRPC errors.
+    let response = client
+        .inspect_scale_up_fabrics(librms::protos::rack_manager::InspectScaleUpFabricsRequest {
+            nodes: Some(NodeSet { nodes: vec![node] }),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert_eq!(response.status, ReturnCode::Failure as i32);
+    assert!(response.fabrics.is_empty());
+    assert_eq!(response.discovery_errors.len(), 1);
+    assert!(response.discovery_errors[0].node_id.is_empty());
+    assert_eq!(response.discovery_errors[0].message, response.error_message);
+    assert!(response.error_message.contains("product_family"));
+
+    server.stop();
+}
+
+#[tokio::test]
+async fn fabric_inspection_preserves_switch_validation_errors() {
+    let (mut server, mut client) = start_server().await;
+
+    for (case, expected) in [
+        ("credentials", "missing host credentials"),
+        ("endpoint", "missing host endpoint ip_address"),
+        ("target", "switch target host is not allowed"),
+    ] {
+        let mut node = switch_device("switch-01", "rack-01", "127.0.0.1", "aa:bb:cc:00:00:11");
+        let endpoint = node.host_endpoint.as_mut().unwrap();
+
+        endpoint.credentials = Some(Credentials {
+            auth: Some(credentials::Auth::UserPass(UsernamePassword {
+                username: "inspection-private-user".into(),
+                password: "inspection-private-password".into(),
+            })),
+        });
+
+        match case {
+            "credentials" => endpoint.credentials = None,
+            "endpoint" => endpoint.interface.as_mut().unwrap().ip_address.clear(),
+            _ => {}
+        }
+
+        let response = client
+            .inspect_scale_up_fabrics(InspectScaleUpFabricsRequest {
+                nodes: Some(NodeSet { nodes: vec![node] }),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert_eq!(response.status, ReturnCode::Failure as i32);
+        assert_eq!(response.discovery_errors.len(), 3);
+
+        let error = response
+            .discovery_errors
+            .iter()
+            .find(|error| error.message.starts_with("switch-connection:"))
+            .expect("switch validation must identify the input error");
+
+        assert_eq!(error.node_id, "switch-01");
+        assert!(error.message.contains(expected), "{response:?}");
+
+        let text = format!("{response:?}");
+
+        assert!(!text.contains("inspection-private-user"));
+        assert!(!text.contains("inspection-private-password"));
+    }
+
+    server.stop();
+}
+
+#[tokio::test]
+async fn fabric_inspection_preserves_compute_validation_errors() {
+    let (mut server, mut client) = start_server().await;
+
+    for (missing_credentials, expected_message) in [
+        (true, "identity: missing BMC credentials"),
+        (false, "identity: missing BMC endpoint mac_address"),
+    ] {
+        let mut compute = compute_node("compute-01", "rack-01", 443);
+
+        let mut endpoint = bmc_endpoint_with_auth(
+            COMPUTE_HOST,
+            "",
+            443,
+            "inspection-private-user",
+            "inspection-private-password",
+        );
+
+        if missing_credentials {
+            endpoint.credentials = None;
+        }
+
+        compute.bmc_endpoint = Some(endpoint);
+
+        // An endpoint-free switch fails locally, so neither node contacts hardware.
+        let switch = NodeInfo {
+            node_id: "switch-01".into(),
+            rack_id: "rack-01".into(),
+            r#type: Some(NodeType::SwitchGb200Nvidia as i32),
+            ..Default::default()
+        };
+
+        let response = client
+            .inspect_scale_up_fabrics(librms::protos::rack_manager::InspectScaleUpFabricsRequest {
+                nodes: Some(NodeSet {
+                    nodes: vec![switch, compute],
+                }),
+                ..Default::default()
+            })
+            .await
+            .expect("inspection must return collection errors in the response")
+            .into_inner();
+
+        assert_eq!(response.status, ReturnCode::Failure as i32);
+
+        let error = response
+            .discovery_errors
+            .iter()
+            .find(|error| error.node_id == "compute-01")
+            .expect("compute validation failure must identify the compute node");
+
+        assert_eq!(error.message, expected_message);
+
+        let response_text = format!("{response:?}");
+        assert!(!response_text.contains("inspection-private-user"));
+        assert!(!response_text.contains("inspection-private-password"));
+    }
+
+    server.stop();
+}
+
 #[tokio::test]
 async fn get_scale_up_fabric_status_normalizes_node_descriptors() {
     let (mut server, mut client) = start_server().await;
@@ -4412,6 +6438,87 @@ async fn get_scale_up_fabric_status_normalizes_node_descriptors() {
 
     assert_eq!(error.code(), tonic::Code::InvalidArgument);
     assert!(error.message().contains("product_family"));
+
+    server.stop();
+}
+
+/// Both V2 paths normalize descriptors; valid layouts require an installed catalog.
+#[tokio::test]
+async fn fabric_layout_validates_inventory_before_requiring_deployment_rules() {
+    let (mut server, mut client) = start_server().await;
+
+    let nodes = Some(NodeSet {
+        nodes: vec![NodeInfo {
+            node_id: "switch-a".to_owned(),
+            node_descriptor: Some(node_descriptor("switch", "NVIDIA", "")),
+            ..Default::default()
+        }],
+    });
+
+    let layout_result = client
+        .rack_manager_v2
+        .configure_scale_up_fabric_manager(rack_manager_v2::ConfigureScaleUpFabricManagerRequest {
+            nodes: nodes.clone(),
+            config: Some(rack_manager_v2::ScaleUpFabricConfig {
+                topology_type: "synthetic".to_owned(),
+                ..Default::default()
+            }),
+            layout: Some(rack_manager_v2::ScaleUpFabricLayout {
+                fabrics: vec![rack_manager_v2::ScaleUpFabricSpec {
+                    compute_tray_count: 2,
+                    switch_tray_count: 1,
+                    primary_switch_node_id: None,
+                }],
+            }),
+            ..Default::default()
+        })
+        .await;
+
+    let layout_error = layout_result.expect_err("layout configuration must be refused");
+
+    assert_eq!(layout_error.code(), tonic::Code::InvalidArgument);
+    assert!(layout_error.message().contains("product_family"));
+
+    let no_layout_result = client
+        .rack_manager_v2
+        .configure_scale_up_fabric_manager(rack_manager_v2::ConfigureScaleUpFabricManagerRequest {
+            nodes,
+            ..Default::default()
+        })
+        .await;
+
+    let no_layout_error = no_layout_result.expect_err("invalid descriptor must be rejected");
+
+    assert_eq!(no_layout_error.code(), tonic::Code::InvalidArgument);
+    assert!(no_layout_error.message().contains("product_family"));
+
+    let configured = client
+        .rack_manager_v2
+        .configure_scale_up_fabric_manager(rack_manager_v2::ConfigureScaleUpFabricManagerRequest {
+            nodes: Some(NodeSet {
+                nodes: vec![NodeInfo {
+                    node_id: "switch-a".to_owned(),
+                    r#type: Some(NodeType::SwitchGb200Nvidia as i32),
+                    ..Default::default()
+                }],
+            }),
+            config: Some(rack_manager_v2::ScaleUpFabricConfig {
+                topology_type: "synthetic".to_owned(),
+                ..Default::default()
+            }),
+            layout: Some(rack_manager_v2::ScaleUpFabricLayout {
+                fabrics: vec![rack_manager_v2::ScaleUpFabricSpec {
+                    compute_tray_count: 1,
+                    switch_tray_count: 1,
+                    ..Default::default()
+                }],
+            }),
+            ..Default::default()
+        })
+        .await
+        .expect_err("layout configuration requires deployment rules");
+
+    assert_eq!(configured.code(), tonic::Code::Unimplemented);
 
     server.stop();
 }
@@ -4471,6 +6578,7 @@ async fn batch_reset_switch_factory_default_rejects_empty_nodes() {
         .batch_reset_switch_factory_default(BatchResetSwitchFactoryDefaultRequest {
             nodes: Some(NodeSet { nodes: vec![] }),
             domain: None,
+            allow_ssh_fallback: false,
         })
         .await
         .unwrap()
@@ -4560,18 +6668,67 @@ async fn batch_set_scale_up_fabric_state_single_switch_failure_makes_batch_failu
 }
 
 #[tokio::test]
-async fn set_scale_up_fabric_state_does_not_echo_http_error_body() {
+async fn set_scale_up_fabric_state_preserves_redacted_http_error_body() {
+    use tokio::io::copy_bidirectional;
+    use tokio::net::{TcpListener, TcpStream};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
     let switch_ip =
         non_loopback_local_ip().expect("test requires a non-loopback local IPv4 address");
-    let mockup = RedfishSimulator::builder()
-        .bind_ip(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
-        .add_gb200_compute(0)
-        .start()
+
+    let nvue = MockServer::start().await;
+    let https = WiremockHttpsProxy::start(*nvue.address()).await;
+
+    Mock::given(method("GET"))
+        .and(path("/nvue_v1/platform/chassis-location"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "chassis-sn": "error-sanitization-test-chassis", "tray-index": "1"
+        })))
+        .expect(1)
+        .mount(&nvue)
         .await;
 
+    Mock::given(method("GET"))
+        .and(path("/nvue_v1/cluster"))
+        .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+            "error": "not found", "path": "/nvue_v1/cluster", "token": "device-secret"
+        })))
+        .expect(1)
+        .mount(&nvue)
+        .await;
+
+    // The RPC rejects loopback management targets; forward local TLS traffic
+    // from an allowed management address to the loopback HTTPS fixture.
+    let listener = TcpListener::bind(SocketAddr::new(switch_ip, 0))
+        .await
+        .expect("bind local management proxy");
+
+    let port = listener
+        .local_addr()
+        .expect("read management proxy address")
+        .port();
+
+    let upstream_port = https.port();
+
+    let task = tokio::spawn(async move {
+        while let Ok((mut downstream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut upstream = TcpStream::connect((Ipv4Addr::LOCALHOST, upstream_port))
+                    .await
+                    .expect("connect local HTTPS fixture");
+
+                let _ = copy_bidirectional(&mut downstream, &mut upstream).await;
+            });
+        }
+    });
+
+    let management_proxy = WiremockHttpsProxy { port, task };
     let (mut server, mut client) = start_server().await;
     let switch_ip = switch_ip.to_string();
+
     let mut device = switch_device("sw-01", "rack-01", &switch_ip, "aa:bb:cc:00:00:11");
+
     if let Some(iface) = device
         .host_endpoint
         .as_mut()
@@ -4580,8 +6737,9 @@ async fn set_scale_up_fabric_state_does_not_echo_http_error_body() {
         // Mock listens on the management IP; omit DNS name so NVUE uses ip_address.
         iface.host_name = None;
     }
+
     if let Some(endpoint) = device.host_endpoint.as_mut() {
-        endpoint.port = u32::from(mockup.ports()[0]);
+        endpoint.port = u32::from(management_proxy.port());
     }
 
     let resp = client
@@ -4596,16 +6754,23 @@ async fn set_scale_up_fabric_state_does_not_echo_http_error_body() {
         .into_inner();
 
     let batch = batch_response(&resp.response);
+
     assert_eq!(batch.status, ReturnCode::Failure as i32);
     assert_batch_stats(batch, 1, 0, 1);
+
     assert_eq!(batch.node_results.len(), 1);
+
     assert_eq!(
         batch.node_results[0].error_message,
-        "HTTP GET /nvue_v1/cluster returned 404"
+        r#"HTTP GET /nvue_v1/cluster returned 404: {"error":"not found","path":"/nvue_v1/cluster","token":"XXXX"}"#
     );
-    assert!(!batch.node_results[0].error_message.contains("not found"));
 
-    mockup.stop();
+    assert!(
+        !batch.node_results[0]
+            .error_message
+            .contains("device-secret")
+    );
+
     server.stop();
 }
 
@@ -4633,6 +6798,104 @@ async fn set_scale_up_fabric_state_rejects_unsafe_host_endpoint() {
         batch.node_results[0].error_message,
         "switch target host is not allowed: 127.0.0.1"
     );
+
+    server.stop();
+}
+
+#[tokio::test]
+async fn password_rotation_retry_uses_requested_credentials_for_physical_admission() {
+    use wiremock::matchers::{basic_auth, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let nvue = MockServer::start().await;
+    let https = WiremockHttpsProxy::start(*nvue.address()).await;
+
+    Mock::given(method("GET"))
+        .and(path("/nvue_v1/system"))
+        .and(basic_auth("admin", "current-password"))
+        .respond_with(ResponseTemplate::new(401))
+        .expect(1)
+        .mount(&nvue)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/nvue_v1/system"))
+        .and(basic_auth("admin", "next-password"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+        .expect(2)
+        .mount(&nvue)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/nvue_v1/platform/chassis-location"))
+        .and(basic_auth("admin", "next-password"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"chassis-sn":"retry-chassis","tray-index":"1"})),
+        )
+        .expect(1)
+        .mount(&nvue)
+        .await;
+
+    Mock::given(method("PATCH"))
+        .and(path("/nvue_v1/revision/applied"))
+        .and(basic_auth("admin", "next-password"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+        .expect(1)
+        .mount(&nvue)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/nvue_v1/revision"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&nvue)
+        .await;
+
+    Mock::given(method("PATCH"))
+        .and(path("/nvue_v1/system/aaa/user/admin"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&nvue)
+        .await;
+
+    let (mut server, mut client) = start_server().await;
+
+    let response = client
+        .update_switch_system_password(UpdateSwitchSystemPasswordRequest {
+            nodes: Some(NodeSet {
+                nodes: vec![switch_password_device(
+                    "retry-switch",
+                    "rack-01",
+                    https.port(),
+                )],
+            }),
+            username: "admin".into(),
+            password: "next-password".into(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+
+    let batch = batch_response(&response.response);
+    let status = poll_generic_job_until_terminal(&mut client, &batch.job_id).await;
+
+    assert_eq!(status.job_states.len(), 2);
+
+    assert!(
+        status
+            .job_states
+            .iter()
+            .all(|job| job.execution_state == JobExecutionState::Completed as i32),
+        "{status:?}"
+    );
+
+    let result: serde_json::Value =
+        serde_json::from_str(&status.job_states[1].result_json).unwrap();
+
+    assert_eq!(result["phase"], "applied_config_persisted");
+
+    nvue.verify().await;
 
     server.stop();
 }

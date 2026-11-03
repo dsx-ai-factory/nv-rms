@@ -763,6 +763,12 @@ impl RFTarget for ConfigRFTarget {
         ConfigRFTarget::get_expected_task_type_from_package(self, recipe_list)
     }
 
+    fn use_update_parameters_for_task_type(&self) -> bool {
+        self.config_platform_target
+            .as_ref()
+            .is_some_and(|target| target.use_update_parameters_for_task_type())
+    }
+
     fn get_update_uri(&self, update_service_response: &Value) -> String {
         ConfigRFTarget::get_update_uri(self, update_service_response)
     }
@@ -1135,6 +1141,61 @@ mod tests {
             "MultipartHttpPushUri": "/redfish/v1/UpdateService/system-multipart"
         }));
         assert_eq!(uri, "/configured/multipart");
+    }
+
+    #[tokio::test]
+    async fn factory_reset_uses_config_bmc_reset_parameters() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/redfish/v1/Managers"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "Members": [
+                    {"@odata.id": "/redfish/v1/Managers/BMC_0"}
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(
+                "/redfish/v1/Managers/BMC_0/Actions/Manager.ResetToDefaults",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "TaskState": "Running"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let access = BmcAccess::mock_with_base_url(server.uri(), "mock-config");
+        let inner_target = RecordingTarget::new(
+            access.clone(),
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(Mutex::new(Vec::new())),
+        );
+        let mut target = ConfigRFTarget {
+            target_access: access,
+            fungible_components: Vec::new(),
+            update_completion_msg: String::new(),
+            progress_table_header_printed: false,
+            config_dict: json!({
+                "BMCResetParameters": {
+                    "ResetToDefaultsType": "ResetAll"
+                }
+            }),
+            config_platform_target: Some(Box::new(inner_target)),
+        };
+
+        let (status, response) = target.factory_reset(None).await;
+
+        assert!(status);
+        assert_eq!(response["TaskState"], "Running");
+        let requests = server.received_requests().await.unwrap();
+        let body = String::from_utf8_lossy(&requests[1].body);
+        assert!(body.contains("\"ResetToDefaultsType\":\"ResetAll\""));
     }
 
     #[tokio::test]

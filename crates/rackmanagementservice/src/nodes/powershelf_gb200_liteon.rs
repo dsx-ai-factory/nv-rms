@@ -18,13 +18,21 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
-use secrecy::{ExposeSecret, SecretString};
+use serde::Deserialize;
+use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use crate::domain::node::*;
 use crate::domain::rack::{Endpoint, EndpointConfig, EndpointCredentials, NodeConfig};
 use crate::nodes::nvfwupd_adapter;
-use crate::transport::http_client::{HttpClient, REDFISH_V1_ROOT};
+use crate::nodes::redfish_action_info::{
+    ActionInfoResource, ChassisResetRequest, EmptyActionRequest, ResetType, reset_allowable_values,
+    to_action_payload,
+};
+use crate::transport::redfish_client::{
+    ODataLink, RedfishClient, ResourceCollection, redfish_client_from_host,
+    redfish_client_from_powershelf_endpoint,
+};
 use crate::utilities::error::{Result, RmsError};
 
 /// Concrete node for LiteOn GB200 powershelf (PDB) BMCs (Redfish).
@@ -40,7 +48,7 @@ pub struct PowershelfGb200Liteon {
     node_type: NodeType,
     bmc_endpoint: EndpointConfig,
     expected_inventory: Option<ExpectedInventoryPolicy>,
-    http: HttpClient,
+    redfish: RedfishClient,
 
     // Serializes full node operations across shared Redfish/NVFWUPD clients.
     // The guard is held across awaits so BMC operations cannot interleave.
@@ -56,9 +64,12 @@ const RMS_CHASSIS_RESET_ACTION: &str = "#Chassis.Reset";
 
 /// High-level power intent the powershelf supports.
 ///
-/// `Off` and `ForceOff` are deliberately distinct: `Off` is a graceful
-/// shutdown request and must never be silently upgraded to a hard cut, which
-/// would abruptly drop power to downstream compute trays.
+/// `Off` is a graceful shutdown request. Some shelves (for example the VR NVL72
+/// LiteOn PF-1114-1RD) expose no graceful off at all, only `ForceOff`. RMS hides
+/// that hardware gap from callers: when the chassis advertises no graceful
+/// path, `Off` is carried out as `ForceOff`. The fallback is capability-based
+/// only. A graceful action the chassis does advertise but that fails at
+/// runtime returns its error and is never retried as a hard cut.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChassisIntent {
     On,
@@ -78,17 +89,20 @@ impl ChassisIntent {
             ChassisIntent::ForceOff => "#Chassis.ForceOff",
         }
     }
+}
 
-    /// Value of the `ResetType` parameter used with `#Chassis.Reset`.
-    fn redfish_reset_type(&self) -> &'static str {
-        match self {
-            ChassisIntent::On => "On",
-            ChassisIntent::Off => "GracefulShutdown",
-            ChassisIntent::ForceOff => "ForceOff",
+/// Maps an intent to the `ResetType` used with `#Chassis.Reset`.
+impl From<ChassisIntent> for ResetType {
+    fn from(intent: ChassisIntent) -> Self {
+        match intent {
+            ChassisIntent::On => Self::On,
+            ChassisIntent::Off => Self::GracefulShutdown,
+            ChassisIntent::ForceOff => Self::ForceOff,
         }
     }
 }
 
+/// Returns `Unimplemented` unless `node_type` is `PowershelfGb200Liteon`.
 fn validate_powershelf_gb200_liteon_node_type(node_type: NodeType) -> Result<()> {
     if node_type != NodeType::PowershelfGb200Liteon {
         return Err(RmsError::unimplemented("create_node", node_type.as_str()));
@@ -97,6 +111,13 @@ fn validate_powershelf_gb200_liteon_node_type(node_type: NodeType) -> Result<()>
 }
 
 impl PowershelfGb200Liteon {
+    /// Builds a LiteOn GB200 shelf node from explicit BMC connection details.
+    ///
+    /// The node has no expected-inventory policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns any error from building the Redfish client.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: String,
@@ -108,15 +129,14 @@ impl PowershelfGb200Liteon {
         mac_address: String,
         dangerously_accept_invalid_certs: bool,
     ) -> Result<Self> {
-        let http = HttpClient::new(
+        let redfish = redfish_client_from_host(
             &host,
             port,
             username,
             password,
             dangerously_accept_invalid_certs,
             true,
-        )?
-        .require_path_prefix(REDFISH_V1_ROOT);
+        )?;
         Ok(Self {
             id,
             rack_id,
@@ -132,12 +152,19 @@ impl PowershelfGb200Liteon {
                 dangerously_accept_invalid_certs,
             ),
             expected_inventory: None,
-            http,
+            redfish,
             op_lock: tokio::sync::Mutex::new(()),
             chassis_url: tokio::sync::OnceCell::new(),
         })
     }
 
+    /// Builds a LiteOn GB200 shelf node from its node configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Unimplemented` if `config.node_type` is not
+    /// `PowershelfGb200Liteon`, `InvalidArgument` if no BMC endpoint is
+    /// configured, or any error from building the Redfish client.
     pub fn from_config(config: &NodeConfig, rack_id: &str) -> Result<Self> {
         validate_powershelf_gb200_liteon_node_type(config.node_type)?;
         let Some(bmc_endpoint) = config.bmc_endpoint.as_ref() else {
@@ -145,70 +172,48 @@ impl PowershelfGb200Liteon {
                 "bmc_endpoint is required for powershelf nodes",
             ));
         };
-        let credentials = bmc_endpoint.credentials.as_ref();
-        let username = credentials
-            .map(|credentials| credentials.username.as_str())
-            .unwrap_or_default();
-        let password = credentials
-            .map(|credentials| credentials.password.expose_secret())
-            .unwrap_or_default();
-
-        let http = HttpClient::new(
-            &bmc_endpoint.endpoint.ip_address,
-            bmc_endpoint.endpoint.port,
-            username,
-            password,
-            bmc_endpoint.dangerously_accept_invalid_certs,
-            true,
-        )?
-        .require_path_prefix(REDFISH_V1_ROOT);
+        let redfish = redfish_client_from_powershelf_endpoint(bmc_endpoint)?;
         Ok(Self {
             id: config.id.clone(),
             rack_id: rack_id.to_owned(),
             node_type: config.node_type,
             bmc_endpoint: bmc_endpoint.clone(),
             expected_inventory: config.expected_inventory.clone(),
-            http,
+            redfish,
             op_lock: tokio::sync::Mutex::new(()),
             chassis_url: tokio::sync::OnceCell::new(),
         })
     }
 
+    /// Returns the NVFWUPD target for this shelf's BMC. TLS verification is on
+    /// unless the endpoint sets `dangerously_accept_invalid_certs`.
     fn nvfwupd_target_config(&self) -> nvfwupd::workflow::TargetConfig {
-        let credentials = self.bmc_endpoint.credentials.as_ref();
-        let username = credentials
-            .map(|credentials| credentials.username.as_str())
-            .unwrap_or_default();
-        let default_password = SecretString::default();
-        let password = credentials
-            .map(|credentials| &credentials.password)
-            .unwrap_or(&default_password);
-
-        nvfwupd_adapter::to_target_config_with_secret(
+        nvfwupd_adapter::to_target_config_with_credentials(
             self.node_type,
             &self.bmc_endpoint.endpoint.ip_address,
             self.bmc_endpoint.endpoint.port,
-            username,
-            password,
+            self.bmc_endpoint.credentials.as_ref(),
             !self.bmc_endpoint.dangerously_accept_invalid_certs,
         )
     }
 
-    /// RMS powershelf ForceOff action.
     /// Lazily resolves and caches the powershelf chassis URL by enumerating
     /// `/redfish/v1/Chassis` and picking the member whose Id starts with
     /// `powershelf` (case-insensitive). This handles both LiteOn
     /// (`/Chassis/powershelf`) and NVIDIA PMC (`/Chassis/PowerShelf_0`).
-    async fn resolve_chassis_url(&self, http: &HttpClient) -> Result<&str> {
+    /// A failed discovery is not cached.
+    async fn resolve_chassis_url(&self, redfish: &RedfishClient) -> Result<&str> {
         self.chassis_url
-            .get_or_try_init(|| discover_chassis_url(http))
+            .get_or_try_init(|| discover_chassis_url(redfish))
             .await
             .map(String::as_str)
     }
 
+    /// Points the node at a test Redfish server and clears the cached chassis
+    /// URL.
     #[cfg(test)]
-    pub(crate) fn replace_http_for_test(&mut self, base_url: &str) {
-        self.http = HttpClient::for_test(base_url);
+    pub(crate) fn replace_redfish_for_test(&mut self, base_url: &str) {
+        self.redfish = crate::transport::redfish_client::redfish_client_for_test(base_url);
         self.chassis_url = tokio::sync::OnceCell::new();
     }
 }
@@ -256,12 +261,12 @@ impl Node for PowershelfGb200Liteon {
     /// masking a degraded shelf behind a healthy peer.
     async fn get_power_state(&self) -> Result<PowerState> {
         let _op_guard = self.op_lock.lock().await;
-        let http = &self.http;
+        let redfish = &self.redfish;
 
         tracing::debug!(node = %self.id, "get_power_state");
-        let chassis_url = self.resolve_chassis_url(http).await?;
-        let chassis = http.get(chassis_url, HttpClient::DEFAULT_TIMEOUT).await?;
-        let psu_states = fetch_psu_power_states(http, &chassis).await;
+        let chassis_url = self.resolve_chassis_url(redfish).await?;
+        let chassis: ChassisResource = redfish_get(redfish, chassis_url).await?;
+        let psu_states = fetch_psu_power_states(redfish, &chassis).await;
         let state = aggregate_psu_power_states(&psu_states);
         tracing::debug!(
             node = %self.id,
@@ -272,18 +277,26 @@ impl Node for PowershelfGb200Liteon {
         Ok(state)
     }
 
+    /// Powers the shelf on or off through its chassis actions.
+    ///
+    /// `On` and `ForceOn` power on, and `ForceOff` cuts power. `Off` and
+    /// `GracefulShutdown` use a graceful path when the chassis advertises one,
+    /// and otherwise fall back to `ForceOff`. `target` is ignored.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidArgument` for `PowerCycle`, `GracefulRestart`,
+    /// `ForceRestart`, and `Nmi`, and fails if the chassis advertises no usable
+    /// action for the request.
     async fn set_power_state(&self, op: PowerOp, _target: PowerTargetType) -> Result<()> {
         tracing::info!(node = %self.id, ?op, "set_power_state");
         let intent = match op {
             PowerOp::On | PowerOp::ForceOn => ChassisIntent::On,
-            // A graceful Off must stay graceful: it maps to a graceful-shutdown
-            // intent, never a hard ForceOff. If the shelf can't honor a
-            // graceful shutdown, invoke_chassis_action fails rather than
-            // silently cutting power.
-            PowerOp::Off => ChassisIntent::Off,
+            // Graceful requests prefer a graceful path. When the shelf
+            // advertises none, invoke_chassis_action serves them as ForceOff.
+            PowerOp::Off | PowerOp::GracefulShutdown => ChassisIntent::Off,
             PowerOp::ForceOff => ChassisIntent::ForceOff,
             PowerOp::PowerCycle
-            | PowerOp::GracefulShutdown
             | PowerOp::GracefulRestart
             | PowerOp::ForceRestart
             | PowerOp::Nmi => {
@@ -294,9 +307,22 @@ impl Node for PowershelfGb200Liteon {
         };
 
         let _op_guard = self.op_lock.lock().await;
-        let http = &self.http;
-        let url = self.resolve_chassis_url(http).await?;
-        invoke_chassis_action(http, url, intent).await
+        let redfish = &self.redfish;
+        let url = self.resolve_chassis_url(redfish).await?;
+        let request = PowerRequest { node: &self.id, op };
+        let outcome = invoke_chassis_action(redfish, url, intent, request).await?;
+        // The hard-cut warning is logged by `try_invoke_intent` before the
+        // fallback is sent, so it exists even if the BMC rejects it. This
+        // records that the BMC accepted it.
+        if let ChassisActionOutcome::FellBackToForceOff { action } = outcome {
+            tracing::info!(
+                node = %self.id,
+                ?op,
+                action,
+                "powershelf accepted the ForceOff fallback for a graceful power off"
+            );
+        }
+        Ok(())
     }
 
     async fn get_firmware_inventory(&self) -> Result<Vec<FirmwareInfo>> {
@@ -314,6 +340,11 @@ impl Node for PowershelfGb200Liteon {
         Ok(inventory)
     }
 
+    /// Updates shelf firmware through NVFWUPD.
+    ///
+    /// Only the target's firmware file and expected version are sent; its
+    /// component, resolution, and LinkX policy are cleared. The node's
+    /// expected-inventory AP names, if any, are passed through.
     async fn update_firmware(
         &self,
         target: &FirmwareTarget,
@@ -332,6 +363,8 @@ impl Node for PowershelfGb200Liteon {
             component: String::new(),
             firmware_file: target.firmware_file.clone(),
             expected_version: target.expected_version.clone(),
+            resolution: None,
+            linkx_policy: None,
         };
         let request = nvfwupd_adapter::to_update_request(&target, force_update, options);
         let expected_inventory = self
@@ -372,6 +405,7 @@ impl Node for PowershelfGb200Liteon {
         Ok(nvfwupd_adapter::map_activation_summary(summary))
     }
 
+    /// Activates staged firmware with a non-forced power shelf reset.
     async fn activate_firmware(&self) -> Result<()> {
         self.activate_firmware_with(FirmwareActivationRequest {
             mode: FirmwareActivationMode::PowerShelfReset { force: false },
@@ -391,20 +425,155 @@ struct ActionLinks {
     action_info: String,
 }
 
+/// Fields RMS reads from the shelf chassis: its advertised actions and its
+/// `PowerSubsystem` link.
+#[derive(Debug, Clone, Default, Deserialize)]
+struct ChassisResource {
+    #[serde(rename = "Actions", default)]
+    actions: HashMap<String, ChassisAction>,
+    #[serde(rename = "PowerSubsystem")]
+    power_subsystem: Option<ODataLink>,
+}
+
+/// One advertised chassis action: its POST target and optional ActionInfo link.
+#[derive(Debug, Clone, Default, Deserialize)]
+struct ChassisAction {
+    target: Option<String>,
+    #[serde(rename = "@Redfish.ActionInfo")]
+    action_info: Option<String>,
+}
+
+/// A chassis `PowerSubsystem`, read only for its `PowerSupplies` link.
+#[derive(Debug, Clone, Default, Deserialize)]
+struct PowerSubsystemResource {
+    #[serde(rename = "PowerSupplies")]
+    power_supplies: Option<ODataLink>,
+}
+
+/// One PSU, read only for its `PowerState`.
+#[derive(Debug, Clone, Default, Deserialize)]
+struct PowerSupplyResource {
+    #[serde(rename = "PowerState")]
+    power_state: Option<Value>,
+}
+
+/// Fetches and decodes the Redfish resource at `path`.
+async fn redfish_get<T>(redfish: &RedfishClient, path: &str) -> Result<T>
+where
+    T: DeserializeOwned + Clone + Send + Sync + 'static,
+{
+    redfish.get_resource(path).await.map_err(RmsError::from)
+}
+
+/// How [`invoke_chassis_action`] satisfied a request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChassisActionOutcome {
+    /// The requested intent was posted.
+    AsRequested,
+    /// A graceful `Off` was served as `ForceOff` because the chassis
+    /// advertises no graceful path. `action` is the chassis action posted.
+    FellBackToForceOff { action: &'static str },
+}
+
+/// The power request being served. Carried down to the point where a graceful
+/// `Off` is turned into a `ForceOff`, so that decision is logged with the node
+/// and operation before anything is sent.
+#[derive(Debug, Clone, Copy)]
+struct PowerRequest<'a> {
+    node: &'a str,
+    op: PowerOp,
+}
+
+/// Warns that RMS is about to hard-cut a shelf that was asked to power off
+/// gracefully. `action` is the chassis action about to be posted.
+fn warn_hard_cut_fallback(request: PowerRequest<'_>, action: &str) {
+    tracing::warn!(
+        node = request.node,
+        op = ?request.op,
+        action,
+        "powershelf advertises no graceful power off; serving the request as ForceOff"
+    );
+}
+
+/// Result of trying to post one intent against the chassis.
+enum IntentAttempt {
+    /// The action was posted and accepted by the BMC.
+    Posted { action: &'static str },
+    /// The chassis does not advertise a usable path for the intent. Nothing
+    /// was sent. Carries the error to return if no fallback applies.
+    Unavailable(RmsError),
+}
+
+/// Posts `intent`, serving a graceful `Off` as `ForceOff` when the chassis
+/// advertises no graceful path.
+///
+/// Fallback is capability-based only. A graceful action that is advertised but
+/// fails (HTTP error, malformed action entry, unreadable ActionInfo) is
+/// returned as an error and is never retried as a hard cut.
+///
+/// `request` identifies the caller's request. When a graceful `Off` becomes a
+/// `ForceOff`, a warning naming it is logged before the `ForceOff` is sent.
 async fn invoke_chassis_action(
-    http: &HttpClient,
+    redfish: &RedfishClient,
     chassis_url: &str,
     intent: ChassisIntent,
-) -> Result<()> {
-    let chassis = http.get(chassis_url, HttpClient::DEFAULT_TIMEOUT).await?;
+    request: PowerRequest<'_>,
+) -> Result<ChassisActionOutcome> {
+    let chassis: ChassisResource = redfish_get(redfish, chassis_url).await?;
 
-    if let Some(links) = find_action_links(&chassis, intent.direct_action_key())? {
+    let graceful_error = match try_invoke_intent(redfish, &chassis, intent, None).await? {
+        IntentAttempt::Posted { .. } => return Ok(ChassisActionOutcome::AsRequested),
+        IntentAttempt::Unavailable(error) => error,
+    };
+    if intent != ChassisIntent::Off {
+        return Err(graceful_error);
+    }
+
+    let fallback = try_invoke_intent(redfish, &chassis, ChassisIntent::ForceOff, Some(request))
+        .await
+        .map_err(|error| {
+            RmsError::new(
+                error.code,
+                format!(
+                    "powershelf advertises no graceful power off; the ForceOff fallback failed: {}",
+                    error.message
+                ),
+            )
+        })?;
+    match fallback {
+        IntentAttempt::Posted { action } => Ok(ChassisActionOutcome::FellBackToForceOff { action }),
+        IntentAttempt::Unavailable(force_error) => {
+            let mut advertised: Vec<&str> = chassis.actions.keys().map(String::as_str).collect();
+            advertised.sort_unstable();
+            Err(RmsError::failed_precondition(format!(
+                "powershelf advertises neither a graceful power off nor a ForceOff \
+                 (graceful: {}; ForceOff: {}); advertised chassis actions: {advertised:?}",
+                graceful_error.message, force_error.message
+            )))
+        }
+    }
+}
+
+/// Posts one intent, preferring its direct chassis action and falling back to
+/// `#Chassis.Reset` with the matching `ResetType`.
+///
+/// Returns [`IntentAttempt::Unavailable`] without sending anything when the
+/// chassis advertises no usable path for the intent.
+///
+/// `hard_cut_for` is `Some` only when `intent` is a `ForceOff` standing in for
+/// a graceful request. The hard-cut warning is logged just before the POST, so
+/// it is present even when the BMC then rejects the action.
+async fn try_invoke_intent(
+    redfish: &RedfishClient,
+    chassis: &ChassisResource,
+    intent: ChassisIntent,
+    hard_cut_for: Option<PowerRequest<'_>>,
+) -> Result<IntentAttempt> {
+    if let Some(links) = find_action_links(chassis, intent.direct_action_key())? {
         let payload = if links.action_info.is_empty() {
-            Value::Object(serde_json::Map::new())
+            to_action_payload(&EmptyActionRequest {})?
         } else {
-            let info = http
-                .get(&links.action_info, HttpClient::DEFAULT_TIMEOUT)
-                .await?;
+            let info: ActionInfoResource = redfish_get(redfish, &links.action_info).await?;
             build_action_payload(&info)
         };
         tracing::debug!(
@@ -413,63 +582,81 @@ async fn invoke_chassis_action(
             payload = %payload,
             "invoke_chassis_action: direct action"
         );
-        http.post(&links.target, &payload, HttpClient::DEFAULT_TIMEOUT)
-            .await?;
-        return Ok(());
+        if let Some(request) = hard_cut_for {
+            warn_hard_cut_fallback(request, intent.direct_action_key());
+        }
+        redfish
+            .post_action(&links.target, &payload)
+            .await
+            .map_err(RmsError::from)?;
+        return Ok(IntentAttempt::Posted {
+            action: intent.direct_action_key(),
+        });
     }
 
-    let reset = find_action_links(&chassis, RMS_CHASSIS_RESET_ACTION)?.ok_or_else(|| {
-        RmsError::internal(format!(
+    let Some(reset) = find_action_links(chassis, RMS_CHASSIS_RESET_ACTION)? else {
+        return Ok(IntentAttempt::Unavailable(RmsError::internal(format!(
             "powershelf chassis Actions expose neither {} nor {RMS_CHASSIS_RESET_ACTION}",
             intent.direct_action_key()
-        ))
-    })?;
+        ))));
+    };
 
     // When the BMC advertises AllowableValues for ResetType, honor them: sending
     // a reset the device says it does not support risks leaving the shelf in an
-    // indeterminate state. Reject rather than "attempt anyway". If no
-    // AllowableValues are advertised we cannot verify, so we let the BMC decide.
+    // indeterminate state. Treat it as unavailable rather than "attempt anyway".
+    // If no AllowableValues are advertised we cannot verify, so we let the BMC
+    // decide.
+    let reset_type = ResetType::from(intent);
     if !reset.action_info.is_empty() {
-        let info = http
-            .get(&reset.action_info, HttpClient::DEFAULT_TIMEOUT)
-            .await?;
+        let info: ActionInfoResource = redfish_get(redfish, &reset.action_info).await?;
         if let Some(allowed) = reset_allowable_values(&info)
-            && !allowed.iter().any(|v| v == intent.redfish_reset_type())
+            && !reset_type.is_in(&allowed)
         {
-            return Err(RmsError::failed_precondition(format!(
-                "#Chassis.Reset ResetType {:?} is not in AllowableValues {:?}; \
+            return Ok(IntentAttempt::Unavailable(RmsError::failed_precondition(
+                format!(
+                    "#Chassis.Reset ResetType {:?} is not in AllowableValues {:?}; \
                      refusing to send an unsupported reset",
-                intent.redfish_reset_type(),
-                allowed
+                    reset_type.as_str(),
+                    allowed
+                ),
             )));
         }
     }
 
-    let payload = serde_json::json!({"ResetType": intent.redfish_reset_type()});
+    let payload = to_action_payload(&ChassisResetRequest { reset_type })?;
     tracing::debug!(
         action = RMS_CHASSIS_RESET_ACTION,
         target = %reset.target,
         payload = %payload,
         "invoke_chassis_action: #Chassis.Reset fallback"
     );
-    http.post(&reset.target, &payload, HttpClient::DEFAULT_TIMEOUT)
-        .await?;
-    Ok(())
+    if let Some(request) = hard_cut_for {
+        warn_hard_cut_fallback(request, RMS_CHASSIS_RESET_ACTION);
+    }
+    redfish
+        .post_action(&reset.target, &payload)
+        .await
+        .map_err(RmsError::from)?;
+    Ok(IntentAttempt::Posted {
+        action: RMS_CHASSIS_RESET_ACTION,
+    })
 }
 
-async fn discover_chassis_url(http: &HttpClient) -> Result<String> {
-    let collection = http
-        .get(RMS_CHASSIS_COLLECTION_ENDPOINT, HttpClient::DEFAULT_TIMEOUT)
-        .await?;
-    let Some(members) = collection.get("Members").and_then(|m| m.as_array()) else {
-        return Err(RmsError::internal(format!(
-            "{RMS_CHASSIS_COLLECTION_ENDPOINT} response missing Members array"
-        )));
-    };
-
-    let matches: Vec<&str> = members
+/// Finds the shelf chassis in `/redfish/v1/Chassis`: the first member whose
+/// last path segment starts with `powershelf`, ignoring ASCII case.
+///
+/// Logs a warning if more than one member matches.
+///
+/// # Errors
+///
+/// Returns `Internal` if no member matches.
+async fn discover_chassis_url(redfish: &RedfishClient) -> Result<String> {
+    let collection: ResourceCollection =
+        redfish_get(redfish, RMS_CHASSIS_COLLECTION_ENDPOINT).await?;
+    let matches: Vec<&str> = collection
+        .members
         .iter()
-        .filter_map(|m| m.get("@odata.id").and_then(|v| v.as_str()))
+        .filter_map(|member| member.nonempty())
         .filter(|uri| {
             uri.rsplit('/')
                 .next()
@@ -504,26 +691,19 @@ async fn discover_chassis_url(http: &HttpClient) -> Result<String> {
 
 /// Returns `Ok(None)` when the action key is absent (caller can fall back),
 /// `Ok(Some(_))` when well-formed, `Err(_)` when present but malformed.
-fn find_action_links(chassis: &Value, action: &str) -> Result<Option<ActionLinks>> {
-    let Some(act) = chassis.get("Actions").and_then(|a| a.get(action)) else {
+fn find_action_links(chassis: &ChassisResource, action: &str) -> Result<Option<ActionLinks>> {
+    let Some(act) = chassis.actions.get(action) else {
         return Ok(None);
     };
 
-    let target = act
-        .get("target")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default();
+    let target = act.target.as_deref().unwrap_or_default();
     if target.is_empty() {
         return Err(RmsError::internal(format!(
             "missing {action} target in powershelf chassis Actions"
         )));
     }
 
-    let action_info = act
-        .get("@Redfish.ActionInfo")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_owned();
+    let action_info = act.action_info.clone().unwrap_or_default();
 
     Ok(Some(ActionLinks {
         target: target.to_owned(),
@@ -531,44 +711,23 @@ fn find_action_links(chassis: &Value, action: &str) -> Result<Option<ActionLinks
     }))
 }
 
-/// Returns the `ResetType` parameter's `AllowableValues` from a `#Chassis.Reset`
-/// ActionInfo, or `None` if the parameter or its allowables aren't advertised.
-fn reset_allowable_values(action_info: &Value) -> Option<Vec<String>> {
-    let params = action_info.get("Parameters").and_then(|p| p.as_array())?;
-    let reset_param = params
-        .iter()
-        .find(|p| p.get("Name").and_then(|n| n.as_str()) == Some("ResetType"))?;
-    let allowed = reset_param
-        .get("AllowableValues")
-        .and_then(|v| v.as_array())?;
-    Some(
-        allowed
-            .iter()
-            .filter_map(|v| v.as_str().map(str::to_owned))
-            .collect(),
-    )
-}
-
 /// Selects each parameter's `DefaultValue`, else the first `AllowableValues`
 /// entry. Parameters with neither are omitted so the BMC's defaults stand.
-fn build_action_payload(action_info: &Value) -> Value {
+fn build_action_payload(action_info: &ActionInfoResource) -> Value {
     let mut obj = serde_json::Map::new();
-    let Some(params) = action_info.get("Parameters").and_then(|p| p.as_array()) else {
-        return Value::Object(obj);
-    };
 
-    for p in params {
-        let Some(name) = p.get("Name").and_then(|v| v.as_str()) else {
+    for parameter in &action_info.parameters {
+        let Some(name) = parameter.name.as_deref() else {
             continue;
         };
-        if let Some(default) = p.get("DefaultValue") {
+        if let Some(default) = parameter.default_value.as_ref() {
             obj.insert(name.to_owned(), default.clone());
             continue;
         }
-        if let Some(first) = p
-            .get("AllowableValues")
-            .and_then(|v| v.as_array())
-            .and_then(|arr| arr.first())
+        if let Some(first) = parameter
+            .allowable_values
+            .as_ref()
+            .and_then(|values| values.first())
         {
             obj.insert(name.to_owned(), first.clone());
         }
@@ -578,24 +737,24 @@ fn build_action_payload(action_info: &Value) -> Value {
 
 /// Walks a powershelf chassis JSON down to its PSU members and returns the
 /// `PowerState` each PSU reports, decoded into a tri-state: `Some(true)` =
-/// energized, `Some(false)` = off, `None` = field absent or unrecognized.
-/// Members whose URL is missing or whose resource fetch fails are skipped — a
-/// missing PSU contributes no signal — so the returned vector has one entry
-/// per PSU we successfully read, in collection order.
-async fn fetch_psu_power_states(http: &HttpClient, chassis: &Value) -> Vec<Option<bool>> {
-    let Some(supplies_url) = power_supplies_url(chassis) else {
+/// energized, `Some(false)` = off, `None` = field absent, unrecognized, or
+/// unreadable. The returned vector has one entry per collection member, in
+/// order. Unreadable members must be recorded as `None` so they cannot be
+/// dropped from the shelf-level aggregate.
+async fn fetch_psu_power_states(
+    redfish: &RedfishClient,
+    chassis: &ChassisResource,
+) -> Vec<Option<bool>> {
+    let Some(subsystem_url) = power_supplies_url(chassis) else {
         tracing::warn!("powershelf chassis exposes no PowerSubsystem.PowerSupplies link");
         return Vec::new();
     };
 
-    let subsystem = match http
-        .get(&supplies_url.subsystem, HttpClient::DEFAULT_TIMEOUT)
-        .await
-    {
+    let subsystem: PowerSubsystemResource = match redfish_get(redfish, subsystem_url).await {
         Ok(v) => v,
         Err(e) => {
             tracing::warn!(
-                url = %supplies_url.subsystem,
+                url = %subsystem_url,
                 error = %e.message,
                 "failed to fetch PowerSubsystem"
             );
@@ -603,21 +762,20 @@ async fn fetch_psu_power_states(http: &HttpClient, chassis: &Value) -> Vec<Optio
         }
     };
 
-    let supplies = match subsystem
-        .pointer("/PowerSupplies/@odata.id")
-        .and_then(|v| v.as_str())
-    {
-        Some(uri) if !uri.is_empty() => uri.to_owned(),
-        _ => {
-            tracing::warn!(
-                url = %supplies_url.subsystem,
-                "PowerSubsystem has no PowerSupplies link"
-            );
-            return Vec::new();
-        }
+    let Some(supplies) = subsystem
+        .power_supplies
+        .as_ref()
+        .and_then(ODataLink::nonempty)
+        .map(str::to_owned)
+    else {
+        tracing::warn!(
+            url = %subsystem_url,
+            "PowerSubsystem has no PowerSupplies link"
+        );
+        return Vec::new();
     };
 
-    let collection = match http.get(&supplies, HttpClient::DEFAULT_TIMEOUT).await {
+    let collection: ResourceCollection = match redfish_get(redfish, &supplies).await {
         Ok(v) => v,
         Err(e) => {
             tracing::warn!(
@@ -629,22 +787,14 @@ async fn fetch_psu_power_states(http: &HttpClient, chassis: &Value) -> Vec<Optio
         }
     };
 
-    let Some(members) = collection.get("Members").and_then(|m| m.as_array()) else {
-        return Vec::new();
-    };
-
-    let mut out = Vec::with_capacity(members.len());
-    for member in members {
-        let Some(uri) = member.get("@odata.id").and_then(|v| v.as_str()) else {
+    let mut out = Vec::with_capacity(collection.members.len());
+    for member in &collection.members {
+        let Some(uri) = member.nonempty() else {
             out.push(None);
             continue;
         };
-        if uri.is_empty() {
-            out.push(None);
-            continue;
-        }
-        match http.get(uri, HttpClient::DEFAULT_TIMEOUT).await {
-            Ok(psu) => out.push(decode_psu_power_state(psu.get("PowerState"))),
+        match redfish_get::<PowerSupplyResource>(redfish, uri).await {
+            Ok(psu) => out.push(decode_psu_power_state(psu.power_state.as_ref())),
             Err(e) => {
                 tracing::warn!(uri, error = %e.message, "failed to fetch PowerSupply");
                 out.push(None);
@@ -677,22 +827,13 @@ fn decode_psu_power_state(field: Option<&Value>) -> Option<bool> {
     }
 }
 
-/// Internal: link to the chassis-level PowerSubsystem. Wrapped so the call site
-/// reads less noisily.
-struct SuppliesLinks {
-    subsystem: String,
-}
-
-fn power_supplies_url(chassis: &Value) -> Option<SuppliesLinks> {
-    let subsystem = chassis
-        .pointer("/PowerSubsystem/@odata.id")
-        .and_then(|v| v.as_str())?;
-    if subsystem.is_empty() {
-        return None;
-    }
-    Some(SuppliesLinks {
-        subsystem: subsystem.to_owned(),
-    })
+/// Returns the chassis `PowerSubsystem` link, the first hop toward its PSUs,
+/// or `None` if it is missing or empty.
+fn power_supplies_url(chassis: &ChassisResource) -> Option<&str> {
+    chassis
+        .power_subsystem
+        .as_ref()
+        .and_then(ODataLink::nonempty)
 }
 
 /// Collapses per-PSU `PowerState` readings into a single shelf-level state:
@@ -721,7 +862,9 @@ fn aggregate_psu_power_states(states: &[Option<bool>]) -> PowerState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::redfish_client::redfish_client_for_test;
     use crate::utilities::error::ErrorCode;
+    use std::sync::{Arc, Mutex};
     use wiremock::matchers::{body_json, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -758,6 +901,8 @@ mod tests {
             )),
             host_endpoint: None,
             expected_inventory: None,
+            recovery: None,
+            runtime_config: None,
         };
 
         let result = PowershelfGb200Liteon::from_config(&config, "rack-01");
@@ -817,8 +962,12 @@ mod tests {
         assert!(!format!("{config:?}").contains("secret"));
     }
 
-    fn sample_chassis() -> Value {
-        serde_json::json!({
+    fn parse<T: DeserializeOwned>(value: Value) -> T {
+        serde_json::from_value(value).expect("test fixture JSON")
+    }
+
+    fn sample_chassis() -> ChassisResource {
+        parse(serde_json::json!({
             "@odata.id": "/redfish/v1/Chassis/powershelf",
             "Actions": {
                 "#Chassis.ForceOff": {
@@ -830,26 +979,33 @@ mod tests {
                     "target": "/redfish/v1/Chassis/powershelf/Actions/Chassis.On"
                 }
             }
-        })
+        }))
     }
 
     #[test]
     fn chassis_intent_maps_to_direct_key_and_reset_type() {
         assert_eq!(ChassisIntent::On.direct_action_key(), "#Chassis.On");
-        assert_eq!(ChassisIntent::On.redfish_reset_type(), "On");
+        assert_eq!(ResetType::from(ChassisIntent::On), ResetType::On);
         assert_eq!(ChassisIntent::Off.direct_action_key(), "#Chassis.Off");
-        assert_eq!(ChassisIntent::Off.redfish_reset_type(), "GracefulShutdown");
+        assert_eq!(
+            ResetType::from(ChassisIntent::Off),
+            ResetType::GracefulShutdown
+        );
         assert_eq!(
             ChassisIntent::ForceOff.direct_action_key(),
             "#Chassis.ForceOff"
         );
-        assert_eq!(ChassisIntent::ForceOff.redfish_reset_type(), "ForceOff");
+        assert_eq!(
+            ResetType::from(ChassisIntent::ForceOff),
+            ResetType::ForceOff
+        );
     }
 
     #[test]
     fn graceful_off_and_force_off_map_to_distinct_intents() {
-        // The whole point of the fix: a graceful Off must not collapse into a
-        // hard ForceOff.
+        // The two intents stay distinct and each keeps its own direct action.
+        // Whether a graceful Off is served as ForceOff is decided at run time
+        // in `invoke_chassis_action`, from what the chassis advertises.
         assert_ne!(ChassisIntent::Off, ChassisIntent::ForceOff);
         assert_eq!(
             ChassisIntent::Off.direct_action_key(),
@@ -889,13 +1045,13 @@ mod tests {
 
     #[test]
     fn find_action_links_missing_action_info_is_ok() {
-        let chassis = serde_json::json!({
+        let chassis = parse(serde_json::json!({
             "Actions": {
                 "#Chassis.ForceOff": {
                     "target": "/redfish/v1/Chassis/powershelf/Actions/Chassis.ForceOff"
                 }
             }
-        });
+        }));
         let links = find_action_links(&chassis, ChassisIntent::ForceOff.direct_action_key())
             .unwrap()
             .unwrap();
@@ -908,9 +1064,9 @@ mod tests {
 
     #[test]
     fn find_action_links_returns_none_when_absent() {
-        let chassis = serde_json::json!({
+        let chassis = parse(serde_json::json!({
             "Actions": { "#Chassis.Reset": { "target": "/r" } }
-        });
+        }));
         assert!(
             find_action_links(&chassis, ChassisIntent::ForceOff.direct_action_key())
                 .unwrap()
@@ -920,45 +1076,40 @@ mod tests {
 
     #[test]
     fn find_action_links_propagates_malformed_entries() {
-        let chassis = serde_json::json!({
+        let chassis = parse(serde_json::json!({
             "Actions": { "#Chassis.ForceOff": { "@Redfish.ActionInfo": "/x" } }
-        });
+        }));
         let err =
             find_action_links(&chassis, ChassisIntent::ForceOff.direct_action_key()).unwrap_err();
         assert_eq!(err.code, ErrorCode::Internal);
         assert!(err.message.contains("target"));
     }
 
-    fn pick_powershelf_uri(collection: &Value) -> Option<String> {
-        collection
-            .get("Members")
-            .and_then(|m| m.as_array())
-            .and_then(|members| {
-                members.iter().find_map(|m| {
-                    let uri = m.get("@odata.id").and_then(|v| v.as_str())?;
-                    if uri
-                        .rsplit('/')
-                        .next()
-                        .unwrap_or_default()
-                        .to_ascii_lowercase()
-                        .starts_with("powershelf")
-                    {
-                        Some(uri.to_owned())
-                    } else {
-                        None
-                    }
-                })
-            })
+    fn pick_powershelf_uri(collection: &ResourceCollection) -> Option<String> {
+        collection.members.iter().find_map(|member| {
+            let uri = member.nonempty()?;
+            if uri
+                .rsplit('/')
+                .next()
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+                .starts_with("powershelf")
+            {
+                Some(uri.to_owned())
+            } else {
+                None
+            }
+        })
     }
 
     #[test]
     fn discover_chassis_url_picks_pmc_capital_variant() {
-        let coll = serde_json::json!({
+        let coll: ResourceCollection = parse(serde_json::json!({
             "Members": [
                 { "@odata.id": "/redfish/v1/Chassis/PowerShelf_0" },
                 { "@odata.id": "/redfish/v1/Chassis/ERoT_BMC_0" }
             ]
-        });
+        }));
         assert_eq!(
             pick_powershelf_uri(&coll).as_deref(),
             Some("/redfish/v1/Chassis/PowerShelf_0")
@@ -967,12 +1118,12 @@ mod tests {
 
     #[test]
     fn discover_chassis_url_picks_liteon_lowercase_variant() {
-        let coll = serde_json::json!({
+        let coll: ResourceCollection = parse(serde_json::json!({
             "Members": [
                 { "@odata.id": "/redfish/v1/Chassis/ERoT_BMC_0" },
                 { "@odata.id": "/redfish/v1/Chassis/powershelf" }
             ]
-        });
+        }));
         assert_eq!(
             pick_powershelf_uri(&coll).as_deref(),
             Some("/redfish/v1/Chassis/powershelf")
@@ -981,51 +1132,18 @@ mod tests {
 
     #[test]
     fn discover_chassis_url_skips_unrelated_chassis() {
-        let coll = serde_json::json!({
+        let coll: ResourceCollection = parse(serde_json::json!({
             "Members": [
                 { "@odata.id": "/redfish/v1/Chassis/PowerSubsystem" },
                 { "@odata.id": "/redfish/v1/Chassis/ERoT_BMC_0" }
             ]
-        });
+        }));
         assert_eq!(pick_powershelf_uri(&coll), None);
     }
 
     #[test]
-    fn reset_allowable_values_returns_advertised_reset_types() {
-        let info = serde_json::json!({
-            "Parameters": [
-                {
-                    "Name": "ResetType",
-                    "AllowableValues": ["On", "ForceOff", "GracefulShutdown"]
-                }
-            ]
-        });
-        assert_eq!(
-            reset_allowable_values(&info),
-            Some(vec![
-                "On".into(),
-                "ForceOff".into(),
-                "GracefulShutdown".into()
-            ])
-        );
-    }
-
-    #[test]
-    fn reset_allowable_values_none_when_param_missing() {
-        assert_eq!(reset_allowable_values(&serde_json::json!({})), None);
-        assert_eq!(
-            reset_allowable_values(&serde_json::json!({ "Parameters": [] })),
-            None
-        );
-        let wrong_name = serde_json::json!({
-            "Parameters": [{ "Name": "OnType", "AllowableValues": ["On"] }]
-        });
-        assert_eq!(reset_allowable_values(&wrong_name), None);
-    }
-
-    #[test]
     fn build_action_payload_uses_first_allowable_value() {
-        let info = serde_json::json!({
+        let info: ActionInfoResource = parse(serde_json::json!({
             "Parameters": [
                 {
                     "Name": "ForceOffType",
@@ -1034,7 +1152,7 @@ mod tests {
                     "AllowableValues": ["ForceOff"]
                 }
             ]
-        });
+        }));
         assert_eq!(
             build_action_payload(&info),
             serde_json::json!({"ForceOffType": "ForceOff"})
@@ -1043,7 +1161,7 @@ mod tests {
 
     #[test]
     fn build_action_payload_prefers_default_value() {
-        let info = serde_json::json!({
+        let info: ActionInfoResource = parse(serde_json::json!({
             "Parameters": [
                 {
                     "Name": "OnType",
@@ -1052,7 +1170,7 @@ mod tests {
                     "AllowableValues": ["On", "Soft"]
                 }
             ]
-        });
+        }));
         assert_eq!(
             build_action_payload(&info),
             serde_json::json!({"OnType": "On"})
@@ -1061,7 +1179,7 @@ mod tests {
 
     #[test]
     fn build_action_payload_skips_unconstrained_parameters() {
-        let info = serde_json::json!({
+        let info: ActionInfoResource = parse(serde_json::json!({
             "Parameters": [
                 { "Name": "Optional", "DataType": "String" },
                 {
@@ -1070,7 +1188,7 @@ mod tests {
                     "AllowableValues": ["X"]
                 }
             ]
-        });
+        }));
         assert_eq!(
             build_action_payload(&info),
             serde_json::json!({"Required": "X"})
@@ -1080,7 +1198,7 @@ mod tests {
     #[test]
     fn build_action_payload_no_parameters_is_empty_object() {
         assert_eq!(
-            build_action_payload(&serde_json::json!({})),
+            build_action_payload(&parse(serde_json::json!({}))),
             serde_json::json!({})
         );
     }
@@ -1099,11 +1217,11 @@ mod tests {
         )
         .unwrap();
 
-        // GracefulShutdown stays unsupported on a power shelf (no OS to shut
-        // down); a graceful power-down is expressed via PowerOp::Off instead.
+        // Restart-style operations stay unsupported on a power shelf. Graceful
+        // power-down (`Off`, `GracefulShutdown`) is supported and falls back to
+        // ForceOff when the shelf advertises no graceful path.
         for op in [
             PowerOp::PowerCycle,
-            PowerOp::GracefulShutdown,
             PowerOp::GracefulRestart,
             PowerOp::ForceRestart,
             PowerOp::Nmi,
@@ -1251,23 +1369,23 @@ mod tests {
 
     #[test]
     fn power_supplies_url_extracts_subsystem_link() {
-        let chassis = serde_json::json!({
+        let chassis = parse(serde_json::json!({
             "PowerSubsystem": {
                 "@odata.id": "/redfish/v1/Chassis/PowerShelf_0/PowerSubsystem"
             }
-        });
+        }));
         let links = power_supplies_url(&chassis).expect("link present");
-        assert_eq!(
-            links.subsystem,
-            "/redfish/v1/Chassis/PowerShelf_0/PowerSubsystem"
-        );
+        assert_eq!(links, "/redfish/v1/Chassis/PowerShelf_0/PowerSubsystem");
     }
 
     #[test]
     fn power_supplies_url_returns_none_when_missing() {
-        assert!(power_supplies_url(&serde_json::json!({})).is_none());
+        assert!(power_supplies_url(&parse(serde_json::json!({}))).is_none());
         assert!(
-            power_supplies_url(&serde_json::json!({"PowerSubsystem": {"@odata.id": ""}})).is_none()
+            power_supplies_url(&parse(serde_json::json!({
+                "PowerSubsystem": {"@odata.id": ""}
+            })))
+            .is_none()
         );
     }
 
@@ -1275,20 +1393,17 @@ mod tests {
     const LITEON_TEST_SUPPLIES_PATH: &str =
         "/redfish/v1/Chassis/powershelf/PowerSubsystem/PowerSupplies";
 
-    /// Minimal chassis document whose `PowerSubsystem` link points at the tree
-    /// mounted by [`mount_liteon_supplies_collection`], for driving
-    /// `fetch_psu_power_states` directly.
-    fn liteon_test_chassis() -> Value {
-        serde_json::json!({
+    /// Minimal chassis whose `PowerSubsystem` link points at the tree mounted
+    /// by [`mount_liteon_supplies_collection`].
+    fn liteon_test_chassis() -> ChassisResource {
+        parse(serde_json::json!({
             "@odata.id": "/redfish/v1/Chassis/powershelf",
             "PowerSubsystem": { "@odata.id": LITEON_TEST_SUBSYSTEM_PATH }
-        })
+        }))
     }
 
-    /// Mounts only the `PowerSubsystem` -> `PowerSupplies` collection layers so a
-    /// test can exercise `fetch_psu_power_states` with an arbitrary `Members`
-    /// array (including malformed or absent `@odata.id`s). Individual PSU
-    /// documents are left to the caller so failure paths can be driven.
+    /// Mounts `PowerSubsystem` → `PowerSupplies` so a test can drive
+    /// `fetch_psu_power_states` with an arbitrary `Members` array.
     async fn mount_liteon_supplies_collection(server: &MockServer, members: Value) {
         Mock::given(method("GET"))
             .and(path(LITEON_TEST_SUBSYSTEM_PATH))
@@ -1317,11 +1432,11 @@ mod tests {
         mount_liteon_supplies_collection(
             &server,
             serde_json::json!([
-                { "@odata.id": PSU_ON },          // readable, powered on   -> Some(true)
-                { "@odata.id": PSU_OFF },         // readable, powered off  -> Some(false)
-                { "@odata.id": PSU_UNREACHABLE }, // fetch fails (503)      -> None
-                { "Name": "no-odata-id" },        // member without @odata.id -> None
-                { "@odata.id": "" },              // member with empty uri  -> None
+                { "@odata.id": PSU_ON },
+                { "@odata.id": PSU_OFF },
+                { "@odata.id": PSU_UNREACHABLE },
+                { "Name": "no-odata-id" },
+                { "@odata.id": "" },
             ]),
         )
         .await;
@@ -1346,12 +1461,12 @@ mod tests {
             .mount(&server)
             .await;
 
-        let http = HttpClient::for_test(&server.uri());
-        let states = fetch_psu_power_states(&http, &liteon_test_chassis()).await;
+        let redfish = redfish_client_for_test(&server.uri());
+        let states = fetch_psu_power_states(&redfish, &liteon_test_chassis()).await;
 
-        // One positional entry per member: Some(_) when the PSU is readable,
-        // None when it is missing an @odata.id, has an empty URI, or fails to
-        // fetch. Regression guard: unreadable PSUs must not be dropped.
+        // One positional entry per member. Regression guard: unreadable PSUs
+        // must not be dropped (which would let the readable ones aggregate to
+        // a falsely-confident state).
         assert_eq!(states, vec![Some(true), Some(false), None, None, None]);
         assert_eq!(
             aggregate_psu_power_states(&states),
@@ -1388,8 +1503,8 @@ mod tests {
             .mount(&server)
             .await;
 
-        let http = HttpClient::for_test(&server.uri());
-        let states = fetch_psu_power_states(&http, &liteon_test_chassis()).await;
+        let redfish = redfish_client_for_test(&server.uri());
+        let states = fetch_psu_power_states(&redfish, &liteon_test_chassis()).await;
 
         assert_eq!(states, vec![Some(true), None]);
         assert_eq!(
@@ -1402,11 +1517,11 @@ mod tests {
     #[tokio::test]
     async fn fetch_psu_power_states_is_empty_without_power_subsystem() {
         let server = MockServer::start().await;
-        let http = HttpClient::for_test(&server.uri());
-
-        // Chassis with no PowerSubsystem link at all.
-        let chassis = serde_json::json!({ "@odata.id": "/redfish/v1/Chassis/powershelf" });
-        let states = fetch_psu_power_states(&http, &chassis).await;
+        let redfish = redfish_client_for_test(&server.uri());
+        let chassis = parse(serde_json::json!({
+            "@odata.id": "/redfish/v1/Chassis/powershelf"
+        }));
+        let states = fetch_psu_power_states(&redfish, &chassis).await;
 
         assert!(states.is_empty());
         assert_eq!(aggregate_psu_power_states(&states), PowerState::Unknown);
@@ -1424,8 +1539,8 @@ mod tests {
             .mount(&server)
             .await;
 
-        let http = HttpClient::for_test(&server.uri());
-        let states = fetch_psu_power_states(&http, &liteon_test_chassis()).await;
+        let redfish = redfish_client_for_test(&server.uri());
+        let states = fetch_psu_power_states(&redfish, &liteon_test_chassis()).await;
 
         assert!(states.is_empty());
         assert_eq!(aggregate_psu_power_states(&states), PowerState::Unknown);
@@ -1443,14 +1558,10 @@ mod tests {
             true,
         )
         .unwrap();
-        ps.replace_http_for_test(base_url);
+        ps.replace_redfish_for_test(base_url);
         ps
     }
 
-    /// Mounts the chassis-collection -> chassis-document discovery layers that
-    /// `get_power_state` walks before reaching the PowerSubsystem. The chassis
-    /// `PowerSubsystem` link points at [`LITEON_TEST_SUBSYSTEM_PATH`], so this
-    /// composes with [`mount_liteon_supplies_collection`].
     async fn mount_liteon_chassis_discovery(server: &MockServer) {
         Mock::given(method("GET"))
             .and(path(RMS_CHASSIS_COLLECTION_ENDPOINT))
@@ -1503,9 +1614,8 @@ mod tests {
 
         let powershelf = test_node(&server.uri());
 
-        // End-to-end through get_power_state: one readable "on" PSU alongside one
-        // unreadable PSU must report Unknown, not On. Before the fix the
-        // unreadable PSU was dropped and the shelf falsely reported On.
+        // End-to-end through get_power_state: one readable "on" PSU alongside
+        // one unreadable PSU must report Unknown, not On.
         assert_eq!(
             powershelf.get_power_state().await.unwrap(),
             PowerState::Unknown
@@ -1513,6 +1623,54 @@ mod tests {
     }
 
     const CHASSIS_PATH: &str = "/redfish/v1/Chassis/powershelf";
+
+    fn test_request() -> PowerRequest<'static> {
+        PowerRequest {
+            node: "ps-01",
+            op: PowerOp::Off,
+        }
+    }
+
+    /// Collects log output written while a [`capture_logs`] guard is alive.
+    #[derive(Clone, Default)]
+    struct LogCapture(Arc<Mutex<Vec<u8>>>);
+
+    impl LogCapture {
+        fn text(&self) -> String {
+            let guard = self.0.lock().unwrap();
+            String::from_utf8_lossy(&guard).into_owned()
+        }
+    }
+
+    impl std::io::Write for LogCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let mut guard = self.0.lock().unwrap();
+            std::io::Write::write(&mut *guard, buf)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Captures this thread's log events until the returned guard is dropped.
+    /// `#[tokio::test]` runs on one thread, so events from awaited code land
+    /// here.
+    fn capture_logs() -> (LogCapture, tracing::subscriber::DefaultGuard) {
+        let capture = LogCapture::default();
+        let writer = capture.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache();
+        (capture, guard)
+    }
+
+    /// The text of the hard-cut warning logged when a graceful request is
+    /// served as `ForceOff`.
+    const HARD_CUT_WARNING: &str = "serving the request as ForceOff";
 
     async fn mount_chassis(server: &MockServer, actions: Value) {
         Mock::given(method("GET"))
@@ -1551,20 +1709,20 @@ mod tests {
             .expect(0)
             .mount(&server)
             .await;
-        let http = HttpClient::for_test(&server.uri());
+        let redfish = redfish_client_for_test(&server.uri());
 
-        invoke_chassis_action(&http, CHASSIS_PATH, ChassisIntent::Off)
-            .await
-            .unwrap();
+        let outcome =
+            invoke_chassis_action(&redfish, CHASSIS_PATH, ChassisIntent::Off, test_request())
+                .await
+                .unwrap();
+        assert_eq!(outcome, ChassisActionOutcome::AsRequested);
     }
 
-    #[tokio::test]
-    async fn invoke_chassis_action_rejects_reset_type_not_in_allowable_values() {
-        let server = MockServer::start().await;
-        // Only a #Chassis.Reset action, advertising On/ForceOff but NOT
-        // GracefulShutdown.
+    /// Mounts a `#Chassis.Reset`-only chassis whose `ResetActionInfo` advertises
+    /// `allowable` reset types.
+    async fn mount_reset_only_chassis(server: &MockServer, allowable: Value) {
         mount_chassis(
-            &server,
+            server,
             serde_json::json!({
                 "#Chassis.Reset": {
                     "target": "/redfish/v1/Chassis/powershelf/Actions/Chassis.Reset",
@@ -1577,11 +1735,69 @@ mod tests {
             .and(path("/redfish/v1/Chassis/powershelf/ResetActionInfo"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "Parameters": [
-                    { "Name": "ResetType", "AllowableValues": ["On", "ForceOff"] }
+                    { "Name": "ResetType", "AllowableValues": allowable }
                 ]
             })))
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn invoke_chassis_action_graceful_off_falls_back_to_reset_force_off() {
+        let server = MockServer::start().await;
+        // Reset advertises On/ForceOff but NOT GracefulShutdown, and there is no
+        // direct #Chassis.Off or #Chassis.ForceOff action.
+        mount_reset_only_chassis(&server, serde_json::json!(["On", "ForceOff"])).await;
+        Mock::given(method("POST"))
+            .and(path("/redfish/v1/Chassis/powershelf/Actions/Chassis.Reset"))
+            .and(body_json(serde_json::json!({ "ResetType": "ForceOff" })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .expect(1)
             .mount(&server)
             .await;
+        let redfish = redfish_client_for_test(&server.uri());
+
+        let outcome =
+            invoke_chassis_action(&redfish, CHASSIS_PATH, ChassisIntent::Off, test_request())
+                .await
+                .unwrap();
+
+        assert_eq!(
+            outcome,
+            ChassisActionOutcome::FellBackToForceOff {
+                action: RMS_CHASSIS_RESET_ACTION
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn invoke_chassis_action_failed_force_off_fallback_reports_the_fallback() {
+        let server = MockServer::start().await;
+        mount_reset_only_chassis(&server, serde_json::json!(["On", "ForceOff"])).await;
+        Mock::given(method("POST"))
+            .and(path("/redfish/v1/Chassis/powershelf/Actions/Chassis.Reset"))
+            .and(body_json(serde_json::json!({ "ResetType": "ForceOff" })))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let redfish = redfish_client_for_test(&server.uri());
+
+        let err = invoke_chassis_action(&redfish, CHASSIS_PATH, ChassisIntent::Off, test_request())
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.message.contains("ForceOff fallback failed"),
+            "message: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn invoke_chassis_action_force_off_rejects_reset_type_not_in_allowable_values() {
+        let server = MockServer::start().await;
+        mount_reset_only_chassis(&server, serde_json::json!(["On", "GracefulShutdown"])).await;
         // The reset must NOT be sent when the device says it is unsupported.
         Mock::given(method("POST"))
             .and(path("/redfish/v1/Chassis/powershelf/Actions/Chassis.Reset"))
@@ -1589,18 +1805,425 @@ mod tests {
             .expect(0)
             .mount(&server)
             .await;
-        let http = HttpClient::for_test(&server.uri());
+        let redfish = redfish_client_for_test(&server.uri());
 
-        let err = invoke_chassis_action(&http, CHASSIS_PATH, ChassisIntent::Off)
+        // Only graceful requests fall back; an explicit ForceOff is never
+        // rewritten into something else.
+        let err = invoke_chassis_action(
+            &redfish,
+            CHASSIS_PATH,
+            ChassisIntent::ForceOff,
+            test_request(),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code, ErrorCode::FailedPrecondition);
+        // The AllowableValues rejection itself is returned. The graceful
+        // fallback error ("neither a graceful power off nor a ForceOff") would
+        // also mention AllowableValues, so rule it out.
+        assert!(
+            err.message.contains("AllowableValues")
+                && !err.message.contains("neither a graceful power off"),
+            "message: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn invoke_chassis_action_graceful_off_fails_when_no_off_path_is_advertised() {
+        let server = MockServer::start().await;
+        mount_reset_only_chassis(&server, serde_json::json!(["On"])).await;
+        Mock::given(method("POST"))
+            .and(path("/redfish/v1/Chassis/powershelf/Actions/Chassis.Reset"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let redfish = redfish_client_for_test(&server.uri());
+
+        let err = invoke_chassis_action(&redfish, CHASSIS_PATH, ChassisIntent::Off, test_request())
             .await
             .unwrap_err();
 
         assert_eq!(err.code, ErrorCode::FailedPrecondition);
         assert!(
-            err.message.contains("AllowableValues"),
+            err.message
+                .contains("neither a graceful power off nor a ForceOff")
+                && err.message.contains("#Chassis.Reset"),
             "message: {}",
             err.message
         );
+    }
+
+    #[tokio::test]
+    async fn invoke_chassis_action_graceful_off_fails_when_chassis_has_no_actions() {
+        let server = MockServer::start().await;
+        mount_chassis(&server, serde_json::json!({})).await;
+        let redfish = redfish_client_for_test(&server.uri());
+
+        let err = invoke_chassis_action(&redfish, CHASSIS_PATH, ChassisIntent::Off, test_request())
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code, ErrorCode::FailedPrecondition);
+    }
+
+    #[tokio::test]
+    async fn invoke_chassis_action_advertised_graceful_failure_is_not_retried_as_force_off() {
+        let server = MockServer::start().await;
+        mount_chassis(
+            &server,
+            serde_json::json!({
+                "#Chassis.Off": { "target": "/redfish/v1/Chassis/powershelf/Actions/Chassis.Off" },
+                "#Chassis.ForceOff": { "target": "/redfish/v1/Chassis/powershelf/Actions/Chassis.ForceOff" }
+            }),
+        )
+        .await;
+        Mock::given(method("POST"))
+            .and(path("/redfish/v1/Chassis/powershelf/Actions/Chassis.Off"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // A runtime failure of an advertised graceful action must never become
+        // a hard power cut.
+        Mock::given(method("POST"))
+            .and(path(
+                "/redfish/v1/Chassis/powershelf/Actions/Chassis.ForceOff",
+            ))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let redfish = redfish_client_for_test(&server.uri());
+
+        invoke_chassis_action(&redfish, CHASSIS_PATH, ChassisIntent::Off, test_request())
+            .await
+            .unwrap_err();
+    }
+
+    #[tokio::test]
+    async fn invoke_chassis_action_unreadable_action_info_for_graceful_action_is_not_retried_as_force_off()
+     {
+        let server = MockServer::start().await;
+        mount_chassis(
+            &server,
+            serde_json::json!({
+                "#Chassis.Off": {
+                    "target": "/redfish/v1/Chassis/powershelf/Actions/Chassis.Off",
+                    "@Redfish.ActionInfo": "/redfish/v1/Chassis/powershelf/OffActionInfo"
+                },
+                "#Chassis.ForceOff": { "target": "/redfish/v1/Chassis/powershelf/Actions/Chassis.ForceOff" }
+            }),
+        )
+        .await;
+        Mock::given(method("GET"))
+            .and(path("/redfish/v1/Chassis/powershelf/OffActionInfo"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // The graceful action is advertised but its ActionInfo cannot be read,
+        // so nothing is sent and the failure is not turned into a hard cut.
+        for action in ["Chassis.Off", "Chassis.ForceOff"] {
+            Mock::given(method("POST"))
+                .and(path(format!(
+                    "/redfish/v1/Chassis/powershelf/Actions/{action}"
+                )))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(0)
+                .mount(&server)
+                .await;
+        }
+        let redfish = redfish_client_for_test(&server.uri());
+
+        invoke_chassis_action(&redfish, CHASSIS_PATH, ChassisIntent::Off, test_request())
+            .await
+            .unwrap_err();
+    }
+
+    #[tokio::test]
+    async fn invoke_chassis_action_unreadable_reset_action_info_is_not_retried_as_force_off() {
+        let server = MockServer::start().await;
+        mount_chassis(
+            &server,
+            serde_json::json!({
+                "#Chassis.Reset": {
+                    "target": "/redfish/v1/Chassis/powershelf/Actions/Chassis.Reset",
+                    "@Redfish.ActionInfo": "/redfish/v1/Chassis/powershelf/ResetActionInfo"
+                }
+            }),
+        )
+        .await;
+        // Read exactly once: a second read would mean the failed graceful
+        // attempt was retried as a ForceOff fallback.
+        Mock::given(method("GET"))
+            .and(path("/redfish/v1/Chassis/powershelf/ResetActionInfo"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/redfish/v1/Chassis/powershelf/Actions/Chassis.Reset"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let redfish = redfish_client_for_test(&server.uri());
+
+        invoke_chassis_action(&redfish, CHASSIS_PATH, ChassisIntent::Off, test_request())
+            .await
+            .unwrap_err();
+    }
+
+    #[tokio::test]
+    async fn invoke_chassis_action_on_is_never_served_as_force_off_through_reset() {
+        let server = MockServer::start().await;
+        // The shelf can be reset to ForceOff but not turned on.
+        mount_reset_only_chassis(&server, serde_json::json!(["ForceOff"])).await;
+        Mock::given(method("POST"))
+            .and(path("/redfish/v1/Chassis/powershelf/Actions/Chassis.Reset"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let redfish = redfish_client_for_test(&server.uri());
+
+        let err = invoke_chassis_action(&redfish, CHASSIS_PATH, ChassisIntent::On, test_request())
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code, ErrorCode::FailedPrecondition);
+        assert!(
+            err.message.contains("\"On\"") && !err.message.contains("ForceOff fallback"),
+            "message: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn invoke_chassis_action_on_is_never_served_as_direct_force_off() {
+        let server = MockServer::start().await;
+        // No way to turn the shelf on is advertised, only a direct ForceOff.
+        mount_chassis(
+            &server,
+            serde_json::json!({
+                "#Chassis.ForceOff": { "target": "/redfish/v1/Chassis/powershelf/Actions/Chassis.ForceOff" }
+            }),
+        )
+        .await;
+        Mock::given(method("POST"))
+            .and(path(
+                "/redfish/v1/Chassis/powershelf/Actions/Chassis.ForceOff",
+            ))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let redfish = redfish_client_for_test(&server.uri());
+
+        let err = invoke_chassis_action(&redfish, CHASSIS_PATH, ChassisIntent::On, test_request())
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.message.contains("#Chassis.On"),
+            "message: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn invoke_chassis_action_fallback_warns_before_posting_reset_force_off() {
+        let server = MockServer::start().await;
+        mount_reset_only_chassis(&server, serde_json::json!(["On", "ForceOff"])).await;
+        Mock::given(method("POST"))
+            .and(path("/redfish/v1/Chassis/powershelf/Actions/Chassis.Reset"))
+            .and(body_json(serde_json::json!({ "ResetType": "ForceOff" })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let redfish = redfish_client_for_test(&server.uri());
+        let (logs, _guard) = capture_logs();
+
+        invoke_chassis_action(&redfish, CHASSIS_PATH, ChassisIntent::Off, test_request())
+            .await
+            .unwrap();
+
+        let logs = logs.text();
+        assert!(
+            logs.contains("WARN")
+                && logs.contains(HARD_CUT_WARNING)
+                && logs.contains("ps-01")
+                && logs.contains("op=Off")
+                && logs.contains("#Chassis.Reset"),
+            "logs: {logs}"
+        );
+    }
+
+    #[tokio::test]
+    async fn invoke_chassis_action_fallback_warns_with_the_direct_force_off_action() {
+        let server = MockServer::start().await;
+        mount_chassis(
+            &server,
+            serde_json::json!({
+                "#Chassis.ForceOff": { "target": "/redfish/v1/Chassis/powershelf/Actions/Chassis.ForceOff" }
+            }),
+        )
+        .await;
+        Mock::given(method("POST"))
+            .and(path(
+                "/redfish/v1/Chassis/powershelf/Actions/Chassis.ForceOff",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let redfish = redfish_client_for_test(&server.uri());
+        let (logs, _guard) = capture_logs();
+
+        invoke_chassis_action(
+            &redfish,
+            CHASSIS_PATH,
+            ChassisIntent::Off,
+            PowerRequest {
+                node: "ps-02",
+                op: PowerOp::GracefulShutdown,
+            },
+        )
+        .await
+        .unwrap();
+
+        let logs = logs.text();
+        assert!(
+            logs.contains("WARN")
+                && logs.contains(HARD_CUT_WARNING)
+                && logs.contains("ps-02")
+                && logs.contains("op=GracefulShutdown")
+                && logs.contains("#Chassis.ForceOff"),
+            "logs: {logs}"
+        );
+    }
+
+    #[tokio::test]
+    async fn invoke_chassis_action_fallback_warns_even_when_the_force_off_is_rejected() {
+        let server = MockServer::start().await;
+        mount_reset_only_chassis(&server, serde_json::json!(["On", "ForceOff"])).await;
+        Mock::given(method("POST"))
+            .and(path("/redfish/v1/Chassis/powershelf/Actions/Chassis.Reset"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let redfish = redfish_client_for_test(&server.uri());
+        let (logs, _guard) = capture_logs();
+
+        invoke_chassis_action(&redfish, CHASSIS_PATH, ChassisIntent::Off, test_request())
+            .await
+            .unwrap_err();
+
+        let logs = logs.text();
+        assert!(
+            logs.contains("WARN") && logs.contains(HARD_CUT_WARNING),
+            "logs: {logs}"
+        );
+    }
+
+    #[tokio::test]
+    async fn invoke_chassis_action_does_not_warn_when_nothing_is_hard_cut() {
+        // A graceful action that is advertised and used.
+        let server = MockServer::start().await;
+        mount_chassis(
+            &server,
+            serde_json::json!({
+                "#Chassis.Off": { "target": "/redfish/v1/Chassis/powershelf/Actions/Chassis.Off" },
+                "#Chassis.ForceOff": { "target": "/redfish/v1/Chassis/powershelf/Actions/Chassis.ForceOff" }
+            }),
+        )
+        .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&server)
+            .await;
+        let redfish = redfish_client_for_test(&server.uri());
+        let (graceful_logs, graceful_guard) = capture_logs();
+        invoke_chassis_action(&redfish, CHASSIS_PATH, ChassisIntent::Off, test_request())
+            .await
+            .unwrap();
+        drop(graceful_guard);
+
+        // An explicit ForceOff is the caller's choice, not a fallback.
+        let (force_logs, force_guard) = capture_logs();
+        invoke_chassis_action(
+            &redfish,
+            CHASSIS_PATH,
+            ChassisIntent::ForceOff,
+            PowerRequest {
+                node: "ps-01",
+                op: PowerOp::ForceOff,
+            },
+        )
+        .await
+        .unwrap();
+        drop(force_guard);
+
+        // No graceful path and no ForceOff either: nothing is sent.
+        let empty = MockServer::start().await;
+        mount_reset_only_chassis(&empty, serde_json::json!(["On"])).await;
+        let redfish = redfish_client_for_test(&empty.uri());
+        let (none_logs, _none_guard) = capture_logs();
+        invoke_chassis_action(&redfish, CHASSIS_PATH, ChassisIntent::Off, test_request())
+            .await
+            .unwrap_err();
+
+        for (case, logs) in [
+            ("graceful action used", graceful_logs.text()),
+            ("explicit ForceOff", force_logs.text()),
+            ("no usable path", none_logs.text()),
+        ] {
+            assert!(!logs.contains(HARD_CUT_WARNING), "{case}: {logs}");
+        }
+    }
+
+    #[tokio::test]
+    async fn invoke_chassis_action_force_off_intent_skips_graceful_paths() {
+        let server = MockServer::start().await;
+        mount_chassis(
+            &server,
+            serde_json::json!({
+                "#Chassis.Off": { "target": "/redfish/v1/Chassis/powershelf/Actions/Chassis.Off" },
+                "#Chassis.ForceOff": { "target": "/redfish/v1/Chassis/powershelf/Actions/Chassis.ForceOff" }
+            }),
+        )
+        .await;
+        Mock::given(method("POST"))
+            .and(path(
+                "/redfish/v1/Chassis/powershelf/Actions/Chassis.ForceOff",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/redfish/v1/Chassis/powershelf/Actions/Chassis.Off"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let redfish = redfish_client_for_test(&server.uri());
+
+        let outcome = invoke_chassis_action(
+            &redfish,
+            CHASSIS_PATH,
+            ChassisIntent::ForceOff,
+            test_request(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome, ChassisActionOutcome::AsRequested);
     }
 
     #[tokio::test]
@@ -1634,11 +2257,181 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-        let http = HttpClient::for_test(&server.uri());
+        let redfish = redfish_client_for_test(&server.uri());
 
-        invoke_chassis_action(&http, CHASSIS_PATH, ChassisIntent::Off)
+        invoke_chassis_action(&redfish, CHASSIS_PATH, ChassisIntent::Off, test_request())
             .await
             .unwrap();
+    }
+
+    /// Chassis `Actions` exactly as reported by the VR NVL72 LiteOn shelf
+    /// (PF-1114-1RD): `On`, `ForceOff`, and `Reset`, with no `#Chassis.Off`.
+    fn pf_1114_1rd_chassis_actions() -> Value {
+        serde_json::json!({
+            "#Chassis.ForceOff": {
+                "target": "/redfish/v1/Chassis/powershelf/Actions/Chassis.ForceOff",
+                "@Redfish.ActionInfo": "/redfish/v1/Chassis/powershelf/ForceOffActionInfo"
+            },
+            "#Chassis.On": {
+                "target": "/redfish/v1/Chassis/powershelf/Actions/Chassis.On",
+                "@Redfish.ActionInfo": "/redfish/v1/Chassis/powershelf/OnActionInfo"
+            },
+            "#Chassis.Reset": {
+                "target": "/redfish/v1/Chassis/powershelf/Actions/Chassis.Reset",
+                "@Redfish.ActionInfo": "/redfish/v1/Chassis/powershelf/ResetActionInfo"
+            }
+        })
+    }
+
+    /// Mounts the `ActionInfo` resources exactly as captured from a VR NVL72
+    /// LiteOn shelf (PF-1114-1RD): `ResetType` allows only `Reset`, and
+    /// `ForceOff` takes a required `ForceOffType` of `ForceOff`.
+    async fn mount_pf_1114_1rd_action_infos(server: &MockServer) {
+        Mock::given(method("GET"))
+            .and(path("/redfish/v1/Chassis/powershelf/ResetActionInfo"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Id": "ResetActionInfo",
+                "Parameters": [{
+                    "AllowableValues": ["Reset"],
+                    "DataType": "String",
+                    "Name": "ResetType",
+                    "Required": true
+                }]
+            })))
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/redfish/v1/Chassis/powershelf/ForceOffActionInfo"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Id": "ForceOffActionInfo",
+                "Parameters": [{
+                    "AllowableValues": ["ForceOff"],
+                    "DataType": "String",
+                    "Name": "ForceOffType",
+                    "Required": true
+                }]
+            })))
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn vr_liteon_shelf_graceful_off_is_served_by_direct_force_off_action() {
+        let server = MockServer::start().await;
+        mount_chassis(&server, pf_1114_1rd_chassis_actions()).await;
+        mount_pf_1114_1rd_action_infos(&server).await;
+        // The shelf has no #Chassis.Off and its ResetType allows only `Reset`,
+        // so a graceful request must never reach #Chassis.Reset.
+        Mock::given(method("POST"))
+            .and(path("/redfish/v1/Chassis/powershelf/Actions/Chassis.Reset"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        // Both the graceful fallback and an explicit ForceOff post the payload
+        // the shelf's ForceOffActionInfo requires.
+        Mock::given(method("POST"))
+            .and(path(
+                "/redfish/v1/Chassis/powershelf/Actions/Chassis.ForceOff",
+            ))
+            .and(body_json(serde_json::json!({ "ForceOffType": "ForceOff" })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let redfish = redfish_client_for_test(&server.uri());
+
+        let graceful =
+            invoke_chassis_action(&redfish, CHASSIS_PATH, ChassisIntent::Off, test_request())
+                .await
+                .unwrap();
+        let forced = invoke_chassis_action(
+            &redfish,
+            CHASSIS_PATH,
+            ChassisIntent::ForceOff,
+            test_request(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            graceful,
+            ChassisActionOutcome::FellBackToForceOff {
+                action: "#Chassis.ForceOff"
+            }
+        );
+        assert_eq!(forced, ChassisActionOutcome::AsRequested);
+    }
+
+    #[tokio::test]
+    async fn vr_liteon_shelf_set_power_state_serves_graceful_requests_as_force_off() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(RMS_CHASSIS_COLLECTION_ENDPOINT))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Members": [{ "@odata.id": CHASSIS_PATH }]
+            })))
+            .mount(&server)
+            .await;
+        mount_chassis(&server, pf_1114_1rd_chassis_actions()).await;
+        mount_pf_1114_1rd_action_infos(&server).await;
+        Mock::given(method("POST"))
+            .and(path(
+                "/redfish/v1/Chassis/powershelf/Actions/Chassis.ForceOff",
+            ))
+            .and(body_json(serde_json::json!({ "ForceOffType": "ForceOff" })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .expect(3)
+            .mount(&server)
+            .await;
+        let powershelf = test_node(&server.uri());
+
+        for op in [PowerOp::Off, PowerOp::GracefulShutdown, PowerOp::ForceOff] {
+            powershelf
+                .set_power_state(op, PowerTargetType::System)
+                .await
+                .unwrap_or_else(|err| panic!("{op:?}: {err}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn set_power_state_serves_graceful_requests_as_force_off_on_force_only_shelf() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(RMS_CHASSIS_COLLECTION_ENDPOINT))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Members": [{ "@odata.id": CHASSIS_PATH }]
+            })))
+            .mount(&server)
+            .await;
+        mount_chassis(
+            &server,
+            serde_json::json!({
+                "#Chassis.ForceOff": {
+                    "target": "/redfish/v1/Chassis/powershelf/Actions/Chassis.ForceOff"
+                },
+                "#Chassis.On": {
+                    "target": "/redfish/v1/Chassis/powershelf/Actions/Chassis.On"
+                }
+            }),
+        )
+        .await;
+        Mock::given(method("POST"))
+            .and(path(
+                "/redfish/v1/Chassis/powershelf/Actions/Chassis.ForceOff",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .expect(3)
+            .mount(&server)
+            .await;
+        let powershelf = test_node(&server.uri());
+
+        for op in [PowerOp::Off, PowerOp::GracefulShutdown, PowerOp::ForceOff] {
+            powershelf
+                .set_power_state(op, PowerTargetType::System)
+                .await
+                .unwrap_or_else(|err| panic!("{op:?}: {err}"));
+        }
     }
 
     #[tokio::test]
@@ -1662,10 +2455,15 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-        let http = HttpClient::for_test(&server.uri());
+        let redfish = redfish_client_for_test(&server.uri());
 
-        invoke_chassis_action(&http, CHASSIS_PATH, ChassisIntent::ForceOff)
-            .await
-            .unwrap();
+        invoke_chassis_action(
+            &redfish,
+            CHASSIS_PATH,
+            ChassisIntent::ForceOff,
+            test_request(),
+        )
+        .await
+        .unwrap();
     }
 }

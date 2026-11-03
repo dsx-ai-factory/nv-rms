@@ -15,5 +15,10 @@
  * limitations under the License.
  */
 
+pub mod compute_power;
+pub mod compute_timing;
+pub mod firmware_manifest;
+pub mod firmware_target;
 pub mod node;
 pub mod rack;
+pub mod redfish_path;

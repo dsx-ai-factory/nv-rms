@@ -15,3 +15,10 @@ transport active, and in-flight requests finish on their original generation.
 
 Helpers normalize switch behavior seen in the field, including action polling,
 image state checks, and platform firmware response shapes.
+
+HTTP failures from the JSON convenience methods retain the original status and
+raw body in `ClientError::HttpStatus`. Their displayed messages include a
+single-line body excerpt, with secret fields redacted in JSON and text before
+truncation to 1024 characters (plus an ellipsis). Empty bodies keep the
+method/path/status message without a suffix. This excerpt also survives
+conversion into an RMS error.

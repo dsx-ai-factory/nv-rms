@@ -35,7 +35,10 @@ The **job tracker** (`job_tracker.rs`, over the generic primitives in
 `job_lifecycle/`) manages the async job lifecycle for both firmware and switch
 OS-image work. It supports parent/child job hierarchies for batch operations, is
 bounded by `max_tracked_jobs`, and evicts terminal (completed/failed) job records
-after `terminal_job_ttl_seconds` via a background reaper. Batch workflows create
+after `terminal_job_ttl_seconds` via a background reaper. Retention age is
+measured on a monotonic clock so NTP or manual wall-clock steps cannot drop
+in-flight status early or retain expired records indefinitely. Display timestamps
+on job status remain wall-clock. Batch workflows create
 their top-level job first and dynamically attach admitted child jobs while that
 job remains non-terminal. See
 [Operations: the async job model](../operations/overview.md#the-async-job-model).
@@ -68,7 +71,8 @@ beyond that.
 A stage can end up `skipped` in two different situations, so a handler
 never has to report a no-op as if it were real work: if a stage starts but
 turns out to have nothing to do (e.g. no unused partition image to clean
-up), the handler calls `skip_current` instead of `complete_current`; and
+up, or the unused image is current, boot-next, or the incoming target),
+the handler calls `skip_current` instead of `complete_current`; and
 when a job exits early - a stage failed, was cancelled, or a precondition
 check failed before any stage started - handlers call `skip_remaining`
 once, right before sealing the job's terminal state, which moves every
@@ -91,11 +95,30 @@ Trait-based. Each node type encapsulates its management protocol behind the
 - **Compute** (`compute_gb200_nvidia`, `compute_gb300_nvidia`,
   `compute_gb300_lenovo`, `compute_vrnvl72_nvidia`) - Redfish over HTTPS.
 - **Powershelf** (`powershelf_gb200_liteon`, `powershelf_gb200_delta`,
-  `powershelf_gb300_liteon`, `powershelf_gb300_delta`) - Redfish over HTTPS; the
-  Delta shelves additionally use the embedded nvfwupd workflow.
-- **Switch** (`switch_gb200_nvidia`, `switch_gb300_nvidia`) - NVUE REST plus
+  `powershelf_gb300_liteon`, `powershelf_gb300_delta`,
+  `powershelf_vrnvl72_liteon`, `powershelf_vrnvl72_delta`) - Redfish over HTTPS via
+  the shared `redfish_client` (nv-redfish origin-pinned GET/action); the Delta
+  shelves additionally use the embedded nvfwupd workflow.
+- **Switch** (`switch_gb200_nvidia`, `switch_gb300_nvidia`, `switch_vrnvl72_nvidia`) - NVUE REST plus
   SSH/SFTP, including NVUE-based SPDM attestation evidence collection. NMX-C
-  gRPC and gNMI provide fabric and telemetry operations.
+  gRPC and gNMI provide fabric and telemetry operations. The concrete VR NVL72
+  wrapper owns BMC-backed power, firmware inventory, comparison, and activation,
+  including NVOS installation without an automatic reboot. It reuses the shared
+  NVUE/SSH operations while retaining VR identity and one operation lock.
+  Image-specific NVOS
+  quirks (for example whether gNMI exposes a client-CA resource) are classified
+  by `nodes/nvos`. Certificate initialization probes only
+  `/system/gnmi-server/mtls`, gathers live observations (NVUE probes today;
+  version or other facts can be added to the same evidence set), and takes the
+  capability as the conjunction of its requirement predicates; bind and verify
+  consume that answer rather than a version table. Each discovery probes the
+  live switch. Certificate initialization stores the gNMI client-CA answer on
+  that switch object, so bind and verify share one
+  `GET /system/gnmi-server/mtls`. A later job builds a new switch and probes
+  again. The discover stage and the completed job record that outcome as
+  `gnmi_client_authentication`: `mtls` when the client CA is bound, and
+  `server-certificate-only` when the probe returned 404 and the bind installed
+  the server certificate alone.
 
 Adding a new node type means implementing the `Node` trait - no changes to
 existing code. Adding a new rack type means implementing the `Rack` trait with its
@@ -109,16 +132,23 @@ crate.
 
 ### Transport and protocol crates (`transport`, workspace crates)
 
-- `transport/http_client.rs` wraps `reqwest` for async Redfish/NVUE HTTP (GET,
-  POST/PATCH JSON, multipart and raw file upload).
+- `transport/http_client.rs` wraps `reqwest` for async HTTP (GET, POST/PATCH
+  JSON, multipart and raw file upload) used by callers that are not on
+  `redfish_client` (for example NVUE and Lenovo compute BMC helpers).
 - `transport/ssh_client.rs` (and the `transport/ssh/` module) wraps `russh` for
-  async SSH exec and SFTP file transfers, with per-step and overall upload
-  timeouts.
+  async SSH exec and SCP/SFTP file transfers, with per-step and overall upload
+  timeouts. The ONIE recovery path uses the legacy `scp -t` sink protocol,
+  while NVOS system-image staging uses SFTP.
 - [`redfish_client`](../reference/crates.md#redfish_client) - RMS-focused Redfish
   operations (power/reset, MNNVLink topology discovery, multipart firmware
-  upload).
+  upload, origin-safe typed `get_resource` / untyped `get_json` and `post_action`
+  for powershelf OEM).
 - [`nvue_client`](../reference/crates.md#nvue_client) - the async NVUE/NVOS REST
   client and API models used by the switch nodes.
+- [`nvswitch_cli`](../reference/crates.md#nvswitch_cli) - typed NVOS `nv` CLI
+  commands and ordered command flows. Every CLI command RMS sends to a switch is
+  built here; `nodes/switch_gb200_nvidia/cli.rs` binds it to the SSH transport
+  above.
 - [`nvfwupd`](../reference/crates.md#nvfwupd) - the embedded firmware-update workflow
   library (and standalone CLI).
 - `libnmxc` - the NMX-C gRPC client and switch TLS material store for the scale-up
@@ -186,10 +216,18 @@ All fallible operations return `Result<T, RmsError>`. `RmsError` carries an
 | `Unavailable` | `UNAVAILABLE` |
 | `Unimplemented` | `UNIMPLEMENTED` |
 | `Internal` | `INTERNAL` |
+| `Aborted` | `INTERNAL` |
 
 ## Credentials
 
-Credentials (username/password) are passed directly in gRPC requests at
-node-creation time and held on the ephemeral node using zero-on-drop secure
-strings (the `secrecy` crate). RMS uses no external credential provider and does
-not persist device credentials.
+Credentials are passed directly in gRPC requests and held on the ephemeral node
+using zero-on-drop secure strings (the `secrecy` crate). BMC endpoints accept
+either username/password credentials or a Redfish session token. RMS applies
+BMC TLS verification from `[bmc] insecure_bmc` (default `true`) when it
+constructs BMC endpoints from protobuf, so firmware, power, inventory, reboot,
+and switch-management RPCs that retain a BMC endpoint cannot skip that policy
+via request fields. Switch NVUE/NVOS remains
+`[switches] insecure_switch`. Host endpoints,
+including switch NVUE/NVOS and SSH management, require username/password
+credentials. RMS uses no external credential provider and does not persist
+device credentials.

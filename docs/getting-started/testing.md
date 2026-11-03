@@ -1,6 +1,6 @@
 # Testing RMS
 
-RMS has unit tests, four integration test binaries, and Criterion scale
+RMS has unit tests, six integration test binaries, and Criterion scale
 benchmarks. Most tests run against an in-process backend with no external
 dependencies; only the Postgres persistence suite needs a real database.
 
@@ -41,7 +41,7 @@ export DATABASE_URL=postgres://postgres:postgres@localhost:5432/rms_test
 cargo test --release
 ```
 
-This runs the unit tests plus all four integration binaries.
+This runs the unit tests plus all six integration binaries.
 
 ## Run without a database
 
@@ -50,10 +50,12 @@ one (the memory backend of the persistence suite always runs):
 
 ```bash
 cargo test --release --lib
+cargo test --release --test config_startup
 cargo test --release --test grpc_e2e
 cargo test --release --test grpc_mtls
 cargo test --release --test mockup_server_test
 cargo test --release --test persistence memory::
+cargo test --release --test tracing_export
 ```
 
 ## Unit tests
@@ -66,10 +68,12 @@ cargo test --lib
 
 | Binary | Command | What it covers |
 | --- | --- | --- |
+| `config_startup` | `cargo test --test config_startup` | Starts the compiled binary. A valid dev-mode config binds the gRPC port; a missing or invalid config, or plaintext API mode without `RMS_ALLOW_INSECURE=1`, exits with a clear error. Tracing checks reject plaintext export to a hostname and ambient OTLP header or compression variables, and confirm that a plaintext loopback endpoint starts with no Collector running. |
 | `grpc_e2e` | `cargo test --test grpc_e2e` | Full gRPC E2E: starts RMS plus the Redfish simulator in-process and exercises power, inventory, firmware, and mixed-rack scenarios for compute and power-shelf nodes. |
 | `grpc_mtls` | `cargo test --test grpc_mtls` | Spawns the gRPC server with a client CA and verifies the rustls TLS 1.3 handshake, client-cert verification, ALPN to h2, and a real RPC round-trip. |
 | `mockup_server_test` | `cargo test --test mockup_server_test` | Redfish-simulator and service-facing tests for TLS startup, JSON serving, multi-port binding, action validation, firmware task simulation, and node APIs. |
 | `persistence` | `cargo test --test persistence` | Cross-backend behavioral tests for the firmware-object store. The memory backend always runs; the Postgres backend requires `DATABASE_URL` (and panics otherwise). Filter with `memory::` to run only the memory backend. |
+| `tracing_export` | `cargo test --test tracing_export` | Exports spans through RMS's logging setup to a TLS gRPC Collector and checks partial-success handling: the rejected-span counter, a bounded warning that honors the log filter, and no Collector-supplied text in RMS output. |
 
 ### The Redfish simulator
 

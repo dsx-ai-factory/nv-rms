@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-//! GB200RFTarget implementation for GB200/GB300/VR NVL platforms.
+//! GB200RFTarget implementation for GB200/GB300/VR NVL/LP30 platforms.
 //!
 //! Extends GH200 behavior with additional HGX platform patterns
 //! and special fungible component handling for SMA, CPLD, and
@@ -34,15 +34,19 @@ use crate::rf_target::{
 };
 use crate::util::{BailAction, TraceFlags, Util};
 use crate::utils::Util as NvUtils;
+use crate::workflow::ActivationCommand;
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
+const AUX_POWER_CYCLE_COMMAND: &str = ActivationCommand::AuxPowerCycle.as_cli_command();
+
 /// Filename patterns that trigger multipart upload.
 /// Extends GH200 patterns with GB200-NVL4.
 const MULTIPART_PLATFORMS: &[&str] = &[
     "P4059",
+    "P4109",
     "P4764",
     "P4974",
     "P4975",
@@ -52,19 +56,19 @@ const MULTIPART_PLATFORMS: &[&str] = &[
 ];
 
 /// Substrings in a package version string that mark it as an HGX-tray package.
-const HGX_PLATFORM_TOKENS: &[&str] = &["HGX", "4059", "4764", "4974", "4975", "GB200-NVL4", "HMC"];
+const HGX_PLATFORM_TOKENS: &[&str] = &[
+    "HGX",
+    "4059",
+    "4109",
+    "4764",
+    "4974",
+    "4975",
+    "GB200-NVL4",
+    "HMC",
+];
 
 /// Component name fragments that are fungible on GB200 platforms.
-const GB200_FUNGIBLE_FRAGMENTS: &[&str] = &["fw_sma_bluefield", "fw_bluefield_sma", "nvme_e1s"];
-
-/// SMA component fragments whose chassis resource carries the SKU identifier.
-const GB200_SMA_CHASSIS_SKU_FRAGMENTS: &[&str] = &[
-    "fw_io_board_sma",
-    "fw_processormodule_sma",
-    "fw_storagebackplane_sma",
-    "fw_gpu_sma",
-    "fw_bay_c_sma",
-];
+const GB200_FUNGIBLE_FRAGMENTS: &[&str] = &["nvme_e1s"];
 
 const BACKGROUND_COPY_STATUS_POINTER: &str = "/Oem/Nvidia/BackgroundCopyStatus";
 const BACKGROUND_COPY_QUERY_TIMEOUT_SECS: u64 = 30;
@@ -94,7 +98,7 @@ struct WriteProtectComponent {
 // GB200RFTarget
 // ---------------------------------------------------------------------------
 
-/// Platform-specific RFTarget for GB200, GB300, and VR NVL systems.
+/// Platform-specific RFTarget for GB200, GB300, VR NVL, and LP30 systems.
 ///
 /// Extends GH200 behavior with additional multipart upload patterns
 /// and GB200-specific fungible component definitions.
@@ -112,6 +116,12 @@ pub struct GB200RFTarget {
 }
 
 impl GB200RFTarget {
+    fn power_request_timeout_secs(&self) -> u64 {
+        self.bmc_access
+            .compute_timing
+            .map_or(30, |timing| timing.recovery_probe_timeout.as_secs())
+    }
+
     /// Create a new `GB200RFTarget` with sensible defaults.
     pub fn new(bmc_access: BmcAccess, config_dict: Option<Value>) -> Self {
         Self {
@@ -122,6 +132,8 @@ impl GB200RFTarget {
                 "fw_processormodule_sma".to_string(),
                 "fw_storagebackplane_sma".to_string(),
                 "fw_gpu_sma".to_string(),
+                "hgx_fw_lpu_sma".to_string(),
+                "hgx_fw_fpga_sma".to_string(),
                 "fw_bay_c_sma".to_string(),
                 "cpld".to_string(),
             ],
@@ -143,7 +155,34 @@ impl GB200RFTarget {
 
     /// Check whether the package name belongs to an HGX tray.
     fn is_hgx_pkg(pkg_name: &str) -> bool {
-        HGX_PLATFORM_TOKENS.iter().any(|tok| pkg_name.contains(tok))
+        let upper = pkg_name.to_uppercase();
+        HGX_PLATFORM_TOKENS.iter().any(|tok| upper.contains(tok))
+    }
+
+    /// Allow HGX BMC inventory entries to look up HMC components across packages.
+    fn is_hgx_bmc_lookup(norm_ap: &str, hgx_pkg_only: bool) -> bool {
+        hgx_pkg_only && norm_ap == "hmc"
+    }
+
+    /// Return true when an HGX-prefixed software-inventory AP should match a
+    /// non-HGX IST vectors package.
+    fn is_hgx_ist_vectors_lookup(norm_ap: &str, hgx_pkg_only: bool) -> bool {
+        hgx_pkg_only && norm_ap == "istvectors"
+    }
+
+    /// LP30 carries the HMC firmware inside its BMC package as `vHMC`.
+    fn lp30_vhmc_matches_hgx_bmc(norm_ap: &str, ap_pkg: &str) -> bool {
+        norm_ap == "hmc" && ap_pkg == "vhmc"
+    }
+
+    /// Match contextual ERoT package aliases to their inventory endpoints.
+    ///
+    /// Some packages can include both BMC and SBIOS ERoT aliases; this prevents
+    /// the generic ERoT fallback from choosing the opposite context.
+    fn contextual_erot_matches(norm_ap: &str, ap_pkg: &str, ap_type: &str) -> bool {
+        ap_pkg == "erot"
+            && ((norm_ap == "erotbmc" && ap_type.contains("bmc"))
+                || (norm_ap == "erotsbios" && ap_type.contains("sbios")))
     }
 
     /// Return true when a reported BackgroundCopyStatus value is complete.
@@ -297,7 +336,11 @@ impl GB200RFTarget {
                 uri,
                 None,
                 None,
-                WRITE_PROTECT_QUERY_TIMEOUT_SECS,
+                self.bmc_access
+                    .compute_timing
+                    .map_or(WRITE_PROTECT_QUERY_TIMEOUT_SECS, |timing| {
+                        timing.precondition_query_timeout.as_secs()
+                    }),
                 true,
                 json_dict,
             )
@@ -357,7 +400,11 @@ impl GB200RFTarget {
     ) -> Result<Vec<String>, String> {
         self.discover_firmware_inventory_uris_with_retry_interval(
             json_dict,
-            WRITE_PROTECT_INVENTORY_QUERY_RETRY_INTERVAL,
+            self.bmc_access
+                .compute_timing
+                .map_or(WRITE_PROTECT_INVENTORY_QUERY_RETRY_INTERVAL, |timing| {
+                    timing.write_protect_inventory_retry_interval
+                }),
         )
         .await
     }
@@ -373,7 +420,13 @@ impl GB200RFTarget {
         retry_interval: Duration,
     ) -> Result<Vec<String>, String> {
         let mut last_inventory = json!({});
-        for attempt in 1..=WRITE_PROTECT_INVENTORY_QUERY_ATTEMPTS {
+        let attempts = self
+            .bmc_access
+            .compute_timing
+            .map_or(WRITE_PROTECT_INVENTORY_QUERY_ATTEMPTS, |timing| {
+                timing.write_protect_inventory_attempts as usize
+            });
+        for attempt in 1..=attempts {
             let (ok, inventory) = self
                 .dispatch_write_protect_get(FIRMWARE_INVENTORY_URI, json_dict.as_deref_mut())
                 .await;
@@ -384,20 +437,20 @@ impl GB200RFTarget {
             tracing::warn!(
                 uri = FIRMWARE_INVENTORY_URI,
                 attempt,
-                max_attempts = WRITE_PROTECT_INVENTORY_QUERY_ATTEMPTS,
+                max_attempts = attempts,
                 response = %NvUtils::redact_secret_json_value(&inventory),
                 "Failed to query FirmwareInventory while checking WriteProtected values"
             );
             last_inventory = inventory;
 
-            if attempt < WRITE_PROTECT_INVENTORY_QUERY_ATTEMPTS {
+            if attempt < attempts {
                 sleep(retry_interval).await;
             }
         }
 
         Err(format!(
             "Failed to query {FIRMWARE_INVENTORY_URI} while checking FirmwareInventory \
-             WriteProtected values after {WRITE_PROTECT_INVENTORY_QUERY_ATTEMPTS} attempt(s): {}",
+             WriteProtected values after {attempts} attempt(s): {}",
             NvUtils::redact_secret_json_value(&last_inventory)
         ))
     }
@@ -577,7 +630,11 @@ impl GB200RFTarget {
                 uri,
                 None,
                 None,
-                BACKGROUND_COPY_QUERY_TIMEOUT_SECS,
+                self.bmc_access
+                    .compute_timing
+                    .map_or(BACKGROUND_COPY_QUERY_TIMEOUT_SECS, |timing| {
+                        timing.precondition_query_timeout.as_secs()
+                    }),
                 true,
                 json_dict,
             )
@@ -733,8 +790,9 @@ impl GB200RFTarget {
     /// Normalize an inventory AP name for matching against PLDM component keys.
     ///
     /// Mirrors the Python `GHRFTarget.get_component_version` normalization:
-    /// strip hgx_fw_ / hgx_ prefix, collapse erot variants, map bmc→hmc for
-    /// HGX, gpu→gpu, cpu→sbios, pcie→pcieswitch, then remove underscores.
+    /// strip hgx_fw_ / hgx_ prefix, collapse erot variants while preserving
+    /// BMC/SBIOS ERoT context, map bmc→hmc for HGX, gpu→gpu, cpu→sbios,
+    /// pcie→pcieswitch, then remove underscores.
     /// Returns `(normalized_name, hgx_pkg_only)`.
     fn normalize_ap_name(ap_name: &str) -> (String, bool) {
         let mut name = ap_name.to_lowercase();
@@ -751,7 +809,11 @@ impl GB200RFTarget {
                 name = "hmc".to_string();
             }
         }
-        if name.contains("erot") {
+        if name.contains("erot") && name.contains("bmc") {
+            name = "erotbmc".to_string();
+        } else if name.contains("erot") && name.contains("sbios") {
+            name = "erotsbios".to_string();
+        } else if name.contains("erot") {
             name = "erot".to_string();
         }
         if name.contains("gpu") && !name.contains("inforom") && !name.contains("sma") {
@@ -951,13 +1013,20 @@ impl RFTarget for GB200RFTarget {
 
     /// GB200 inherits `get_expected_task_type_from_package` from GH200.
     fn get_expected_task_type_from_package(&self, recipe_list: &[String]) -> String {
-        let hgx_platforms = ["P4059", "P4764", "P4974", "P4975", "GB200-NVL4", "HMC"];
         for package_file in recipe_list {
-            if hgx_platforms.iter().any(|p| package_file.contains(p)) {
+            let package_name = std::path::Path::new(package_file)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(package_file);
+            if Self::is_hgx_pkg(package_name) {
                 return "HMC".to_string();
             }
         }
         "BMC".to_string()
+    }
+
+    fn use_update_parameters_for_task_type(&self) -> bool {
+        true
     }
 
     // ------------------------------------------------------------------
@@ -975,7 +1044,7 @@ impl RFTarget for GB200RFTarget {
     async fn run_oob_activation(&mut self, cmd_args: &CmdArgs) -> i32 {
         let mut quiet_json = json!({"Error": [], "Error Code": 0, "Output": []});
         let supported = [
-            "RF_AUX_PWR_CYCLE",
+            AUX_POWER_CYCLE_COMMAND,
             "RF_PWR_ON",
             "RF_PWR_OFF",
             "RF_PWR_CYCLE",
@@ -994,13 +1063,21 @@ impl RFTarget for GB200RFTarget {
         let trace = TraceFlags::default();
 
         if cmd_args.cmd == "RF_PWR_STATUS" {
-            let systems = self.bmc_access.get_systems_members(trace).await;
+            let systems = self.bmc_access.compute_power_system_members(trace).await;
             let mut found_any = false;
             let mut first = true;
             for system_uri in &systems {
                 let (status, response) = self
                     .bmc_access
-                    .dispatch_request_full("GET", system_uri, None, None, 30, true, None)
+                    .dispatch_request_full(
+                        "GET",
+                        system_uri,
+                        None,
+                        None,
+                        self.power_request_timeout_secs(),
+                        true,
+                        None,
+                    )
                     .await;
                 if !status {
                     continue;
@@ -1048,18 +1125,37 @@ impl RFTarget for GB200RFTarget {
             "RF_PWR_ON" => "On",
             "RF_PWR_OFF" => "ForceOff",
             "RF_PWR_CYCLE" => "ForceRestart",
-            "RF_AUX_PWR_CYCLE" => "AuxPowerCycle",
+            AUX_POWER_CYCLE_COMMAND => "AuxPowerCycle",
             _ => unreachable!(),
         };
 
-        let mut target_uri: Option<String> = None;
+        let mut target_uri = if cmd_args.cmd == AUX_POWER_CYCLE_COMMAND {
+            self.bmc_access
+                .compute_power_paths
+                .aux_power_cycle_path
+                .as_deref()
+        } else {
+            self.bmc_access
+                .compute_power_paths
+                .system_reset_path
+                .as_deref()
+        }
+        .map(str::to_owned);
 
-        if cmd_args.cmd == "RF_AUX_PWR_CYCLE" {
+        if target_uri.is_none() && cmd_args.cmd == AUX_POWER_CYCLE_COMMAND {
             let chassis_list = self.bmc_access.get_chassis_members(trace).await;
             for chassis in &chassis_list {
                 let (status, response) = self
                     .bmc_access
-                    .dispatch_request_full("GET", chassis, None, None, 30, true, None)
+                    .dispatch_request_full(
+                        "GET",
+                        chassis,
+                        None,
+                        None,
+                        self.power_request_timeout_secs(),
+                        true,
+                        None,
+                    )
                     .await;
                 if !status {
                     continue;
@@ -1075,12 +1171,20 @@ impl RFTarget for GB200RFTarget {
                     break;
                 }
             }
-        } else {
-            let systems = self.bmc_access.get_systems_members(trace).await;
+        } else if target_uri.is_none() {
+            let systems = self.bmc_access.compute_power_system_members(trace).await;
             for system_uri in &systems {
                 let (status, response) = self
                     .bmc_access
-                    .dispatch_request_full("GET", system_uri, None, None, 30, true, None)
+                    .dispatch_request_full(
+                        "GET",
+                        system_uri,
+                        None,
+                        None,
+                        self.power_request_timeout_secs(),
+                        true,
+                        None,
+                    )
                     .await;
                 if !status {
                     continue;
@@ -1106,7 +1210,7 @@ impl RFTarget for GB200RFTarget {
                     &uri,
                     None,
                     Some(&body),
-                    30,
+                    self.power_request_timeout_secs(),
                     false,
                     cmd_args.quiet.then_some(&mut quiet_json),
                 )
@@ -1136,9 +1240,13 @@ impl RFTarget for GB200RFTarget {
 
     /// Perform factory reset with GH-family parameters.
     ///
-    /// GB200 inherits from GH200 → GH, which sends
-    /// `{"ResetToDefaultsType": "ResetAll"}` as the reset body.
-    async fn factory_reset(&mut self, _reset_params: Option<&Value>) -> (bool, Value) {
+    /// GB200 inherits from GH200 -> GH, which sends
+    /// `{"ResetToDefaultsType": "ResetAll"}` as the reset body unless the caller supplies a body.
+    async fn factory_reset(&mut self, reset_params: Option<&Value>) -> (bool, Value) {
+        if reset_params.is_some() {
+            return self.redfish_factory_reset(reset_params).await;
+        }
+
         let params = json!({"ResetToDefaultsType": "ResetAll"});
         let (status, response_dict) = self
             .bmc_access
@@ -1171,7 +1279,15 @@ impl RFTarget for GB200RFTarget {
         );
         let (status, response_dict) = self
             .bmc_access
-            .dispatch_request_full("POST", &reset_uri, None, Some(&params), 30, false, None)
+            .dispatch_request_full(
+                "POST",
+                &reset_uri,
+                None,
+                Some(&params),
+                self.power_request_timeout_secs(),
+                false,
+                None,
+            )
             .await;
 
         if !status {
@@ -1356,16 +1472,14 @@ impl RFTarget for GB200RFTarget {
     /// GB200-specific fungible component check.
     ///
     /// Mirrors Python `GB200RFTarget.is_fungible_component`:
-    /// - Specific SMA/NVMe fragments are always fungible
+    /// - SMA/NVMe fragments are always fungible
     /// - CPLD is fungible except HGX CPLD
     /// - "gpu" is fungible unless it also contains inforom/erot/sma/driver
     fn is_fungible_component(&self, component_name: &str) -> bool {
         let lower = component_name.to_lowercase();
 
-        for fragment in GB200_SMA_CHASSIS_SKU_FRAGMENTS {
-            if lower.contains(fragment) {
-                return true;
-            }
+        if lower.contains("sma") {
+            return true;
         }
 
         for fragment in GB200_FUNGIBLE_FRAGMENTS {
@@ -1409,7 +1523,12 @@ impl RFTarget for GB200RFTarget {
 
         for (pkg_name, pkg_dict_val) in outer {
             let pkg_is_hgx = Self::is_hgx_pkg(pkg_name);
-            if hgx_pkg_only && !pkg_is_hgx {
+            // LP30's HGX_FW_BMC_0 version comes from vHMC in the BMC package.
+            if hgx_pkg_only
+                && !pkg_is_hgx
+                && !Self::is_hgx_bmc_lookup(&norm_ap, hgx_pkg_only)
+                && !Self::is_hgx_ist_vectors_lookup(&norm_ap, hgx_pkg_only)
+            {
                 continue;
             }
             if !hgx_pkg_only && pkg_is_hgx {
@@ -1437,6 +1556,26 @@ impl RFTarget for GB200RFTarget {
                 let ap_pkg = ap_pkg_raw.replace('_', "").replace('-', "");
 
                 let cx9_pkg = if ap_pkg == "cx9" { "fwcx" } else { &ap_pkg };
+
+                if Self::lp30_vhmc_matches_hgx_bmc(&norm_ap, &ap_pkg) {
+                    return Some(version_str.to_string());
+                }
+
+                if Self::contextual_erot_matches(&norm_ap, &ap_pkg, ap_type) {
+                    return Some(version_str.to_string());
+                }
+                if ap_pkg == "erot" && (norm_ap == "erotbmc" || norm_ap == "erotsbios") {
+                    // Plain ERoT entries are allowed as fallback. Contextual
+                    // ERoT aliases only apply to their matching AP context.
+                    if !ap_type.is_empty() {
+                        continue;
+                    }
+                }
+                let is_erot_inventory =
+                    matches!(norm_ap.as_str(), "erot" | "erotbmc" | "erotsbios");
+                if is_erot_inventory && ap_pkg != "erot" {
+                    continue;
+                }
 
                 if norm_ap.contains("inforom") && !cx9_pkg.contains("inforom") {
                     continue;
@@ -1511,24 +1650,28 @@ impl RFTarget for GB200RFTarget {
         let ap_name = ap_inv_uri.rsplit('/').next().unwrap_or(ap_inv_uri);
         let ap_lower = ap_name.to_lowercase();
 
-        // SMA components – get SKU from Chassis
-        if GB200_SMA_CHASSIS_SKU_FRAGMENTS
-            .iter()
-            .any(|component| ap_lower.contains(component))
-        {
+        // These lookups are optional identifier probes. Some platforms expose
+        // firmware inventory names that do not have a matching Chassis resource,
+        // so suppress Redfish error-body printing when a probe misses.
+        // SMA components are fungible and must match by SKU. Most GB200 SMA
+        // entries expose the SKU on a matching Chassis resource; other variants
+        // can still fall through to the RelatedItem path below.
+        if ap_lower.contains("sma") {
             let ap_chassis = ap_name.replacen("FW_", "", 1);
             let uri = format!("/redfish/v1/Chassis/{}", ap_chassis);
             let (status, sma_dict) = self
                 .target_access()
-                .dispatch_request("GET", &uri, None, None)
+                .dispatch_request_full("GET", &uri, None, None, 30, true, None)
                 .await;
-            if !status {
-                return None;
+            if status {
+                if let Some(sku) = sma_dict
+                    .get("SKU")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                {
+                    return Some(sku);
+                }
             }
-            return sma_dict
-                .get("SKU")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
         }
 
         // CPLD components – get Model from Chassis
@@ -1537,7 +1680,7 @@ impl RFTarget for GB200RFTarget {
             let uri = format!("/redfish/v1/Chassis/{}", ap_chassis);
             let (status, cpld_dict) = self
                 .target_access()
-                .dispatch_request("GET", &uri, None, None)
+                .dispatch_request_full("GET", &uri, None, None, 30, true, None)
                 .await;
             if !status {
                 return None;
@@ -1556,7 +1699,7 @@ impl RFTarget for GB200RFTarget {
         if ap_lower.contains("nvme_e1s") {
             let (status, fw_inv_dict) = self
                 .target_access()
-                .dispatch_request("GET", ap_inv_uri, None, None)
+                .dispatch_request_full("GET", ap_inv_uri, None, None, 30, true, None)
                 .await;
             if !status {
                 return None;
@@ -1577,7 +1720,7 @@ impl RFTarget for GB200RFTarget {
             if let Some(ref du) = drive_uri {
                 let (status2, drive_dict) = self
                     .target_access()
-                    .dispatch_request("GET", du, None, None)
+                    .dispatch_request_full("GET", du, None, None, 30, true, None)
                     .await;
                 if status2 {
                     return drive_dict
@@ -1592,7 +1735,7 @@ impl RFTarget for GB200RFTarget {
         // Default path (GPU etc.) – follow RelatedItem → Chassis → SKU
         let (status, fw_inv_dict) = self
             .target_access()
-            .dispatch_request("GET", ap_inv_uri, None, None)
+            .dispatch_request_full("GET", ap_inv_uri, None, None, 30, true, None)
             .await;
         if !status {
             tracing::debug!(
@@ -1612,7 +1755,7 @@ impl RFTarget for GB200RFTarget {
         if let Some(uri) = chassis_uri {
             let (status2, chassis_dict) = self
                 .target_access()
-                .dispatch_request("GET", uri, None, None)
+                .dispatch_request_full("GET", uri, None, None, 30, true, None)
                 .await;
             if status2 {
                 return chassis_dict
@@ -1724,6 +1867,20 @@ mod tests {
     }
 
     #[test]
+    fn test_normalize_bmc_erot_preserves_context() {
+        let (name, hgx) = GB200RFTarget::normalize_ap_name("FW_ERoT_BMC_0");
+        assert_eq!(name, "erotbmc");
+        assert!(!hgx);
+    }
+
+    #[test]
+    fn test_normalize_sbios_erot_preserves_context() {
+        let (name, hgx) = GB200RFTarget::normalize_ap_name("FW_ERoT_SBIOS_0");
+        assert_eq!(name, "erotsbios");
+        assert!(!hgx);
+    }
+
+    #[test]
     fn test_normalize_hgx_gpu() {
         let (name, hgx) = GB200RFTarget::normalize_ap_name("HGX_FW_GPU_SXM_0");
         assert_eq!(name, "gpu");
@@ -1770,6 +1927,13 @@ mod tests {
         assert!(hgx);
     }
 
+    #[test]
+    fn test_normalize_hgx_ist_vectors() {
+        let (name, hgx) = GB200RFTarget::normalize_ap_name("HGX_IST_Vectors");
+        assert_eq!(name, "istvectors");
+        assert!(hgx);
+    }
+
     // ---------------------------------------------------------------
     // is_hgx_pkg
     // ---------------------------------------------------------------
@@ -1779,12 +1943,36 @@ mod tests {
         assert!(GB200RFTarget::is_hgx_pkg("GB200-P4972_0009-HGX"));
         assert!(GB200RFTarget::is_hgx_pkg("Something-4059-image"));
         assert!(GB200RFTarget::is_hgx_pkg("HMC_firmware"));
+        assert!(GB200RFTarget::is_hgx_pkg(
+            "vr-nvl-hmc-p4109_VRH-2608-00.01_prod.fwpkg"
+        ));
     }
 
     #[test]
     fn test_is_hgx_pkg_false() {
         assert!(!GB200RFTarget::is_hgx_pkg("BMC-update-001"));
         assert!(!GB200RFTarget::is_hgx_pkg("random_firmware"));
+        assert!(!GB200RFTarget::is_hgx_pkg(
+            "vr-nvl-bmc-p4110_VRH-2608-00.01_prod.fwpkg"
+        ));
+    }
+
+    #[test]
+    fn task_type_detection_uses_package_basename() {
+        let target = GB200RFTarget::new(BmcAccess::default_stub(), None);
+
+        assert_eq!(
+            target.get_expected_task_type_from_package(&[
+                "/tmp/HMC-staging/BMC-update-001.fwpkg".to_string()
+            ]),
+            "BMC"
+        );
+        assert_eq!(
+            target.get_expected_task_type_from_package(&[
+                "/tmp/bmc-staging/vr-nvl-hmc-p4109.fwpkg".to_string()
+            ]),
+            "HMC"
+        );
     }
 
     // ---------------------------------------------------------------
@@ -2662,6 +2850,7 @@ mod tests {
         assert!(target.is_fungible_component("FW_IO_Board_SMA_0"));
         assert!(target.is_fungible_component("FW_Bay_C_SMA_0"));
         assert!(target.is_fungible_component("FW_StorageBackplane_SMA_0"));
+        assert!(target.is_fungible_component("FW_Custom_SMA_0"));
     }
 
     #[tokio::test]
@@ -2691,6 +2880,52 @@ mod tests {
             .await;
 
         assert_eq!(identifier.as_deref(), Some("bay-c-sku"));
+    }
+
+    #[tokio::test]
+    async fn test_sma_identifier_falls_through_to_related_item_when_chassis_missing() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/redfish/v1/Chassis/Custom_SMA_0"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+                "error": "not found"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/redfish/v1/UpdateService/FirmwareInventory/FW_Custom_SMA_0",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "RelatedItem": [
+                    {"@odata.id": "/redfish/v1/Chassis/Related_Custom_SMA_0"}
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/redfish/v1/Chassis/Related_Custom_SMA_0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "SKU": "related-sma-sku"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let target = GB200RFTarget::new(
+            BmcAccess::mock_with_base_url(server.uri(), "mock-gb200"),
+            None,
+        );
+
+        let identifier = target
+            .get_identifier_from_chassis(
+                "/redfish/v1/UpdateService/FirmwareInventory/FW_Custom_SMA_0",
+            )
+            .await;
+
+        assert_eq!(identifier.as_deref(), Some("related-sma-sku"));
     }
 
     #[test]
@@ -2733,6 +2968,173 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_lp30_hmc_sma_identifiers_use_chassis_sku() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        for (chassis, sku) in [
+            ("HGX_LPU_SMA_C_0", "0x2c000002"),
+            ("HGX_LPU_SMA_M_0", "0x2b000002"),
+            ("HGX_FPGA_SMA_M_0", "0x29000002"),
+            ("HGX_FPGA_SMA_M_1", "0x2a000002"),
+        ] {
+            Mock::given(method("GET"))
+                .and(path(format!("/redfish/v1/Chassis/{chassis}")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "SKU": sku
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+
+        let target = GB200RFTarget::new(
+            BmcAccess::mock_with_base_url(server.uri(), "mock-lp30"),
+            None,
+        );
+
+        for (inventory, expected_sku) in [
+            ("HGX_FW_LPU_SMA_C_0", "0x2c000002"),
+            ("HGX_FW_LPU_SMA_M_0", "0x2b000002"),
+            ("HGX_FW_FPGA_SMA_M_0", "0x29000002"),
+            ("HGX_FW_FPGA_SMA_M_1", "0x2a000002"),
+        ] {
+            let identifier = target
+                .get_identifier_from_chassis(&format!(
+                    "/redfish/v1/UpdateService/FirmwareInventory/{inventory}"
+                ))
+                .await;
+
+            assert_eq!(identifier.as_deref(), Some(expected_sku));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_component_version_lp30_vhmc_matches_hgx_bmc() {
+        let bmc = BmcAccess::default_stub();
+        let target = GB200RFTarget::new(bmc, None);
+        let dict = json!({
+            "LPX30-P4229-BMC_0000_260709.1.5": {
+                "vHMC::,": ["vl30-2607.01.00", ""]
+            }
+        });
+        let result = target
+            .get_component_version(&dict, "HGX_FW_BMC_0", None)
+            .await;
+        assert_eq!(result, Some("vl30-2607.01.00".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_get_component_version_lp30_vhmc_does_not_get_overwritten() {
+        let bmc = BmcAccess::default_stub();
+        let target = GB200RFTarget::new(bmc, None);
+        let dict = json!({
+            "LPX30-P4229-BMC_0000_260709.1.5": {
+                "vHMC::,": ["vl30-2607.01.00", ""]
+            },
+            "ZZZ-HGX-PKG": {
+                "HMC,0x12340001": ["wrong-hgx-version", "hmc_sku"]
+            }
+        });
+        let result = target
+            .get_component_version(&dict, "HGX_FW_BMC_0", None)
+            .await;
+        assert_eq!(result, Some("vl30-2607.01.00".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_get_component_version_lp30_vhmc_does_not_match_plain_bmc() {
+        let bmc = BmcAccess::default_stub();
+        let target = GB200RFTarget::new(bmc, None);
+        let dict = json!({
+            "LPX30-P4229-BMC_0000_260709.1.5": {
+                "vHMC::,": ["vl30-2607.01.00", ""]
+            }
+        });
+        let result = target.get_component_version(&dict, "FW_BMC_0", None).await;
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_get_version_sku_lp30_hgx_sma_by_sku() {
+        let bmc = BmcAccess::default_stub();
+        let target = GB200RFTarget::new(bmc, None);
+        let dict = json!({
+            "LPX30-P4228-HMC_0000": {
+                "SMA:C-MCXN556:,0x2c000002": ["0038.02.0002.0020", "0x2c000002"],
+                "SMA:M1-MCXN556,0x29000002": ["0039.01.0303.0019", "0x29000002"]
+            }
+        });
+        let result = target.get_version_sku("0x2c000002", &dict, "hgx_fw_lpu_sma_c_0");
+        assert_eq!(result, Some("0038.02.0002.0020".to_string()));
+    }
+
+    #[test]
+    fn test_get_version_sku_lp30_hmc_lpu_sma_by_sku() {
+        let bmc = BmcAccess::default_stub();
+        let target = GB200RFTarget::new(bmc, None);
+        let dict = json!({
+            "LPX30-P4229-HMC_0000": {
+                "SMA:C-MCXN556:,0x2c000002": ["0038.02.0016.0005", "0x2c000002"],
+                "SMA:M-MCXN556,0x2b000002": ["0037.02.0015.0005", "0x2b000002"],
+                "SMA:M1-MCXN556,0x29000002": ["0039.01.0310.0031", "0x29000002"]
+            }
+        });
+
+        assert_eq!(
+            target.get_version_sku("0x2c000002", &dict, "hgx_fw_lpu_sma_c_0"),
+            Some("0038.02.0016.0005".to_string())
+        );
+        assert_eq!(
+            target.get_version_sku("0x2b000002", &dict, "hgx_fw_lpu_sma_m_0"),
+            Some("0037.02.0015.0005".to_string())
+        );
+    }
+
+    #[test]
+    fn test_get_version_sku_lp30_hmc_fpga_sma_by_sku() {
+        let bmc = BmcAccess::default_stub();
+        let target = GB200RFTarget::new(bmc, None);
+        let dict = json!({
+            "LPX30-P4229-HMC_0000": {
+                "SMA:M-MCXN556,0x2b000002": ["0037.02.0015.0005", "0x2b000002"],
+                "SMA:M1-MCXN556,0x29000002": ["0039.01.0310.0031", "0x29000002"],
+                "SMA:M2-MCXN556,0x2a000002": ["0040.01.0310.0030", "0x2a000002"]
+            }
+        });
+
+        assert_eq!(
+            target.get_version_sku("0x29000002", &dict, "hgx_fw_fpga_sma_m_0"),
+            Some("0039.01.0310.0031".to_string())
+        );
+        assert_eq!(
+            target.get_version_sku("0x2a000002", &dict, "hgx_fw_fpga_sma_m_1"),
+            Some("0040.01.0310.0030".to_string())
+        );
+    }
+
+    #[test]
+    fn test_get_version_sku_lp30_generic_sma_by_sku() {
+        let bmc = BmcAccess::default_stub();
+        let target = GB200RFTarget::new(bmc, None);
+        let dict = json!({
+            "LPX30-P4229-BMC_0000": {
+                "SMA:CX9-MCXN556:,0x12345678": ["0050.02.0001.1001", "0x12345678"]
+            }
+        });
+
+        assert_eq!(
+            target.get_version_sku("0x12345678", &dict, "fw_cx9_sma_0"),
+            Some("0050.02.0001.1001".to_string())
+        );
+        assert_eq!(
+            target.get_version_sku("0x99999999", &dict, "fw_hpm_sma_0"),
+            None
+        );
+    }
+
+    #[tokio::test]
     async fn test_get_component_version_hgx_bmc() {
         let bmc = BmcAccess::default_stub();
         let target = GB200RFTarget::new(bmc, None);
@@ -2752,6 +3154,102 @@ mod tests {
             .get_component_version(&dict, "HGX_FW_ERoT_GPU_SXM_0", None)
             .await;
         assert_eq!(result, Some("01.01.00.04".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_get_component_version_bmc_erot_prefers_contextual_entry() {
+        let bmc = BmcAccess::default_stub();
+        let target = GB200RFTarget::new(bmc, None);
+        let dict = json!({
+            "Generic-BMC-package": {
+                "ERoT,TEST-EROT-SKU": ["00.04.0066.0000_n05", "TEST-EROT-SKU"],
+                "ERoT:BMC,TEST-EROT-SKU": ["02.00.0034.0000_n05", "TEST-EROT-SKU"],
+                "ERoT:SBIOS,TEST-EROT-SKU": ["00.04.0066.0000_n05", "TEST-EROT-SKU"]
+            }
+        });
+        let result = target
+            .get_component_version(&dict, "FW_ERoT_BMC_0", None)
+            .await;
+        assert_eq!(result, Some("02.00.0034.0000_n05".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_get_component_version_sbios_erot_prefers_contextual_entry() {
+        let bmc = BmcAccess::default_stub();
+        let target = GB200RFTarget::new(bmc, None);
+        let dict = json!({
+            "Generic-BMC-package": {
+                "ERoT,TEST-EROT-SKU": ["00.04.0066.0000_n05", "TEST-EROT-SKU"],
+                "ERoT:SBIOS,TEST-EROT-SKU": ["00.04.0066.0000_n05", "TEST-EROT-SKU"],
+                "ERoT:BMC,TEST-EROT-SKU": ["02.00.0034.0000_n05", "TEST-EROT-SKU"]
+            }
+        });
+        let result = target
+            .get_component_version(&dict, "FW_ERoT_SBIOS_0", None)
+            .await;
+        assert_eq!(result, Some("00.04.0066.0000_n05".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_get_component_version_bmc_erot_falls_back_to_generic_erot() {
+        let bmc = BmcAccess::default_stub();
+        let target = GB200RFTarget::new(bmc, None);
+        let dict = json!({
+            "Generic-BMC-package": {
+                "ERoT,TEST-EROT-SKU": ["02.00.0034.0000_n05", "TEST-EROT-SKU"]
+            }
+        });
+        let result = target
+            .get_component_version(&dict, "FW_ERoT_BMC_0", None)
+            .await;
+        assert_eq!(result, Some("02.00.0034.0000_n05".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_get_component_version_bmc_erot_ignores_plain_bmc_key() {
+        let bmc = BmcAccess::default_stub();
+        let target = GB200RFTarget::new(bmc, None);
+        let dict = json!({
+            "Generic-BMC-package": {
+                "BMC,N/A": ["GB200Nvl-25.02-9", "N/A"]
+            }
+        });
+        let result = target
+            .get_component_version(&dict, "FW_ERoT_BMC_0", None)
+            .await;
+        assert_eq!(result, None);
+    }
+
+    #[tokio::test]
+    async fn test_get_component_version_bmc_erot_ignores_opposite_contextual_alias() {
+        let bmc = BmcAccess::default_stub();
+        let target = GB200RFTarget::new(bmc, None);
+        let dict = json!({
+            "Generic-BMC-package": {
+                "ERoT,TEST-EROT-SKU": ["02.00.0034.0000_n05", "TEST-EROT-SKU"],
+                "ERoT:SBIOS,TEST-EROT-SKU": ["00.04.0066.0000_n05", "TEST-EROT-SKU"]
+            }
+        });
+        let result = target
+            .get_component_version(&dict, "FW_ERoT_BMC_0", None)
+            .await;
+        assert_eq!(result, Some("02.00.0034.0000_n05".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_get_component_version_sbios_erot_ignores_opposite_contextual_alias() {
+        let bmc = BmcAccess::default_stub();
+        let target = GB200RFTarget::new(bmc, None);
+        let dict = json!({
+            "Generic-BMC-package": {
+                "ERoT,TEST-EROT-SKU": ["00.04.0066.0000_n05", "TEST-EROT-SKU"],
+                "ERoT:BMC,TEST-EROT-SKU": ["02.00.0034.0000_n05", "TEST-EROT-SKU"]
+            }
+        });
+        let result = target
+            .get_component_version(&dict, "FW_ERoT_SBIOS_0", None)
+            .await;
+        assert_eq!(result, Some("00.04.0066.0000_n05".to_string()));
     }
 
     #[tokio::test]
@@ -2786,6 +3284,21 @@ mod tests {
         let dict = make_pldm_version_dict();
         let result = target.get_component_version(&dict, "FW_BMC_0", None).await;
         assert_eq!(result, Some("26.03-1".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_get_component_version_hgx_ist_vectors_matches_ist_package() {
+        let bmc = BmcAccess::default_stub();
+        let target = GB200RFTarget::new(bmc, None);
+        let dict = json!({
+            "IST-Vectors_0000_260629.1.0_test": {
+                "IST-Vectors,": ["4_TP34_06", ""]
+            }
+        });
+        let result = target
+            .get_component_version(&dict, "HGX_IST_Vectors", None)
+            .await;
+        assert_eq!(result, Some("4_TP34_06".to_string()));
     }
 
     #[tokio::test]

@@ -110,6 +110,164 @@ fn parse_static_config_file(
 mod tests {
     use super::*;
 
+    use prost::Message;
+
+    #[test]
+    fn domain_wire_preserves_configured_state_and_independent_unhealthy_controller() {
+        let wire = [0x0a, 0x02, 0x20, 0x01, 0x18, 0x03, 0x30, 0x03];
+        let domain = nmxc_model::NmxDomainStateInfo::decode(wire.as_slice()).unwrap();
+
+        assert!(
+            check_server_header_success(domain.server_header.as_ref(), "GetDomainStateInfo")
+                .is_ok()
+        );
+
+        assert_eq!(domain.control_plane_state, 3);
+        assert_eq!(domain.nmx_controller_health, 3);
+        assert_eq!(domain.encode_to_vec(), wire);
+    }
+
+    #[test]
+    fn domain_wire_preserves_unknown_enum_values_and_unknown_return_codes() {
+        let wire = [0x18, 0x8d, 0x07, 0x30, 0x8e, 0x07];
+        let domain = nmxc_model::NmxDomainStateInfo::decode(wire.as_slice()).unwrap();
+
+        let header = nmxc_model::NmxServerHeader {
+            return_code: 503,
+            ..Default::default()
+        };
+
+        let error = check_server_header_success(Some(&header), "GetDomainStateInfo").unwrap_err();
+
+        assert_eq!(domain.control_plane_state, 909);
+        assert_eq!(domain.nmx_controller_health, 910);
+        assert_eq!(domain.encode_to_vec(), wire);
+        assert_eq!(error.nmx_return_code(), Some(503));
+    }
+
+    #[test]
+    fn membership_wire_preserves_alphanumeric_chassis_and_zero_position() {
+        let location_wire = [
+            0x12, 0x08, b'r', b'a', b'c', b'k', b'-', b'A', b'0', b'1', 0x20, 0x00, 0x32, 0x04,
+            0x10, 0x00, 0x18, 0x07,
+        ];
+
+        let mut node_wire = vec![0x0a, location_wire.len() as u8];
+
+        node_wire.extend_from_slice(&location_wire);
+        node_wire.extend_from_slice(&[0x10, 0x02, 0x18, 0x8d, 0x07]);
+
+        let mut list_wire = vec![0x1a, node_wire.len() as u8];
+
+        list_wire.extend_from_slice(&node_wire);
+
+        let switches =
+            nmxc_model::NmxGetSwitchNodeInfoListResponse::decode(list_wire.as_slice()).unwrap();
+
+        let computes =
+            nmxc_model::NmxGetComputeNodeInfoListResponse::decode(list_wire.as_slice()).unwrap();
+
+        let switch = switches.node_info_list.first().unwrap();
+        let location = switch.loc.as_ref().unwrap();
+
+        assert_eq!(location.chassis_serial_number, "rack-A01");
+        assert_eq!(location.tray_index, 0);
+        assert_eq!(location.location.as_ref().unwrap().slot_id, 0);
+        assert_eq!(location.location.as_ref().unwrap().host_id, 7);
+        assert_eq!(switch.num_switches, 2);
+        assert_eq!(switch.node_health, 909);
+        assert_eq!(computes.node_info_list.first().unwrap().num_gpus, 2);
+        assert_eq!(computes.node_info_list.first().unwrap().node_health, 909);
+    }
+
+    #[test]
+    fn topology_wire_preserves_device_health_and_port_states_at_official_tags() {
+        let port_wire = [
+            0x08, 0x02, 0x18, 0x07, 0x20, 0x0a, 0x28, 0x03, 0x30, 0x05, 0x38, 0x04, 0xf8, 0x01,
+            0x01,
+        ];
+
+        let mut switch_wire = vec![
+            0x18,
+            0x09,
+            0x28,
+            0x01,
+            0x30,
+            0x0b,
+            0x58,
+            0x02,
+            0x62,
+            port_wire.len() as u8,
+        ];
+
+        switch_wire.extend_from_slice(&port_wire);
+
+        let mut device_wire = vec![0x0a, switch_wire.len() as u8];
+
+        device_wire.extend_from_slice(&switch_wire);
+
+        let mut topology_wire = vec![0x1a, device_wire.len() as u8];
+
+        topology_wire.extend_from_slice(&device_wire);
+
+        let topology = nmxc_model::NmxFmTopologyInfo::decode(topology_wire.as_slice()).unwrap();
+
+        let device = topology
+            .device_topo_info
+            .first()
+            .unwrap()
+            .device
+            .as_ref()
+            .unwrap();
+
+        let nmxc_model::nmx_device_topo_info::Device::SwitchTopoInfo(switch) = device else {
+            panic!("expected a switch topology observation");
+        };
+
+        let port = switch.port_topo_info.first().unwrap();
+
+        assert_eq!(switch.device_uid, 9);
+        assert_eq!(switch.system_uid, 11);
+        assert_eq!(switch.device_health, 2);
+        assert_eq!(switch.num_ports, 1);
+        assert_eq!(port.port_type, 2);
+        assert_eq!(port.port_num, 7);
+        assert_eq!(port.peer_port_device_uid, 10);
+        assert_eq!(port.peer_port_num, 3);
+        assert_eq!(port.physical_state, 5);
+        assert_eq!(port.logical_state, 4);
+        assert_eq!(port.port_admin_state, 1);
+        assert_eq!(topology.encode_to_vec(), topology_wire);
+    }
+
+    #[test]
+    fn gpu_topology_wire_preserves_independent_health_and_unknown_link_states() {
+        let wire = [
+            0x1a, 0x0b, 0x12, 0x09, 0x68, 0x03, 0x72, 0x05, 0x30, 0x08, 0x38, 0x8d, 0x07,
+        ];
+
+        let topology = nmxc_model::NmxFmTopologyInfo::decode(wire.as_slice()).unwrap();
+
+        let device = topology
+            .device_topo_info
+            .first()
+            .unwrap()
+            .device
+            .as_ref()
+            .unwrap();
+
+        let nmxc_model::nmx_device_topo_info::Device::GpuTopoInfo(gpu) = device else {
+            panic!("expected a GPU topology observation");
+        };
+
+        let port = gpu.port_topo_info.first().unwrap();
+
+        assert_eq!(gpu.device_health, 3);
+        assert_eq!(port.physical_state, 8);
+        assert_eq!(port.logical_state, 909);
+        assert_eq!(topology.encode_to_vec(), wire);
+    }
+
     fn success_header() -> nmxc_model::NmxServerHeader {
         nmxc_model::NmxServerHeader {
             domain_uuid: String::new(),

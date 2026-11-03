@@ -21,6 +21,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use futures::TryStreamExt as _;
 use librms::protos::rack_manager as rm;
 use librms::protos::rack_manager::rack_manager_server::{
     RackManager as RackManagerTrait, RackManagerServer,
@@ -32,29 +33,34 @@ use librms::protos::rack_manager_v2::rack_manager_v2_server::{
 use tokio::io::AsyncWriteExt;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 use tonic::service::{LayerExt, Routes};
+use tonic::transport::Server;
 use tonic::transport::server::TcpIncoming;
-use tonic::transport::{Identity, Server, ServerTlsConfig};
 use tonic::{Request, Status};
 
-use crate::api::grpc::artifact_download::reap_firmware_temp_files;
+use crate::api::grpc::artifact_download::{ArtifactDownloadPolicy, reap_firmware_temp_files};
+use crate::api::grpc::mtls_reload::{self, TlsIncoming};
 use crate::api::grpc::node_type_resolver::{
     NodeTypeResolutionError, inventory_profile_from_descriptor,
     normalize_component_filter_selectors, normalize_firmware_target_selectors, normalize_node_info,
     normalize_node_set, normalize_node_type_selector,
 };
 use crate::api::grpc::scaleupfabricmanager_handlers::normalize_v2_node_set;
-use crate::config::ExpectedInventoryCatalog;
-use crate::domain::node::ExpectedInventoryPolicy;
-use crate::domain::rack::EndpointConfig;
+use crate::config::fabric_layout::FabricLayoutCatalog;
+use crate::config::hardware_profiles::HardwareProfileCatalog;
+use crate::config::{ExpectedInventoryCatalog, RecoveryProfiles, WorkflowTimings};
+use crate::domain::node::{ExpectedInventoryPolicy, RecoveryProfile};
 use crate::libnmxc::TlsMaterialStore;
 use crate::nodes::NodeInstance;
 use crate::orchestrator::job_tracker::JobTracker;
 use crate::orchestrator::rack_manager::RackManager;
 use crate::persistence::Backends;
 use crate::racks::ManagedRack;
-use crate::transport::ssh::{SFTP_UPLOAD_BUFFER_SIZE_BYTES, SftpUploadOptions};
+use crate::transport::ssh::{SSH_UPLOAD_BUFFER_SIZE_BYTES, SshUploadOptions};
 use crate::utilities::error::{Result, RmsError};
+
+mod shutdown;
 
 /// The version of the server, derived from the vergen git describe output. Falls back to "unknown".
 const SERVER_VERSION: &str = match option_env!("VERGEN_GIT_DESCRIBE") {
@@ -67,6 +73,7 @@ const SERVER_VERSION: &str = match option_env!("VERGEN_GIT_DESCRIBE") {
 /// Bounds shutdown so a job wedged in non-cancellation-aware work cannot block
 /// the process forever.
 const SHUTDOWN_AWAIT_TERMINAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+const FORCED_REQUEST_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 fn normalize_request<T>(
     mut req: Request<T>,
@@ -311,12 +318,18 @@ impl SwitchTlsRoots {
 }
 
 /// TLS material that has already been read from disk and parsed, ready to hand
-/// to the tonic server. Produced by [`TlsConfig::resolve`]; the parsed bytes
-/// are held in memory so the actual bind never re-reads the files.
+/// to the gRPC listener. Produced by [`TlsConfig::resolve`]; the parsed bytes
+/// are held in memory so the initial bind never re-reads the files.
+///
+/// `cert_path`/`key_path` are retained (not just their parsed bytes) so
+/// [`crate::api::grpc::mtls_reload::spawn_cert_reload_task`] can re-read them
+/// periodically and pick up a cert-manager renewal without a restart.
 pub struct TlsConfig {
-    config: ServerTlsConfig,
     cert_pem: Vec<u8>,
     key_pem: Vec<u8>,
+    ca_pem: Vec<u8>,
+    cert_path: PathBuf,
+    key_path: PathBuf,
 }
 
 impl TlsConfig {
@@ -374,15 +387,14 @@ impl TlsConfig {
         let ca = ca.unwrap();
         let cert_pem = read(cert)?;
         let key_pem = read(key)?;
-        let identity = Identity::from_pem(&cert_pem, &key_pem);
-        let config = ServerTlsConfig::new()
-            .identity(identity)
-            .client_ca_root(tonic::transport::Certificate::from_pem(read(ca)?));
+        let ca_pem = read(ca)?;
 
         Ok(Some(Self {
-            config,
             cert_pem,
             key_pem,
+            ca_pem,
+            cert_path: PathBuf::from(cert),
+            key_path: PathBuf::from(key),
         }))
     }
 
@@ -967,7 +979,7 @@ mod tests {
         })
         .expect("metrics init");
 
-        let invalid_options = SftpUploadOptions {
+        let invalid_options = SshUploadOptions {
             overall_timeout: Duration::from_secs(30),
             step_timeout: Duration::from_secs(31),
         };
@@ -988,6 +1000,104 @@ mod tests {
         );
 
         assert!(err.message.contains("step timeout"));
+    }
+
+    #[tokio::test]
+    async fn start_rejects_invalid_workflow_timings() {
+        use crate::config::FirmwareTaskPollOptions;
+        use crate::metrics::{self, MetricsInfo};
+
+        // Port 0 is an OS-assigned port: this test only asserts that `start`
+        // fails closed, so it never connects and never reads the port back.
+        let port = 0;
+
+        let _metrics_registry = metrics::init(&MetricsInfo {
+            grpc_port: port,
+            firmware_dir: "firmware".to_string(),
+            persistence_type: "memory".to_string(),
+            tls_mode: TlsMode::Insecure,
+        })
+        .expect("metrics init");
+
+        let invalid_timings = WorkflowTimings {
+            firmware_task_poll: FirmwareTaskPollOptions {
+                timeout: Duration::from_secs(30),
+                interval: Duration::from_secs(31),
+                ..FirmwareTaskPollOptions::default()
+            },
+            ..WorkflowTimings::default()
+        };
+
+        let mut server = GrpcServer::new(
+            port,
+            Arc::new(RackManager::new()),
+            Arc::new(JobTracker::new()),
+            Backends::memory(),
+        )
+        .with_workflow_timings(invalid_timings);
+
+        let err = server.start().await.unwrap_err();
+
+        assert_eq!(
+            err.code,
+            crate::utilities::error::ErrorCode::InvalidArgument
+        );
+        assert!(err.message.contains("firmware task poll interval"));
+    }
+
+    #[tokio::test]
+    async fn failed_firmware_startup_does_not_spawn_cert_reload() {
+        use crate::metrics::{self, MetricsInfo};
+
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let generated =
+            rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("generate cert");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cert_path = dir.path().join("cert.pem");
+        let key_path = dir.path().join("key.pem");
+        let ca_path = dir.path().join("ca.pem");
+        std::fs::write(&cert_path, generated.cert.pem()).unwrap();
+        std::fs::write(&key_path, generated.key_pair.serialize_pem()).unwrap();
+        std::fs::write(&ca_path, generated.cert.pem()).unwrap();
+        let tls = TlsConfig::resolve(
+            cert_path.to_str(),
+            key_path.to_str(),
+            ca_path.to_str(),
+            None,
+        )
+        .unwrap()
+        .expect("fixture provides TLS material");
+
+        // A file where a directory is required makes firmware startup fail
+        // after the TLS config has already been built.
+        let blocker = dir.path().join("not-a-directory");
+        std::fs::write(&blocker, b"x").unwrap();
+
+        let _metrics_registry = metrics::init(&MetricsInfo {
+            grpc_port: 0,
+            firmware_dir: "firmware".to_string(),
+            persistence_type: "memory".to_string(),
+            tls_mode: TlsMode::Mtls,
+        })
+        .expect("metrics init");
+
+        let mut server = GrpcServer::new(
+            0,
+            Arc::new(RackManager::new()),
+            Arc::new(JobTracker::new()),
+            Backends::memory(),
+        )
+        .with_tls(tls)
+        .with_firmware_dir(blocker.join("firmware"));
+
+        let err = server.start().await.unwrap_err();
+        assert!(
+            err.message.contains("firmware directory"),
+            "expected firmware startup to fail, got: {}",
+            err.message
+        );
+        assert!(server.router_task.is_none());
+        assert!(server.cert_reload_task.is_none());
     }
 
     #[tokio::test]
@@ -1097,11 +1207,229 @@ mod tests {
             firmware_download_cancellations: Arc::new(Mutex::new(HashMap::new())),
             backends: Backends::memory(),
             firmware_dir: PathBuf::from("firmware"),
+            artifact_require_sha256: false,
+            insecure_bmc: true,
+            artifact_download_policy: ArtifactDownloadPolicy::default(),
             switch_tls_roots,
-            sftp_upload_options: SftpUploadOptions::default(),
+            sftp_upload_options: SshUploadOptions::default(),
             nmx_gateway_id: crate::libnmxc::DEFAULT_NMX_C_GATEWAY_ID.to_owned(),
             expected_inventory_catalog: ExpectedInventoryCatalog::default(),
+            workflow_timings: WorkflowTimings::default(),
+            recovery_profiles: RecoveryProfiles::default(),
+            fabric_operations: Arc::new(Default::default()),
+            fabric_layout_catalog: std::sync::Arc::new(
+                crate::config::fabric_layout::FabricLayoutCatalog::default(),
+            ),
+            hardware_profiles: Arc::new(HardwareProfileCatalog::built_in().unwrap()),
         }
+    }
+
+    #[test]
+    fn fabric_catalog_builder_and_service_clones_keep_the_validated_catalog() {
+        let catalog = crate::config::fabric_layout::test_support::parse_document(
+            &crate::config::fabric_layout::test_support::document(),
+        )
+        .unwrap();
+
+        let identity = catalog.identity().to_owned();
+        let service = test_service(SwitchTlsRoots::default());
+
+        let server = GrpcServer::new(
+            0,
+            Arc::clone(&service.rack_manager),
+            Arc::clone(&service.job_tracker),
+            service.backends.clone(),
+        );
+
+        assert!(server.fabric_layout_catalog.identity().is_empty());
+
+        let server = server.with_fabric_layout_catalog(catalog);
+        let mut service = service;
+        service.fabric_layout_catalog = Arc::clone(&server.fabric_layout_catalog);
+
+        let cloned = service.clone();
+
+        assert_eq!(server.fabric_layout_catalog.identity(), identity);
+
+        assert!(Arc::ptr_eq(
+            &server.fabric_layout_catalog,
+            &cloned.fabric_layout_catalog,
+        ));
+    }
+
+    #[tokio::test]
+    async fn certificate_readiness_does_not_fallback_for_connection_errors() {
+        let root = tempfile::tempdir().unwrap();
+        write_nvue_test_material(root.path(), "fabric-a").await;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        drop(listener);
+
+        let client = nvue_client::Client::new(nvue_client::ClientConfig {
+            endpoint: nvue_client::ClientEndpoint::https("switch.example.com", "127.0.0.1", port),
+            credentials: nvue_client::ClientCredentials::new("admin", "password"),
+            dangerously_accept_invalid_certs: false,
+        })
+        .unwrap();
+
+        let service = test_service(SwitchTlsRoots {
+            client_tls: Some(TlsMaterialStore::new(root.path())),
+            default_domain: Some("fabric-a".into()),
+            ..SwitchTlsRoots::default()
+        });
+
+        service
+            .ensure_nvue_client_for_certificate(Some(&client), None, None)
+            .await
+            .expect_err("a connection failure must not allow unverified bootstrap");
+
+        // A true return means the readiness path did not already switch to
+        // unverified HTTPS.
+        assert!(client.configure_insecure_https().await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn certificate_readiness_keeps_client_identity_when_server_certificate_expired()
+    -> anyhow::Result<()> {
+        use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair, KeyUsagePurpose};
+        use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio_rustls::TlsAcceptor;
+
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+        let mut ca_params = CertificateParams::new(Vec::<String>::new())?;
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+
+        let ca_key = KeyPair::generate()?;
+        let ca_cert = ca_params.self_signed(&ca_key)?;
+        let client_key = KeyPair::generate()?;
+
+        let client_cert = CertificateParams::new(vec!["rms-client".to_owned()])?.signed_by(
+            &client_key,
+            &ca_cert,
+            &ca_key,
+        )?;
+
+        let server_key = KeyPair::generate()?;
+        let mut server_params = CertificateParams::new(vec!["127.0.0.1".to_owned()])?;
+        server_params.not_before = rcgen::date_time_ymd(2020, 1, 1);
+        server_params.not_after = rcgen::date_time_ymd(2021, 1, 1);
+
+        let server_cert = server_params.signed_by(&server_key, &ca_cert, &ca_key)?;
+        let mut client_roots = rustls::RootCertStore::empty();
+
+        client_roots.add(CertificateDer::from(ca_cert.der().to_vec()))?;
+
+        let verifier =
+            rustls::server::WebPkiClientVerifier::builder(Arc::new(client_roots)).build()?;
+
+        let server_tls = rustls::ServerConfig::builder()
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(
+                vec![CertificateDer::from(server_cert.der().to_vec())],
+                PrivatePkcs8KeyDer::from(server_key.serialize_der()).into(),
+            )?;
+
+        let acceptor = TlsAcceptor::from(Arc::new(server_tls));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let port = listener.local_addr()?.port();
+
+        let server_task = tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                if let Ok(mut stream) = acceptor.accept(socket).await {
+                    let mut request = [0; 4096];
+
+                    if stream.read(&mut request).await.is_ok() {
+                        let _ = stream
+                            .write_all(
+                                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                            )
+                            .await;
+                    }
+                }
+            }
+        });
+
+        let root = tempfile::tempdir()?;
+        let domain_dir = root.path().join("fabric-a");
+
+        tokio::fs::create_dir(&domain_dir).await?;
+        tokio::fs::write(domain_dir.join("ca.pem"), ca_cert.pem()).await?;
+        tokio::fs::write(domain_dir.join("client.pem"), client_cert.pem()).await?;
+        tokio::fs::write(domain_dir.join("client.key"), client_key.serialize_pem()).await?;
+
+        let client = nvue_client::Client::new(nvue_client::ClientConfig {
+            endpoint: nvue_client::ClientEndpoint::https("127.0.0.1", "127.0.0.1", port),
+            credentials: nvue_client::ClientCredentials::new("admin", "password"),
+            dangerously_accept_invalid_certs: false,
+        })?;
+
+        let verified_error = client
+            .get_json("/nvue_v1/system", Duration::from_secs(1))
+            .await
+            .expect_err("the expired server certificate must fail verified HTTPS");
+
+        let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(&verified_error);
+        let mut expired_certificate = false;
+
+        while let Some(error) = cause {
+            if matches!(
+                error.downcast_ref::<rustls::Error>(),
+                Some(rustls::Error::InvalidCertificate(
+                    rustls::CertificateError::Expired
+                        | rustls::CertificateError::ExpiredContext { .. }
+                ))
+            ) {
+                expired_certificate = true;
+                break;
+            }
+
+            cause = error
+                .downcast_ref::<std::io::Error>()
+                .and_then(std::io::Error::get_ref)
+                .map(|source| source as &(dyn std::error::Error + 'static))
+                .or_else(|| error.source());
+        }
+
+        assert!(
+            expired_certificate,
+            "verified TLS failed for a reason other than certificate expiry: {verified_error:?}"
+        );
+
+        let service = test_service(SwitchTlsRoots {
+            client_tls: Some(TlsMaterialStore::new(root.path())),
+            default_domain: Some("fabric-a".into()),
+            ..SwitchTlsRoots::default()
+        });
+
+        service
+            .ensure_nvue_client_for_certificate(Some(&client), None, None)
+            .await?;
+
+        assert!(client.uses_client_tls());
+        assert!(!client.uses_verified_client_tls());
+
+        assert!(
+            client
+                .get_json("/nvue_v1/system", Duration::from_secs(1))
+                .await
+                .is_ok()
+        );
+
+        service
+            .initialize_nvue_client_with_options(Some(&client), None, None, false)
+            .await
+            .expect_err("normal NVUE initialization must not retain unverified bootstrap mTLS");
+
+        assert!(!client.uses_verified_client_tls());
+
+        server_task.abort();
+
+        Ok(())
     }
 
     #[tokio::test]
@@ -1208,13 +1536,32 @@ pub struct GrpcServer {
     firmware_download_cancellations: Arc<Mutex<HashMap<String, CancellationToken>>>,
     backends: Backends,
     firmware_dir: PathBuf,
+    artifact_require_sha256: bool,
+    insecure_bmc: bool,
+    artifact_download_policy: ArtifactDownloadPolicy,
     tls: Option<TlsConfig>,
     listener_mode: ApiListenerMode,
     switch_tls_roots: SwitchTlsRoots,
-    sftp_upload_options: SftpUploadOptions,
+    sftp_upload_options: SshUploadOptions,
     nmx_gateway_id: String,
     expected_inventory_catalog: ExpectedInventoryCatalog,
+    workflow_timings: WorkflowTimings,
+    recovery_profiles: RecoveryProfiles,
+    hardware_profiles: Arc<HardwareProfileCatalog>,
+    fabric_operations: Arc<crate::orchestrator::fabric_operation::FabricOperationRegistry>,
+    fabric_layout_catalog: Arc<FabricLayoutCatalog>,
     shutdown_tx: Option<watch::Sender<()>>,
+    router_task: Option<tokio::task::JoinHandle<()>>,
+    force_connection_shutdown: CancellationToken,
+    requests: TaskTracker,
+    /// Background task that periodically re-reads the mTLS cert/key from disk
+    /// and swaps the identity presented on new handshakes; `Some` only while
+    /// [`ApiListenerMode::Secure`] is running. See [`mtls_reload`].
+    cert_reload_task: Option<tokio::task::JoinHandle<()>>,
+    /// Poll period for [`cert_reload_task`]. Defaults to
+    /// [`mtls_reload::CERT_RELOAD_INTERVAL`]; startup overrides it from
+    /// `[tls] cert_reload_interval_seconds`.
+    cert_reload_interval: std::time::Duration,
 }
 
 impl GrpcServer {
@@ -1231,13 +1578,31 @@ impl GrpcServer {
             firmware_download_cancellations: Arc::new(Mutex::new(HashMap::new())),
             backends,
             firmware_dir: PathBuf::from("firmware"),
+            artifact_require_sha256: false,
+            insecure_bmc: true,
+            artifact_download_policy: ArtifactDownloadPolicy::default(),
             tls: None,
             listener_mode: ApiListenerMode::Secure,
             switch_tls_roots: SwitchTlsRoots::default(),
-            sftp_upload_options: SftpUploadOptions::default(),
+            sftp_upload_options: SshUploadOptions::default(),
             nmx_gateway_id: crate::libnmxc::DEFAULT_NMX_C_GATEWAY_ID.to_owned(),
             expected_inventory_catalog: ExpectedInventoryCatalog::default(),
+            workflow_timings: WorkflowTimings::default(),
+            recovery_profiles: RecoveryProfiles::default(),
+            fabric_operations: Arc::new(Default::default()),
+            fabric_layout_catalog: std::sync::Arc::new(
+                crate::config::fabric_layout::FabricLayoutCatalog::default(),
+            ),
+            hardware_profiles: Arc::new(
+                HardwareProfileCatalog::built_in()
+                    .expect("RMS built-in hardware profiles must be valid"),
+            ),
             shutdown_tx: None,
+            router_task: None,
+            force_connection_shutdown: CancellationToken::new(),
+            requests: TaskTracker::new(),
+            cert_reload_task: None,
+            cert_reload_interval: mtls_reload::CERT_RELOAD_INTERVAL,
         }
     }
 
@@ -1246,8 +1611,34 @@ impl GrpcServer {
         self
     }
 
+    /// Configures whether HTTP(S) firmware artifacts require SHA-256 digests.
+    pub fn with_artifact_require_sha256(mut self, artifact_require_sha256: bool) -> Self {
+        self.artifact_require_sha256 = artifact_require_sha256;
+        self
+    }
+
+    pub fn with_insecure_bmc(mut self, insecure_bmc: bool) -> Self {
+        self.insecure_bmc = insecure_bmc;
+        self
+    }
+
+    pub fn with_artifact_download_policy(
+        mut self,
+        artifact_download_policy: ArtifactDownloadPolicy,
+    ) -> Self {
+        self.artifact_download_policy = artifact_download_policy;
+        self
+    }
+
     pub fn with_tls(mut self, tls: TlsConfig) -> Self {
         self.tls = Some(tls);
+        self
+    }
+
+    /// Sets how often a secure listener re-reads its certificate and key.
+    /// Zero is rejected when the server starts.
+    pub fn with_cert_reload_interval(mut self, interval: std::time::Duration) -> Self {
+        self.cert_reload_interval = interval;
         self
     }
 
@@ -1265,7 +1656,7 @@ impl GrpcServer {
         self
     }
 
-    pub fn with_sftp_upload_options(mut self, sftp_upload_options: SftpUploadOptions) -> Self {
+    pub fn with_sftp_upload_options(mut self, sftp_upload_options: SshUploadOptions) -> Self {
         self.sftp_upload_options = sftp_upload_options;
         self
     }
@@ -1286,6 +1677,30 @@ impl GrpcServer {
         self
     }
 
+    /// Set the workflow-loop timing bounds resolved from `[workflows]`.
+    pub fn with_workflow_timings(mut self, workflow_timings: WorkflowTimings) -> Self {
+        self.workflow_timings = workflow_timings;
+        self
+    }
+
+    /// Set the deployment-defined recovery profiles loaded at startup.
+    pub fn with_recovery_profiles(mut self, recovery_profiles: RecoveryProfiles) -> Self {
+        self.recovery_profiles = recovery_profiles;
+        self
+    }
+
+    /// Set the immutable hardware update profile catalog used for this server's lifetime.
+    pub fn with_hardware_profiles(mut self, hardware_profiles: HardwareProfileCatalog) -> Self {
+        self.hardware_profiles = Arc::new(hardware_profiles);
+        self
+    }
+
+    /// Shares the validated deployment catalog with requests and background jobs.
+    pub fn with_fabric_layout_catalog(mut self, catalog: FabricLayoutCatalog) -> Self {
+        self.fabric_layout_catalog = Arc::new(catalog);
+        self
+    }
+
     pub async fn start(&mut self) -> Result<()> {
         let (incoming, _) = self.bind_incoming_on("0.0.0.0", self.port)?;
         self.start_with_bound_incoming(incoming).await
@@ -1301,23 +1716,52 @@ impl GrpcServer {
     }
 
     pub async fn start_with_bound_incoming(&mut self, incoming: TcpIncoming) -> Result<()> {
+        if self.router_task.is_some() {
+            return Err(RmsError::failed_precondition(
+                "gRPC server is already running",
+            ));
+        }
         let addr = incoming
             .local_addr()
             .map_err(|e| RmsError::internal(format!("failed to inspect bound address: {e}")))?;
         self.port = addr.port();
 
         self.sftp_upload_options.validate()?;
+        self.workflow_timings.validate()?;
 
-        // Build the server (and apply TLS if configured) before spawning so any
-        // error is reported via this `Result` rather than swallowed inside the
-        // background task. Borrow (don't take) `self.tls` and clone the parsed
-        // config so a repeated `start()` cannot silently fall back to plaintext.
-        let mut builder = Server::builder().accept_http1(true);
-        if let Some(tls) = &self.tls {
+        // Build the server (and the mTLS acceptor, if configured) before
+        // spawning so any error is reported via this `Result` rather than
+        // swallowed inside the background task. Borrow (don't take) `self.tls`
+        // so a repeated `start()` cannot silently fall back to plaintext.
+        //
+        // TLS is terminated ourselves (via `mtls_reload::TlsIncoming`) rather
+        // than through `Server::tls_config`: tonic reads the identity once
+        // when `tls_config` is called and has no reload hook, so a
+        // cert-manager renewal would otherwise never reach the running
+        // process without a restart. The resulting stream of already-TLS-
+        // terminated connections is handed to `serve_with_incoming_shutdown`
+        // exactly as a plain TCP stream would be; tonic does not care which
+        // produced it.
+        let builder = Server::builder().accept_http1(true);
+        // Held until firmware startup succeeds. Spawning the reload task
+        // earlier would leave it running when this function returns an error,
+        // and a retry would replace the handle without aborting the first task.
+        let mut pending_cert_reload = None;
+        let tls_acceptor = if let Some(tls) = &self.tls {
             tracing::info!(port = self.port, mode = "mTLS", "gRPC server starting");
-            builder = builder
-                .tls_config(tls.config.clone())
-                .map_err(|e| RmsError::internal(format!("failed to apply TLS config: {e}")))?;
+            let (server_config, resolver) = mtls_reload::build_reloadable_server_config(
+                &tls.cert_pem,
+                &tls.key_pem,
+                &tls.ca_pem,
+            )
+            .map_err(|e| RmsError::internal(format!("failed to build TLS config: {e}")))?;
+            if self.cert_reload_interval.is_zero() {
+                return Err(RmsError::failed_precondition(
+                    "tls.cert_reload_interval_seconds must be greater than zero",
+                ));
+            }
+            pending_cert_reload = Some((tls.cert_path.clone(), tls.key_path.clone(), resolver));
+            Some(tokio_rustls::TlsAcceptor::from(server_config))
         } else if self.listener_mode == ApiListenerMode::Insecure {
             tracing::warn!(
                 port = self.port,
@@ -1326,13 +1770,14 @@ impl GrpcServer {
                  in plaintext. Development/testing only; never use insecure = true in production. \
                  Provide tls.cert, tls.key, and tls.ca for mTLS."
             );
+            None
         } else {
             return Err(RmsError::internal(
                 "refusing to start gRPC server without mTLS. Set tls.cert, tls.key, \
                  and tls.ca in the configuration file. For local development only: \
                  insecure = true",
             ));
-        }
+        };
         if let Some(store) = &self.switch_tls_roots.switch_cert {
             tracing::info!(
                 switch_cert_root = %store.base_dir().display(),
@@ -1359,7 +1804,7 @@ impl GrpcServer {
         tracing::info!(
             upload_timeout_secs = self.sftp_upload_options.overall_timeout.as_secs(),
             step_timeout_secs = self.sftp_upload_options.step_timeout.as_secs(),
-            buffer_size_bytes = SFTP_UPLOAD_BUFFER_SIZE_BYTES,
+            buffer_size_bytes = SSH_UPLOAD_BUFFER_SIZE_BYTES,
             "SFTP upload options configured"
         );
 
@@ -1379,16 +1824,29 @@ impl GrpcServer {
             firmware_download_cancellations: self.firmware_download_cancellations.clone(),
             backends: self.backends.clone(),
             firmware_dir: self.firmware_dir.clone(),
+            artifact_require_sha256: self.artifact_require_sha256,
+            insecure_bmc: self.insecure_bmc,
+            artifact_download_policy: self.artifact_download_policy.clone(),
             switch_tls_roots: self.switch_tls_roots.clone(),
             sftp_upload_options: self.sftp_upload_options,
             nmx_gateway_id: self.nmx_gateway_id.clone(),
             expected_inventory_catalog: self.expected_inventory_catalog.clone(),
+            workflow_timings: self.workflow_timings,
+            recovery_profiles: self.recovery_profiles.clone(),
+            fabric_operations: Arc::clone(&self.fabric_operations),
+            fabric_layout_catalog: Arc::clone(&self.fabric_layout_catalog),
+            hardware_profiles: Arc::clone(&self.hardware_profiles),
         };
 
         let (shutdown_tx, shutdown_rx) = watch::channel(());
         self.shutdown_tx = Some(shutdown_tx);
 
-        let log_layer = crate::logging::api_logs::LogLayer::default();
+        self.force_connection_shutdown = CancellationToken::new();
+        self.requests = TaskTracker::new();
+        let log_layer = crate::logging::api_logs::LogLayer::default().with_request_tracker(
+            self.requests.clone(),
+            self.force_connection_shutdown.clone(),
+        );
         let metric_layer = crate::metrics::grpc_layer();
 
         let routes =
@@ -1397,18 +1855,44 @@ impl GrpcServer {
                 .into_axum_router();
 
         let router = builder.layer(log_layer).add_routes(Routes::from(routes));
+        let force_shutdown = self.force_connection_shutdown.clone();
 
-        tokio::spawn(async move {
-            if let Err(e) = router
-                .serve_with_incoming_shutdown(incoming, async {
-                    let mut rx = shutdown_rx;
-                    let _ = rx.changed().await;
-                })
-                .await
-            {
+        if let Some((cert_path, key_path, resolver)) = pending_cert_reload {
+            self.cert_reload_task = Some(mtls_reload::spawn_cert_reload_task(
+                cert_path,
+                key_path,
+                resolver,
+                self.cert_reload_interval,
+            ));
+        }
+
+        self.router_task = Some(tokio::spawn(async move {
+            let result = match tls_acceptor {
+                Some(acceptor) => {
+                    let tls_incoming = TlsIncoming::new(incoming, acceptor, force_shutdown.clone())
+                        .map_ok(move |io| shutdown::ShutdownIo::new(io, force_shutdown.clone()));
+                    router
+                        .serve_with_incoming_shutdown(tls_incoming, async {
+                            let mut rx = shutdown_rx;
+                            let _ = rx.changed().await;
+                        })
+                        .await
+                }
+                None => {
+                    let incoming = incoming
+                        .map_ok(move |io| shutdown::ShutdownIo::new(io, force_shutdown.clone()));
+                    router
+                        .serve_with_incoming_shutdown(incoming, async {
+                            let mut rx = shutdown_rx;
+                            let _ = rx.changed().await;
+                        })
+                        .await
+                }
+            };
+            if let Err(e) = result {
                 tracing::error!(error = %e, "gRPC server error");
             }
-        });
+        }));
 
         Ok(())
     }
@@ -1450,6 +1934,10 @@ impl GrpcServer {
             );
         }
         self.signal_router_shutdown();
+        self.force_connection_shutdown.cancel();
+        if let Some(router_task) = self.router_task.take() {
+            router_task.abort();
+        }
     }
 
     /// Graceful shutdown: stops accepting new RPCs, refuses new job creation
@@ -1458,6 +1946,7 @@ impl GrpcServer {
     /// `SHUTDOWN_AWAIT_TERMINAL_TIMEOUT`) for them to reach a terminal state
     /// before returning.
     pub async fn stop_and_await_terminal(&mut self) {
+        let shutdown_deadline = tokio::time::Instant::now() + SHUTDOWN_AWAIT_TERMINAL_TIMEOUT;
         // Stop accepting new RPCs first so no fresh work races the wait.
         self.signal_router_shutdown();
 
@@ -1465,7 +1954,9 @@ impl GrpcServer {
         // terminal state
         let signalled = self
             .job_tracker
-            .shutdown_and_await_terminal(SHUTDOWN_AWAIT_TERMINAL_TIMEOUT)
+            .shutdown_and_await_terminal(
+                SHUTDOWN_AWAIT_TERMINAL_TIMEOUT - FORCED_REQUEST_DRAIN_TIMEOUT,
+            )
             .await;
         if signalled > 0 {
             tracing::info!(
@@ -1474,15 +1965,38 @@ impl GrpcServer {
                  terminal state (see warnings for any that did not finish in time)"
             );
         }
+
+        let remaining = shutdown_deadline.saturating_duration_since(tokio::time::Instant::now());
+        self.await_router_shutdown(remaining).await;
     }
 
-    /// Signals the running tonic router to stop serving. Idempotent: the
-    /// `shutdown_tx` is taken on first use, so repeated calls are no-ops.
+    /// Signals the running tonic router to stop serving and stops the mTLS
+    /// cert reload task, if either was started. Idempotent: `shutdown_tx` and
+    /// `cert_reload_task` are taken on first use, so repeated calls are no-ops.
     fn signal_router_shutdown(&mut self) {
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(());
             tracing::info!("gRPC server shutdown signal sent");
         }
+        if let Some(task) = self.cert_reload_task.take() {
+            task.abort();
+        }
+    }
+
+    async fn await_router_shutdown(&mut self, timeout: std::time::Duration) {
+        let Some(router_task) = self.router_task.take() else {
+            return;
+        };
+
+        let forced_timeout = timeout.min(FORCED_REQUEST_DRAIN_TIMEOUT);
+        shutdown::drain_router(
+            router_task,
+            &self.requests,
+            &self.force_connection_shutdown,
+            timeout.saturating_sub(forced_timeout),
+            forced_timeout,
+        )
+        .await;
     }
 }
 
@@ -1563,10 +2077,24 @@ pub struct RackManagerServiceImpl {
     pub firmware_download_cancellations: Arc<Mutex<HashMap<String, CancellationToken>>>,
     pub backends: Backends,
     pub firmware_dir: PathBuf,
+    pub artifact_require_sha256: bool,
+    pub insecure_bmc: bool,
+    pub artifact_download_policy: ArtifactDownloadPolicy,
     pub switch_tls_roots: SwitchTlsRoots,
-    pub sftp_upload_options: SftpUploadOptions,
+    pub sftp_upload_options: SshUploadOptions,
     pub nmx_gateway_id: String,
     pub expected_inventory_catalog: ExpectedInventoryCatalog,
+    pub workflow_timings: WorkflowTimings,
+    pub recovery_profiles: RecoveryProfiles,
+    /// Immutable startup catalog shared by all requests and background jobs.
+    pub hardware_profiles: Arc<HardwareProfileCatalog>,
+
+    /// Process-local ownership shared by all switch mutation handlers.
+    pub(crate) fabric_operations:
+        Arc<crate::orchestrator::fabric_operation::FabricOperationRegistry>,
+
+    /// Immutable deployment rules shared by service clones until RMS restarts.
+    pub fabric_layout_catalog: Arc<FabricLayoutCatalog>,
 }
 
 fn can_keep_current_nvue_transport(strict: bool, has_active_tls: bool) -> bool {
@@ -1585,24 +2113,26 @@ impl RackManagerServiceImpl {
             .map_err(|error| RmsError::invalid_argument(error.to_string()))
     }
 
-    pub(crate) fn bmc_endpoint_with_rms_tls_policy(
+    /// The recovery profile a node binds to, by the same `inventory_profile`
+    /// descriptor attribute the expected-inventory catalog uses. Validates its
+    /// own input: a blank name is an error, whatever other resolvers did.
+    /// `Ok(None)` when the descriptor names no profile or the profile has no
+    /// recovery table: recovery detection stays off for that node. The table
+    /// is returned as written; the node type parses it in `from_config`.
+    pub(crate) fn recovery_profile_for_node(
         &self,
-        mut endpoint: EndpointConfig,
-    ) -> EndpointConfig {
-        // Production BMC Redfish access currently uses HTTPS with Basic auth,
-        // but the BMC certificates are not issued from a CA that RMS can
-        // validate. Keep this as an RMS-owned BMC-only policy so clients cannot
-        // weaken TLS verification per request, and so switch host/NVUE paths do
-        // not inherit this behavior.
-        endpoint.dangerously_accept_invalid_certs = true;
-        endpoint
-    }
-
-    pub(crate) fn optional_bmc_endpoint_with_rms_tls_policy(
-        &self,
-        endpoint: Option<EndpointConfig>,
-    ) -> Option<EndpointConfig> {
-        endpoint.map(|endpoint| self.bmc_endpoint_with_rms_tls_policy(endpoint))
+        node_info: &rm::NodeInfo,
+    ) -> Result<Option<RecoveryProfile>> {
+        let Some(profile) = inventory_profile_from_descriptor(node_info.node_descriptor.as_ref())
+        else {
+            return Ok(None);
+        };
+        if profile.is_empty() {
+            return Err(RmsError::invalid_argument(
+                "inventory_profile must not be empty",
+            ));
+        }
+        Ok(self.recovery_profiles.for_profile(&profile).cloned())
     }
 
     pub(crate) async fn initialize_nvue_client(
@@ -1644,13 +2174,25 @@ impl RackManagerServiceImpl {
             .resolve_required_nvue_client_tls(request_domain)
             .map_err(RmsError::failed_precondition)?;
 
-        let prepared = match client
-            .prepare_client_tls_if_changed(tls, Some(&server_name))
-            .await
-        {
+        // An unverified bootstrap generation can use the same files as the
+        // normal transport, so it still needs a fresh verified probe.
+        let candidate = if client.uses_verified_client_tls() {
+            client
+                .prepare_client_tls_if_changed(tls, Some(&server_name))
+                .await
+        } else {
+            client
+                .prepare_verified_client_tls(tls, Some(&server_name))
+                .await
+                .map(Some)
+        };
+
+        let prepared = match candidate {
             Ok(Some(prepared)) => prepared,
             Ok(None) => return Ok(()),
-            Err(error) if can_keep_current_nvue_transport(strict, client.uses_client_tls()) => {
+            Err(error)
+                if can_keep_current_nvue_transport(strict, client.uses_verified_client_tls()) =>
+            {
                 tracing::debug!(%error, "keeping current NVUE transport during TLS material reload");
                 return Ok(());
             }
@@ -1665,7 +2207,7 @@ impl RackManagerServiceImpl {
             )
             .await
         {
-            if !can_keep_current_nvue_transport(strict, client.uses_client_tls()) {
+            if !can_keep_current_nvue_transport(strict, client.uses_verified_client_tls()) {
                 return Err(error.into());
             }
 
@@ -1725,7 +2267,7 @@ impl RackManagerServiceImpl {
             .map_err(RmsError::failed_precondition)?;
 
         let prepared = client
-            .prepare_verified_client_tls(tls, Some(&server_name))
+            .prepare_verified_client_tls(tls.clone(), Some(&server_name))
             .await?;
 
         let mtls_result = client
@@ -1782,13 +2324,19 @@ impl RackManagerServiceImpl {
             current_transport_error = %current_transport_error,
             mtls_error = %mtls_error,
             "NVUE verified transports failed for certificate install; falling back to \
-             unverified HTTPS to bootstrap the switch certificate (RMS-owned install policy)"
+             unverified mTLS to bootstrap the switch certificate (RMS-owned install policy)"
         );
 
-        let transport_changed = client.configure_insecure_https().await?;
+        let unverified_mtls = client
+            .prepare_unverified_client_tls(tls, Some(&server_name))
+            .await?;
 
         let bootstrap_result = client
-            .get_json("/nvue_v1/system", nvue_client::DEFAULT_TIMEOUT)
+            .activate_prepared_client_tls(
+                &unverified_mtls,
+                "/nvue_v1/system",
+                nvue_client::DEFAULT_TIMEOUT,
+            )
             .await;
 
         if let Err(error) = bootstrap_result {
@@ -1796,9 +2344,8 @@ impl RackManagerServiceImpl {
                 host = %endpoint.host,
                 connect_host = %endpoint.connect_host,
                 %server_name,
-                transport_changed,
                 error = %error,
-                "NVUE readiness check failed with unverified bootstrap HTTPS"
+                "NVUE readiness check failed with unverified bootstrap mTLS"
             );
 
             return Err(error.into());
@@ -1808,8 +2355,7 @@ impl RackManagerServiceImpl {
             host = %endpoint.host,
             connect_host = %endpoint.connect_host,
             %server_name,
-            transport_changed,
-            "NVUE readiness check succeeded with unverified bootstrap HTTPS"
+            "NVUE readiness check succeeded with unverified bootstrap mTLS"
         );
 
         Ok(())
@@ -1979,6 +2525,21 @@ impl RackManagerTrait for RackManagerServiceImpl {
     {
         let req = normalize_request(req, |r| normalize_node_set(&mut r.nodes))?;
         self.handle_batch_get_firmware_inventory(req).await
+    }
+
+    async fn compare_firmware_object(
+        &self,
+        req: tonic::Request<rm::CompareFirmwareObjectRequest>,
+    ) -> std::result::Result<tonic::Response<rm::CompareFirmwareObjectResponse>, tonic::Status>
+    {
+        let req = normalize_request(req, |r| {
+            normalize_node_set(&mut r.nodes)?;
+            normalize_component_filter_selectors(
+                &mut r.component_filters,
+                &mut r.node_descriptor_component_filters,
+            )
+        })?;
+        self.handle_compare_firmware_object(req).await
     }
 
     async fn update_firmware(
@@ -2243,6 +2804,15 @@ impl RackManagerTrait for RackManagerServiceImpl {
         self.handle_get_scale_up_fabric_status(req).await
     }
 
+    /// Discovers live fabrics without changing device configuration.
+    async fn inspect_scale_up_fabrics(
+        &self,
+        req: tonic::Request<rm::InspectScaleUpFabricsRequest>,
+    ) -> std::result::Result<tonic::Response<rm::InspectScaleUpFabricsResponse>, tonic::Status>
+    {
+        self.handle_inspect_scale_up_fabrics(req).await
+    }
+
     async fn batch_reset_switch_sdn_factory_default(
         &self,
         req: tonic::Request<rm::BatchResetSwitchSdnFactoryDefaultRequest>,
@@ -2362,6 +2932,15 @@ impl RackManagerV2Trait for RackManagerServiceImpl {
         tonic::Status,
     > {
         let req = normalize_request(req, |r| normalize_v2_node_set(&mut r.nodes))?;
+
         self.handle_configure_scale_up_fabric_manager_v2(req).await
+    }
+
+    async fn start_system_validation(
+        &self,
+        req: tonic::Request<rm_v2::StartSystemValidationRequest>,
+    ) -> std::result::Result<tonic::Response<rm_v2::StartSystemValidationResponse>, tonic::Status>
+    {
+        self.handle_start_system_validation(req).await
     }
 }

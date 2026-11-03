@@ -47,6 +47,8 @@ The following platforms are supported in NVFWUPD:
 
 -  NVIDIA Vera Rubin NVL72, NVIDIA MGX Vera C1, NVIDIA MGX Vera C2
 
+-  NVIDIA LP30
+
 -  Delta PowerShelf, LiteOn PowerShelf, and Megmeet PowerShelf
 
 
@@ -108,7 +110,7 @@ Command Syntax
       OS target options: port=<SSH port>, servertype=<Type of server>.
 
       Supported servertype values: DGX, DGXRUBIN, HGX, MGX, GH200, HGXB100, HGXB300, HGXRUBIN, GB200,
-      GB300, VRNVL72, GB200Switch, GB300Switch, VRNVL72Switch, Powershelf.
+      GB300, VRNVL72, LP30, GB200Switch, GB300Switch, VRNVL72Switch, Powershelf.
 
   Commands:
       help       Show tool help.                         
@@ -170,3 +172,6 @@ Command Syntax
           -j  --json                   show output in JSON.                                        
           -v  --version                Query firmware version only                                 
           -t  --timeout                Query timeout in seconds for OS commands. Flash timeout is 20x the query timeout. (default 60 for queries, 1200 for flash operations)
+
+.. note::
+   Starting with NVFWUPD 2.1.3, cleartext HTTP connections are disabled by default. Use ``allow_http=true`` only for trusted HTTP-only Redfish targets or port-forwarding cases.

@@ -21,10 +21,15 @@ use std::time::Duration;
 
 use clap::Parser;
 
+use rackmanagementservice::api::grpc::ArtifactDownloadPolicy;
 use rackmanagementservice::api::grpc::server::{
     ApiListenerMode, GrpcServer, SwitchTlsRoots, TlsConfig, TlsMode, assert_insecure_allowed,
 };
-use rackmanagementservice::config::{DEFAULT_CONFIG_PATH, ExpectedInventoryCatalog, RmsConfig};
+use rackmanagementservice::config::fabric_layout::FabricLayoutCatalog;
+use rackmanagementservice::config::hardware_profiles::HardwareProfileCatalog;
+use rackmanagementservice::config::{
+    DEFAULT_CONFIG_PATH, ExpectedInventoryCatalog, RmsConfig, WorkflowTimings,
+};
 use rackmanagementservice::libnmxc::{
     TlsMaterialStore, normalize_tls_server_name, validate_domain,
 };
@@ -36,7 +41,7 @@ use rackmanagementservice::persistence::Backends;
 use rackmanagementservice::persistence::postgres::{
     PostgresFirmwareObjectStore, connect as pg_connect, run_bootstrap,
 };
-use rackmanagementservice::transport::ssh::SftpUploadOptions;
+use rackmanagementservice::transport::ssh::SshUploadOptions;
 
 // RMS fans out many async gRPC, Redfish, SSH, and firmware tasks that allocate
 // request buffers, JSON/protobuf payloads, task state, and transport objects
@@ -246,11 +251,21 @@ struct RunningService {
 }
 
 impl RunningService {
-    /// Drain in-flight jobs, then stop and await the metrics server task.
-    async fn stop(&mut self) {
+    /// Drain in-flight requests and jobs.
+    async fn stop_grpc(&mut self) {
         self.grpc_server.stop_and_await_terminal().await;
+    }
+
+    /// Stop and await the metrics server task.
+    async fn stop_metrics(&mut self) {
         self.metrics_server.stop();
         self.metrics_server.join().await;
+    }
+
+    #[cfg(test)]
+    async fn stop(&mut self) {
+        self.stop_grpc().await;
+        self.stop_metrics().await;
     }
 }
 
@@ -260,15 +275,36 @@ async fn start_service(
     tls: Option<TlsConfig>,
     listener_mode: ApiListenerMode,
     switch_tls_roots: SwitchTlsRoots,
+    tracing_guard: Option<&rackmanagementservice::observability::tracing::TracingGuard>,
 ) -> Result<RunningService, String> {
     validate_metrics_config(config, &tls)?;
     validate_nmx_gateway_id(config)?;
 
-    let sftp_upload_options = SftpUploadOptions::new(
+    // Load once; all requests use this validated catalog until RMS restarts.
+    let hardware_profiles = match &config.workflows.hardware_profiles_dir {
+        Some(path) => HardwareProfileCatalog::load_directory(path).map_err(|error| {
+            format!(
+                "failed to load hardware profiles from {}: {error}",
+                path.display()
+            )
+        })?,
+        None => HardwareProfileCatalog::built_in()
+            .map_err(|error| format!("built-in hardware profiles are invalid: {error}"))?,
+    };
+
+    let fabric_layout_catalog = match &config.workflows.fabric_layout {
+        Some(settings) => FabricLayoutCatalog::from_config(settings)
+            .map_err(|error| format!("invalid workflows.fabric_layout: {error}"))?,
+        None => FabricLayoutCatalog::default(),
+    };
+
+    let sftp_upload_options = SshUploadOptions::new(
         std::time::Duration::from_secs(config.workflows.sftp_upload_timeout_seconds),
         std::time::Duration::from_secs(config.workflows.sftp_step_timeout_seconds),
     )
     .map_err(|e| e.message)?;
+
+    let workflow_timings = WorkflowTimings::try_from(&config.workflows).map_err(|e| e.message)?;
 
     let rack_manager = Arc::new(RackManager::new());
     let backends = build_backends(config).await?;
@@ -282,6 +318,11 @@ async fn start_service(
     };
     let metrics_registry = metrics::init(&metrics_info)
         .map_err(|e| format!("failed to initialize metrics: {}", e.message))?;
+    if let Some(tracing_guard) = tracing_guard {
+        tracing_guard
+            .register_metrics(metrics_registry.as_ref())
+            .map_err(|e| format!("failed to register tracing metrics: {e}"))?;
+    }
 
     // The tracker owns its workflow-metric registration, keeping the base
     // metrics module free of any workflow-specific knowledge.
@@ -321,11 +362,21 @@ async fn start_service(
 
     let mut grpc_server = GrpcServer::new(config.port, rack_manager, job_tracker, backends)
         .with_firmware_dir(config.workflows.firmware_dir.clone())
+        .with_artifact_require_sha256(config.workflows.artifact_require_sha256)
+        .with_insecure_bmc(config.bmc.insecure_bmc)
+        .with_artifact_download_policy(
+            ArtifactDownloadPolicy::from_workflows(&config.workflows).map_err(|e| e.message)?,
+        )
         .with_sftp_upload_options(sftp_upload_options)
         .with_nmx_gateway_id(config.switches.nmx_gateway_id.clone())
         .with_expected_inventory_catalog(ExpectedInventoryCatalog::from(
             &config.workflows.expected_inventory_profiles,
-        ));
+        ))
+        .with_workflow_timings(workflow_timings)
+        .with_recovery_profiles(config.workflows.recovery_profiles.clone())
+        .with_hardware_profiles(hardware_profiles)
+        .with_cert_reload_interval(Duration::from_secs(config.tls.cert_reload_interval_seconds))
+        .with_fabric_layout_catalog(fabric_layout_catalog);
 
     if let Some(tls) = tls {
         grpc_server = grpc_server.with_tls(tls);
@@ -336,6 +387,12 @@ async fn start_service(
     if switch_tls_roots.insecure_switch {
         tracing::warn!(
             "insecure_switch disables switch client mTLS; NVUE uses unverified HTTPS and NMX-C uses plaintext HTTP"
+        );
+    }
+
+    if config.bmc.insecure_bmc {
+        tracing::warn!(
+            "insecure_bmc disables BMC/Redfish server certificate verification; set [bmc] insecure_bmc = false after BMC certificates are CA-verifiable"
         );
     }
 
@@ -419,10 +476,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Promote only job_id from active spans so nested SFTP progress events can
     // be correlated with jobs without adding node IDs or paths to upload spans.
-    setup_logging(
+    let tracing_guard = setup_logging(
         vec!["job_id".to_string()],
         config.logging.log_level.as_deref(),
         config.logging.enable_timestamps,
+        &config.tracing,
     )?;
 
     for key in &unknown_config_keys {
@@ -463,7 +521,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let switch_tls_roots = build_switch_tls_roots(&config);
     let listener_mode = ApiListenerMode::from_tls_config(&tls);
 
-    let mut service = match start_service(&config, tls, listener_mode, switch_tls_roots).await {
+    let mut service = match start_service(
+        &config,
+        tls,
+        listener_mode,
+        switch_tls_roots,
+        Some(&tracing_guard),
+    )
+    .await
+    {
         Ok(s) => s,
         Err(msg) => {
             tracing::error!("{msg}");
@@ -481,7 +547,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     wait_for_shutdown().await;
 
     tracing::info!("shutting down...");
-    service.stop().await;
+    service.stop_grpc().await;
+    tracing_guard.shutdown().await;
+    service.stop_metrics().await;
 
     Ok(())
 }
@@ -514,8 +582,10 @@ mod tests {
         assert_eq!(c.metrics.port, 8802);
         assert!(!c.metrics.tls);
         assert_eq!(c.postgres.db_pool_max, NonZeroUsize::new(20).unwrap());
+        assert!(c.bmc.insecure_bmc);
 
-        let sftp_upload_options = SftpUploadOptions::default();
+        let sftp_upload_options = SshUploadOptions::default();
+
         assert_eq!(
             c.workflows.sftp_upload_timeout_seconds,
             sftp_upload_options.overall_timeout.as_secs()
@@ -857,6 +927,139 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn start_service_rejects_unusable_profile_directories_before_listening() {
+        let temporary = tempfile::tempdir().unwrap();
+        let cases = [
+            (
+                "missing-directory",
+                false,
+                None,
+                "failed to load hardware profiles",
+            ),
+            (
+                "invalid-yaml",
+                true,
+                Some("not: [valid".to_owned()),
+                "failed to load hardware profiles",
+            ),
+        ];
+        for (name, create_directory, profile, expected) in cases {
+            let directory = temporary.path().join(name);
+            if create_directory {
+                std::fs::create_dir(&directory).unwrap();
+            }
+            if let Some(profile) = profile {
+                std::fs::write(directory.join("gb200.yaml"), profile).unwrap();
+            }
+            let mut c = config(true);
+            c.port = 0;
+            c.metrics.port = 0;
+            c.workflows.hardware_profiles_dir = Some(directory);
+            let error = match start_service(
+                &c,
+                None,
+                ApiListenerMode::Insecure,
+                SwitchTlsRoots::default(),
+                None,
+            )
+            .await
+            {
+                Err(error) => error,
+                Ok(mut service) => {
+                    service.stop().await;
+                    panic!("RMS must reject {name}");
+                }
+            };
+            assert!(error.contains(expected), "{name}: {error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn start_service_accepts_empty_partial_and_disabled_profile_catalogs() {
+        let temporary = tempfile::tempdir().unwrap();
+        let gb200 = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../hardware-profiles/v1/compute_gb200_nvidia.yaml"
+        ));
+        let supermicro = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../hardware-profiles/v1/compute_gb300_supermicro.yaml"
+        ));
+        for (name, source) in [
+            ("empty", None),
+            ("partial", Some(supermicro.to_owned())),
+            (
+                "disabled",
+                Some(gb200.replacen("enabled: true", "enabled: false", 1)),
+            ),
+        ] {
+            let directory = temporary.path().join(name);
+            std::fs::create_dir(&directory).unwrap();
+            if let Some(source) = source {
+                std::fs::write(directory.join("profile.yaml"), source).unwrap();
+            }
+            let mut c = config(true);
+            c.port = 0;
+            c.metrics.port = 0;
+            c.workflows.hardware_profiles_dir = Some(directory);
+            let mut service = start_service(
+                &c,
+                None,
+                ApiListenerMode::Insecure,
+                SwitchTlsRoots::default(),
+                None,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{name} catalog should be optional: {error}"));
+            service.stop().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn start_service_returns_conflicting_profile_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("conflicting.yaml");
+        let profile = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../hardware-profiles/v1/compute_gb200_nvidia.yaml"
+        ));
+        std::fs::write(
+            &path,
+            profile.replacen("component_key: CPU_0", "component_key: HMC", 1),
+        )
+        .unwrap();
+        let mut c = config(true);
+        c.port = 0;
+        c.metrics.port = 0;
+        c.workflows.hardware_profiles_dir = Some(directory.path().to_path_buf());
+
+        let error = match start_service(
+            &c,
+            None,
+            ApiListenerMode::Insecure,
+            SwitchTlsRoots::default(),
+            None,
+        )
+        .await
+        {
+            Err(error) => error,
+            Ok(mut service) => {
+                service.stop().await;
+                panic!("RMS must not start with ambiguous target selectors");
+            }
+        };
+        for expected in [
+            "failed to load hardware profiles",
+            path.to_str().unwrap(),
+            "compute_gb200_nvidia",
+            "component_key \"hmc\"",
+            "[cpu_0, hmc]",
+        ] {
+            assert!(error.contains(expected), "{error}");
+        }
+    }
+
+    #[tokio::test]
     async fn start_service_binds_to_port() {
         // Bind two ephemeral listeners simultaneously so the OS assigns two
         // distinct ports; calling pick_unused_port twice can return the same
@@ -882,6 +1085,7 @@ mod tests {
             None,
             ApiListenerMode::Insecure,
             SwitchTlsRoots::default(),
+            None,
         )
         .await
         .unwrap();
@@ -906,6 +1110,7 @@ mod tests {
             None,
             ApiListenerMode::Insecure,
             SwitchTlsRoots::default(),
+            None,
         )
         .await
         .expect("start_service should succeed with OS-assigned ports");

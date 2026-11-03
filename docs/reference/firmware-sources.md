@@ -12,6 +12,10 @@ marking the object `available`. Subsequent `ApplyStoredFirmwareObject` calls
 read from that cache. RMS must be able to reach every artifact URL or path at
 the time of download.
 
+HTTP(S) artifact download and validation errors omit URL userinfo, query strings, and
+fragments from job-status messages and logs. Signed query parameters remain part
+of the HTTP request sent to the artifact server.
+
 ### Supported endpoints
 
 RMS supports three source types, selected by the `LocationType` field in each
@@ -24,10 +28,44 @@ RMS supports three source types, selected by the `LocationType` field in each
 | `file` | Bare filesystem path (`/data/fw/artifact.fwpkg`) or `file:///…` URL | None |
 
 For HTTP and HTTPS downloads, RMS streams the response body directly to the
-staging directory. When you supply an optional `Sha256` digest in a `Locations`
+staging directory. The initial URL and every redirect hop must pass the
+optional `[workflows]` download policy, and RMS follows at most 10 redirects. When private targets are disallowed,
+RMS resolves each host through a policy-aware DNS resolver and connects only
+to the addresses that passed the check, so a later unconstrained lookup cannot
+bypass the policy. Defaults leave downloads unrestricted:
+an empty `artifact_https_hosts` allow-list and
+`artifact_allow_private_targets = true`. Present `Sha256` digests are always
+verified. To make a digest mandatory on HTTP(S) artifacts, set
+`[workflows] artifact_require_sha256 = true` (default `false`). To restrict
+hosts or reject private/loopback targets, see
+[Configuring RMS: Artifact download policy](../configuration/configuring-rms.md#artifact-download-policy).
+When you supply an optional `Sha256` digest in a `Locations`
 entry, RMS accumulates the hash chunk-by-chunk as bytes arrive, then compares
 the digest after the stream completes. If the digest does not match, RMS
 discards the temp file and returns an error without promoting anything to cache.
+
+When an HTTP or HTTPS artifact without a `Sha256` digest is already in the
+staging directory, RMS compares the cached file size with the server's
+`Content-Length` before it reuses the file. If the HEAD request fails with HTTP
+408, 429, or 5xx, a timeout, or an interrupted connection, RMS keeps and reuses
+the nonempty cached file without confirming its current size on the server.
+Stored firmware object applies do not repeat this size check. To refresh the
+file from the server, delete the firmware object and add it again. A size
+check cannot detect a change that preserves the file size; supply a `Sha256`
+digest to verify the content.
+
+RMS retries an HTTP or HTTPS download that fails for a reason a later attempt
+can cure: a 408, 429, or 5xx response, a refused or reset connection, a
+transport timeout, or a response that ends early. RMS makes at most three
+attempts per artifact. It waits 2 seconds before the second attempt and
+4 seconds before the third, and each attempt starts a new temp file. All attempts and waits for
+one artifact share a 600-second network deadline. The waits add 6 seconds
+when failures return immediately; an unreachable host can spend the
+30-second connection timeout on each attempt, about 96 seconds in total.
+An expired deadline prevents further retries. RMS does not retry other HTTP
+errors, malformed HTTP responses, digest mismatches, or download policy
+rejections. A failed job keeps the first attempt's error text alongside the
+final failure and attempt count.
 
 #### Local filesystem paths
 
@@ -40,8 +78,11 @@ directory and applies the same optional SHA-256 check.
 
 Artifactory and JFrog use the same HTTP/HTTPS download path as a plain file
 server. When you pass a non-empty `access_token` in `AddFirmwareObjectRequest`,
-RMS attaches it as the `X-JFrog-Art-Api` header. When `access_token` is absent
-or empty, RMS performs an unauthenticated GET.
+RMS attaches it as the `X-JFrog-Art-Api` header only after the request host
+and effective port match the catalog URL origin. Credentialed requests do not
+use automatic HTTP redirects; same-origin `Location` hops are followed only
+when that origin check passes. When `access_token` is absent or empty, RMS
+performs an unauthenticated GET.
 
 ### Unsupported endpoints
 
@@ -65,9 +106,11 @@ describes the board SKUs, firmware components, expected versions, and the
 download locations for every artifact. You pass the manifest content as the
 `config_json` field in `AddFirmwareObjectRequest` or `ApplyFirmwareObjectRequest`.
 
-RMS parses the manifest, builds an internal lookup table of components and
-targets, and downloads all referenced artifacts. The object becomes `available`
-once all downloads complete successfully.
+RMS parses the manifest, records an artifact catalog, and downloads eligible
+firmware payloads, recovery packages, and NVOS switch system images from their
+referenced locations. Firmware targets are resolved for each node type when the
+object is applied. The object becomes `available` once all required downloads
+complete successfully.
 
 ### Top-level structure
 
@@ -89,7 +132,7 @@ once all downloads complete successfully.
 | Field | Type | Required | Description |
 | --- | --- | --- | --- |
 | `Name` | string | No | Human-readable SKU name. |
-| `SKUID` | string | No | Hardware SKU identifier used for lookup-table keying. |
+| `SKUID` | string | No | Informational hardware SKU identifier preserved in the manifest. |
 | `Type` | string | No | SKU category: `Compute Node`, `Switch Tray`, `Power Shelf`, or `VRNVL72 Compute Node`. RMS uses this to route artifacts to the correct node type. |
 | `Components` | object | Yes | Contains `Firmware` and `Software` arrays. |
 
@@ -202,3 +245,9 @@ compute and one switch SKU. Fields not relevant to RMS processing are omitted.
 For a complete, real-world example, refer to the
 [sample manifest](https://github.com/dsx-ai-factory/nv-rms/tree/main/sample_firmware_manifest)
 in the repository.
+
+Parser and planner tests embed a copy of the GB200 1.3.6 sample at
+`crates/rackmanagementservice/tests/fixtures/gb200_1.3.6_sanitized.json`.
+The original remains in `sample_firmware_manifest/` for human reference; tests
+use the crate-local copy so Docker builds do not depend on that directory.
+When intentionally updating this sample, update both copies together.

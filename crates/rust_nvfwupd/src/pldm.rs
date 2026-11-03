@@ -74,6 +74,11 @@ pub trait FirmwarePkg: Send + Sync {
         true
     }
 
+    /// Return non-fatal parse warnings produced while extracting package metadata.
+    fn parse_warnings(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     /// Unpack the package and populate the internal file-to-AP mapping.
     async fn prepare_unpack_file_dict(&mut self, _pkg_name: &str) {}
 
@@ -201,6 +206,8 @@ pub struct TarPkg {
     pub apname_version_dict: HashMap<String, IndexMap<String, Vec<String>>>,
     /// Verbose output flag.
     pub verbose: bool,
+    /// Non-fatal metadata warnings from the most recent parse.
+    parse_warnings: Vec<String>,
     /// Path to the extracted tar contents (for cleanup).
     untar_file_path: String,
 }
@@ -211,6 +218,7 @@ impl TarPkg {
         Self {
             apname_version_dict: HashMap::new(),
             verbose: false,
+            parse_warnings: Vec::new(),
             untar_file_path: String::new(),
         }
     }
@@ -246,7 +254,11 @@ impl TarPkg {
         package_name: &str,
         skip_parsing: bool,
     ) -> (bool, String) {
+        self.parse_warnings.clear();
         if skip_parsing || manifest_content.is_none() {
+            self.parse_warnings.push(
+                "tar archive did not contain a MANIFEST; using default tar metadata".to_string(),
+            );
             let component_type = "psu";
             let version = "N/A".to_string();
             let model = "PowerShelf".to_string();
@@ -341,6 +353,7 @@ impl FirmwarePkg for TarPkg {
         package_name: &str,
         _json_dict: Option<&mut Value>,
     ) -> (bool, String) {
+        self.parse_warnings.clear();
         let package_name_owned = package_name.to_string();
         let (untar_file_path, manifest_content) = match tokio::task::spawn_blocking(move || {
             Self::unpack_tar_blocking(package_name_owned)
@@ -382,6 +395,10 @@ impl FirmwarePkg for TarPkg {
 
     fn has_printable_package_content(&self, package_name: &str) -> bool {
         self.apname_version_dict.contains_key(package_name)
+    }
+
+    fn parse_warnings(&self) -> Vec<String> {
+        self.parse_warnings.clone()
     }
 }
 
@@ -1162,13 +1179,21 @@ impl PldmParsedData {
         records: &[DeviceIdRecord],
         comp_index: usize,
     ) -> Option<(String, &[RawDescriptor])> {
+        Self::get_component_name_info_for_index(records, comp_index)
+            .map(|(name, descriptors, _)| (name, descriptors))
+    }
+
+    fn get_component_name_info_for_index(
+        records: &[DeviceIdRecord],
+        comp_index: usize,
+    ) -> Option<(String, &[RawDescriptor], Option<String>)> {
         let mask = 1u64 << comp_index;
         for rec in records {
             if rec.applicable_components & mask != mask {
                 continue;
             }
             let name = &rec.component_image_set_version_string;
-            let base = if name.contains(',') {
+            let (base, context) = if name.contains(',') {
                 let parts: Vec<&str> = name.split(',').collect();
                 let mut count = 0usize;
                 let mut ac = rec.applicable_components;
@@ -1178,15 +1203,24 @@ impl PldmParsedData {
                     }
                     ac >>= 1;
                 }
-                parts
-                    .get(count.saturating_sub(1))
-                    .unwrap_or(&"")
-                    .to_string()
+                let part_index = count.saturating_sub(1);
+                let base = parts.get(part_index).unwrap_or(&"").to_string();
+                let context = if base.eq_ignore_ascii_case("ERoT") {
+                    parts
+                        .get(part_index + 1)
+                        .and_then(|part| part.split(':').next())
+                        .map(str::trim)
+                        .filter(|part| !part.is_empty())
+                        .map(ToString::to_string)
+                } else {
+                    None
+                };
+                (base, context)
             } else {
-                name.clone()
+                (name.clone(), None)
             };
             if !base.is_empty() {
-                return Some((base, &rec.descriptors));
+                return Some((base, &rec.descriptors, context));
             }
         }
         None
@@ -1479,15 +1513,18 @@ impl PLDM {
         let mut ver_dict: IndexMap<String, Vec<String>> = IndexMap::new();
 
         for (index, img) in parsed.component_images.iter().enumerate() {
-            if let Some((name, descriptors)) =
-                PldmParsedData::get_component_name_for_index(&parsed.device_records, index)
+            if let Some((name, descriptors, context)) =
+                PldmParsedData::get_component_name_info_for_index(&parsed.device_records, index)
             {
                 let sku_id = Self::get_ap_sku_from_descriptors(descriptors, &name);
+                let version_entry = vec![img.version_string.clone(), sku_id.to_lowercase()];
                 let ap_name = format!("{},{}", name, sku_id);
-                ver_dict.insert(
-                    ap_name,
-                    vec![img.version_string.clone(), sku_id.to_lowercase()],
-                );
+                ver_dict.insert(ap_name, version_entry.clone());
+                if name.eq_ignore_ascii_case("ERoT") {
+                    if let Some(context) = context {
+                        ver_dict.insert(format!("{}:{},{}", name, context, sku_id), version_entry);
+                    }
+                }
             }
         }
 
@@ -1855,6 +1892,36 @@ mod tests {
         assert!(ok);
         assert!(err.is_empty());
         assert!(tar.apname_version_dict.contains_key("test.tar"));
+        assert_eq!(
+            tar.parse_warnings(),
+            vec!["tar archive did not contain a MANIFEST; using default tar metadata".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tarpkg_parse_pkg_clears_stale_warning_before_unpack_error() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let valid_tar_path = temp.path().join("no-manifest.tar");
+        let invalid_tar_path = temp.path().join("invalid.tar");
+        write_test_tar(&valid_tar_path, "README", b"no manifest here");
+        fs::write(&invalid_tar_path, b"not a tar archive").expect("write invalid tar");
+
+        let mut tar = TarPkg::new();
+        let valid_package_name = valid_tar_path.to_string_lossy().to_string();
+        let (ok, err) = tar.parse_pkg(&valid_package_name, None).await;
+        assert!(ok, "{err}");
+        assert_eq!(
+            tar.parse_warnings(),
+            vec!["tar archive did not contain a MANIFEST; using default tar metadata".to_string()]
+        );
+
+        let invalid_package_name = invalid_tar_path.to_string_lossy().to_string();
+        let (ok, err) = tar.parse_pkg(&invalid_package_name, None).await;
+        assert!(!ok, "invalid tar unexpectedly parsed: {err}");
+        assert!(
+            tar.parse_warnings().is_empty(),
+            "parse warnings should describe only the most recent parse attempt"
+        );
     }
 
     #[tokio::test]
@@ -2194,6 +2261,28 @@ mod tests {
         }
     }
 
+    fn component_image_for_version(version: &str) -> ComponentImageInfo {
+        ComponentImageInfo {
+            identifier: 0,
+            location_offset: 0,
+            size: 0,
+            version_string: version.to_string(),
+            fw_image_name: None,
+            sha256: None,
+            image_size: None,
+        }
+    }
+
+    fn vendor_descriptor(title: &str, data: &[u8]) -> RawDescriptor {
+        RawDescriptor {
+            is_initial: false,
+            descriptor_type: 0xFFFF,
+            data: Vec::new(),
+            vendor_title: Some(title.to_string()),
+            vendor_data: Some(data.to_vec()),
+        }
+    }
+
     #[test]
     fn vendor_descriptor_rejects_length_shorter_than_title_metadata() {
         let bytes = device_record_with_vendor_descriptor(0, &[]);
@@ -2346,6 +2435,62 @@ mod tests {
             applicable_components: 1,
             descriptors: Vec::new(),
         }
+    }
+
+    #[test]
+    fn pldm_apname_version_dict_preserves_contextual_erot_aliases() {
+        let descriptors = vec![vendor_descriptor("ECSKU", &[0x12, 0x34, 0x56, 0x78])];
+        let mut pldm = PLDM::new();
+        pldm.last_parsed = Some(PldmParsedData {
+            header: PldmHeader {
+                version_string: "Generic-BMC-SBIOS-package".to_string(),
+                ..pldm_header(4)
+            },
+            device_records: vec![
+                DeviceIdRecord {
+                    component_image_set_version_string: "ERoT,BMC:SKU-650:".to_string(),
+                    applicable_components: 0b001,
+                    descriptors: descriptors.clone(),
+                },
+                DeviceIdRecord {
+                    component_image_set_version_string: "ERoT,SBIOS::".to_string(),
+                    applicable_components: 0b010,
+                    descriptors,
+                },
+            ],
+            component_images: vec![
+                component_image_for_version("02.00.0034.0000_n05"),
+                component_image_for_version("00.04.0066.0000_n05"),
+            ],
+        });
+
+        pldm.build_apname_version_from_parsed();
+        let versions = pldm
+            .apname_version_dict
+            .get("Generic-BMC-SBIOS-package")
+            .expect("package version dict");
+
+        assert_eq!(
+            versions
+                .get("ERoT:BMC,0x12345678")
+                .and_then(|entry| entry.first())
+                .map(String::as_str),
+            Some("02.00.0034.0000_n05")
+        );
+        assert_eq!(
+            versions
+                .get("ERoT:SBIOS,0x12345678")
+                .and_then(|entry| entry.first())
+                .map(String::as_str),
+            Some("00.04.0066.0000_n05")
+        );
+        assert_eq!(
+            versions
+                .get("ERoT,0x12345678")
+                .and_then(|entry| entry.first())
+                .map(String::as_str),
+            Some("00.04.0066.0000_n05")
+        );
     }
 
     #[test]

@@ -15,13 +15,16 @@
  * limitations under the License.
  */
 
-pub use ::redfish_client::{NvidiaMnnvlinkTopology, RedfishClient, ResetType};
+pub use ::redfish_client::{
+    NvidiaMnnvlinkTopology, ODataLink, RedfishClient, ResetType, ResourceCollection,
+};
 
 use crate::domain::node::PowerState;
-use crate::domain::rack::EndpointConfig;
+use crate::domain::rack::{EndpointConfig, EndpointCredentials};
 use crate::utilities::error::{ErrorCode, Result, RmsError};
 
 use ::redfish_client::{BmcCredentials, RedfishError, RedfishPowerState};
+use reqwest::header::HeaderValue;
 use secrecy::ExposeSecret;
 
 /// Build a shared Redfish client from RMS endpoint config.
@@ -36,6 +39,89 @@ pub fn redfish_client_from_endpoint_config(config: &EndpointConfig) -> Result<Re
     .map_err(RmsError::from)
 }
 
+/// Build a Redfish client from explicit connection fields.
+///
+/// Empty username/password skip Basic auth, matching
+/// [`HttpClient`](crate::transport::http_client::HttpClient) so powershelf
+/// constructors that historically allowed anonymous test clients keep working.
+pub fn redfish_client_from_host(
+    host: &str,
+    port: u16,
+    username: &str,
+    password: &str,
+    dangerously_accept_invalid_certs: bool,
+    https: bool,
+) -> Result<RedfishClient> {
+    let credentials = if username.is_empty() {
+        BmcCredentials::username_password(String::new(), None)
+    } else {
+        BmcCredentials::username_password(username.to_owned(), Some(password.to_owned()))
+    };
+
+    RedfishClient::new(
+        host,
+        port,
+        credentials,
+        dangerously_accept_invalid_certs,
+        https,
+    )
+    .map_err(RmsError::from)
+}
+
+/// Build a Redfish client with profile-specific transport limits.
+pub fn redfish_client_from_endpoint_config_with_timeouts(
+    config: &EndpointConfig,
+    connect_timeout: std::time::Duration,
+    request_timeout: std::time::Duration,
+) -> Result<RedfishClient> {
+    RedfishClient::new_with_timeouts(
+        &config.endpoint.ip_address,
+        config.endpoint.port,
+        credentials_from_endpoint_config(config)?,
+        config.dangerously_accept_invalid_certs,
+        true,
+        connect_timeout,
+        request_timeout,
+    )
+    .map_err(RmsError::from)
+}
+
+/// Build a Redfish client for a powershelf BMC endpoint.
+///
+/// When the endpoint has username/password or a session token, this uses the
+/// same credential mapping as [`redfish_client_from_endpoint_config`]. Empty
+/// or missing credentials skip Basic auth, matching historical `HttpClient`
+/// powershelf constructors.
+pub fn redfish_client_from_powershelf_endpoint(config: &EndpointConfig) -> Result<RedfishClient> {
+    match config.credentials.as_ref() {
+        Some(credentials) if credentials.has_auth_material() => {
+            redfish_client_from_endpoint_config(config)
+        }
+        _ => redfish_client_from_host(
+            &config.endpoint.ip_address,
+            config.endpoint.port,
+            "",
+            "",
+            config.dangerously_accept_invalid_certs,
+            true,
+        ),
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn redfish_client_for_test(base_url: &str) -> RedfishClient {
+    let url = reqwest::Url::parse(base_url).expect("test Redfish URL");
+    redfish_client_from_host(
+        url.host_str().expect("test Redfish host"),
+        url.port_or_known_default().expect("test Redfish port"),
+        "test-bmc-username",
+        "test-bmc-password",
+        true,
+        url.scheme() == "https",
+    )
+    .expect("test Redfish client")
+}
+
 fn credentials_from_endpoint_config(config: &EndpointConfig) -> Result<BmcCredentials> {
     let Some(credentials) = config.credentials.as_ref() else {
         return Err(RmsError::invalid_argument(
@@ -43,16 +129,34 @@ fn credentials_from_endpoint_config(config: &EndpointConfig) -> Result<BmcCreden
         ));
     };
 
-    if credentials.username.is_empty() || credentials.password.expose_secret().is_empty() {
+    if !credentials.has_auth_material() {
         return Err(RmsError::invalid_argument(
-            "BMC username and password must not be empty for Redfish operations",
+            "BMC Redfish credentials must not be empty",
         ));
     }
 
-    Ok(BmcCredentials::username_password(
-        credentials.username.clone(),
-        Some(credentials.password.expose_secret().to_owned()),
-    ))
+    tracing::debug!(
+        credential_auth_type = credentials.auth_type(),
+        "building BMC Redfish credentials"
+    );
+
+    match credentials {
+        EndpointCredentials::UserPass { username, password } => {
+            Ok(BmcCredentials::username_password(
+                username.to_owned(),
+                Some(password.expose_secret().to_owned()),
+            ))
+        }
+        EndpointCredentials::BmcSessionToken(token) => {
+            let token = token.expose_secret();
+
+            HeaderValue::try_from(token).map_err(|error| {
+                RmsError::invalid_argument(format!("invalid BMC session token header: {error}"))
+            })?;
+
+            Ok(BmcCredentials::token(token.to_owned()))
+        }
+    }
 }
 
 impl From<Option<RedfishPowerState>> for PowerState {
@@ -64,6 +168,8 @@ impl From<Option<RedfishPowerState>> for PowerState {
                 RedfishPowerState::PoweringOn
                 | RedfishPowerState::PoweringOff
                 | RedfishPowerState::Paused
+                | RedfishPowerState::Sleeping
+                | RedfishPowerState::Hibernating
                 | RedfishPowerState::UnsupportedValue,
             )
             | None => Self::Unknown,
@@ -151,6 +257,33 @@ mod tests {
 
         let Err(error) = redfish_client_from_endpoint_config(&config) else {
             panic!("empty credentials should be rejected");
+        };
+
+        assert_eq!(error.code, ErrorCode::InvalidArgument);
+    }
+
+    #[test]
+    fn credentials_from_config_preserve_bmc_session_token() {
+        let mut config = endpoint_config();
+        config.credentials = Some(EndpointCredentials::from_session_token("session-secret"));
+
+        let credentials = credentials_from_endpoint_config(&config).unwrap();
+
+        assert_eq!(
+            credentials,
+            BmcCredentials::token("session-secret".to_owned())
+        );
+
+        assert!(!format!("{credentials:?}").contains("session-secret"));
+    }
+
+    #[test]
+    fn endpoint_config_with_malformed_session_token_is_rejected() {
+        let mut config = endpoint_config();
+        config.credentials = Some(EndpointCredentials::from_session_token("invalid\ntoken"));
+
+        let Err(error) = redfish_client_from_endpoint_config(&config) else {
+            panic!("malformed session token should be rejected");
         };
 
         assert_eq!(error.code, ErrorCode::InvalidArgument);

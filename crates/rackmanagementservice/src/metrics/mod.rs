@@ -15,20 +15,22 @@
  * limitations under the License.
  */
 
+pub(crate) mod fabric_workflow;
+
+pub mod server;
+
+pub use server::MetricsServer;
+
 use std::sync::Arc;
+
+use crate::api::grpc::server::TlsMode;
+use crate::utilities::error::{Result, RmsError};
 
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{MethodRouter, get};
 use prometheus::{Registry, TextEncoder};
 use tonic_prometheus_layer::metrics::{Error as MetricsError, GlobalSettings, try_init_settings};
-
-use crate::api::grpc::server::TlsMode;
-use crate::utilities::error::{Result, RmsError};
-
-pub mod server;
-
-pub use server::MetricsServer;
 
 /// Wrapper around key configuration values for RMS, meant to be consumed by the metrics subsystem.
 pub struct MetricsInfo {
@@ -75,10 +77,9 @@ const RMS_METRIC_PREFIX: &str = "rms";
 /// Initialize the process-wide metrics collector.
 ///
 /// Must be called once before the gRPC server starts. Creates a dedicated
-/// Prometheus registry with the `rms_` namespace so that every metric —
-/// both the gRPC call counters/histograms from `tonic_prometheus_layer` and
-/// the `rms_api_version` / `rms_api_config` info gauges — is automatically
-/// prefixed with `rms_`.
+/// Prometheus registry with the `rms_` namespace. The namespace prefixes gRPC
+/// counters and histograms, service information gauges, and managed fabric
+/// reconciliation collectors.
 ///
 /// Returns an `Arc` to the registry so the caller can pass it to
 /// `prometheus_route` and expose it on `GET /metrics`.
@@ -107,6 +108,9 @@ pub fn init(config: &MetricsInfo) -> Result<Arc<Registry>> {
 
     register_config_gauge(&registry, config)
         .map_err(|e| RmsError::internal(format!("failed to register config gauge: {e}")))?;
+
+    fabric_workflow::register(&registry)
+        .map_err(|e| RmsError::internal(format!("failed to register fabric metrics: {e}")))?;
 
     Ok(Arc::new(registry))
 }

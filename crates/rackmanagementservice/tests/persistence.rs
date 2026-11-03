@@ -222,6 +222,50 @@ async fn apply_history_unavailable_firmware<S: FirmwareObjectStore>(store: &S) {
     assert!(!history[0].firmware_available);
 }
 
+async fn apply_history_rejects_stale_and_missing_incarnations<S: FirmwareObjectStore>(store: &S) {
+    let old = store
+        .create("reused", RackHardwareType::any(), json!({}), None)
+        .await
+        .unwrap();
+    let record = |created| {
+        store.record_apply_for_incarnation(
+            &old.id,
+            created,
+            "rack-a",
+            "prod",
+            RackHardwareType::any(),
+            &[],
+        )
+    };
+    let wrong = old.created - chrono::Duration::seconds(1);
+    assert_eq!(record(wrong).await.unwrap_err().code, ErrorCode::NotFound);
+    store.delete(&old.id).await.unwrap();
+    assert_eq!(
+        record(old.created).await.unwrap_err().code,
+        ErrorCode::NotFound
+    );
+    let replacement = store
+        .create(&old.id, RackHardwareType::any(), json!({}), None)
+        .await
+        .unwrap();
+    assert_ne!(old.created, replacement.created);
+    assert_eq!(
+        record(old.created).await.unwrap_err().code,
+        ErrorCode::NotFound
+    );
+    assert!(
+        store
+            .list_apply_history(None, &[])
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    record(replacement.created).await.unwrap();
+    let history = store.list_apply_history(None, &[]).await.unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].object_id, replacement.id);
+}
+
 async fn has_default_returns_false_when_none_set<S: FirmwareObjectStore>(store: &S) {
     store
         .create(
@@ -537,6 +581,7 @@ mod memory {
     memory_test!(apply_history_record_and_list);
     memory_test!(apply_history_firmware_available_reflects_deletion);
     memory_test!(apply_history_unavailable_firmware);
+    memory_test!(apply_history_rejects_stale_and_missing_incarnations);
     memory_test!(has_default_returns_false_when_none_set);
     memory_test!(set_default_and_has_default);
     memory_test!(set_default_clears_previous_default);
@@ -568,6 +613,58 @@ macro_rules! postgres_test {
 
 mod postgres {
     use super::*;
+
+    #[sqlx::test(migrations = "src/persistence/postgres/migrations")]
+    async fn history_insertion_serializes_with_concurrent_delete(pool: sqlx::PgPool) {
+        let store = std::sync::Arc::new(PostgresFirmwareObjectStore::new(pool.clone()));
+        let old = store
+            .create("history-race", RackHardwareType::any(), json!({}), None)
+            .await
+            .unwrap();
+        let mut deletion = pool.begin().await.unwrap();
+        sqlx::query("DELETE FROM rack_firmware WHERE id = $1")
+            .bind(&old.id)
+            .execute(&mut *deletion)
+            .await
+            .unwrap();
+        let worker = store.clone();
+        let writer = tokio::spawn(async move {
+            worker
+                .record_apply_for_incarnation(
+                    &old.id,
+                    old.created,
+                    "rack",
+                    "prod",
+                    RackHardwareType::any(),
+                    &["node".to_owned()],
+                )
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                assert!(!writer.is_finished(), "history insertion must wait for the deleting transaction");
+                let blocked: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname = current_database() \
+                     AND wait_event_type = 'Lock' AND query LIKE 'WITH current_object AS%')")
+                    .fetch_one(&pool).await.unwrap();
+                if blocked { break; }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        }).await.expect("writer must take the incarnation row lock");
+        deletion.commit().await.unwrap();
+        assert_eq!(writer.await.unwrap().unwrap_err().code, ErrorCode::NotFound);
+        store
+            .create("history-race", RackHardwareType::any(), json!({}), None)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .list_apply_history(None, &[])
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
 
     /// Exercises the `connect` and `run_migrations` helpers in
     /// `persistence::postgres`. `#[sqlx::test]` provisions its own pool
@@ -798,6 +895,7 @@ mod postgres {
     postgres_test!(apply_history_record_and_list);
     postgres_test!(apply_history_firmware_available_reflects_deletion);
     postgres_test!(apply_history_unavailable_firmware);
+    postgres_test!(apply_history_rejects_stale_and_missing_incarnations);
     postgres_test!(has_default_returns_false_when_none_set);
     postgres_test!(set_default_and_has_default);
     postgres_test!(set_default_clears_previous_default);

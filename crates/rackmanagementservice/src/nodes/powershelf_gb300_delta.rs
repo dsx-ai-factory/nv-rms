@@ -38,6 +38,29 @@ pub struct PowershelfGb300Delta {
 }
 
 impl PowershelfGb300Delta {
+    /// Builds a Delta GB300 shelf node backed by a GB200 Delta node.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Unimplemented` if `config.node_type` is not
+    /// `PowershelfGb300Delta`, or any error from
+    /// [`PowershelfGb200Delta::from_config`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rackmanagementservice::domain::node::{Node, NodeType};
+    /// use rackmanagementservice::domain::rack::NodeConfig;
+    /// use rackmanagementservice::nodes::powershelf_gb300_delta::PowershelfGb300Delta;
+    ///
+    /// let config = NodeConfig::new("ps-0", NodeType::PowershelfGb300Delta, "192.0.2.10");
+    /// let shelf = PowershelfGb300Delta::from_config(&config, "rack-1")?;
+    /// assert_eq!(shelf.node_type(), NodeType::PowershelfGb300Delta);
+    ///
+    /// let other = NodeConfig::new("ps-1", NodeType::PowershelfGb200Delta, "192.0.2.11");
+    /// assert!(PowershelfGb300Delta::from_config(&other, "rack-1").is_err());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     pub fn from_config(config: &NodeConfig, rack_id: &str) -> Result<Self> {
         if config.node_type != NodeType::PowershelfGb300Delta {
             return Err(RmsError::unimplemented(
@@ -141,12 +164,14 @@ mod tests {
             )),
             host_endpoint: None,
             expected_inventory: None,
+            recovery: None,
+            runtime_config: None,
         }
     }
 
     fn test_node(base_url: &str) -> PowershelfGb300Delta {
         let mut powershelf = PowershelfGb300Delta::from_config(&test_config(), "rack-01").unwrap();
-        powershelf.inner.replace_http_for_test(base_url);
+        powershelf.inner.replace_redfish_for_test(base_url);
         powershelf
     }
 
@@ -254,14 +279,18 @@ mod tests {
             ))
             .and(body_json(serde_json::json!({})))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
-            .expect(1)
+            .expect(3)
             .mount(&server)
             .await;
         let powershelf = test_node(&server.uri());
 
-        powershelf
-            .set_power_state(PowerOp::Off, PowerTargetType::System)
-            .await
-            .unwrap();
+        // Delta has no graceful power off, so graceful requests are served as
+        // ForceOff.
+        for op in [PowerOp::Off, PowerOp::GracefulShutdown, PowerOp::ForceOff] {
+            powershelf
+                .set_power_state(op, PowerTargetType::System)
+                .await
+                .unwrap_or_else(|err| panic!("{op:?}: {err}"));
+        }
     }
 }

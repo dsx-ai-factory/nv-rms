@@ -1,6 +1,6 @@
 [package]
 name = "nvfwupd"
-version = "2.1.2"
+version = "2.1.3"
 edition = "2021"
 license.workspace = true
 description = "CLI tool for updating firmware components through BMC using Redfish protocol"
@@ -28,7 +28,9 @@ reqwest = { workspace = true, features = [
 serde = { workspace = true }
 serde_json = { workspace = true, features = ["preserve_order"] }
 noyalib = { workspace = true }
+nvswitch_cli = { workspace = true }
 nvue_client = { workspace = true }
+redfish_client = { workspace = true }
 regex = { workspace = true }
 chrono = { workspace = true }
 thiserror = { workspace = true }
@@ -46,5 +48,6 @@ sha2 = { workspace = true }
 indexmap = { workspace = true }
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber = { workspace = true, features = ["json"] }
 wiremock = { workspace = true }

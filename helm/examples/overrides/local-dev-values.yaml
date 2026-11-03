@@ -14,12 +14,30 @@
 
 databaseMode: memory
 
+# NVSSVT scan launcher alongside the API server, so StartSystemValidation works
+# locally. Point repository/tag at an image the cluster can actually get: a
+# locally built `nvssvt-server:latest` must be loaded into the cluster first
+# (e.g. `kind load docker-image nvssvt-server:latest`), since IfNotPresent
+# means it is never pulled from a registry.
+nvssvt:
+  enabled: true
+  image:
+    repository: nvssvt-server
+    tag: 2.0.0-QS2
+    pullPolicy: IfNotPresent
+
 global:
   imagePullSecrets:
     - name: imagepullsecret
 
 apiServer:
   environmentPath: local-dev
+  # A bare local cluster has no Prometheus Operator, so the ServiceMonitor CRD
+  # does not exist and rendering one fails the install with "no matches for
+  # kind ServiceMonitor". Metrics are still served on the metrics port; only
+  # the scrape registration is skipped.
+  serviceMonitor:
+    enabled: false
   allowInsecure: true
   insecureSwitch: true
   clientTlsCertificates: []

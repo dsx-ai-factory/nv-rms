@@ -1,5 +1,8 @@
 {{- if .Values.apiServer.enabled }}
 {{- include "rack-manager.validateSftpOptions" . -}}
+{{- include "rack-manager.validateFirmwareTaskOptions" . -}}
+{{- include "rack-manager.validateComputePowerOnOptions" . -}}
+{{- include "rack-manager.validateTracingOptions" . -}}
 # RMS runtime configuration, rendered from values and mounted read-only at
 # /etc/rms/config.toml. The database connection string is intentionally NOT
 # rendered here: it (with its password) is injected via the DATABASE_URL

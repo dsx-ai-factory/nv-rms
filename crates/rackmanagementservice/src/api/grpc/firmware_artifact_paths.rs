@@ -17,6 +17,8 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::utilities::filename::{BasenameError, validate_non_hidden_basename};
+
 /// Describes why a firmware artifact path or location is not safe for cache use.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum ArtifactPathError {
@@ -90,23 +92,15 @@ pub(crate) fn redact_location_for_logging(location: &str) -> String {
 pub(crate) fn validate_artifact_filename(
     filename: &str,
 ) -> std::result::Result<(), ArtifactPathError> {
-    if filename.is_empty() {
-        return Err(ArtifactPathError::EmptyFilename);
-    }
-
-    if !is_safe_artifact_path_component(filename) {
-        return Err(ArtifactPathError::UnsafeCharacters {
+    validate_non_hidden_basename(filename).map_err(|error| match error {
+        BasenameError::Empty => ArtifactPathError::EmptyFilename,
+        BasenameError::UnsupportedCharacters => ArtifactPathError::UnsafeCharacters {
             filename: filename.to_owned(),
-        });
-    }
-
-    if filename.starts_with('.') {
-        return Err(ArtifactPathError::NonHiddenBasename {
+        },
+        BasenameError::Hidden => ArtifactPathError::NonHiddenBasename {
             filename: filename.to_owned(),
-        });
-    }
-
-    Ok(())
+        },
+    })
 }
 
 /// Builds a validated firmware artifact path under a cache subdirectory.
@@ -116,21 +110,14 @@ pub(crate) fn artifact_cache_path(
     filename: &str,
 ) -> std::result::Result<PathBuf, ArtifactPathError> {
     validate_artifact_filename(filename)?;
-    if !cache_subdir.is_empty()
-        && (cache_subdir.starts_with('.') || !is_safe_artifact_path_component(cache_subdir))
-    {
+
+    if !cache_subdir.is_empty() && validate_non_hidden_basename(cache_subdir).is_err() {
         return Err(ArtifactPathError::UnsafeCacheSubdir {
             cache_subdir: cache_subdir.to_owned(),
         });
     }
 
     Ok(cache_dir.join(cache_subdir).join(filename))
-}
-
-fn is_safe_artifact_path_component(value: &str) -> bool {
-    value
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
 
 #[cfg(test)]

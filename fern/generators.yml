@@ -1,0 +1,13 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# yaml-language-server: $schema=https://schema.buildwithfern.dev/generators-yml.json
+
+# The RMS gRPC API definition. The protos under ./proto are vendored from the
+# `librms` crate (nv-rms-client) revision pinned in ../Cargo.toml; refresh them
+# with `just api-ref-sync` and never edit them by hand.
+api:
+  specs:
+    - proto:
+        root: ./proto
+        local-generation: true

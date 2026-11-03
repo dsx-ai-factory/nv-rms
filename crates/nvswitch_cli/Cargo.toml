@@ -1,0 +1,18 @@
+[package]
+name = "nvswitch_cli"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+description = "Typed NVOS `nv` CLI commands and ordered flows for NVIDIA switches"
+
+[lib]
+name = "nvswitch_cli"
+path = "src/lib.rs"
+
+[dependencies]
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["time"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }

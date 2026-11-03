@@ -48,8 +48,8 @@ Here is an example of the command:
     +---------------------------+-------------------------------------+---------------------------------------------------------+
     | RF_PWR_STATUS             | Redfish chassis power status query  | GH200, GB200 NVL, GB300 NVL, and Vera Rubin NVL72       |
     +---------------------------+-------------------------------------+---------------------------------------------------------+
-    | RF_PWRSHELF_RESET         | Redfish PowerShelf graceful restart | Delta, LiteOn, and Megmeet PowerShelves                 |
+    | RF_PWRSHELF_RESET         | Redfish PowerShelf graceful restart | Delta, LiteOn, Flex, and Megmeet PowerShelves           |
     +---------------------------+-------------------------------------+---------------------------------------------------------+
-    | RF_PWRSHELF_RESET_FORCE   | Redfish PowerShelf force restart    | Delta, LiteOn, and Megmeet PowerShelves                 |
+    | RF_PWRSHELF_RESET_FORCE   | Redfish PowerShelf force restart    | Delta, LiteOn, Flex, and Megmeet PowerShelves           |
     +---------------------------+-------------------------------------+---------------------------------------------------------+
 

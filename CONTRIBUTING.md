@@ -223,6 +223,7 @@ cargo test --release --test grpc_e2e
 cargo test --release --test grpc_mtls
 cargo test --release --test mockup_server_test
 cargo test --release --test persistence memory::
+cargo test --release --test tracing_export
 ```
 
 You can run the build, formatting, and Clippy checks in the builder image:
@@ -258,8 +259,8 @@ Maintainers may ask for changes, split an overly broad pull request, or decline
 work that does not align with the project roadmap or security posture.
 
 Pull requests are not merged directly on GitHub: after review, maintainers
-integrate accepted changes into NVIDIA's internal repository, and the changes
-appear in a subsequent public release of this repository.
+integrate accepted changes, and they appear in a subsequent public release of
+this repository.
 
 ## Questions
 

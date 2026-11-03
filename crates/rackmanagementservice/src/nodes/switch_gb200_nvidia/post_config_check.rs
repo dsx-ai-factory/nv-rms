@@ -49,7 +49,6 @@ const REPORT_DIR: &str = "/host/cluster_infra/app_state/nmx-controller/nv-bridge
 
 const CONNECTION_STATE_CONNECTED: &str = "NMX_NVB_CONNECTION_STATE_CONNECTED";
 const KA_STATE_OK: &str = "NMX_NVB_KA_STATE_OK";
-const ACTIVE_STATE_ACTIVE: &str = "NMX_NVB_ACTIVE_STATE_ACTIVE";
 
 #[derive(Debug, Deserialize)]
 struct SdnStateReport {
@@ -74,12 +73,12 @@ struct SdnConnectionStatus {
     #[serde(rename = "nvbsAddress")]
     peer_address: String,
 
-    // The three state fields and chassis_sn_mismatch are proto3 enums/bool
-    // in the wire schema (nmx-m-nmx-c.proto), whose JSON encoding omits a
-    // field entirely when it holds its zero/default value. `default` lets a
-    // genuinely UNKNOWN-state or unset-mismatch connection deserialize (as
-    // "" or false) and fail the health check below on its own merits,
-    // instead of a missing key failing the whole report's parse.
+    // The state fields and chassis_sn_mismatch are proto3 enums/bool in the
+    // wire schema (nmx-m-nmx-c.proto), whose JSON encoding omits a field
+    // entirely when it holds its zero/default value. `default` lets a
+    // genuinely UNKNOWN connection or keepalive state deserialize as "" and
+    // fail the health check below on its own merits. Active state is role
+    // metadata rather than a health signal, but is retained for diagnostics.
     #[serde(rename = "connectionState", default)]
     connection_state: String,
 
@@ -162,7 +161,6 @@ impl SwitchGb200Nvidia {
             for status in &group.connection_statuses {
                 if status.connection_state != CONNECTION_STATE_CONNECTED
                     || status.ka_state != KA_STATE_OK
-                    || status.active_state != ACTIVE_STATE_ACTIVE
                 {
                     return Err(RmsError::internal(format!(
                         "SDN connection to '{}' ({}) in group '{}' is unhealthy: \

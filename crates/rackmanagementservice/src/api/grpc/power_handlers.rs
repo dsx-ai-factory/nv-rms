@@ -17,14 +17,10 @@
 
 use std::sync::Arc;
 
-use secrecy::ExposeSecret;
-
 use crate::api::grpc::conversions::{flatten_node_info, power_state_to_string};
 use crate::api::grpc::node_type_resolver::resolve_node_info;
-use crate::domain::node::{Node, NodeKind, PowerOp, PowerTargetType};
-use crate::domain::rack::{
-    Endpoint, EndpointConfig, EndpointCredentials, NodeConfig, RACK_POWER_BUSY_MESSAGE,
-};
+use crate::domain::node::{Node, NodeKind, NodeType, PowerOp, PowerTargetType};
+use crate::domain::rack::{Endpoint, EndpointConfig, NodeConfig, RACK_POWER_BUSY_MESSAGE};
 use crate::nodes::NodeInstance;
 use librms::protos::rack_manager as rm;
 
@@ -83,7 +79,6 @@ impl RackManagerServiceImpl {
             tracing::error!(node = %r.node_id, rack = %r.rack_id, error = %error.message, "failed to configure NVUE client");
             return Ok(tonic::Response::new(resp));
         }
-
         match node.set_power_state(op, PowerTargetType::System).await {
             Ok(()) => {
                 tracing::info!(node = %r.node_id, rack = %r.rack_id, ?op, "power state set");
@@ -141,7 +136,11 @@ impl RackManagerServiceImpl {
             // serialization; inventory-backed callers use SetPowerState instead.
             //
 
-            let node = match build_ephemeral_power_node(&node_info) {
+            let node = match build_ephemeral_power_node(
+                &node_info,
+                &self.hardware_profiles,
+                self.insecure_bmc,
+            ) {
                 Ok(node) => node,
                 Err(e) => {
                     tracing::error!(
@@ -248,7 +247,6 @@ impl RackManagerServiceImpl {
             tracing::error!(node = %r.node_id, rack = %r.rack_id, error = %error.message, "failed to configure NVUE client");
             return Ok(tonic::Response::new(resp));
         }
-
         match node.get_power_state().await {
             Ok(state) => {
                 resp.status = rm::ReturnCode::Success.into();
@@ -292,7 +290,11 @@ impl RackManagerServiceImpl {
 
         for node_info in nodes {
             let node_id = node_info.node_id.clone();
-            let node = match build_ephemeral_power_node(&node_info) {
+            let node = match build_ephemeral_power_node(
+                &node_info,
+                &self.hardware_profiles,
+                self.insecure_bmc,
+            ) {
                 Ok(node) => node,
                 Err(e) => {
                     tracing::error!(
@@ -367,7 +369,6 @@ impl RackManagerServiceImpl {
             failed_nodes,
         )))
     }
-
     async fn initialize_power_nvue_client_if_needed(
         &self,
         node: &NodeInstance,
@@ -376,21 +377,20 @@ impl RackManagerServiceImpl {
         let Some(client) = node.nvue_client() else {
             return Ok(());
         };
-
-        if node.supports_bmc_aux_powercycle() {
+        if node.node_type() == NodeType::SwitchVrnvl72Nvidia || node.supports_bmc_aux_powercycle() {
             return Ok(());
         }
-
         if op.is_some_and(|op| op != PowerOp::PowerCycle) {
             return Ok(());
         }
-
         self.initialize_nvue_client(Some(client), None).await
     }
 }
 
 pub(crate) fn build_ephemeral_power_node(
     node_info: &rm::NodeInfo,
+    hardware_profiles: &crate::config::hardware_profiles::HardwareProfileCatalog,
+    insecure_bmc: bool,
 ) -> std::result::Result<Arc<NodeInstance>, String> {
     let node_type = resolve_node_info(node_info).map_err(|error| error.to_string())?;
 
@@ -398,7 +398,7 @@ pub(crate) fn build_ephemeral_power_node(
 
     if node_type.kind() == NodeKind::Switch {
         // Switch power is a BMC/Redfish workflow. Even if the caller supplied a
-        // host_endpoint for NVUE, non-PowerCycle operations need BMC details so
+        // host_endpoint for NVUE, all power operations need BMC details so
         // RMS does not send Redfish power commands to the host endpoint.
         let Some(bmc) = flat.bmc.as_ref() else {
             return Err(format!(
@@ -412,12 +412,18 @@ pub(crate) fn build_ephemeral_power_node(
                 node_info.node_id
             ));
         }
-        if bmc.username.is_empty() || bmc.password.expose_secret().is_empty() {
+
+        let Some(credentials) = bmc
+            .credentials
+            .as_ref()
+            .filter(|credentials| credentials.has_auth_material())
+        else {
             return Err(format!(
                 "Missing BMC credentials for node {}",
                 node_info.node_id
             ));
-        }
+        };
+
         let port = flat.resolve_bmc_port().map_err(|e| e.message)?;
         let config = NodeConfig {
             id: node_info.node_id.clone(),
@@ -429,20 +435,19 @@ pub(crate) fn build_ephemeral_power_node(
                     port,
                     host_name: None,
                 },
-                Some(EndpointCredentials::new(
-                    bmc.username.as_str(),
-                    bmc.password.expose_secret(),
-                )),
-                true,
+                Some(credentials.clone()),
+                insecure_bmc,
             )),
             host_endpoint: None,
             expected_inventory: None,
+            recovery: None,
+            runtime_config: hardware_profiles.runtime_config_for_request(node_type),
         };
 
         return NodeInstance::create(&config, &node_info.rack_id).map_err(|e| e.message);
     }
 
-    if flat.creds_for_node_type(node_type).is_none() {
+    if !flat.has_credentials_for_node_type(node_type) {
         return Err(format!(
             "Missing BMC credentials for node {}",
             node_info.node_id
@@ -452,16 +457,11 @@ pub(crate) fn build_ephemeral_power_node(
     let config = NodeConfig {
         id: node_info.node_id.clone(),
         node_type,
-        bmc_endpoint: Some({
-            let mut endpoint = flat.bmc_endpoint().map_err(|e| e.message)?;
-            // BMC/Redfish endpoints use HTTPS with Basic auth in current
-            // deployments, but RMS cannot validate BMC certificates. Keep this
-            // hardcoded here rather than honoring a client-supplied endpoint field.
-            endpoint.dangerously_accept_invalid_certs = true;
-            endpoint
-        }),
+        bmc_endpoint: Some(flat.bmc_endpoint(insecure_bmc).map_err(|e| e.message)?),
         host_endpoint: flat.optional_host_endpoint().map_err(|e| e.message)?,
         expected_inventory: None,
+        recovery: None,
+        runtime_config: hardware_profiles.runtime_config_for_request(node_type),
     };
 
     NodeInstance::create(&config, &node_info.rack_id).map_err(|e| e.message)
@@ -590,10 +590,23 @@ mod tests {
             firmware_download_cancellations: Arc::new(Mutex::new(HashMap::new())),
             backends: Backends::memory(),
             firmware_dir: PathBuf::from("firmware"),
+            artifact_require_sha256: false,
+            insecure_bmc: true,
+            artifact_download_policy:
+                crate::api::grpc::artifact_download::ArtifactDownloadPolicy::default(),
             switch_tls_roots: SwitchTlsRoots::default(),
-            sftp_upload_options: crate::transport::ssh::SftpUploadOptions::default(),
+            sftp_upload_options: crate::transport::ssh::SshUploadOptions::default(),
             nmx_gateway_id: crate::libnmxc::DEFAULT_NMX_C_GATEWAY_ID.to_owned(),
             expected_inventory_catalog: crate::config::ExpectedInventoryCatalog::default(),
+            workflow_timings: crate::config::WorkflowTimings::default(),
+            recovery_profiles: crate::config::RecoveryProfiles::default(),
+            fabric_operations: std::sync::Arc::new(Default::default()),
+            fabric_layout_catalog: std::sync::Arc::new(
+                crate::config::fabric_layout::FabricLayoutCatalog::default(),
+            ),
+            hardware_profiles: Arc::new(
+                crate::config::hardware_profiles::HardwareProfileCatalog::built_in().unwrap(),
+            ),
         }
     }
 

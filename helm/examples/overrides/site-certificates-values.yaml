@@ -36,6 +36,8 @@ certificates:
   # re-run. Raise these if the site cannot redistribute on a 30-day cadence.
   duration: 720h0m0s
   renewBefore: 360h0m0s
+  # API server and switch client defaults. Switch server certificates use the
+  # chart's certificates.switchServer.privateKey default: ECDSA P-256 for NMX-C.
   privateKey:
     algorithm: ECDSA
     size: 384

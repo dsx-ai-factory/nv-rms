@@ -20,5 +20,5 @@
 //! New code can import [`crate::transport::ssh`]. Existing call sites keep
 //! using `transport::ssh_client` without refactoring.
 
-/// SSH client, endpoint, and SFTP option types retained at the legacy path.
-pub use super::ssh::{SftpUploadOptions, SshClient, SshEndpoint};
+/// SSH client, endpoint, and upload option types retained at the compatibility path.
+pub use super::ssh::{SshClient, SshEndpoint, SshUploadOptions};

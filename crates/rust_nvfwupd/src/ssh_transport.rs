@@ -30,10 +30,21 @@ use russh::keys::{known_hosts, PublicKey, PublicKeyOrCertificate};
 use russh::{client, ChannelMsg, Disconnect};
 use russh_sftp::client::SftpSession;
 use russh_sftp::protocol::{FileAttributes, OpenFlags};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const SFTP_BUF_SIZE: usize = 128 * 1024;
+const SFTP_PROGRESS_INTERVAL: Duration = Duration::from_secs(60);
 const DEFAULT_KNOWN_HOSTS_RELATIVE_PATH: &str = ".ssh/known_hosts";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SftpUploadProgress {
+    pub(crate) uploaded_bytes: u64,
+    pub(crate) total_bytes: Option<u64>,
+    pub(crate) elapsed_secs: u64,
+}
+
+pub(crate) type SftpUploadProgressReporter =
+    Arc<dyn Fn(SftpUploadProgress) + Send + Sync + 'static>;
 
 /// Host-key verification behavior for NVFWUPD SSH/SFTP sessions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -537,17 +548,26 @@ pub(crate) async fn upload_file_async(
     result
 }
 
+/// Run each `setup_command` and then SFTP-upload `local_path` to `remote_path`
+/// over a single SSH session.
+///
+/// `setup_timeout_secs` bounds each (quick) setup command independently of
+/// `operation_timeout_secs`, which is reserved for the potentially large file
+/// transfer -- a `mkdir -p` / `rm -f` must not inherit a multi-minute upload
+/// budget.
 pub(crate) async fn upload_file_with_setup_async(
     host: &str,
     port: u16,
     user: &str,
     password: &str,
     connect_timeout_secs: u64,
+    setup_timeout_secs: u64,
     operation_timeout_secs: u64,
     setup_commands: &[String],
     local_path: PathBuf,
     remote_path: String,
     host_key_policy: SshHostKeyPolicy,
+    progress_reporter: Option<SftpUploadProgressReporter>,
 ) -> Result<(), String> {
     #[cfg(test)]
     if let Some(result) = mock_upload_with_setup_result(
@@ -573,12 +593,12 @@ pub(crate) async fn upload_file_with_setup_async(
     let result = async {
         for command in setup_commands {
             let output = tokio::time::timeout(
-                Duration::from_secs(operation_timeout_secs),
+                Duration::from_secs(setup_timeout_secs),
                 exec_on_session(&mut session, command, None),
             )
             .await
             .map_err(|_| {
-                format!("SSH command '{command}' timed out after {operation_timeout_secs}s")
+                format!("SSH command '{command}' timed out after {setup_timeout_secs}s")
             })??;
 
             if !output.success {
@@ -595,6 +615,7 @@ pub(crate) async fn upload_file_with_setup_async(
             operation_timeout_secs,
             local_path,
             remote_path,
+            progress_reporter,
         )
         .await
     }
@@ -611,10 +632,16 @@ async fn upload_file_on_session(
     timeout_secs: u64,
     local_path: PathBuf,
     remote_path: String,
+    progress_reporter: Option<SftpUploadProgressReporter>,
 ) -> Result<(), String> {
     let local_file = tokio::fs::File::open(&local_path)
         .await
         .map_err(|e| format!("Failed to open file {}: {e}", local_path.display()))?;
+    let total_bytes = local_file
+        .metadata()
+        .await
+        .ok()
+        .map(|metadata| metadata.len());
     let mut reader = tokio::io::BufReader::with_capacity(SFTP_BUF_SIZE, local_file);
 
     tokio::time::timeout(Duration::from_secs(timeout_secs), async {
@@ -643,9 +670,38 @@ async fn upload_file_on_session(
             .await
             .map_err(|e| format!("SFTP open failed: {e}"))?;
 
-        tokio::io::copy_buf(&mut reader, &mut remote_file)
-            .await
-            .map_err(|e| format!("SFTP write failed: {e}"))?;
+        let started = std::time::Instant::now();
+        let mut last_report = started;
+        let mut uploaded_bytes = 0_u64;
+        let mut buffer = vec![0_u8; SFTP_BUF_SIZE];
+
+        loop {
+            let read_bytes = reader
+                .read(&mut buffer)
+                .await
+                .map_err(|e| format!("Local file read failed during SFTP upload: {e}"))?;
+            if read_bytes == 0 {
+                break;
+            }
+
+            remote_file
+                .write_all(&buffer[..read_bytes])
+                .await
+                .map_err(|e| format!("SFTP write failed: {e}"))?;
+            uploaded_bytes += read_bytes as u64;
+
+            if let Some(reporter) = &progress_reporter {
+                let now = std::time::Instant::now();
+                if now.duration_since(last_report) >= SFTP_PROGRESS_INTERVAL {
+                    reporter(SftpUploadProgress {
+                        uploaded_bytes,
+                        total_bytes,
+                        elapsed_secs: now.duration_since(started).as_secs(),
+                    });
+                    last_report = now;
+                }
+            }
+        }
         remote_file
             .flush()
             .await

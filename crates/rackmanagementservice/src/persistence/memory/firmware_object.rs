@@ -166,6 +166,26 @@ impl FirmwareObjectStore for MemoryFirmwareObjectStore {
         Ok(fw.clone())
     }
 
+    async fn finish_preparation(
+        &self,
+        id: &str,
+        created: chrono::DateTime<Utc>,
+        metadata: serde_json::Value,
+        available: bool,
+    ) -> Result<FirmwareObject> {
+        let mut catalog = recover(self.catalog.write());
+        let firmware = catalog
+            .get_mut(id)
+            .filter(|firmware| firmware.created == created)
+            .ok_or_else(|| {
+                RmsError::not_found(format!("firmware object incarnation {id} not found"))
+            })?;
+        firmware.parsed_components = Some(metadata);
+        firmware.available = available;
+        firmware.updated = Utc::now();
+        Ok(firmware.clone())
+    }
+
     async fn set_default(&self, id: &str) -> Result<FirmwareObject> {
         // Hold the write lock across the entire clear+set sequence -- this
         // is what gives us the same atomicity as the Postgres transaction.
@@ -259,6 +279,38 @@ impl FirmwareObjectStore for MemoryFirmwareObjectStore {
         node_ids: &[String],
     ) -> Result<()> {
         let mut history = recover(self.history.write());
+        history.push(StoredApply {
+            object_id: object_id.to_owned(),
+            rack_id: rack_id.to_owned(),
+            firmware_type: firmware_type.to_owned(),
+            rack_hardware_type: hw_type,
+            node_ids: node_ids.to_vec(),
+            applied_at: Utc::now(),
+        });
+        Ok(())
+    }
+
+    async fn record_apply_for_incarnation(
+        &self,
+        object_id: &str,
+        created: chrono::DateTime<Utc>,
+        rack_id: &str,
+        firmware_type: &str,
+        hw_type: RackHardwareType,
+        node_ids: &[String],
+    ) -> Result<()> {
+        // Same lock order as list_apply_history. Holding the catalog read lock
+        // through insertion prevents delete/create from interleaving the check.
+        let mut history = recover(self.history.write());
+        let catalog = recover(self.catalog.read());
+        if catalog
+            .get(object_id)
+            .is_none_or(|firmware| firmware.created != created)
+        {
+            return Err(RmsError::not_found(format!(
+                "firmware object incarnation {object_id} not found"
+            )));
+        }
         history.push(StoredApply {
             object_id: object_id.to_owned(),
             rack_id: rack_id.to_owned(),

@@ -57,7 +57,7 @@ static SECRET_BARE_EQUALS_RE: LazyLock<Regex> = LazyLock::new(|| {
         r#"(?ix)
         (?P<prefix>["']?(?P<key>[A-Za-z0-9_.-]*(?:password|passwd|pwd|pass|token|secret|credential|api[_-]?key|authorization|cookie|session)[A-Za-z0-9_.-]*)["']?\s*=\s*)
         (?P<value>[^"',}\]\r\n]*?)
-        (?P<suffix>["']|\s+[A-Za-z0-9_.-]+\s*=|\s*[,}\]]|$)
+        (?P<suffix>["']|[\r\n]|\s+[A-Za-z0-9_.-]+\s*=|\s*[,}\]]|$)
         "#,
     )
     .expect("valid bare equals secret field regex")
@@ -170,6 +170,23 @@ pub fn redact_secret_fields(data: &str) -> String {
         .into_owned()
 }
 
+/// Redacts secret fields, then retains at most `max_chars` Unicode characters.
+/// An additional ellipsis marks truncation; redaction always runs before truncation.
+///
+/// ```
+/// assert_eq!(common::redaction::redact_secret_fields_bounded("token=secret", 10), "token=XXXX");
+/// assert_eq!(common::redaction::redact_secret_fields_bounded("é\u{10400}text", 2), "é\u{10400}…");
+/// ```
+pub fn redact_secret_fields_bounded(value: &str, max_chars: usize) -> String {
+    let redacted = redact_secret_fields(value);
+    let mut characters = redacted.chars();
+    let mut bounded: String = characters.by_ref().take(max_chars).collect();
+    if characters.next().is_some() {
+        bounded.push('…');
+    }
+    bounded
+}
+
 /// Redacts one CLI-style `key=value` argument without relying on whitespace delimiters.
 pub fn redact_secret_key_value_arg(arg: &str) -> String {
     let Some((key, _value)) = arg.split_once('=') else {
@@ -228,6 +245,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn bounded_redaction_preserves_unicode_and_masks_before_truncation() {
+        for (value, max_chars, expected) in [
+            ("", 0, ""),
+            ("safe", 0, "…"),
+            ("safe", 3, "saf…"),
+            ("safe", 4, "safe"),
+            ("é\u{10400}text", 2, "é\u{10400}…"),
+            ("é\u{10400}", 2, "é\u{10400}"),
+            ("token=plain_secret", 10, "token=XXXX"),
+            ("token=plain_secret", 8, "token=XX…"),
+            (r#"token="plain_secret""#, 10, "token=XXXX…"),
+            (r#"token="plain\"secret""#, 10, "token=XXXX…"),
+            ("é\u{10400} token=plain_secret", 64, "é\u{10400} token=XXXX"),
+            ("compass=north", 64, "compass=north"),
+        ] {
+            let result = redact_secret_fields_bounded(value, max_chars);
+            assert_eq!(result, expected, "value={value:?}, max_chars={max_chars}");
+            assert!(!result.contains("plain"));
+            assert!(!result.contains("secret"));
+        }
+    }
+
+    #[test]
     fn masks_password_like_keys() {
         let secret = "plain_secret";
         let cases = [
@@ -248,6 +288,22 @@ mod tests {
         }
 
         assert_eq!(redact_secret_fields("compass=north"), "compass=north");
+    }
+
+    #[test]
+    fn masks_bare_secrets_at_line_boundaries() {
+        for (input, expected) in [
+            (
+                "password=hunter2\nanother line",
+                "password=XXXX\nanother line",
+            ),
+            ("password=hunter2\r\n", "password=XXXX\r\n"),
+            ("password=hunter2\rnext", "password=XXXX\rnext"),
+            ("password=a\npassword=b", "password=XXXX\npassword=XXXX"),
+            ("password=a\r\npassword=b", "password=XXXX\r\npassword=XXXX"),
+        ] {
+            assert_eq!(redact_secret_fields(input), expected, "input: {input:?}");
+        }
     }
 
     #[test]

@@ -15,11 +15,14 @@
  * limitations under the License.
  */
 
+pub(crate) mod bmc_tls;
 pub mod conversions;
 pub mod firmware_handlers;
 pub mod firmware_object_handlers;
 pub mod inventory_handlers;
+pub mod mtls_reload;
 pub mod node_type_resolver;
+pub mod nvssvt_handlers;
 pub mod power_handlers;
 pub mod reboot_handlers;
 pub mod scaleupfabricmanager_handlers;
@@ -28,9 +31,12 @@ pub mod switch_attestation_handlers;
 pub mod switch_certificate_handlers;
 pub mod switch_handlers;
 pub mod switch_image_handlers;
+mod switch_scope;
 pub mod switch_security_handlers;
 
 pub(crate) mod artifact_download;
+pub use artifact_download::ArtifactDownloadPolicy;
+pub(crate) mod artifact_download_policy;
 pub(crate) mod firmware_artifact_paths;
 pub(crate) mod firmware_task_util;
 pub(crate) mod node_recovery;

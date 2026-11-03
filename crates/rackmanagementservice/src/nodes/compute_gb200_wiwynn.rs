@@ -27,9 +27,8 @@ use crate::utilities::error::{Result, RmsError};
 
 /// Wiwynn GB200 compute node.
 ///
-/// Wiwynn GB200 uses the reference GB200 runtime behavior. Its descriptor-selected
-/// internal identity allows firmware-object apply to preserve both BMC images
-/// supplied by the firmware manifest without changing NVIDIA GB200 policy or the protobuf enum.
+/// Wiwynn GB200 uses the reference GB200 runtime behavior while preserving its
+/// descriptor-selected identity without changing the protobuf enum.
 pub struct WiwynnGb200Compute {
     inner: NvidiaGb200Compute,
 }
@@ -164,6 +163,8 @@ mod tests {
             )),
             host_endpoint: None,
             expected_inventory: None,
+            recovery: None,
+            runtime_config: None,
         }
     }
 
@@ -205,11 +206,15 @@ mod tests {
                 component: "CX7".to_owned(),
                 firmware_file: "/tmp/cx7-a.bin".to_owned(),
                 expected_version: None,
+                resolution: None,
+                linkx_policy: None,
             },
             FirmwareTarget {
                 component: "CX7".to_owned(),
                 firmware_file: "/tmp/cx7-b.bin".to_owned(),
                 expected_version: None,
+                resolution: None,
+                linkx_policy: None,
             },
         ];
 

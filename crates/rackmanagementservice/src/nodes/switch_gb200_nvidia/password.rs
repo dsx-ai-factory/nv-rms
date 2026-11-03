@@ -21,6 +21,7 @@ use std::time::Duration;
 
 use super::validation::is_valid_system_username;
 use super::{SwitchGb200Nvidia, config};
+use crate::domain::rack::EndpointCredentials;
 use crate::transport::http_client::HttpClient;
 use crate::transport::ssh_client::{SshClient, SshEndpoint};
 use crate::utilities::error::{ErrorCode, Result, RmsError};
@@ -145,11 +146,11 @@ impl SwitchGb200Nvidia {
         }
 
         let (active_auth_username, requested_password_matches_active_credentials) = {
-            let current_credentials = self.require_host_credentials()?;
-            let matches_active_user = user_id == current_credentials.username.as_str();
+            let (current_username, current_password) = self.require_host_credentials()?;
+            let matches_active_user = user_id == current_username;
             (
-                matches_active_user.then(|| current_credentials.username.clone()),
-                matches_active_user && current_credentials.password.expose_secret() == new_password,
+                matches_active_user.then(|| current_username.to_owned()),
+                matches_active_user && current_password.expose_secret() == new_password,
             )
         };
 
@@ -210,7 +211,7 @@ impl SwitchGb200Nvidia {
             .map(|username| self.build_candidate_nvue_client(username, new_password))
             .transpose()?;
 
-        let no_config_diff = self
+        let outcome = self
             .wait_for_revision_applied_or_no_config_diff(
                 &revision_id,
                 Duration::from_secs(config::REVISION_APPLY_TIMEOUT_SECONDS),
@@ -219,12 +220,15 @@ impl SwitchGb200Nvidia {
             .await
             .map_err(|e| redact_password_update_rms_error(e, new_password, &encoded_password))?;
 
-        if no_config_diff {
+        if !outcome.needs_save() {
+            // Rotation still saves below: the save doubles as the repair path
+            // for an earlier attempt that applied but failed to save.
             tracing::info!(
                 node = %self.id,
                 user = %user_id,
                 revision = %revision_id,
-                "switch password revision had no config diff; continuing to save applied config"
+                ?outcome,
+                "switch password revision needed no save from apply; continuing to save applied config"
             );
         }
 
@@ -284,11 +288,11 @@ impl SwitchGb200Nvidia {
         }
 
         let (target_is_endpoint_user, requested_password_matches_endpoint) = {
-            let credentials = self.require_host_credentials()?;
+            let (username, current_password) = self.require_host_credentials()?;
 
             (
-                credentials.username == user_id,
-                credentials.username == user_id && credentials.password.expose_secret() == password,
+                username == user_id,
+                username == user_id && current_password.expose_secret() == password,
             )
         };
 
@@ -355,9 +359,7 @@ impl SwitchGb200Nvidia {
         .await?;
 
         if !(200..300).contains(&status) {
-            if status == 401
-                && user_id == "admin"
-                && self.require_host_credentials()?.username == "admin"
+            if status == 401 && user_id == "admin" && self.require_host_credentials()?.0 == "admin"
             {
                 self.recover_admin_password_after_boot(password).await?;
 
@@ -487,24 +489,82 @@ impl SwitchGb200Nvidia {
             .clone_with_credentials(NvueCredentials::new(username, password)))
     }
 
-    async fn refresh_http_credentials(&mut self, new_password: &str) -> Result<()> {
-        let Some(host_endpoint) = self.host_endpoint.as_mut() else {
-            return Err(RmsError::failed_precondition(
-                "switch host endpoint is required for NVUE/NVOS operations",
-            ));
+    /// Selects credentials for physical admission without changing switch state.
+    ///
+    /// Rejected endpoint credentials permit a requested-password probe only for
+    /// the same user. A returned alternate client is used for identity discovery
+    /// and passed to the resumable update; persistence still follows admission.
+    pub(crate) async fn authenticate_system_user_password_update(
+        &self,
+        user_id: &str,
+        password: &str,
+    ) -> Result<Option<SharedNvueClient>> {
+        let Err(error) = self.verify_current_nvue_credentials().await else {
+            return Ok(None);
         };
 
-        let Some(credentials) = host_endpoint.credentials.as_mut() else {
+        if error.code != ErrorCode::Unauthenticated {
+            return Err(error);
+        }
+
+        let (endpoint_username, _) = self.require_host_credentials()?;
+
+        if endpoint_username != user_id {
+            return Err(error);
+        }
+
+        let candidate = self.build_candidate_nvue_client(user_id, password)?;
+
+        let status = Self::probe_nvue_credentials(
+            &candidate,
+            "requested switch credentials before mutation admission",
+        )
+        .await?;
+
+        if status == 401 {
+            return Err(RmsError::unauthenticated(
+                "neither endpoint nor requested switch credentials authenticated for password rotation",
+            ));
+        }
+
+        if !(200..300).contains(&status) {
+            let code = match status {
+                408 => ErrorCode::Timeout,
+                503 => ErrorCode::Unavailable,
+                _ => ErrorCode::Internal,
+            };
+
+            return Err(RmsError::new(
+                code,
+                format!(
+                    "requested switch credential probe returned HTTP {status} before mutation admission"
+                ),
+            ));
+        }
+
+        Ok(Some(candidate))
+    }
+
+    async fn refresh_http_credentials(&mut self, new_password: &str) -> Result<()> {
+        let username = self.require_host_credentials()?.0.to_owned();
+
+        // Update the NVUE client first: if this fails, return before mutating
+        // in-memory credentials so they never diverge from what the client uses.
+        self.nvue_client()?
+            .update_credentials(NvueCredentials::new(&username, new_password))
+            .await?;
+
+        let Some(EndpointCredentials::UserPass { password, .. }) = self
+            .host_endpoint
+            .as_mut()
+            .and_then(|endpoint| endpoint.credentials.as_mut())
+        else {
             return Err(RmsError::failed_precondition(
                 "switch host credentials are required for NVUE/NVOS operations",
             ));
         };
 
-        let username = credentials.username.clone();
-        credentials.password = SecretString::from(new_password);
-        self.nvue_client()?
-            .update_credentials(NvueCredentials::new(&username, new_password))
-            .await?;
+        *password = SecretString::from(new_password);
 
         tracing::debug!(
             node = %self.id,
@@ -524,7 +584,7 @@ impl SwitchGb200Nvidia {
     ///
     /// Precondition: this Switch's host endpoint user must be `admin`.
     pub async fn recover_admin_password_after_boot(&mut self, new_password: &str) -> Result<()> {
-        let host_username = self.require_host_credentials()?.username.clone();
+        let host_username = self.require_host_credentials()?.0.to_owned();
 
         if host_username != "admin" {
             return Err(RmsError::failed_precondition(
@@ -596,5 +656,97 @@ impl SwitchGb200Nvidia {
 
             tokio::time::sleep(RECOVERED_PASSWORD_VALIDATION_INTERVAL).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use wiremock::matchers::{basic_auth, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn password_admission_probes_are_read_only_and_restrict_candidate_credentials() {
+        for (target_user, candidate_status, expected_code) in [
+            ("operator", 200, None),
+            ("operator", 401, Some(ErrorCode::Unauthenticated)),
+            ("operator", 408, Some(ErrorCode::Timeout)),
+            ("operator", 503, Some(ErrorCode::Unavailable)),
+            ("operator", 418, Some(ErrorCode::Internal)),
+            ("other-user", 200, Some(ErrorCode::Unauthenticated)),
+        ] {
+            let nvue = MockServer::start().await;
+
+            Mock::given(method("GET"))
+                .and(path("/nvue_v1/system"))
+                .and(basic_auth("operator", "current-password"))
+                .respond_with(ResponseTemplate::new(401))
+                .expect(1)
+                .mount(&nvue)
+                .await;
+
+            Mock::given(method("GET"))
+                .and(path("/nvue_v1/system"))
+                .and(basic_auth(target_user, "next-password"))
+                .respond_with(ResponseTemplate::new(candidate_status))
+                .expect(u64::from(target_user == "operator"))
+                .mount(&nvue)
+                .await;
+
+            let switch = SwitchGb200Nvidia::for_test(&nvue.uri())
+                .with_host_credentials_for_test("operator", "current-password");
+
+            let result = switch
+                .authenticate_system_user_password_update(target_user, "next-password")
+                .await;
+
+            if let Some(code) = expected_code {
+                assert_eq!(result.err().unwrap().code, code);
+            } else {
+                assert!(result.unwrap().is_some());
+            }
+
+            let requests = nvue.received_requests().await.unwrap();
+
+            assert!(
+                requests
+                    .iter()
+                    .all(|request| request.method == wiremock::http::Method::Get)
+            );
+
+            assert_eq!(
+                switch.require_host_credentials().unwrap().1.expose_secret(),
+                "current-password"
+            );
+
+            nvue.verify().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_http_credentials_does_not_mutate_password_when_nvue_client_missing() {
+        let mut switch = SwitchGb200Nvidia::for_test("http://127.0.0.1:1");
+        switch.nvue = None;
+
+        let result = switch.refresh_http_credentials("new-password").await;
+
+        assert!(
+            result.is_err(),
+            "refresh should fail before touching in-memory credentials"
+        );
+
+        let password = switch
+            .host_endpoint
+            .as_ref()
+            .and_then(|endpoint| endpoint.credentials.as_ref())
+            .and_then(EndpointCredentials::user_pass)
+            .map(|(_, password)| password.to_owned())
+            .expect("host endpoint credentials should still be present");
+
+        assert_eq!(
+            password, "test-password",
+            "in-memory credentials must not change when the NVUE update never ran"
+        );
     }
 }

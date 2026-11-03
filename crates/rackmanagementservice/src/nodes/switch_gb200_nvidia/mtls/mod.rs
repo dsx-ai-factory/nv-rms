@@ -18,11 +18,25 @@
 //! mTLS certificate installation and NVUE configuration for NVIDIA GB200 switches.
 
 mod nvue;
+mod retention;
 mod workflows;
 
-pub(crate) use self::workflows::{
-    StableNmxcTlsConfig, mtls_remote_file_specs, sftp_copy_stage_name,
+pub(crate) use self::retention::{
+    CertificateBindings, CertificateInventory, CertificateStore, NVOS_CERTIFICATE_STORE_LIMIT,
+    plan_store_reclaim,
 };
+
+#[cfg(test)]
+pub(crate) use self::retention::{ReportedUsage, StoreInventory};
+
+pub(crate) use self::workflows::{
+    GNMI_CLIENT_AUTHENTICATION_MTLS, GNMI_CLIENT_AUTHENTICATION_SERVER_CERTIFICATE_ONLY,
+    MtlsSftpCopyOutcome, MtlsUnsetReport, MtlsUnsetStage, MtlsUnsetStatus, StableNmxcTlsConfig,
+    mtls_remote_file_specs, sftp_copy_stage_name,
+};
+
+#[cfg(test)]
+pub(crate) use self::workflows::{MtlsPersistOutcome, MtlsServiceOutcome, MtlsUnsetFailureSite};
 
 pub use self::workflows::{
     SWITCH_CERTIFICATE_PRIVATE_KEY_PERMISSIONS, SWITCH_CERTIFICATE_PUBLIC_FILE_PERMISSIONS,

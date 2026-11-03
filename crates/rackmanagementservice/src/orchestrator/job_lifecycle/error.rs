@@ -83,9 +83,46 @@ impl JobError {
     }
 }
 
+/// Recovers a lifecycle failure's typed code for API results and telemetry.
+/// Untyped errors retain the existing [`JobError::Internal`] classification;
+/// their free-form messages must never be used as telemetry labels.
+pub(crate) fn job_error_of(error: &anyhow::Error) -> JobError {
+    error
+        .downcast_ref::<JobError>()
+        .copied()
+        .unwrap_or(JobError::Internal)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recovery_preserves_typed_codes_and_defaults_untyped_errors() {
+        for (code, label) in [
+            (JobError::Unspecified, "unspecified"),
+            (JobError::Internal, "internal"),
+            (JobError::Other, "other"),
+            (JobError::InvalidArgument, "invalid_argument"),
+            (JobError::FailedPrecondition, "failed_precondition"),
+            (JobError::ClientError, "client_error"),
+            (JobError::ServerError, "server_error"),
+            (JobError::Timeout, "timeout"),
+            (JobError::InvalidResponse, "invalid_response"),
+            (JobError::Unauthenticated, "unauthenticated"),
+            (JobError::TargetNotFound, "target_not_found"),
+            (JobError::FileNotFound, "file_not_found"),
+            (JobError::UpdateInProgress, "update_in_progress"),
+        ] {
+            let error = anyhow::Error::new(code);
+            assert_eq!(job_error_of(&error), code);
+            assert_eq!(job_error_of(&error.context("private-error-detail")), code);
+            assert_eq!(code.metrics_label(), label);
+        }
+        let untyped = anyhow::anyhow!("private-untyped-error").context("private-context");
+        assert_eq!(job_error_of(&untyped), JobError::Internal);
+        assert_eq!(job_error_of(&untyped).metrics_label(), "internal");
+    }
 
     #[test]
     fn display_uses_human_readable_text() {

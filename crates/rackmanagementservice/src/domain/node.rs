@@ -132,14 +132,21 @@ pub struct FirmwareInfo {
     pub updateable: bool,
     pub target: String,
     pub health: String,
+    pub state: String,
     pub sku: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FirmwareTarget {
+    /// Logical component identity; profile resolution must not replace it with a path.
     pub component: String,
     pub firmware_file: String,
     pub expected_version: Option<String>,
+    /// Present once a profile target is selected. Legacy/code-default requests
+    /// retain their existing component interpretation when this is absent.
+    pub resolution: Option<super::firmware_target::FirmwareTargetResolution>,
+    /// Private manifest rollout policy; never inferred from a filename.
+    pub linkx_policy: Option<nvfwupd::flint::LinkxPolicy>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -149,6 +156,14 @@ pub struct FirmwareTaskStatus {
     pub state: String,
     pub status: String,
     pub message: String,
+    pub rejection: Option<FirmwareTaskRejection>,
+}
+
+/// A terminal firmware task rejection established from the structured response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FirmwareTaskRejection {
+    /// Every reported failure is an identical image; no component reports a completed update or pending activation.
+    IdenticalImage,
 }
 
 /// Canonical RMS node type.
@@ -159,6 +174,7 @@ pub struct FirmwareTaskStatus {
 pub enum NodeType {
     ComputeGb200Nvidia,
     ComputeGb200Wiwynn,
+    ComputeGb200Dell,
     PowershelfGb200Liteon,
     SwitchGb200Nvidia,
     PowershelfGb200Delta,
@@ -170,10 +186,13 @@ pub enum NodeType {
     ComputeGb300Supermicro,
     ComputeVrnvl72Nvidia,
     SwitchVrnvl72Nvidia,
+    PowershelfVrnvl72Liteon,
+    PowershelfVrnvl72Delta,
 }
 
 /// Broad device kind used for policies that only care about node role.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum NodeKind {
     Compute,
     Powershelf,
@@ -204,7 +223,69 @@ pub enum NvfwupdServerProfile {
     SwitchVrnvl72,
 }
 
+/// Profile-derived parameters for a concrete Redfish/NVFWUPD compute node.
+///
+/// These values are compiled from a hardware profile at startup and passed to
+/// the implementation selected by [`NodeType`]. They configure existing
+/// behavior; they do not select or replace the concrete node implementation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RedfishNvfwupdComputeConfig {
+    /// NVFWUPD protocol family used to interpret packages and workflows.
+    pub nvfwupd_server_profile: NvfwupdServerProfile,
+    /// Redfish `ComputerSystem` resource ID used for host power operations.
+    pub computer_system_id: Arc<str>,
+    /// Redfish `Manager` resource ID used for host-BMC power operations.
+    pub bmc_manager_id: Arc<str>,
+    /// Redfish `Manager` resource ID used for HMC power operations.
+    pub hmc_manager_id: Arc<str>,
+    /// Aggregate timeout for one MNNVLink topology read.
+    pub device_info_timeout: Duration,
+    /// Connection establishment limit for the shared Redfish client.
+    pub redfish_connect_timeout: Duration,
+    /// Per-request limit for shared Redfish reads and power operations.
+    pub redfish_request_timeout: Duration,
+    /// Per-upload limit for the direct Redfish upload operation.
+    pub redfish_upload_timeout: Duration,
+    /// Optional paths for direct power operations and firmware activation.
+    pub power_paths: super::compute_power::ComputePowerPaths,
+    /// Low-level compute firmware workflow timings.
+    pub firmware_timing: super::compute_timing::ComputeFirmwareTiming,
+}
+
+/// Validated runtime parameters supplied to a concrete node implementation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NodeRuntimeConfig {
+    /// Parameters understood by concrete Redfish/NVFWUPD compute implementations.
+    RedfishNvfwupdCompute(RedfishNvfwupdComputeConfig),
+}
+
 impl NodeType {
+    /// Resolve a canonical node type from its stable configuration name.
+    ///
+    /// Matching is exact and case-sensitive so configuration does not create
+    /// aliases for hardware identity.
+    pub fn from_stable_name(value: &str) -> Option<Self> {
+        match value {
+            "compute_gb200_nvidia" => Some(Self::ComputeGb200Nvidia),
+            "compute_gb200_wiwynn" => Some(Self::ComputeGb200Wiwynn),
+            "compute_gb200_dell" => Some(Self::ComputeGb200Dell),
+            "powershelf_gb200_liteon" => Some(Self::PowershelfGb200Liteon),
+            "switch_gb200_nvidia" => Some(Self::SwitchGb200Nvidia),
+            "powershelf_gb200_delta" => Some(Self::PowershelfGb200Delta),
+            "compute_gb300_nvidia" => Some(Self::ComputeGb300Nvidia),
+            "switch_gb300_nvidia" => Some(Self::SwitchGb300Nvidia),
+            "powershelf_gb300_liteon" => Some(Self::PowershelfGb300Liteon),
+            "powershelf_gb300_delta" => Some(Self::PowershelfGb300Delta),
+            "compute_gb300_lenovo" => Some(Self::ComputeGb300Lenovo),
+            "compute_gb300_supermicro" => Some(Self::ComputeGb300Supermicro),
+            "compute_vrnvl72_nvidia" => Some(Self::ComputeVrnvl72Nvidia),
+            "switch_vrnvl72_nvidia" => Some(Self::SwitchVrnvl72Nvidia),
+            "powershelf_vrnvl72_liteon" => Some(Self::PowershelfVrnvl72Liteon),
+            "powershelf_vrnvl72_delta" => Some(Self::PowershelfVrnvl72Delta),
+            _ => None,
+        }
+    }
+
     /// Stable protobuf/config string for this node type.
     ///
     /// Prefer `Display` in formatting contexts. This method remains
@@ -214,6 +295,7 @@ impl NodeType {
         match self {
             Self::ComputeGb200Nvidia => "compute_gb200_nvidia",
             Self::ComputeGb200Wiwynn => "compute_gb200_wiwynn",
+            Self::ComputeGb200Dell => "compute_gb200_dell",
             Self::PowershelfGb200Liteon => "powershelf_gb200_liteon",
             Self::SwitchGb200Nvidia => "switch_gb200_nvidia",
             Self::PowershelfGb200Delta => "powershelf_gb200_delta",
@@ -225,6 +307,8 @@ impl NodeType {
             Self::ComputeGb300Supermicro => "compute_gb300_supermicro",
             Self::ComputeVrnvl72Nvidia => "compute_vrnvl72_nvidia",
             Self::SwitchVrnvl72Nvidia => "switch_vrnvl72_nvidia",
+            Self::PowershelfVrnvl72Liteon => "powershelf_vrnvl72_liteon",
+            Self::PowershelfVrnvl72Delta => "powershelf_vrnvl72_delta",
         }
     }
 
@@ -233,6 +317,7 @@ impl NodeType {
         match self {
             Self::ComputeGb200Nvidia
             | Self::ComputeGb200Wiwynn
+            | Self::ComputeGb200Dell
             | Self::ComputeGb300Nvidia
             | Self::ComputeGb300Lenovo
             | Self::ComputeGb300Supermicro
@@ -240,7 +325,9 @@ impl NodeType {
             Self::PowershelfGb200Liteon
             | Self::PowershelfGb200Delta
             | Self::PowershelfGb300Liteon
-            | Self::PowershelfGb300Delta => NodeKind::Powershelf,
+            | Self::PowershelfGb300Delta
+            | Self::PowershelfVrnvl72Liteon
+            | Self::PowershelfVrnvl72Delta => NodeKind::Powershelf,
             Self::SwitchGb200Nvidia | Self::SwitchGb300Nvidia | Self::SwitchVrnvl72Nvidia => {
                 NodeKind::Switch
             }
@@ -252,11 +339,20 @@ impl NodeType {
         matches!(self, Self::ComputeGb200Nvidia | Self::ComputeGb200Wiwynn)
     }
 
+    /// Node types with a compute OOB recovery flow: the only ones a recovery
+    /// profile may bind to. The GB200 constructor is shared by wrappers that
+    /// have no flow of their own, so the check happens by type, not by
+    /// constructor.
+    pub const fn has_recovery_flow(self) -> bool {
+        matches!(self, Self::ComputeGb200Nvidia)
+    }
+
     /// Product family that owns this node type.
     pub const fn product_family(self) -> ProductFamily {
         match self {
             Self::ComputeGb200Nvidia
             | Self::ComputeGb200Wiwynn
+            | Self::ComputeGb200Dell
             | Self::PowershelfGb200Liteon
             | Self::SwitchGb200Nvidia
             | Self::PowershelfGb200Delta => ProductFamily::Gb200,
@@ -266,7 +362,10 @@ impl NodeType {
             | Self::PowershelfGb300Delta
             | Self::ComputeGb300Lenovo
             | Self::ComputeGb300Supermicro => ProductFamily::Gb300,
-            Self::ComputeVrnvl72Nvidia | Self::SwitchVrnvl72Nvidia => ProductFamily::Vrnvl72,
+            Self::ComputeVrnvl72Nvidia
+            | Self::SwitchVrnvl72Nvidia
+            | Self::PowershelfVrnvl72Liteon
+            | Self::PowershelfVrnvl72Delta => ProductFamily::Vrnvl72,
         }
     }
 
@@ -281,7 +380,7 @@ impl NodeType {
     /// NVFWUPD server-type profile for firmware workflows.
     pub const fn nvfwupd_server_profile(self) -> NvfwupdServerProfile {
         match self {
-            Self::ComputeGb200Nvidia | Self::ComputeGb200Wiwynn => {
+            Self::ComputeGb200Nvidia | Self::ComputeGb200Wiwynn | Self::ComputeGb200Dell => {
                 NvfwupdServerProfile::ComputeGb200
             }
             Self::ComputeGb300Nvidia | Self::ComputeGb300Lenovo | Self::ComputeGb300Supermicro => {
@@ -291,7 +390,9 @@ impl NodeType {
             Self::PowershelfGb200Liteon
             | Self::PowershelfGb200Delta
             | Self::PowershelfGb300Liteon
-            | Self::PowershelfGb300Delta => NvfwupdServerProfile::Powershelf,
+            | Self::PowershelfGb300Delta
+            | Self::PowershelfVrnvl72Liteon
+            | Self::PowershelfVrnvl72Delta => NvfwupdServerProfile::Powershelf,
             Self::SwitchGb200Nvidia => NvfwupdServerProfile::SwitchGb200,
             Self::SwitchGb300Nvidia => NvfwupdServerProfile::SwitchGb300,
             Self::SwitchVrnvl72Nvidia => NvfwupdServerProfile::SwitchVrnvl72,
@@ -347,6 +448,22 @@ pub struct ExpectedInventoryPolicy {
     pub flint_device_counts: Arc<nvfwupd::workflow::FlintExpectedDeviceCounts>,
 }
 
+/// One recovery profile as written in the config, opaque to generic RMS.
+/// A node type turns it into its own roster with [`RecoveryProfile::parse`]
+/// when it binds to the profile at add_nodes; nothing else reads inside.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+pub struct RecoveryProfile(serde_json::Map<String, serde_json::Value>);
+
+impl RecoveryProfile {
+    /// Parse the table into a node type's roster. `T` decides which fields
+    /// exist; with `deny_unknown_fields` a field meant for another platform
+    /// fails here, before the profile can reach a job.
+    pub fn parse<T: serde::de::DeserializeOwned>(&self) -> serde_json::Result<T> {
+        serde_json::from_value(serde_json::Value::Object(self.0.clone()))
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct FirmwareUpdateOptions {
     pub special_json: Option<Value>,
@@ -373,6 +490,16 @@ pub enum FirmwareUpdateOutcome {
     Started(FirmwareTaskHandle),
     Completed(FirmwareUpdateSummary),
     Skipped { reason: String },
+}
+
+/// Optional cleanup for nodes that temporarily change device-wide settings.
+///
+/// The caller invokes this after monitoring a started task, including on poll
+/// errors and cancellation. Implementations must check whether it is safe to
+/// restore settings: stopping RMS polling does not stop the device's task.
+#[async_trait]
+pub trait FirmwareTaskCleanup: Send + Sync {
+    async fn finish(&self, task_id: &str) -> Result<()>;
 }
 
 #[derive(Debug, Clone)]
@@ -412,7 +539,48 @@ pub struct FirmwareVersionCheckSummary {
     pub details: Value,
 }
 
+/// Bundle files for the recovery pushes. The resolver supplies both or
+/// errors. Which SOT artifact serves each node is still open (the
+/// bundle-selection question).
+#[derive(Debug, Clone)]
+pub struct RecoveryBundles {
+    /// The regular HMC PLDM bundle. One push+cycle round recovers one
+    /// reachable FPGA.
+    pub regular: String,
+    /// The HMC recovery bundle. One push recovers every CPU ERoT and GPU.
+    pub recovery: String,
+}
+
 // ── Node Trait ──
+
+/// The firmware recovery capability of a node type. Three tiers share one
+/// trait boundary: the job layer reads the inventory, asks `detect`, and hands
+/// a non-empty result to `recover` with the bundles it resolved, and it never
+/// learns the signature, the watched names, or the steps. The node type owns
+/// both methods. Behind them sits a procedure module that sees the tray only
+/// through the primitives it declares. A node reaches this capability through
+/// [`Node::recovery`]: `None` there means no recovery flow, or no profile bound,
+/// and detection stays off.
+#[async_trait]
+pub trait Recoverable: Send + Sync {
+    /// The watched components this inventory shows in recovery state. Empty
+    /// means the flow does not apply to this reading.
+    fn detect(&self, inventory: &[FirmwareInfo]) -> Vec<String>;
+
+    /// Run the recovery procedure for `in_recovery`, the names `detect`
+    /// returned, with the bundle files the job resolved. `Ok` means every
+    /// touched component reads healthy again and the update may proceed.
+    /// `cancel` is read between stages and while a push task is awaited,
+    /// never inside a push or a power cycle: those leave the tray
+    /// half-activated when interrupted. A fired token ends the flow with a
+    /// `Cancelled` error at the next such point.
+    async fn recover(
+        &self,
+        in_recovery: &[String],
+        bundles: RecoveryBundles,
+        cancel: &CancellationToken,
+    ) -> Result<()>;
+}
 
 /// Trait for all node implementations.
 ///
@@ -424,6 +592,9 @@ pub struct FirmwareVersionCheckSummary {
 /// allowing node types to opt in to only the operations they support
 /// (e.g., Powershelf does not support `activate_firmware`).
 ///
+/// A method added here with a default body is silently absent on the five
+/// node types that wrap `NvidiaGb200Compute`, since they forward methods
+/// one by one. Every new default needs a decision per wrapper.
 #[async_trait]
 pub trait Node: Send + Sync {
     // ── Identity (sync, returns stored data) ──
@@ -432,7 +603,19 @@ pub trait Node: Send + Sync {
     fn rack_id(&self) -> &str;
     fn node_type(&self) -> NodeType;
     fn get_info(&self) -> HashMap<String, String>;
+    /// The recovery capability, when this node type has a flow and a
+    /// profile is bound. `None` keeps detection off (see [`Recoverable`]).
+    fn recovery(&self) -> Option<&dyn Recoverable> {
+        None
+    }
+
     fn expected_inventory_policy(&self) -> Option<&ExpectedInventoryPolicy> {
+        None
+    }
+
+    /// Only adapters that change persistent settings during upload opt in.
+    /// The shared NVIDIA driver and its other wrappers need no such cleanup.
+    fn firmware_task_cleanup(&self) -> Option<&dyn FirmwareTaskCleanup> {
         None
     }
 
@@ -590,6 +773,30 @@ pub trait Node: Send + Sync {
             self.node_type().as_str(),
         ))
     }
+
+    /// Sends one request to the node's operating-system management API and
+    /// returns `Ok(())` when it answers, the transport error otherwise.
+    ///
+    /// A switch power-cycled through its BMC can pass the version check while
+    /// its OS still boots, so the readiness poll waits on this first. Nodes
+    /// without such an API have nothing to wait for and return `Ok(())`.
+    async fn verify_management_api_reachable(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Confirms the node's operating system reports itself booted and healthy
+    /// after an activation.
+    ///
+    /// Nodes without such a signal have nothing to verify and return `Ok(())`.
+    /// Nodes that have one fail with `FailedPrecondition` while the signal
+    /// says not ready, and with `Aborted` when it reports a state that waiting
+    /// will not change, such as a failed boot. A caller that polls stops on
+    /// `Aborted` and on `InvalidArgument` (no usable management endpoint) and
+    /// retries the other errors, because a booting node can answer with any
+    /// of them before it answers ready.
+    async fn verify_system_ready(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -599,6 +806,20 @@ mod tests {
 
     struct StubNode;
     struct LegacySkipNode;
+
+    #[test]
+    fn node_kind_uses_snake_case_serialization() {
+        for (kind, name) in [
+            (NodeKind::Compute, "compute"),
+            (NodeKind::Powershelf, "powershelf"),
+            (NodeKind::Switch, "switch"),
+        ] {
+            let value = serde_json::Value::String(name.to_owned());
+
+            assert_eq!(serde_json::to_value(kind).unwrap(), value);
+            assert_eq!(serde_json::from_value::<NodeKind>(value).unwrap(), kind);
+        }
+    }
 
     #[async_trait]
     impl Node for StubNode {
@@ -670,6 +891,14 @@ mod tests {
             (
                 NodeType::ComputeGb200Wiwynn,
                 "compute_gb200_wiwynn",
+                NodeKind::Compute,
+                ProductFamily::Gb200,
+                NvfwupdServerProfile::ComputeGb200,
+                false,
+            ),
+            (
+                NodeType::ComputeGb200Dell,
+                "compute_gb200_dell",
                 NodeKind::Compute,
                 ProductFamily::Gb200,
                 NvfwupdServerProfile::ComputeGb200,
@@ -763,9 +992,26 @@ mod tests {
                 NvfwupdServerProfile::SwitchVrnvl72,
                 true,
             ),
+            (
+                NodeType::PowershelfVrnvl72Liteon,
+                "powershelf_vrnvl72_liteon",
+                NodeKind::Powershelf,
+                ProductFamily::Vrnvl72,
+                NvfwupdServerProfile::Powershelf,
+                false,
+            ),
+            (
+                NodeType::PowershelfVrnvl72Delta,
+                "powershelf_vrnvl72_delta",
+                NodeKind::Powershelf,
+                ProductFamily::Vrnvl72,
+                NvfwupdServerProfile::Powershelf,
+                false,
+            ),
         ];
 
         for (node_type, name, kind, product_family, nvfwupd_profile, uses_host) in cases {
+            assert_eq!(NodeType::from_stable_name(name), Some(node_type));
             assert_eq!(node_type.as_str(), name);
             assert_eq!(node_type.to_string(), name);
             assert_eq!(node_type.kind(), kind);
@@ -779,6 +1025,7 @@ mod tests {
             assert_eq!(node_type.nvfwupd_server_profile(), nvfwupd_profile);
             assert_eq!(node_type.uses_host_management_endpoint(), uses_host);
         }
+        assert_eq!(NodeType::from_stable_name("unknown_node"), None);
     }
 
     #[test]
@@ -808,6 +1055,8 @@ mod tests {
                     component: "bmc".into(),
                     firmware_file: "fw.bin".into(),
                     expected_version: None,
+                    resolution: None,
+                    linkx_policy: None,
                 },
                 false,
                 FirmwareUpdateOptions::default(),
@@ -821,6 +1070,8 @@ mod tests {
                     component: "bmc".into(),
                     firmware_file: "fw.bin".into(),
                     expected_version: None,
+                    resolution: None,
+                    linkx_policy: None,
                 },
                 false,
             )
@@ -848,6 +1099,8 @@ mod tests {
                     component: "bmc".into(),
                     firmware_file: "fw.bin".into(),
                     expected_version: None,
+                    resolution: None,
+                    linkx_policy: None,
                 },
                 false,
                 FirmwareUpdateOptions::default(),

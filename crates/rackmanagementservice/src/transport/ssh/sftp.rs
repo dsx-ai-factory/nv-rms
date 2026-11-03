@@ -26,7 +26,7 @@ use russh_sftp::protocol::OpenFlags;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 
-use super::client::{SFTP_UPLOAD_BUFFER_SIZE_BYTES, SftpUploadOptions, SshClient, SshHandler};
+use super::client::{SSH_UPLOAD_BUFFER_SIZE_BYTES, SshClient, SshHandler, SshUploadOptions};
 use super::error::{SshError, SshResult};
 use super::request::{ChannelRequestFailureCode, wait_for_channel_request_confirmation};
 use crate::utilities::error::Result;
@@ -68,11 +68,11 @@ impl SshClient {
         timeout: Duration,
         cancel: CancellationToken,
     ) -> Result<()> {
-        let default_options = SftpUploadOptions::default();
+        let default_options = SshUploadOptions::default();
         self.sftp_upload_with_options(
             local_path,
             remote_path,
-            SftpUploadOptions {
+            SshUploadOptions {
                 overall_timeout: timeout,
                 step_timeout: default_options.step_timeout.min(timeout),
             },
@@ -112,7 +112,7 @@ impl SshClient {
         &self,
         local_path: &str,
         remote_path: &str,
-        options: SftpUploadOptions,
+        options: SshUploadOptions,
         cancel: CancellationToken,
     ) -> Result<()> {
         options.validate()?;
@@ -122,7 +122,7 @@ impl SshClient {
         let upload_timeout = options.overall_timeout;
         let timeout_secs = upload_timeout.as_secs();
         let step_timeout_secs = options.step_timeout.as_secs();
-        let buffer_size_bytes = SFTP_UPLOAD_BUFFER_SIZE_BYTES;
+        let buffer_size_bytes = SSH_UPLOAD_BUFFER_SIZE_BYTES;
 
         let local_file = tokio::fs::File::open(local_path).await.map_err(|e| {
             let error = e.to_string();
@@ -616,7 +616,7 @@ fn mib_per_second(bytes: u64, elapsed: Duration) -> f64 {
 ///
 /// The upload path caps each operation two ways at once. The caller-supplied
 /// upload timeout caps the whole transfer, while
-/// [`SftpUploadOptions::step_timeout`] caps each setup, open, read, write, and
+/// [`SshUploadOptions::step_timeout`] caps each setup, open, read, write, and
 /// flush step so stalls are detected promptly.
 ///
 /// In parallel, the operation races `cancel` with `biased` priority so an
@@ -886,7 +886,7 @@ mod tests {
                 "/tmp/fw.bin",
                 "/remote/fw.bin",
                 &unknown_snapshot,
-                SFTP_UPLOAD_BUFFER_SIZE_BYTES,
+                SSH_UPLOAD_BUFFER_SIZE_BYTES,
             );
 
             log_sftp_upload_progress("10.0.0.1", "/tmp/fw.bin", "/remote/fw.bin", &known_snapshot);

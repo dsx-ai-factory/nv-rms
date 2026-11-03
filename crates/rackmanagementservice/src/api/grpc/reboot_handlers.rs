@@ -377,24 +377,40 @@ impl RackManagerServiceImpl {
             };
 
             match kind {
-                NodeKind::Powershelf => match build_ephemeral_power_node(device) {
-                    Ok(node) => shelves.push(NamedNode { id: node_id, node }),
-                    Err(e) => {
-                        fail(batch, &node_id, e);
-                        had_error = true;
+                NodeKind::Powershelf => {
+                    match build_ephemeral_power_node(
+                        device,
+                        &self.hardware_profiles,
+                        self.insecure_bmc,
+                    ) {
+                        Ok(node) => shelves.push(NamedNode { id: node_id, node }),
+                        Err(e) => {
+                            fail(batch, &node_id, e);
+                            had_error = true;
+                        }
                     }
-                },
-                NodeKind::Compute => match build_ephemeral_power_node(device) {
-                    Ok(node) => computes.push(NamedNode { id: node_id, node }),
-                    Err(e) => {
-                        fail(batch, &node_id, e);
-                        had_error = true;
+                }
+                NodeKind::Compute => {
+                    match build_ephemeral_power_node(
+                        device,
+                        &self.hardware_profiles,
+                        self.insecure_bmc,
+                    ) {
+                        Ok(node) => computes.push(NamedNode { id: node_id, node }),
+                        Err(e) => {
+                            fail(batch, &node_id, e);
+                            had_error = true;
+                        }
                     }
-                },
+                }
                 NodeKind::Switch => {
                     // Switch trays need a BMC handle (reachability gating) and a
                     // separate NVUE handle (NVOS readiness gating). Require both.
-                    let bmc = build_ephemeral_power_node(device);
+                    let bmc = build_ephemeral_power_node(
+                        device,
+                        &self.hardware_profiles,
+                        self.insecure_bmc,
+                    );
                     let nvue = self.build_ephemeral_switch(device, domain.as_deref()).await;
                     match (bmc, nvue) {
                         (Ok(node), Ok(switch)) => {
@@ -610,7 +626,7 @@ async fn execute_cold_reboot_stages(
 
     // Steps 7-8: switch trays auto-boot to NVOS; verify readiness with an "nvue
     // hello" (GET /nvue_v1/system) on every switch, retried with exponential backoff.
-    verify_nvos_ready(
+    verify_nvue_reachable(
         job,
         timeline,
         "7-8",
@@ -888,11 +904,14 @@ async fn wait_stage(
     Ok(())
 }
 
-/// Steps 7-8: verify every switch tray's NVOS/NVUE is up via an "nvue hello"
-/// (`GET /nvue_v1/system`). Tries up to `NVOS_HELLO_ATTEMPTS` times, backing off
-/// exponentially from `backoff_base` (doubling each attempt) between tries. No
-/// wait follows the final attempt. Honors cancellation throughout.
-async fn verify_nvos_ready(
+/// Steps 7-8: verify every switch tray's NVUE answers an "nvue hello"
+/// (`GET /nvue_v1/system`, body ignored). Reachability only: the rack reboot
+/// does not read the body's readiness and health, unlike the firmware and
+/// image jobs' `verify_nvos_ready`. Tries up to `NVOS_HELLO_ATTEMPTS` times,
+/// backing off exponentially from `backoff_base` (doubling each attempt)
+/// between tries. No wait follows the final attempt. Honors cancellation
+/// throughout. The stage keeps its recorded name `verify_nvos_ready`.
+async fn verify_nvue_reachable(
     job: &RmsJobHandle,
     timeline: &mut StageTimeline,
     step: &str,
@@ -1048,7 +1067,7 @@ mod tests {
     use crate::orchestrator::job_tracker::JobTracker;
     use crate::orchestrator::rack_manager::RackManager;
     use crate::persistence::Backends;
-    use crate::transport::ssh::SftpUploadOptions;
+    use crate::transport::ssh::SshUploadOptions;
 
     const RACK: &str = "rack-01";
 
@@ -1065,13 +1084,26 @@ mod tests {
             firmware_download_cancellations: Arc::new(Mutex::new(HashMap::new())),
             backends: Backends::memory(),
             firmware_dir: PathBuf::from("firmware"),
+            artifact_require_sha256: false,
+            insecure_bmc: true,
+            artifact_download_policy:
+                crate::api::grpc::artifact_download::ArtifactDownloadPolicy::default(),
             switch_tls_roots: SwitchTlsRoots {
                 insecure_switch: true,
                 ..SwitchTlsRoots::default()
             },
-            sftp_upload_options: SftpUploadOptions::default(),
+            sftp_upload_options: SshUploadOptions::default(),
             nmx_gateway_id: crate::libnmxc::DEFAULT_NMX_C_GATEWAY_ID.to_owned(),
             expected_inventory_catalog: crate::config::ExpectedInventoryCatalog::default(),
+            workflow_timings: crate::config::WorkflowTimings::default(),
+            recovery_profiles: crate::config::RecoveryProfiles::default(),
+            fabric_operations: std::sync::Arc::new(Default::default()),
+            fabric_layout_catalog: std::sync::Arc::new(
+                crate::config::fabric_layout::FabricLayoutCatalog::default(),
+            ),
+            hardware_profiles: std::sync::Arc::new(
+                crate::config::hardware_profiles::HardwareProfileCatalog::built_in().unwrap(),
+            ),
         }
     }
 

@@ -1,0 +1,24 @@
+suite: External PostgreSQL patch job
+templates:
+  - templates/rms-postgres-patch-job.yaml
+tests:
+  - it: grants a login role with no superuser or createdb flags
+    set:
+      databaseMode: external
+      rmsPostgres.patchExternalCluster.enabled: true
+      rmsPostgres.patchExternalCluster.postgresqlNamespace: postgres
+      rmsPostgres.patchExternalCluster.postgresqlName: my-pg-cluster
+      rmsPostgres.patchExternalCluster.databaseName: my_rms_db
+      rmsPostgres.patchExternalCluster.userName: rms-api-server.rack-manager
+    documentSelector:
+      path: kind
+      value: Job
+    asserts:
+      - isKind:
+          of: Job
+      - matchRegex:
+          path: spec.template.spec.containers[0].command[2]
+          pattern: "\"users\":\\{\"rms-api-server\\.rack-manager\":\\[\\]\\}"
+      - notMatchRegex:
+          path: spec.template.spec.containers[0].command[2]
+          pattern: superuser|createdb

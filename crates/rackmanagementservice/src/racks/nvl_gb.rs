@@ -18,8 +18,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, PoisonError, RwLock};
 
-use secrecy::ExposeSecret;
-
 use crate::domain::node::{Node, NodeKind, NodeType, ProductFamily};
 use crate::domain::rack::{NodeConfig, Rack};
 use crate::nodes::NodeInstance;
@@ -312,24 +310,19 @@ fn validate_node_config(config: &NodeConfig) -> Result<()> {
 }
 
 fn validate_credentials(config: &NodeConfig, node_kind: NodeKind) -> Result<()> {
-    let credentials = config
+    let has_bmc_credentials = config
         .bmc_endpoint
         .as_ref()
-        .and_then(|endpoint| endpoint.credentials.as_ref());
+        .and_then(|endpoint| endpoint.credentials.as_ref())
+        .is_some_and(|credentials| credentials.has_auth_material());
 
-    let username = credentials
-        .map(|credentials| credentials.username.as_str())
-        .unwrap_or_default();
-    let password = credentials
-        .map(|credentials| credentials.password.expose_secret())
-        .unwrap_or_default();
-
-    if username.is_empty() || password.is_empty() {
+    if !has_bmc_credentials {
         return Err(RmsError::invalid_argument(format!(
-            "create_{node_kind}: missing credentials for {} (provide username/password)",
+            "create_{node_kind}: missing credentials for {} (provide username/password or a BMC session token)",
             config.id
         )));
     }
+
     Ok(())
 }
 
@@ -354,6 +347,8 @@ mod tests {
             )),
             host_endpoint: None,
             expected_inventory: None,
+            recovery: None,
+            runtime_config: None,
         };
         if node_type.kind() == NodeKind::Switch {
             config.host_endpoint = Some(EndpointConfig::with_credentials(
@@ -367,6 +362,11 @@ mod tests {
                 false,
             ));
         }
+
+        config.runtime_config =
+            crate::config::hardware_profiles::HardwareProfileCatalog::built_in()
+                .expect("built-in hardware profiles")
+                .runtime_config_for_request(node_type);
 
         config
     }
@@ -391,6 +391,26 @@ mod tests {
 
         assert_eq!(node.node_type(), NodeType::ComputeGb200Wiwynn);
         assert_eq!(node.get_info()["type"], "compute_gb200_wiwynn");
+    }
+
+    #[test]
+    fn create_node_compute_gb200_dell() {
+        let rack = NvlGb200Rack::new("rack-01".into());
+        let node = rack
+            .create_node(&test_config("c-01", NodeType::ComputeGb200Dell))
+            .unwrap();
+
+        assert_eq!(node.node_type(), NodeType::ComputeGb200Dell);
+        assert_eq!(node.get_info()["type"], "compute_gb200_dell");
+    }
+
+    #[test]
+    fn gb300_rack_rejects_dell_gb200() {
+        let rack = NvlGb300Rack::new("rack-01".into());
+        assert!(
+            rack.create_node(&test_config("c-01", NodeType::ComputeGb200Dell))
+                .is_err()
+        );
     }
 
     #[test]
@@ -450,6 +470,117 @@ mod tests {
     }
 
     #[test]
+    fn create_node_vrnvl72_powershelf_liteon() {
+        let rack = NvlVrnvl72Rack::new("rack-01".into());
+        let node = rack
+            .create_node(&test_config("p-01", NodeType::PowershelfVrnvl72Liteon))
+            .unwrap();
+
+        assert_eq!(node.node_type(), NodeType::PowershelfVrnvl72Liteon);
+        assert_eq!(node.get_info()["type"], "powershelf_vrnvl72_liteon");
+    }
+
+    #[test]
+    fn create_node_vrnvl72_powershelf_delta() {
+        let rack = NvlVrnvl72Rack::new("rack-01".into());
+        let node = rack
+            .create_node(&test_config("p-01", NodeType::PowershelfVrnvl72Delta))
+            .unwrap();
+
+        assert_eq!(node.node_type(), NodeType::PowershelfVrnvl72Delta);
+        assert_eq!(node.get_info()["type"], "powershelf_vrnvl72_delta");
+    }
+
+    #[test]
+    fn create_node_vrnvl72_delta_powershelf_rejected_by_other_rack_generations() {
+        let gb200 = NvlGb200Rack::new("rack-01".into());
+        let err = gb200
+            .create_node(&test_config("p-01", NodeType::PowershelfVrnvl72Delta))
+            .err()
+            .expect("GB200 rack must reject a VR Delta power shelf");
+        assert!(
+            err.message.contains(
+                "rack type NVL_GB200 does not support node type powershelf_vrnvl72_delta"
+            ),
+            "unexpected message: {}",
+            err.message
+        );
+
+        let gb300 = NvlGb300Rack::new("rack-01".into());
+        let err = gb300
+            .create_node(&test_config("p-01", NodeType::PowershelfVrnvl72Delta))
+            .err()
+            .expect("GB300 rack must reject a VR Delta power shelf");
+        assert!(
+            err.message.contains(
+                "rack type NVL_GB300 does not support node type powershelf_vrnvl72_delta"
+            ),
+            "unexpected message: {}",
+            err.message
+        );
+
+        let vr = NvlVrnvl72Rack::new("rack-01".into());
+        for node_type in [
+            NodeType::PowershelfGb200Delta,
+            NodeType::PowershelfGb300Delta,
+        ] {
+            let err = vr
+                .create_node(&test_config("p-01", node_type))
+                .err()
+                .expect("VR rack must reject a GB Delta power shelf");
+            assert!(
+                err.message.contains(&format!(
+                    "rack type NVL_VRNVL72 does not support node type {node_type}"
+                )),
+                "unexpected message: {}",
+                err.message
+            );
+        }
+    }
+
+    #[test]
+    fn create_node_vrnvl72_powershelf_rejected_by_other_rack_generations() {
+        let gb200 = NvlGb200Rack::new("rack-01".into());
+        let err = gb200
+            .create_node(&test_config("p-01", NodeType::PowershelfVrnvl72Liteon))
+            .err()
+            .expect("GB200 rack must reject a VR power shelf");
+        assert!(
+            err.message.contains(
+                "rack type NVL_GB200 does not support node type powershelf_vrnvl72_liteon"
+            ),
+            "unexpected message: {}",
+            err.message
+        );
+
+        let gb300 = NvlGb300Rack::new("rack-01".into());
+        let err = gb300
+            .create_node(&test_config("p-01", NodeType::PowershelfVrnvl72Liteon))
+            .err()
+            .expect("GB300 rack must reject a VR power shelf");
+        assert!(
+            err.message.contains(
+                "rack type NVL_GB300 does not support node type powershelf_vrnvl72_liteon"
+            ),
+            "unexpected message: {}",
+            err.message
+        );
+
+        let vr = NvlVrnvl72Rack::new("rack-01".into());
+        let err = vr
+            .create_node(&test_config("p-01", NodeType::PowershelfGb300Liteon))
+            .err()
+            .expect("VR rack must reject a GB300 power shelf");
+        assert!(
+            err.message.contains(
+                "rack type NVL_VRNVL72 does not support node type powershelf_gb300_liteon"
+            ),
+            "unexpected message: {}",
+            err.message
+        );
+    }
+
+    #[test]
     fn create_node_switch() {
         let rack = NvlGb200Rack::new("rack-01".into());
         let node = rack
@@ -478,6 +609,31 @@ mod tests {
         let node = rack.create_node(&config).unwrap();
 
         assert_eq!(node.node_type(), NodeType::SwitchGb200Nvidia);
+    }
+
+    #[test]
+    fn create_node_switch_accepts_bmc_session_token_for_power_only_config() {
+        let rack = NvlGb200Rack::new("rack-01".into());
+        let mut config = test_config("s-01", NodeType::SwitchGb200Nvidia);
+        config.host_endpoint = None;
+        config.bmc_endpoint.as_mut().unwrap().credentials =
+            Some(EndpointCredentials::from_session_token("session-token"));
+
+        let node = rack.create_node(&config).unwrap();
+
+        assert_eq!(node.node_type(), NodeType::SwitchGb200Nvidia);
+    }
+
+    #[test]
+    fn create_node_compute_accepts_bmc_session_token() {
+        let rack = NvlGb200Rack::new("rack-01".into());
+        let mut config = test_config("c-01", NodeType::ComputeGb200Nvidia);
+        config.bmc_endpoint.as_mut().unwrap().credentials =
+            Some(EndpointCredentials::from_session_token("session-token"));
+
+        let node = rack.create_node(&config).unwrap();
+
+        assert_eq!(node.node_type(), NodeType::ComputeGb200Nvidia);
     }
 
     #[test]

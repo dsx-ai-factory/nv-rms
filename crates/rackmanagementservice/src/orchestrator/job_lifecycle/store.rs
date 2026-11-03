@@ -17,24 +17,30 @@
 
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
-use std::time::Duration;
-
-use chrono::{DateTime, Utc};
+use std::time::{Duration, Instant};
 
 use super::ids::JobId;
-use super::registry::{JobLifecycleState, JobSnapshot, LifecycleTransition};
+use super::registry::{JobLifecycleState, JobScope, JobSnapshot, LifecycleTransition};
 
 /// Authoritative job records and the indexes derived from them.
 ///
 /// Every non-terminal job with a non-empty node ID appears in `active_by_node`.
-/// Both maps are private so mutations must use methods that preserve that
-/// invariant.
+/// Job aliases remain reserved until a terminal transition; direct-mutation
+/// aliases remain reserved until their guard is dropped. All indexes are private
+/// and mutate under the registry's write lock.
 #[derive(Default)]
 pub(super) struct JobStore {
     /// Authoritative snapshots keyed by their stable job IDs.
     by_id: HashMap<JobId, JobSnapshot>,
+
     /// Derived rack -> node -> active job IDs index.
     active_by_node: HashMap<String, HashMap<String, HashSet<JobId>>>,
+
+    /// Forward alias index shared by tracked jobs and direct-mutation guards.
+    active_by_scope: HashMap<JobScope, JobId>,
+
+    /// Reverse index used to release every alias when its owner finishes.
+    scopes_by_owner: HashMap<JobId, HashSet<JobScope>>,
 }
 
 impl JobStore {
@@ -77,6 +83,74 @@ impl JobStore {
             .cloned()
     }
 
+    /// Checks every alias before any reservation is inserted.
+    pub(super) fn conflicting_scope(&self, scopes: &[JobScope]) -> Option<(JobScope, JobId)> {
+        self.conflicting_scope_except(scopes, None)
+    }
+
+    /// Finds overlap while allowing the named worker to reuse its own aliases.
+    /// Logical aliases also check jobs created without an explicit scope list.
+    pub(super) fn conflicting_scope_except(
+        &self,
+        scopes: &[JobScope],
+        owner_id: Option<&JobId>,
+    ) -> Option<(JobScope, JobId)> {
+        scopes.iter().find_map(|scope| {
+            let active = self
+                .active_by_scope
+                .get(scope)
+                .filter(|active| Some(*active) != owner_id)
+                .cloned()
+                .or_else(|| {
+                    if let JobScope::LogicalNode { rack_id, node_id } = scope {
+                        self.active_by_node
+                            .get(rack_id)
+                            .and_then(|nodes| nodes.get(node_id))
+                            .and_then(|jobs| jobs.iter().find(|active| Some(*active) != owner_id))
+                            .cloned()
+                    } else {
+                        None
+                    }
+                });
+
+            active.map(|owner| (scope.clone(), owner))
+        })
+    }
+
+    /// Includes direct-mutation owners that have no retained job record.
+    pub(super) fn has_scope_owner(&self, owner_id: &JobId) -> bool {
+        self.scopes_by_owner.contains_key(owner_id)
+    }
+
+    /// Installs all validated aliases while the registry holds its write lock.
+    pub(super) fn reserve_scopes(&mut self, owner_id: JobId, scopes: Vec<JobScope>) {
+        let scopes: HashSet<_> = scopes.into_iter().collect();
+
+        if scopes.is_empty() {
+            return;
+        }
+
+        for scope in &scopes {
+            self.active_by_scope.insert(scope.clone(), owner_id.clone());
+        }
+
+        self.scopes_by_owner
+            .entry(owner_id)
+            .or_default()
+            .extend(scopes);
+    }
+
+    /// Removes only the aliases owned by the completed mutation or job.
+    pub(super) fn release_scopes(&mut self, owner_id: &JobId) {
+        let Some(scopes) = self.scopes_by_owner.remove(owner_id) else {
+            return;
+        };
+
+        for scope in scopes {
+            self.active_by_scope.remove(&scope);
+        }
+    }
+
     /// Returns whether a top-level job can accept a newly constructed child.
     pub(super) fn can_accept_child(&self, parent_job_id: &JobId) -> bool {
         let Some(parent) = self.by_id.get(parent_job_id) else {
@@ -97,7 +171,7 @@ impl JobStore {
             return false;
         }
         parent.child_job_ids.push(child.job_id.clone());
-        parent.updated_at = Utc::now();
+        parent.touch();
         true
     }
 
@@ -145,7 +219,7 @@ impl JobStore {
             };
 
             record.state = next_state;
-            record.updated_at = Utc::now();
+            record.touch();
 
             let is_indexed = should_index(record);
             let index_change = (was_indexed != is_indexed).then(|| {
@@ -169,6 +243,10 @@ impl JobStore {
             (index_change, event)
         };
 
+        if matches!(event, Some(LifecycleTransition::Terminal(_))) {
+            self.release_scopes(job_id);
+        }
+
         if let Some((rack_id, node_id, indexed_job_id, should_be_indexed)) = index_change {
             if should_be_indexed {
                 self.active_by_node
@@ -189,10 +267,15 @@ impl JobStore {
     ///
     /// An expired parent that still has retained children remains until a later
     /// pass, after those children have been removed.
-    pub(super) fn cleanup_expired(&mut self, now: DateTime<Utc>, ttl: Duration) {
+    pub(super) fn cleanup_expired(&mut self, now: Instant, ttl: Duration) {
+        for job in self.by_id.values_mut() {
+            if job.state.is_terminal() {
+                warn_if_monotonic_timestamp_in_future(job, now);
+            }
+        }
         let protected_children = protected_children(&self.by_id, now, ttl);
         let expired = filter_job_ids(&self.by_id, |jobs, job_id, job| {
-            let expired = job.state.is_terminal() && is_older_than(now, job.updated_at, ttl);
+            let expired = job.state.is_terminal() && is_older_than(now, job.updated_at_mono, ttl);
             let removable = !job.is_parent()
                 || !job
                     .child_job_ids
@@ -213,6 +296,10 @@ impl JobStore {
         if let Some(job) = self.by_id.get_mut(job_id) {
             job.created_at -= delta;
             job.updated_at -= delta;
+            job.updated_at_mono = job
+                .updated_at_mono
+                .checked_sub(age)
+                .unwrap_or(job.updated_at_mono);
         }
     }
 
@@ -231,6 +318,20 @@ impl JobStore {
         }
 
         assert_eq!(self.active_by_node, expected);
+
+        let expected_scopes: HashMap<_, _> = self
+            .scopes_by_owner
+            .iter()
+            .flat_map(|(owner_id, scopes)| {
+                if let Some(job) = self.by_id.get(owner_id) {
+                    assert!(!job.state.is_terminal());
+                }
+
+                scopes.iter().map(|scope| (scope.clone(), owner_id.clone()))
+            })
+            .collect();
+
+        assert_eq!(self.active_by_scope, expected_scopes);
     }
 
     /// Inserts a job, using `next_job_id` to retry collisions.
@@ -243,6 +344,11 @@ impl JobStore {
         mut next_job_id: impl FnMut() -> JobId,
     ) -> JobSnapshot {
         loop {
+            if self.has_scope_owner(&record.job_id) {
+                record.job_id = next_job_id();
+                continue;
+            }
+
             match self.by_id.entry(record.job_id.clone()) {
                 Entry::Vacant(entry) => {
                     entry.insert(record.clone());
@@ -272,6 +378,7 @@ impl JobStore {
     fn remove(&mut self, job_id: &JobId) -> Option<JobSnapshot> {
         let record = self.by_id.remove(job_id)?;
         self.remove_active_job(&record.rack_id, &record.node_id, &record.job_id);
+        self.release_scopes(job_id);
         Some(record)
     }
 
@@ -314,28 +421,38 @@ fn should_index(job: &JobSnapshot) -> bool {
 /// Returns child IDs protected by parents that have not expired.
 fn protected_children(
     jobs: &HashMap<JobId, JobSnapshot>,
-    now: DateTime<Utc>,
+    now: Instant,
     ttl: Duration,
 ) -> HashSet<JobId> {
     jobs.values()
         .filter(|job| job.is_parent())
         .filter(|job| {
-            let expired = job.state.is_terminal() && is_older_than(now, job.updated_at, ttl);
+            let expired = job.state.is_terminal() && is_older_than(now, job.updated_at_mono, ttl);
             !expired
         })
         .flat_map(|job| job.child_job_ids.iter().cloned())
         .collect()
 }
 
-/// Returns `true` when `timestamp` is at least `ttl` in the past.
+/// Returns `true` when `timestamp` is at least `ttl` in the past on the
+/// monotonic clock.
 ///
-/// A non-positive elapsed interval, such as a backwards wall-clock step, is
-/// treated as not yet expired.
-fn is_older_than(now: DateTime<Utc>, timestamp: DateTime<Utc>, ttl: Duration) -> bool {
-    now.signed_duration_since(timestamp)
-        .to_std()
-        .map(|elapsed| elapsed >= ttl)
-        .unwrap_or(false)
+/// [`Instant::saturating_duration_since`] treats a `now` that is earlier than
+/// `timestamp` as zero elapsed time, so eviction never panics and never fires
+/// early if a test (or a clock quirk) inverts the two instants.
+fn is_older_than(now: Instant, timestamp: Instant, ttl: Duration) -> bool {
+    now.saturating_duration_since(timestamp) >= ttl
+}
+
+fn warn_if_monotonic_timestamp_in_future(job: &mut JobSnapshot, now: Instant) {
+    if now >= job.updated_at_mono || job.mono_inversion_warned {
+        return;
+    }
+    job.mono_inversion_warned = true;
+    tracing::warn!(
+        job_id = %job.job_id,
+        "monotonic TTL timestamp is ahead of Instant::now(); treating elapsed as zero"
+    );
 }
 
 /// Collects job IDs whose snapshots satisfy `predicate`.
@@ -354,6 +471,7 @@ fn filter_job_ids(
 
 #[cfg(test)]
 mod tests {
+    use chrono::Utc;
     use tokio_util::sync::CancellationToken;
 
     use super::*;
@@ -370,6 +488,8 @@ mod tests {
             node_id: "node".to_string(),
             created_at: now,
             updated_at: now,
+            updated_at_mono: Instant::now(),
+            mono_inversion_warned: false,
             child_job_ids: Vec::new(),
             parent_job_id: None,
             cancellation_token: CancellationToken::new(),
@@ -426,7 +546,9 @@ mod tests {
         let mut store = JobStore::default();
         let parent = store.insert(leaf("parent"));
         store.age_job_for_test(&parent.job_id, Duration::from_secs(1));
-        let previous_updated_at = store.get(&parent.job_id).unwrap().updated_at;
+        let previous = store.get(&parent.job_id).unwrap();
+        let previous_updated_at = previous.updated_at;
+        let previous_updated_at_mono = previous.updated_at_mono;
         let mut child = leaf("child");
         child.parent_job_id = Some(parent.job_id.clone());
         let child = store.insert(child);
@@ -436,6 +558,7 @@ mod tests {
         let parent = store.get(&parent.job_id).unwrap();
         assert_eq!(parent.child_job_ids, vec![child.job_id]);
         assert!(parent.updated_at > previous_updated_at);
+        assert!(parent.updated_at_mono > previous_updated_at_mono);
     }
 
     #[test]
@@ -499,5 +622,94 @@ mod tests {
             panic!("expected a Progress transition event");
         };
         assert_eq!(progress_snapshot.job_id, job.job_id);
+    }
+
+    fn complete_leaf(store: &mut JobStore, job_id: &JobId) {
+        store.transition_state(job_id, |_| {
+            Some(JobLifecycleState::Completed {
+                description: "complete".to_string(),
+                result_json: String::new(),
+            })
+        });
+    }
+
+    #[test]
+    fn ttl_ignores_stale_wall_clock_updated_at() {
+        let mut store = JobStore::default();
+        let job = store.insert(leaf("queued"));
+        complete_leaf(&mut store, &job.job_id);
+        let ttl = Duration::from_secs(60);
+
+        store.by_id.get_mut(&job.job_id).unwrap().updated_at -= chrono::Duration::hours(48);
+
+        store.cleanup_expired(Instant::now(), ttl);
+        assert!(
+            store.get(&job.job_id).is_some(),
+            "a wall-clock jump into the past must not evict a still-young job"
+        );
+    }
+
+    #[test]
+    fn ttl_evicts_from_monotonic_age_even_when_wall_clock_looks_fresh() {
+        let mut store = JobStore::default();
+        let job = store.insert(leaf("queued"));
+        complete_leaf(&mut store, &job.job_id);
+        let ttl = Duration::from_secs(60);
+
+        store.age_job_for_test(&job.job_id, ttl + Duration::from_secs(1));
+        store.by_id.get_mut(&job.job_id).unwrap().updated_at = Utc::now();
+
+        store.cleanup_expired(Instant::now(), ttl);
+        assert!(
+            store.get(&job.job_id).is_none(),
+            "a wall-clock jump into the future must not retain an aged terminal job"
+        );
+    }
+
+    #[test]
+    fn ttl_treats_future_monotonic_timestamp_as_not_expired() {
+        let mut store = JobStore::default();
+        let job = store.insert(leaf("queued"));
+        complete_leaf(&mut store, &job.job_id);
+        let ttl = Duration::from_secs(60);
+
+        store.by_id.get_mut(&job.job_id).unwrap().updated_at_mono =
+            Instant::now() + Duration::from_secs(3600);
+
+        store.cleanup_expired(Instant::now(), ttl);
+        assert!(store.get(&job.job_id).is_some());
+        assert!(
+            store
+                .get(&job.job_id)
+                .expect("job retained")
+                .mono_inversion_warned
+        );
+
+        store.cleanup_expired(Instant::now(), ttl);
+        assert!(
+            store
+                .get(&job.job_id)
+                .expect("job retained")
+                .mono_inversion_warned,
+            "a second sweep must not clear the one-shot warn flag"
+        );
+    }
+
+    #[test]
+    fn ttl_does_not_warn_on_live_jobs_with_future_monotonic_timestamp() {
+        let mut store = JobStore::default();
+        let job = store.insert(leaf("queued"));
+        let ttl = Duration::from_secs(60);
+
+        store.by_id.get_mut(&job.job_id).unwrap().updated_at_mono =
+            Instant::now() + Duration::from_secs(3600);
+
+        store.cleanup_expired(Instant::now(), ttl);
+        assert!(
+            !store
+                .get(&job.job_id)
+                .expect("live job")
+                .mono_inversion_warned
+        );
     }
 }

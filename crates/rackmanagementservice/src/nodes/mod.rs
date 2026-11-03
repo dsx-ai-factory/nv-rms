@@ -16,7 +16,13 @@
  */
 
 mod instance;
+mod redfish_action_info;
+mod switch_system_image;
 
+#[cfg(test)]
+mod compute_verification_tests;
+
+pub mod compute_gb200_dell;
 pub mod compute_gb200_nvidia;
 pub mod compute_gb200_wiwynn;
 pub mod compute_gb300_lenovo;
@@ -24,14 +30,19 @@ pub mod compute_gb300_nvidia;
 pub mod compute_gb300_supermicro;
 pub mod compute_vrnvl72_nvidia;
 pub mod nvfwupd_adapter;
+pub(crate) mod nvos;
 pub mod powershelf_gb200_delta;
 pub mod powershelf_gb200_liteon;
 pub mod powershelf_gb300_delta;
 pub mod powershelf_gb300_liteon;
+pub mod powershelf_vrnvl72_delta;
+pub mod powershelf_vrnvl72_liteon;
 pub mod switch_gb200_nvidia;
 pub mod switch_gb300_nvidia;
+pub mod switch_vrnvl72_nvidia;
 
-pub(crate) use instance::{SwitchFirmwareManagement, SwitchScaleUpManagement};
+pub(crate) use instance::{ScaleUpLinkSnapshot, SwitchFirmwareManagement, SwitchScaleUpManagement};
+pub(crate) use switch_system_image::SwitchSystemImageNode;
 
 pub use instance::NodeInstance;
 pub use switch_gb200_nvidia::mtls as switch_mtls;

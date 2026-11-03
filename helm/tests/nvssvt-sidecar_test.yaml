@@ -1,0 +1,57 @@
+suite: NVSSVT sidecar
+templates:
+  - templates/api-server-deployment.yaml
+# The template renders the Deployment and its Service; document 0 is the
+# Deployment.
+tests:
+  - it: is absent by default, leaving the API server the only container
+    set:
+      global.image.tag: test
+    documentIndex: 0
+    asserts:
+      - isKind:
+          of: Deployment
+      - lengthEqual:
+          path: spec.template.spec.containers
+          count: 1
+      - equal:
+          path: spec.template.spec.containers[0].name
+          value: rms-api-server
+
+  - it: runs alongside the API server in the same pod when enabled
+    set:
+      global.image.tag: test
+      nvssvt.enabled: true
+      nvssvt.image.repository: nvssvt-server
+      nvssvt.image.tag: latest
+    documentIndex: 0
+    asserts:
+      # Same pod, not a second Deployment: this is what puts the launcher on
+      # the API server's loopback address.
+      - lengthEqual:
+          path: spec.template.spec.containers
+          count: 2
+      - equal:
+          path: spec.template.spec.containers[1].name
+          value: nvssvt-server
+      - equal:
+          path: spec.template.spec.containers[1].image
+          value: nvssvt-server:latest
+      - equal:
+          path: spec.template.spec.containers[1].imagePullPolicy
+          value: IfNotPresent
+      - equal:
+          path: spec.template.spec.containers[1].ports[0].containerPort
+          value: 8000
+
+  - it: does not inherit the RMS image tag
+    set:
+      global.image.tag: rms-only-tag
+      nvssvt.enabled: true
+      nvssvt.image.repository: nvssvt-server
+      nvssvt.image.tag: "2.0.0"
+    documentIndex: 0
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[1].image
+          value: nvssvt-server:2.0.0

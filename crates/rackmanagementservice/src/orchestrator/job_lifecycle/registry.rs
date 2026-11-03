@@ -15,21 +15,28 @@
  * limitations under the License.
  */
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
+use std::net::{IpAddr, Ipv6Addr};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
-use std::time::Duration;
-
-use anyhow::Error;
-use chrono::{DateTime, Utc};
-use tokio_util::sync::CancellationToken;
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
 
 use super::domain::{JobDomain, JobFailure};
+use super::error::job_error_of;
 use super::handle::JobHandle;
 use super::ids::JobId;
 use super::job_type::JobType;
 use super::store::JobStore;
+
+use anyhow::Error;
+use chrono::{DateTime, Utc};
+use opentelemetry::KeyValue;
+use opentelemetry::trace::{Status, TraceContextExt};
+use tokio::sync::Notify;
+use tokio::task::AbortHandle;
+use tokio_util::sync::CancellationToken;
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 #[cfg(not(test))]
 const TERMINAL_WAIT_POLL_INTERVAL: Duration = Duration::from_secs(1);
@@ -83,10 +90,24 @@ impl JobLifecycleState {
 pub struct JobSpec {
     pub rack_id: String,
     pub node_id: String,
-    pub span: tracing::Span,
+    span: JobSpanSource,
     /// When set, this job is an externally visible async workflow (returned to API callers).
     pub workflow_type: Option<JobType>,
     pub initial_state: JobLifecycleState,
+}
+
+enum JobSpanSource {
+    Ready(tracing::Span),
+    Deferred(Box<dyn FnOnce(&JobId) -> tracing::Span + Send + 'static>),
+}
+
+impl JobSpanSource {
+    fn resolve(self, job_id: &JobId) -> tracing::Span {
+        match self {
+            Self::Ready(span) => span,
+            Self::Deferred(create) => create(job_id),
+        }
+    }
 }
 
 impl JobSpec {
@@ -100,7 +121,25 @@ impl JobSpec {
         Self {
             rack_id: rack_id.into(),
             node_id: node_id.into(),
-            span,
+            span: JobSpanSource::Ready(span),
+            workflow_type: None,
+            initial_state: JobLifecycleState::Queued {
+                description: queued_description.into(),
+            },
+        }
+    }
+
+    /// Creates a leaf specification whose span is built only after admission.
+    pub fn new_deferred(
+        rack_id: impl Into<String>,
+        node_id: impl Into<String>,
+        queued_description: impl Into<String>,
+        create_span: impl FnOnce(&JobId) -> tracing::Span + Send + 'static,
+    ) -> Self {
+        Self {
+            rack_id: rack_id.into(),
+            node_id: node_id.into(),
+            span: JobSpanSource::Deferred(Box::new(create_span)),
             workflow_type: None,
             initial_state: JobLifecycleState::Queued {
                 description: queued_description.into(),
@@ -117,7 +156,24 @@ impl JobSpec {
         Self {
             rack_id: rack_id.into(),
             node_id: String::new(),
-            span,
+            span: JobSpanSource::Ready(span),
+            workflow_type: None,
+            initial_state: JobLifecycleState::Running {
+                description: running_description.into(),
+            },
+        }
+    }
+
+    /// Creates a parent specification whose span is built only after admission.
+    pub fn new_parent_deferred(
+        rack_id: impl Into<String>,
+        running_description: impl Into<String>,
+        create_span: impl FnOnce(&JobId) -> tracing::Span + Send + 'static,
+    ) -> Self {
+        Self {
+            rack_id: rack_id.into(),
+            node_id: String::new(),
+            span: JobSpanSource::Deferred(Box::new(create_span)),
             workflow_type: None,
             initial_state: JobLifecycleState::Running {
                 description: running_description.into(),
@@ -161,6 +217,12 @@ pub struct JobSnapshot {
     pub node_id: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// Monotonic last-touch used for TTL eviction. Wall-clock `updated_at` is
+    /// for display only and can jump under NTP steps.
+    pub(crate) updated_at_mono: Instant,
+    /// Set after the first inverted-clock warn on a terminal job so a stuck
+    /// stamp does not log on every reaper sweep.
+    pub(crate) mono_inversion_warned: bool,
     pub child_job_ids: Vec<JobId>,
     pub parent_job_id: Option<JobId>,
     pub cancellation_token: CancellationToken,
@@ -176,11 +238,16 @@ impl JobSnapshot {
 
     fn new(spec: JobSpec, parent_job_id: Option<JobId>) -> Self {
         let now = Utc::now();
+        let job_id = JobId::new();
+        let span = spec.span.resolve(&job_id);
+        span.record("job_id", job_id.as_ref());
         Self {
-            job_id: JobId::new(),
-            span: spec.span,
+            job_id,
+            span,
             created_at: now,
             updated_at: now,
+            updated_at_mono: Instant::now(),
+            mono_inversion_warned: false,
             cancellation_token: CancellationToken::new(),
             state: spec.initial_state,
             rack_id: spec.rack_id,
@@ -189,6 +256,13 @@ impl JobSnapshot {
             parent_job_id,
             workflow_type: spec.workflow_type,
         }
+    }
+
+    /// Records a lifecycle touch on both the display wall-clock and the
+    /// monotonic TTL clock.
+    pub(super) fn touch(&mut self) {
+        self.updated_at = Utc::now();
+        self.updated_at_mono = Instant::now();
     }
 }
 
@@ -209,17 +283,92 @@ pub type JobObserver = Arc<dyn Fn(&JobSnapshot) + Send + Sync>;
 pub(super) enum LifecycleTransition {
     /// The first `Queued -> Running` move: the workflow has actually started.
     Started(JobSnapshot),
+
     /// A later `Running -> Running` description update (progress reporting).
     Progress(JobSnapshot),
+
     /// The first non-terminal to terminal move (`Completed` or `Failed`).
     Terminal(JobSnapshot),
 }
 
+/// An identity alias that must remain exclusive while a mutation is active.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize)]
+pub enum JobScope {
+    /// A registered node alias, also checked against the active-node index.
+    LogicalNode { rack_id: String, node_id: String },
+
+    /// A switch tray within a chassis; the serial number identifies the chassis.
+    PhysicalSwitch {
+        chassis_serial_number: String,
+        tray_index: u32,
+    },
+
+    /// A management socket whose host spelling is normalized during admission.
+    Endpoint { host: String, port: u16 },
+}
+
+impl JobScope {
+    /// Normalizes IP spelling and DNS case before indexing an endpoint alias.
+    ///
+    /// IPv4-mapped IPv6 addresses share the IPv4 key. Scoped IPv6 addresses
+    /// retain their zone ID verbatim so distinct interfaces remain distinct.
+    pub fn endpoint(host: impl AsRef<str>, port: u16) -> Self {
+        let host = host
+            .as_ref()
+            .trim()
+            .trim_start_matches('[')
+            .trim_end_matches(']');
+
+        let host = if let Some((address, zone)) = host.split_once('%')
+            && let Ok(address) = address.parse::<Ipv6Addr>()
+        {
+            format!("{address}%{zone}")
+        } else {
+            host.parse::<IpAddr>().map_or_else(
+                |_| host.trim_end_matches('.').to_ascii_lowercase(),
+                |address| address.to_canonical().to_string(),
+            )
+        };
+
+        Self::Endpoint { host, port }
+    }
+
+    pub(crate) fn normalized(self) -> Self {
+        match self {
+            Self::Endpoint { host, port } => Self::endpoint(host, port),
+            Self::PhysicalSwitch {
+                chassis_serial_number,
+                tray_index,
+            } => Self::PhysicalSwitch {
+                chassis_serial_number: chassis_serial_number.trim().to_owned(),
+                tray_index,
+            },
+            scope => scope,
+        }
+    }
+}
+
+/// Holds all direct-mutation aliases until the caller finishes or drops the guard.
+#[must_use = "hold the reservation for the complete device mutation"]
+pub struct MutationReservation<D: JobDomain> {
+    registry: Arc<JobRegistry<D>>,
+    owner_id: JobId,
+}
+
+impl<D: JobDomain> Drop for MutationReservation<D> {
+    fn drop(&mut self) {
+        self.registry
+            .jobs
+            .write()
+            .unwrap()
+            .release_scopes(&self.owner_id);
+    }
+}
+
 /// Shared in-memory registry for asynchronous jobs.
 ///
-/// Job records are stored domain-agnostically; the `D` parameter only selects
-/// the [`JobDomain`] policy used to build supervisor and capacity failures, so
-/// it is carried as a marker.
+/// The domain selects failure policy. Job state and mutation aliases share
+/// one admission and transition lock.
 pub struct JobRegistry<D: JobDomain> {
     /// Job records and derived indexes guarded by the same lock.
     jobs: RwLock<JobStore>,
@@ -231,7 +380,14 @@ pub struct JobRegistry<D: JobDomain> {
     /// poisoning the registry. Must not re-enter the registry.
     created_observer: Option<JobObserver>,
     terminal_observer: Option<JobObserver>,
+    tasks: Mutex<HashMap<JobId, JobTaskControl>>,
+    task_change: Notify,
     _domain: PhantomData<fn() -> D>,
+}
+
+struct JobTaskControl {
+    worker: AbortHandle,
+    supervisor: AbortHandle,
 }
 
 impl<D: JobDomain> JobRegistry<D> {
@@ -252,6 +408,8 @@ impl<D: JobDomain> JobRegistry<D> {
             shutting_down: AtomicBool::new(false),
             created_observer: None,
             terminal_observer: None,
+            tasks: Mutex::new(HashMap::new()),
+            task_change: Notify::new(),
             _domain: PhantomData,
         }
     }
@@ -288,6 +446,29 @@ impl<D: JobDomain> JobRegistry<D> {
         parent_job_id: Option<&JobId>,
         require_node_idle: bool,
     ) -> Result<JobHandle<D>, JobFailure> {
+        self.create_job_with_scopes(spec, parent_job_id, require_node_idle, Vec::new())
+    }
+
+    /// Atomically admits every supplied alias before publishing a job record.
+    ///
+    /// Scope overlap, node occupancy, shutdown, and capacity leave no reservation.
+    /// The owned job handle releases aliases only after a terminal transition.
+    pub fn create_job_with_scopes(
+        self: &Arc<Self>,
+        spec: JobSpec,
+        parent_job_id: Option<&JobId>,
+        require_node_idle: bool,
+        scopes: Vec<JobScope>,
+    ) -> Result<JobHandle<D>, JobFailure> {
+        let mut scopes: Vec<_> = scopes.into_iter().map(JobScope::normalized).collect();
+
+        if require_node_idle && !spec.node_id.is_empty() {
+            scopes.push(JobScope::LogicalNode {
+                rack_id: spec.rack_id.clone(),
+                node_id: spec.node_id.clone(),
+            });
+        }
+
         let (job_id, span, cancellation_token, record) = {
             let mut jobs = self.jobs.write().unwrap();
             if self.shutting_down.load(Ordering::SeqCst) {
@@ -307,12 +488,20 @@ impl<D: JobDomain> JobRegistry<D> {
                     &active_job_id,
                 ));
             }
+
+            if let Some((scope, owner_id)) = jobs.conflicting_scope(&scopes) {
+                return Err(D::scope_busy_failure(&scope, &owner_id));
+            }
+
             if let Some(at_capacity) = self.capacity_check(&mut jobs) {
                 return Err(at_capacity);
             }
 
             let record = JobSnapshot::new(spec, parent_job_id.cloned());
             let record = jobs.insert(record);
+
+            jobs.reserve_scopes(record.job_id.clone(), scopes);
+
             if parent_job_id.is_some() {
                 assert!(
                     jobs.attach_child(&record),
@@ -328,6 +517,70 @@ impl<D: JobDomain> JobRegistry<D> {
         self.notify_created(&record);
 
         Ok(handle)
+    }
+
+    /// Reserves all aliases for a synchronous mutation under the admission lock.
+    ///
+    /// The guard shares exclusion with jobs without consuming a retained-job slot.
+    pub fn reserve_mutation(
+        self: &Arc<Self>,
+        scopes: Vec<JobScope>,
+    ) -> Result<MutationReservation<D>, JobFailure> {
+        let scopes: Vec<_> = scopes.into_iter().map(JobScope::normalized).collect();
+
+        let owner_id = {
+            let mut jobs = self.jobs.write().unwrap();
+
+            if self.shutting_down.load(Ordering::SeqCst) {
+                return Err(D::shutting_down_failure());
+            }
+
+            if let Some((scope, owner_id)) = jobs.conflicting_scope(&scopes) {
+                return Err(D::scope_busy_failure(&scope, &owner_id));
+            }
+
+            let mut owner_id = JobId::new();
+
+            while jobs.has_scope_owner(&owner_id) || jobs.get(&owner_id).is_some() {
+                owner_id = JobId::new();
+            }
+
+            jobs.reserve_scopes(owner_id.clone(), scopes);
+            owner_id
+        };
+
+        Ok(MutationReservation {
+            registry: Arc::clone(self),
+            owner_id,
+        })
+    }
+
+    /// Adds every alias to an active worker before the worker starts device mutation.
+    ///
+    /// Existing aliases owned by this job are accepted. Any other occupancy,
+    /// terminal state, or shutdown leaves the job's prior aliases unchanged.
+    pub fn reserve_job_scopes(
+        &self,
+        job_id: &JobId,
+        scopes: Vec<JobScope>,
+    ) -> Result<(), JobFailure> {
+        let scopes: Vec<_> = scopes.into_iter().map(JobScope::normalized).collect();
+        let mut jobs = self.jobs.write().unwrap();
+
+        if self.shutting_down.load(Ordering::SeqCst) {
+            return Err(D::shutting_down_failure());
+        }
+
+        if jobs.get(job_id).is_none_or(|job| job.state.is_terminal()) {
+            return Err(D::inactive_job_failure(job_id));
+        }
+
+        if let Some((scope, owner_id)) = jobs.conflicting_scope_except(&scopes, Some(job_id)) {
+            return Err(D::scope_busy_failure(&scope, &owner_id));
+        }
+
+        jobs.reserve_scopes(job_id.clone(), scopes);
+        Ok(())
     }
 
     #[cfg(test)]
@@ -363,7 +616,7 @@ impl<D: JobDomain> JobRegistry<D> {
     /// Call while holding the store write lock.
     fn capacity_check(&self, jobs: &mut JobStore) -> Option<JobFailure> {
         if jobs.tracked_job_count() >= self.max_jobs {
-            jobs.cleanup_expired(Utc::now(), self.ttl);
+            jobs.cleanup_expired(Instant::now(), self.ttl);
         }
 
         let current = jobs.tracked_job_count();
@@ -410,7 +663,7 @@ impl<D: JobDomain> JobRegistry<D> {
 
     /// Marks a job running with a new description.
     pub fn mark_running(&self, job_id: &JobId, description: impl Into<String>) -> bool {
-        self.update(job_id, |state| {
+        self.update(job_id, false, |state| {
             if state.is_terminal() {
                 return None;
             }
@@ -427,8 +680,9 @@ impl<D: JobDomain> JobRegistry<D> {
         job_id: &JobId,
         description: impl Into<String>,
         result_json: impl Into<String>,
+        verified_completion: bool,
     ) -> bool {
-        self.update(job_id, |state| {
+        self.update(job_id, verified_completion, |state| {
             if state.is_terminal() {
                 tracing::error!(
                     "Job was terminal before mark_completed or mark_failed had been called"
@@ -445,7 +699,7 @@ impl<D: JobDomain> JobRegistry<D> {
 
     /// Marks a non-terminal job failed on behalf of its owned [`JobHandle`].
     pub(super) fn mark_failed(&self, job_id: &JobId, failure: JobFailure) -> bool {
-        self.update(job_id, |state| {
+        self.update(job_id, false, |state| {
             if state.is_terminal() {
                 tracing::error!("Job was terminal before mark_failed had been called");
                 return None;
@@ -491,6 +745,109 @@ impl<D: JobDomain> JobRegistry<D> {
         self.shutting_down.store(true, Ordering::SeqCst);
     }
 
+    pub(super) fn register_task(
+        &self,
+        job_id: JobId,
+        worker: AbortHandle,
+        supervisor: AbortHandle,
+    ) -> bool {
+        // Cleanup remains tracked even when shutdown rejects starting the worker.
+        self.tasks
+            .lock()
+            .unwrap()
+            .insert(job_id, JobTaskControl { worker, supervisor });
+        !self.shutting_down.load(Ordering::SeqCst)
+    }
+
+    pub(super) fn remove_task(&self, job_id: &JobId) {
+        self.tasks.lock().unwrap().remove(job_id);
+        self.task_change.notify_waiters();
+    }
+
+    pub(crate) fn abort_workers(&self, job_ids: &[JobId]) {
+        let tasks = self.tasks.lock().unwrap();
+        for job_id in job_ids {
+            if let Some(task) = tasks.get(job_id) {
+                task.worker.abort();
+            }
+        }
+    }
+
+    pub(crate) fn task_job_ids(&self) -> Vec<JobId> {
+        self.tasks.lock().unwrap().keys().cloned().collect()
+    }
+
+    pub(crate) fn abort_supervisors(&self, job_ids: &[JobId]) {
+        let tasks = self.tasks.lock().unwrap();
+        for job_id in job_ids {
+            if let Some(task) = tasks.get(job_id) {
+                task.supervisor.abort();
+            }
+        }
+    }
+
+    pub(crate) async fn wait_for_tasks(&self, job_ids: &[JobId], timeout: Duration) -> bool {
+        let job_ids: HashSet<_> = job_ids.iter().cloned().collect();
+        let wait = async {
+            loop {
+                let changed = self.task_change.notified();
+                if !self
+                    .tasks
+                    .lock()
+                    .unwrap()
+                    .keys()
+                    .any(|job_id| job_ids.contains(job_id))
+                {
+                    return;
+                }
+                changed.await;
+            }
+        };
+        tokio::time::timeout(timeout, wait).await.is_ok()
+    }
+
+    pub(crate) async fn wait_for_workers(&self, job_ids: &[JobId], timeout: Duration) -> bool {
+        let job_ids: HashSet<_> = job_ids.iter().cloned().collect();
+        let wait = async {
+            loop {
+                if self.workers_finished(&job_ids) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        };
+        tokio::time::timeout(timeout, wait).await.is_ok()
+    }
+
+    fn workers_finished(&self, job_ids: &HashSet<JobId>) -> bool {
+        self.tasks
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(job_id, _)| job_ids.contains(*job_id))
+            .all(|(_, task)| task.worker.is_finished())
+    }
+
+    pub(crate) fn all_workers_finished(&self, job_ids: &[JobId]) -> bool {
+        self.workers_finished(&job_ids.iter().cloned().collect())
+    }
+
+    pub(crate) fn non_terminal_job_ids(&self) -> Vec<JobId> {
+        self.jobs
+            .read()
+            .unwrap()
+            .snapshots()
+            .filter(|job| !job.state.is_terminal())
+            .map(|job| job.job_id.clone())
+            .collect()
+    }
+
+    pub(crate) fn fail_non_terminal_for_shutdown(&self, job_ids: &[JobId]) {
+        for job_id in job_ids {
+            self.mark_failed(job_id, D::shutdown_failure());
+        }
+    }
+
     /// Signals cooperative cancellation for every active leaf job and returns
     /// their IDs.
     pub fn cancel_active_leaves(&self) -> Vec<JobId> {
@@ -510,36 +867,61 @@ impl<D: JobDomain> JobRegistry<D> {
         active.into_iter().map(|(job_id, _)| job_id).collect()
     }
 
-    // Note: missing job IDs are treated as already-done (because TTL cleanup may have evicted records between the call to cancel_active_leaves and the wait)
+    /// Wait for all known jobs to become terminal. Missing/TTL-evicted records
+    /// count as settled, but never as successful outcomes.
     pub async fn wait_for_terminal_jobs(
         &self,
         job_ids: &[JobId],
         timeout: Option<Duration>,
     ) -> bool {
-        let mut remaining: HashSet<JobId> = job_ids.iter().cloned().collect();
-        let wait = async move {
-            while !remaining.is_empty() {
-                self.retain_non_terminal_or_missing(&mut remaining);
-                if remaining.is_empty() {
-                    break;
-                }
+        self.wait_for_terminal_outcomes(job_ids, timeout)
+            .await
+            .pending
+            .is_empty()
+    }
 
-                tokio::time::sleep(TERMINAL_WAIT_POLL_INTERVAL).await;
+    /// Preserve terminal snapshots as they arrive, before TTL cleanup can evict
+    /// them. Timeout returns partial outcomes without cancelling hardware work.
+    pub(crate) async fn wait_for_terminal_outcomes(
+        &self,
+        job_ids: &[JobId],
+        timeout: Option<Duration>,
+    ) -> TerminalJobOutcomes {
+        let mut outcomes = TerminalJobOutcomes {
+            pending: job_ids.iter().cloned().collect(),
+            ..TerminalJobOutcomes::default()
+        };
+        let wait = async {
+            while !outcomes.pending.is_empty() {
+                outcomes.pending.retain(|id| match self.get(id) {
+                    Some(snapshot) if snapshot.state.is_terminal() => {
+                        outcomes.terminal.push(snapshot);
+                        false
+                    }
+                    Some(_) => true,
+                    None => {
+                        outcomes.missing.push(id.clone());
+                        false
+                    }
+                });
+                if !outcomes.pending.is_empty() {
+                    tokio::time::sleep(TERMINAL_WAIT_POLL_INTERVAL).await;
+                }
             }
         };
-
         if let Some(timeout) = timeout {
-            tokio::time::timeout(timeout, wait).await.is_ok()
+            // Partial snapshots remain owned by outcomes when the wait is dropped.
+            tokio::time::timeout(timeout, wait).await.ok();
         } else {
             wait.await;
-            true
         }
+        outcomes
     }
 
     /// Evicts expired terminal jobs while preserving children of live parents.
     pub fn cleanup_expired(&self) {
         let mut jobs = self.jobs.write().unwrap();
-        jobs.cleanup_expired(Utc::now(), self.ttl);
+        jobs.cleanup_expired(Instant::now(), self.ttl);
     }
 
     /// Test helper for timestamp-sensitive cleanup coverage.
@@ -555,22 +937,13 @@ impl<D: JobDomain> JobRegistry<D> {
         self.jobs.read().unwrap().assert_consistent();
     }
 
-    fn retain_non_terminal_or_missing(&self, remaining: &mut HashSet<JobId>) {
-        let jobs = self.jobs.read().unwrap();
-        remaining.retain(|job_id| match jobs.get(job_id) {
-            Some(job) => !job.state.is_terminal(),
-            // Waiters receive IDs for jobs that were already created. Missing
-            // records were terminal long enough to be collected by TTL cleanup.
-            None => false,
-        });
-    }
-
     /// Applies a lifecycle-state transition, logs the resulting chokepoint
     /// event (`job started`/`job progress`/`job completed`/`job failed`), and
     /// notifies the terminal observer.
     fn update(
         &self,
         job_id: &JobId,
+        verified_completion: bool,
         transition: impl FnOnce(&JobLifecycleState) -> Option<JobLifecycleState>,
     ) -> bool {
         let (changed, event) = {
@@ -582,7 +955,7 @@ impl<D: JobDomain> JobRegistry<D> {
             Some(LifecycleTransition::Started(snapshot)) => log_started(&snapshot),
             Some(LifecycleTransition::Progress(snapshot)) => log_progress(&snapshot),
             Some(LifecycleTransition::Terminal(snapshot)) => {
-                log_terminal(&snapshot);
+                log_terminal(&snapshot, verified_completion);
                 if let Some(observer) = &self.terminal_observer {
                     observer(&snapshot);
                 }
@@ -668,7 +1041,7 @@ fn log_progress(snapshot: &JobSnapshot) {
 /// even when `update` is driven from a context that hasn't entered it (e.g.
 /// the tracker-compatibility path in `job_tracker.rs`, which drives a
 /// previously created `JobHandle` from an unrelated call site).
-fn log_terminal(snapshot: &JobSnapshot) {
+fn log_terminal(snapshot: &JobSnapshot, verified_completion: bool) {
     let _entered = snapshot.span.enter();
     match &snapshot.state {
         JobLifecycleState::Completed { description, .. } => tracing::info!(
@@ -687,4 +1060,32 @@ fn log_terminal(snapshot: &JobSnapshot) {
         ),
         JobLifecycleState::Queued { .. } | JobLifecycleState::Running { .. } => {}
     }
+
+    // The registry retains snapshots for status queries and TTL cleanup, so
+    // dropping the tracing::Span would otherwise delay OTLP export for hours.
+    // End only the OpenTelemetry span after the terminal event is recorded;
+    // the tracing span remains available for retained log metadata.
+    let context = snapshot.span.context();
+    let span = context.span();
+    if let JobLifecycleState::Failed { failure, .. } = &snapshot.state {
+        span.set_attribute(KeyValue::new(
+            "error.type",
+            job_error_of(failure.as_ref()).metrics_label(),
+        ));
+        // The taxonomy is in error.type; raw job errors may contain secrets.
+        span.set_status(Status::error(""));
+    } else if verified_completion && matches!(snapshot.state, JobLifecycleState::Completed { .. }) {
+        // Only the winning terminal transition may assert verified success.
+        span.set_status(Status::Ok);
+    }
+    span.end();
+}
+
+/// Terminal observations from one bounded wait; missing and pending jobs never
+/// appear in `terminal` and therefore cannot be mistaken for successful work.
+#[derive(Default)]
+pub(crate) struct TerminalJobOutcomes {
+    pub terminal: Vec<JobSnapshot>,
+    pub missing: Vec<JobId>,
+    pub pending: HashSet<JobId>,
 }

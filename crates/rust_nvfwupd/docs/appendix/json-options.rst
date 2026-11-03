@@ -753,3 +753,47 @@ nvfwupd v2.0.5 and later supports JSON output options for the ``show_version``, 
             }
         ]
     }
+
+Multipart Firmware Submission Failures
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+When a multipart firmware upload is rejected or returns no usable task
+reference, ``update_fw -j`` includes a ``SubmissionDiagnostic`` object in its
+``Output`` array. The existing ``Error``, ``Error Code``, and ``Output`` envelope
+is preserved. Each diagnostic contains a zero-based ``target_index`` referring
+to the target's input order. This index identifies the target even when its
+address is sanitized. Indices refer to positions in the original input, including
+entries skipped by validation. For example, a valid second target keeps index
+``1`` when the first target is invalid. Serial CLI JSON updates accept one valid
+target. Parallel CLI JSON updates retain diagnostics for all failing targets.
+When a library caller reuses its output object for additional uploads, failed
+attempts are appended in call order. A later successful upload does not remove
+that history. The caller can start a new output object to begin a new history.
+
+The diagnostic includes a ``category`` and, when available, ``http_status``,
+selected response ``headers``, and a redacted ``body`` limited to 4096 characters.
+Submission text masks the current target's username and password or session token
+before truncation, including escaped echoes. This credential masking is applied
+even when optional log sanitization is disabled and does not depend on another
+parallel worker's sanitizer settings. ``body_truncated`` is true only when the
+redacted body was actually cut to the character limit.
+Categories are ``http_rejection``, ``json_decode_failure``,
+``missing_task_reference``, ``malformed_task_reference``,
+``response_read_failure``, and ``transport_failure``.
+``missing_task_reference`` means none of the recognized task-reference fields
+(``Id``, ``@odata.id``, or ``Messages``) is present. ``malformed_task_reference``
+means at least one is present but no usable task ID can be extracted.
+Transport and response-read failures carry a ``message`` instead of a body. These diagnostics cover multipart
+submission responses and transport failures; HTTPPushURI uploads and multipart
+preflight failures do not emit this entry.
+
+Plain-text CLI updates also print the diagnostic when HTTP 200 or 202 is returned
+without a usable task reference. The update still fails in that case. The legacy
+upload error also limits its redacted response text to 4096 characters.
+
+The low-level Rust multipart upload methods return an HTTP/JSON success boolean:
+HTTP 200/202 with valid JSON yields ``true`` even if the response has no usable
+task reference. Callers must validate the task reference to determine whether an
+update started. The CLI and firmware workflow perform that validation and report
+missing or malformed task references as update failures. A diagnostic retained
+from an earlier attempt is history, rather than the result of the latest call.

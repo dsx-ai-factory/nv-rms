@@ -83,6 +83,17 @@ hardware identity from their spelling. When a platform needs expected-inventory
 profiles or catalog changes, inspect `src/config/mod.rs` and add parsing,
 validation, and default/configuration coverage.
 
+Recovery profiles (`[workflows.recovery_profiles]`) take that rule one step
+further. RMS keeps each profile an opaque table. Only a node type with a
+recovery flow parses it (`NodeType::has_recovery_flow`), and
+`NodeInstance::from_config` rejects a table bound to any other type. Put the
+parser, its rules, and the recovery procedure in that node's modules
+(`src/nodes/compute_gb200_nvidia/`, `mod.rs` and `recovery.rs`, today). Keep
+handlers roster-blind: they read the inventory, ask `detect` through
+`Node::recovery()`, resolve bundle files, and call `recover`. Name profile keys
+by what the flow does with each list, never by bundle: "bundle" means a
+firmware file.
+
 ## Runtime implementation and reuse
 
 For every new `NodeType`:

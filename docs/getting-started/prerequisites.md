@@ -26,7 +26,7 @@ For a local (non-Docker) build:
   runner used by the [`Justfile`](https://github.com/dsx-ai-factory/nv-rms/blob/main/Justfile)
   build and Docker helpers. Install via `cargo install just` or `brew install just`.
 
-For a **Docker-based build**, only **Docker 24+** is needed - all toolchain
+For a **Docker-based build**, **Docker 24+** is needed; all toolchain
 dependencies are installed inside the builder image.
 
 On Debian/Ubuntu, the full system dependency set is:
@@ -58,6 +58,10 @@ When running RMS against real hardware:
 - A reachable, supported endpoint for downloading firmware artifacts.
   See [Firmware Sources](../reference/firmware-sources.md#firmware-sources) for the supported
   protocols and endpoint types, including HTTP/HTTPS file servers, Artifactory, and local paths.
+  HTTP(S) catalogs may omit a digest by default; SHA-256 can be configured as
+  required. Downloads are unrestricted by host unless optional host controls are
+  set, as documented in
+  [Configuring RMS: Artifact download policy](../configuration/configuring-rms.md#artifact-download-policy).
 
 ## The librms proto definitions
 

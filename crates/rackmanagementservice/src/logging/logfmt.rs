@@ -20,11 +20,15 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::marker::PhantomData;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
+use opentelemetry::trace::TraceContextExt;
+use tracing::dispatcher::WeakDispatch;
 use tracing::field::{self, Field, Visit};
 use tracing::span::{self, Attributes};
-use tracing::{Event, Subscriber};
+use tracing::{Dispatch, Event, Subscriber};
+use tracing_opentelemetry::get_otel_context;
+use tracing_subscriber::EnvFilter;
 use tracing_subscriber::Layer;
 use tracing_subscriber::layer::Context;
 use tracing_subscriber::registry::{LookupSpan, SpanRef};
@@ -41,6 +45,8 @@ where
         write_end_time: false,
         extra_event_fields: Vec::new(),
         emit_timestamps: false,
+        dispatch: OnceLock::new(),
+        span_output_filter: None,
     }
 }
 
@@ -59,6 +65,8 @@ pub struct LogFmtLayer<S> {
     write_end_time: bool,
     extra_event_fields: Vec<String>,
     emit_timestamps: bool,
+    dispatch: OnceLock<WeakDispatch>,
+    span_output_filter: Option<EnvFilter>,
 }
 
 impl<S> LogFmtLayer<S>
@@ -114,6 +122,33 @@ where
             ..self
         }
     }
+
+    /// Filter used only for SPAN close records. The layer itself remains
+    /// span-aware even when this filter suppresses an INFO close record.
+    pub fn with_span_output_filter(self, span_output_filter: EnvFilter) -> Self {
+        Self {
+            span_output_filter: Some(span_output_filter),
+            ..self
+        }
+    }
+
+    fn otel_context<'a>(&self, span: &SpanRef<'a, S>) -> Option<OtelLogContext> {
+        let dispatch = self.dispatch.get()?.upgrade()?;
+        let context = get_otel_context(&span.id(), &dispatch)?;
+        let span = context.span();
+        let span_context = span.span_context();
+        span_context.is_valid().then(|| OtelLogContext {
+            trace_id: span_context.trace_id().to_string(),
+            span_id: span_context.span_id().to_string(),
+            trace_flags: format!("{:02x}", span_context.trace_flags().to_u8()),
+        })
+    }
+}
+
+struct OtelLogContext {
+    trace_id: String,
+    span_id: String,
+    trace_flags: String,
 }
 
 struct Timing {
@@ -146,18 +181,27 @@ struct LogFmtData {
     /// Formatted Span attributes
     /// This is a BTreeMap to guarantee order when formatting
     attributes: BTreeMap<String, String>,
+    output_enabled: bool,
+}
+
+fn is_formatter_owned_trace_field(name: &str) -> bool {
+    matches!(name, "trace_id" | "span_id" | "trace_flags")
 }
 
 impl LogFmtData {
-    pub fn new() -> Self {
+    pub fn new(output_enabled: bool) -> Self {
         Self {
             timing: Timing::new(),
             suppressed: false,
             attributes: BTreeMap::new(),
+            output_enabled,
         }
     }
 
     pub fn update_attribute(&mut self, field: &Field, value: String) {
+        if is_formatter_owned_trace_field(field.name()) {
+            return;
+        }
         // Note that this doesn't use the `.entry()` API to avoid unnecessary
         // allocations for `.to_string()` if the entry does already exist
         match self.attributes.get_mut(field.name()) {
@@ -175,8 +219,30 @@ impl<S> Layer<S> for LogFmtLayer<S>
 where
     S: Subscriber + for<'span> LookupSpan<'span>,
 {
+    fn on_register_dispatch(&self, subscriber: &Dispatch) {
+        let _ = self.dispatch.set(subscriber.downgrade());
+    }
+
+    fn register_callsite(
+        &self,
+        metadata: &'static tracing::Metadata<'static>,
+    ) -> tracing::subscriber::Interest {
+        if let Some(filter) = &self.span_output_filter {
+            // Dynamic directives need their callsite matchers before the span
+            // lifecycle callbacks can track fields and inherited scope levels.
+            let _ = <EnvFilter as Layer<S>>::register_callsite(filter, metadata);
+        }
+        // This filter governs close records only. The outer per-layer filter
+        // still owns event output and retains spans needed for correlation.
+        tracing::subscriber::Interest::always()
+    }
+
     fn on_new_span(&self, attrs: &Attributes<'_>, id: &span::Id, ctx: Context<'_, S>) {
-        let mut data = LogFmtData::new();
+        let output_enabled = self.span_output_filter.as_ref().is_none_or(|filter| {
+            filter.on_new_span(attrs, id, ctx.clone());
+            filter.enabled(attrs.metadata(), ctx.clone())
+        });
+        let mut data = LogFmtData::new(output_enabled);
         let mut visitor = SpanAttributeVisitor { data: &mut data };
         attrs.record(&mut visitor);
 
@@ -186,6 +252,9 @@ where
     }
 
     fn on_enter(&self, id: &span::Id, ctx: Context<'_, S>) {
+        if let Some(filter) = &self.span_output_filter {
+            filter.on_enter(id, ctx.clone());
+        }
         let span = ctx.span(id).expect("Span not found, this is a bug");
         let mut extensions = span.extensions_mut();
 
@@ -198,6 +267,9 @@ where
     }
 
     fn on_exit(&self, id: &span::Id, ctx: Context<'_, S>) {
+        if let Some(filter) = &self.span_output_filter {
+            filter.on_exit(id, ctx.clone());
+        }
         let span = ctx.span(id).expect("Span not found, this is a bug");
         let mut extensions = span.extensions_mut();
 
@@ -210,6 +282,9 @@ where
     }
 
     fn on_record(&self, id: &span::Id, values: &span::Record<'_>, ctx: Context<'_, S>) {
+        if let Some(filter) = &self.span_output_filter {
+            filter.on_record(id, values, ctx.clone());
+        }
         let span = ctx.span(id).expect("Span not found, this is a bug");
         let mut extensions = span.extensions_mut();
         if let Some(data) = extensions.get_mut::<LogFmtData>() {
@@ -222,12 +297,16 @@ where
     fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
         // If the event doesn't happen in the scope of a Span, we don't log some span data
         let current_span = ctx.lookup_current();
+        let otel_context = current_span
+            .as_ref()
+            .and_then(|span| span.scope().find_map(|span| self.otel_context(&span)));
 
         /// This formatting subfunction exists so that we can use the ? operator
         /// on write! results
         fn write_event_data<'a, R: LookupSpan<'a>>(
             event: &Event<'_>,
             current_span: Option<&SpanRef<'a, R>>,
+            otel_context: Option<&OtelLogContext>,
             out: &mut Vec<u8>,
             extra_event_fields: &[String],
             emit_timestamps: bool,
@@ -247,14 +326,13 @@ where
                 write!(out, "{} ", kvp("time", format_event_timestamp()))?;
             }
 
-            // TODO: More metadata?
+            if let Some(otel_context) = otel_context {
+                write!(out, "{} ", kvp("trace_id", &otel_context.trace_id))?;
+                write!(out, "{} ", kvp("span_id", &otel_context.span_id))?;
+                write!(out, "{} ", kvp("trace_flags", &otel_context.trace_flags))?;
+            }
 
             if let Some(current_span) = current_span {
-                // Get the span_id to correlate the event with the actual span
-                if let Some(span_id) = span_attribute(current_span, "span_id") {
-                    write!(out, "{} ", kvp("span_id", span_id))?;
-                }
-
                 // Extra event fields can be owned by parent job spans while the
                 // event is emitted from a nested operation span.
                 for key in extra_event_fields {
@@ -301,6 +379,7 @@ where
             if let Ok(()) = write_event_data(
                 event,
                 current_span.as_ref(),
+                otel_context.as_ref(),
                 format_buffer,
                 &self.extra_event_fields,
                 self.emit_timestamps,
@@ -313,7 +392,11 @@ where
     }
 
     fn on_close(&self, id: span::Id, ctx: Context<'_, S>) {
+        if let Some(filter) = &self.span_output_filter {
+            filter.on_close(id.clone(), ctx.clone());
+        }
         let span = ctx.span(&id).expect("Span not found, this is a bug");
+        let otel_context = span.scope().find_map(|span| self.otel_context(&span));
 
         let mut extensions = span.extensions_mut();
 
@@ -321,9 +404,9 @@ where
             return;
         };
 
-        if !self.emit_span_logs {
-            // Only return after the extension data is removed. We still need the
-            // data around in order to carry the span_id around
+        if !self.emit_span_logs || !data.output_enabled {
+            // Only return after the extension data is removed so per-span
+            // timing and promoted fields are released.
             return;
         }
 
@@ -370,14 +453,16 @@ where
         /// on write! results
         fn write_span_data(
             span_metadata: &tracing::Metadata,
-            mut data: LogFmtData,
+            data: LogFmtData,
+            otel_context: Option<&OtelLogContext>,
             out: &mut Vec<u8>,
         ) -> Result<(), std::io::Error> {
             write!(out, "level=SPAN")?;
 
-            // Start writing the span_id and span_name for consistency
-            if let Some(value) = data.attributes.remove("span_id") {
-                write!(out, " {}", kvp("span_id", value))?;
+            if let Some(otel_context) = otel_context {
+                write!(out, " {}", kvp("trace_id", &otel_context.trace_id))?;
+                write!(out, " {}", kvp("span_id", &otel_context.span_id))?;
+                write!(out, " {}", kvp("trace_flags", &otel_context.trace_flags))?;
             }
 
             let span_name = span_metadata.name();
@@ -396,7 +481,9 @@ where
         // The format buffer is kept around as a threadlocal variable to reduce allocations
         FORMAT_BUFFER.with(|fbuf| {
             let format_buffer: &mut Vec<u8> = &mut fbuf.borrow_mut();
-            if let Ok(()) = write_span_data(span.metadata(), data, format_buffer) {
+            if let Ok(()) =
+                write_span_data(span.metadata(), data, otel_context.as_ref(), format_buffer)
+            {
                 let mut writer = (self.make_writer)();
                 let _ = writer.write_all(format_buffer);
             }
@@ -528,6 +615,9 @@ pub struct FieldVisitor {
 
 impl Visit for FieldVisitor {
     fn record_str(&mut self, field: &Field, value: &str) {
+        if is_formatter_owned_trace_field(field.name()) {
+            return;
+        }
         self.fields.push(format!("{}", kvp(field.name(), value)));
     }
     fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
@@ -538,26 +628,44 @@ impl Visit for FieldVisitor {
         self.record_str(field, &format!("{value:?}"));
     }
     fn record_f64(&mut self, field: &Field, value: f64) {
+        if is_formatter_owned_trace_field(field.name()) {
+            return;
+        }
         self.fields
             .push(format!("{}={value}", escape_key_name(field.name())));
     }
     fn record_i64(&mut self, field: &Field, value: i64) {
+        if is_formatter_owned_trace_field(field.name()) {
+            return;
+        }
         self.fields
             .push(format!("{}={value}", escape_key_name(field.name())));
     }
     fn record_u64(&mut self, field: &Field, value: u64) {
+        if is_formatter_owned_trace_field(field.name()) {
+            return;
+        }
         self.fields
             .push(format!("{}={value}", escape_key_name(field.name())));
     }
     fn record_i128(&mut self, field: &Field, value: i128) {
+        if is_formatter_owned_trace_field(field.name()) {
+            return;
+        }
         self.fields
             .push(format!("{}={value}", escape_key_name(field.name())));
     }
     fn record_u128(&mut self, field: &Field, value: u128) {
+        if is_formatter_owned_trace_field(field.name()) {
+            return;
+        }
         self.fields
             .push(format!("{}={value}", escape_key_name(field.name())));
     }
     fn record_bool(&mut self, field: &Field, value: bool) {
+        if is_formatter_owned_trace_field(field.name()) {
+            return;
+        }
         self.fields
             .push(format!("{}={value}", escape_key_name(field.name())));
     }
@@ -582,6 +690,8 @@ fn clear_format_buffer(buf: &mut Vec<u8>) {
 mod tests {
     use std::sync::Mutex;
 
+    use opentelemetry::trace::TracerProvider as _;
+    use opentelemetry_sdk::trace::SdkTracerProvider;
     use tracing::Level;
     use tracing::level_filters::LevelFilter;
     use tracing_subscriber::EnvFilter;
@@ -643,6 +753,25 @@ mod tests {
         assert!(lines.next().is_none(), "expected one logfmt line: {output}");
 
         line
+    }
+
+    fn capture_output_with_filter(directives: &str, emit: impl FnOnce()) -> String {
+        use tracing_subscriber::filter::FilterExt as _;
+
+        let writer = TestWriter::new();
+        let cloned_writer = writer.clone();
+        let output_filter = EnvFilter::new(directives);
+        let context_filter = output_filter
+            .clone()
+            .or(tracing_subscriber::filter::filter_fn(|metadata| {
+                metadata.is_span()
+            }));
+        let formatter = layer()
+            .with_writer(Arc::new(move || Box::new(cloned_writer.clone())))
+            .with_span_output_filter(output_filter)
+            .with_filter(context_filter);
+        tracing::subscriber::with_default(tracing_subscriber::registry().with(formatter), emit);
+        writer.text()
     }
 
     /// Removes the nondeterministic `time=<rfc3339>` field from an event line so
@@ -748,7 +877,6 @@ mod tests {
 
         let span = tracing::span!(tracing::Level::WARN,
             "test_span",
-            span_id = "s1234",
             fval.initial = 1.00,
             fval.unset = tracing::field::Empty,
             fval.updated = 1.00,
@@ -827,14 +955,13 @@ mod tests {
             lines.len(),
             lines
         );
-        assert!(strip_time_field(&lines[0]).starts_with(r#"level=INFO span_id=s1234 bool_value=false debug_value=111s error_value=abc f64_value=-2.0 i64_value=-3 str_escaped_value="Hello World" str_value=Hello summary=Summary1 location=""#), "Line is: {}", lines[0]);
+        assert!(strip_time_field(&lines[0]).starts_with(r#"level=INFO bool_value=false debug_value=111s error_value=abc f64_value=-2.0 i64_value=-3 str_escaped_value="Hello World" str_value=Hello summary=Summary1 location=""#), "Line is: {}", lines[0]);
         assert!(
-            strip_time_field(&lines[1])
-                .starts_with(r#"level=ERROR span_id=s1234 msg="as expected" location=""#),
+            strip_time_field(&lines[1]).starts_with(r#"level=ERROR msg="as expected" location=""#),
             "Line is: {}",
             lines[1]
         );
-        assert!(lines[2].starts_with(r#"level=SPAN span_id=s1234 span_name=test_span bval_inital=false bval_unset=true bval_updated=true dval_initial=1s dval_unset=2s dval_updated=3s eval_initial=ab eval_unset=bb eval_updated=cc fval_initial=1 fval_unset=2.2 fval_updated=3.3 ival_initial=0 ival_unset=9 ival_updated=3 sval_inital=a sval_unset=c sval_updated="d e" timing_"#), "Line is: {}", lines[2]);
+        assert!(lines[2].starts_with(r#"level=SPAN span_name=test_span bval_inital=false bval_unset=true bval_updated=true dval_initial=1s dval_unset=2s dval_updated=3s eval_initial=ab eval_unset=bb eval_updated=cc fval_initial=1 fval_unset=2.2 fval_updated=3.3 ival_initial=0 ival_unset=9 ival_updated=3 sval_inital=a sval_unset=c sval_updated="d e" timing_"#), "Line is: {}", lines[2]);
         let elapsed_str_idx = lines[2].find("timing_elapsed_us=").unwrap();
         let elapsed_str = lines[2][elapsed_str_idx..].trim_start_matches("timing_elapsed_us=");
         let elapsed_str_end_idx = elapsed_str.find(' ').unwrap();
@@ -859,13 +986,13 @@ mod tests {
             .with(layer.with_filter(env_filter))
             .set_default();
 
-        let span = tracing::span!(tracing::Level::INFO, "info_span", span_id = "s1234",);
+        let span = tracing::span!(tracing::Level::INFO, "info_span");
         let _entered = span.enter();
         tracing::info!("info_event");
         drop(_entered);
         drop(span);
 
-        let span = tracing::span!(tracing::Level::WARN, "warn_span", span_id = "s1234",);
+        let span = tracing::span!(tracing::Level::WARN, "warn_span");
         let _entered = span.enter();
         tracing::warn!("warn_event");
         drop(_entered);
@@ -881,16 +1008,133 @@ mod tests {
             lines
         );
         assert!(
-            strip_time_field(&lines[0])
-                .starts_with(r#"level=WARN span_id=s1234 msg=warn_event location="#),
+            strip_time_field(&lines[0]).starts_with(r#"level=WARN msg=warn_event location="#),
             "Line is: {}",
             lines[0]
         );
         assert!(
-            lines[1].starts_with(r#"level=SPAN span_id=s1234 span_name=warn_span timing_"#),
+            lines[1].starts_with(r#"level=SPAN span_name=warn_span timing_"#),
             "Line is: {}",
             lines[1]
         );
+    }
+
+    #[test]
+    fn restrictive_filter_preserves_trace_and_job_correlation() {
+        use tracing_subscriber::filter::FilterExt as _;
+
+        let writer = TestWriter::new();
+        let cloned_writer = writer.clone();
+        let output_filter = crate::logging::setup::dep_log_filter(
+            EnvFilter::builder()
+                .with_default_directive(LevelFilter::INFO.into())
+                .parse_lossy("warn"),
+        );
+        let context_filter = output_filter
+            .clone()
+            .or(tracing_subscriber::filter::filter_fn(|metadata| {
+                metadata.is_span()
+            }))
+            .and(tracing_subscriber::filter::filter_fn(|metadata| {
+                !metadata.target().starts_with("opentelemetry")
+            }));
+        let fmt_layer = layer()
+            .with_writer(Arc::new(move || Box::new(cloned_writer.clone())))
+            .with_event_fields(vec!["job_id".to_string()])
+            .with_span_output_filter(output_filter)
+            .with_filter(context_filter);
+        let provider = SdkTracerProvider::builder().build();
+        let otel_layer =
+            tracing_opentelemetry::layer().with_tracer(provider.tracer("restrictive-filter-test"));
+        let _subscriber = tracing_subscriber::registry()
+            .with(fmt_layer)
+            .with(otel_layer)
+            .set_default();
+
+        let request = tracing::info_span!("request");
+        let _request = request.enter();
+        let job = tracing::info_span!("firmware_update", job_id = "job-123");
+        let _job = job.enter();
+        tracing::info!("suppressed info");
+        tracing::warn!("visible warning");
+        tracing::warn!(
+            target: "opentelemetry-otlp",
+            error_message = "collector-controlled secret",
+            "suppressed internal diagnostic"
+        );
+        drop(_job);
+        drop(job);
+        drop(_request);
+        drop(request);
+
+        let output = writer.text();
+        let warning = output
+            .lines()
+            .find(|line| line.contains("visible warning"))
+            .expect("warning line");
+        assert!(warning.contains("trace_id="), "{warning}");
+        assert!(warning.contains("span_id="), "{warning}");
+        assert!(warning.contains("job_id=job-123"), "{warning}");
+        assert!(!output.contains("suppressed info"));
+        assert!(!output.contains("collector-controlled secret"));
+        assert!(!output.contains("level=SPAN"));
+    }
+
+    #[test]
+    fn dynamic_span_directive_preserves_request_and_nested_close_records() {
+        let output = capture_output_with_filter("warn,[request]=info", || {
+            let request = tracing::info_span!("request");
+            request.in_scope(|| {
+                let child = tracing::info_span!("nested_operation");
+                child.in_scope(|| tracing::info!("visible request event"));
+            });
+            drop(request);
+
+            let outside = tracing::info_span!("outside_request");
+            outside.in_scope(|| tracing::info!("suppressed outside event"));
+            tracing::warn!("visible outside warning");
+        });
+
+        assert!(output.contains("level=SPAN span_name=request "), "{output}");
+        assert!(
+            output.contains("level=SPAN span_name=nested_operation "),
+            "{output}"
+        );
+        assert!(output.contains("visible request event"), "{output}");
+        assert!(output.contains("visible outside warning"), "{output}");
+        assert!(!output.contains("outside_request"), "{output}");
+        assert!(!output.contains("suppressed outside event"), "{output}");
+    }
+
+    #[test]
+    fn dynamic_field_directive_tracks_recorded_values_and_parent_scope() {
+        let output = capture_output_with_filter("warn,[request{selected=true}]=debug", || {
+            for selected in [false, true] {
+                let request = tracing::info_span!("request", selected = tracing::field::Empty);
+                request.record("selected", selected);
+                request.in_scope(|| {
+                    let child = tracing::debug_span!("selected_operation", selected);
+                    child.in_scope(|| tracing::debug!(selected, "conditional event"));
+                });
+            }
+            let outside = tracing::debug_span!("outside_selected_request");
+            outside.in_scope(|| tracing::debug!("suppressed after request"));
+        });
+
+        let child_lines: Vec<_> = output
+            .lines()
+            .filter(|line| line.contains("span_name=selected_operation "))
+            .collect();
+        assert_eq!(child_lines.len(), 1, "{output}");
+        assert!(child_lines[0].contains("selected=true"), "{output}");
+        let event_lines: Vec<_> = output
+            .lines()
+            .filter(|line| line.contains("conditional event"))
+            .collect();
+        assert_eq!(event_lines.len(), 1, "{output}");
+        assert!(event_lines[0].contains("selected=true"), "{output}");
+        assert!(!output.contains("outside_selected_request"), "{output}");
+        assert!(!output.contains("suppressed after request"), "{output}");
     }
 
     #[test]
@@ -968,7 +1212,7 @@ mod tests {
 
         let _subscriber = tracing_subscriber::registry().with(layer).set_default();
 
-        let span = tracing::span!(tracing::Level::WARN, "test_span", span_id = "s1234",);
+        let span = tracing::span!(tracing::Level::WARN, "test_span");
 
         let _entered = span.enter();
         tracing::info!("abc");
@@ -986,8 +1230,7 @@ mod tests {
             lines
         );
         assert!(
-            strip_time_field(&lines[0])
-                .starts_with(r#"level=INFO span_id=s1234 msg=abc location=""#),
+            strip_time_field(&lines[0]).starts_with(r#"level=INFO msg=abc location=""#),
             "Line is: {}",
             lines[0]
         );
@@ -1021,6 +1264,85 @@ mod tests {
     }
 
     #[test]
+    fn event_in_unexported_child_span_inherits_parent_otel_context() {
+        use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+
+        let writer = TestWriter::new();
+        let cloned_writer = writer.clone();
+        let fmt_layer = layer().with_writer(Arc::new(move || Box::new(cloned_writer.clone())));
+        let provider = SdkTracerProvider::builder().build();
+        let otel_layer = tracing_opentelemetry::layer()
+            .with_tracer(provider.tracer("logfmt-test"))
+            .with_filter(tracing_subscriber::filter::filter_fn(|metadata| {
+                metadata.is_span() && metadata.name() == "request"
+            }));
+        let _subscriber = tracing_subscriber::registry()
+            .with(fmt_layer)
+            .with(otel_layer)
+            .set_default();
+
+        let request = tracing::info_span!(
+            "request",
+            trace_id = "forged-parent-trace",
+            span_id = "forged-parent-span",
+            trace_flags = 0_u64,
+        );
+        request.record("span_id", "forged-recorded-span");
+        let expected = request.context().span().span_context().clone();
+        let _request_entered = request.enter();
+        let child = tracing::info_span!(
+            "unexported_child",
+            trace_id = 123_u64,
+            span_id = false,
+            trace_flags = "forged-child-flags",
+        );
+        let _child_entered = child.enter();
+        tracing::info!(
+            trace_id = "forged-event-trace",
+            span_id = 456_u64,
+            trace_flags = false,
+            "nested event"
+        );
+
+        let event = writer
+            .text()
+            .lines()
+            .find(|line| line.contains("nested event"))
+            .expect("nested event")
+            .to_string();
+        assert!(event.contains("trace_id="), "line is: {event}");
+        assert!(event.contains("span_id="), "line is: {event}");
+        assert!(event.contains("trace_flags=01"), "line is: {event}");
+
+        drop(_child_entered);
+        drop(child);
+        drop(_request_entered);
+        drop(request);
+
+        let output = writer.text();
+        assert_eq!(output.lines().count(), 3, "{output}");
+        assert!(!output.contains("forged"), "{output}");
+        let expected_fields = [
+            ("trace_id", expected.trace_id().to_string()),
+            ("span_id", expected.span_id().to_string()),
+            (
+                "trace_flags",
+                format!("{:02x}", expected.trace_flags().to_u8()),
+            ),
+        ];
+        for line in output.lines() {
+            for (name, value) in &expected_fields {
+                let prefix = format!("{name}=");
+                let values: Vec<_> = line
+                    .split_whitespace()
+                    .filter_map(|field| field.strip_prefix(&prefix))
+                    .collect();
+                assert_eq!(values, vec![value.as_str()], "{line}");
+            }
+        }
+    }
+
+    #[test]
     fn test_object_id_in_event_logs() {
         let writer = TestWriter::new();
         let cloned_writer = writer.clone();
@@ -1033,7 +1355,6 @@ mod tests {
         let span = tracing::span!(
             tracing::Level::INFO,
             "test_span",
-            span_id = "s1234",
             object_id = "machine-abc-123",
         );
 
@@ -1051,9 +1372,9 @@ mod tests {
             lines.len(),
             lines
         );
-        // Event should include both span_id and object_id
+        // Event should include the configured object_id.
         assert!(
-            strip_time_field(&lines[0]).starts_with(r#"level=INFO span_id=s1234 object_id=machine-abc-123 msg="event inside span with object_id" location=""#),
+            strip_time_field(&lines[0]).starts_with(r#"level=INFO object_id=machine-abc-123 msg="event inside span with object_id" location=""#),
             "Line is: {}",
             lines[0]
         );
@@ -1129,15 +1450,14 @@ mod tests {
         let span = tracing::span!(
             tracing::Level::INFO,
             "request",
-            span_id = "req-1",
             password = tracing::field::Empty,
-            otel.status_message = tracing::field::Empty,
+            otel.status_description = tracing::field::Empty,
             rpc.grpc.status_description = tracing::field::Empty,
         );
         let _entered = span.enter();
         span.record("password", "s3cr3t");
         span.record(
-            "otel.status_message",
+            "otel.status_description",
             "southbound failed: password=plain_secret",
         );
         span.record(

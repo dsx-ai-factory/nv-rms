@@ -20,6 +20,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("cargo:rerun-if-changed=src/api/grpc/proto/switch_client.proto");
     println!("cargo:rerun-if-changed=src/api/grpc/proto/gnmi.proto");
+    generate_hardware_profile_catalog()?;
 
     let build = BuildBuilder::default().build_timestamp(true).build()?;
     let git = GitclBuilder::default()
@@ -44,5 +45,59 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ],
             &["src/api/grpc/proto/"],
         )?;
+    Ok(())
+}
+
+/// Generate a deterministic embedded catalog from every shipped YAML profile.
+///
+/// This is intentionally discovery-based: adding a profile file to the
+/// versioned directory must not require a matching Rust registration edit.
+fn generate_hardware_profile_catalog() -> Result<(), Box<dyn std::error::Error>> {
+    use std::fmt::Write as _;
+    use std::fs;
+    use std::path::PathBuf;
+
+    let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR")?);
+    let profile_dir = manifest_dir.join("../../hardware-profiles/v1");
+    println!("cargo:rerun-if-changed={}", profile_dir.display());
+
+    let mut profiles = Vec::new();
+    for entry in fs::read_dir(&profile_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if entry.file_type()?.is_file()
+            && matches!(
+                path.extension().and_then(|extension| extension.to_str()),
+                Some("yaml" | "yml")
+            )
+        {
+            profiles.push(path);
+        }
+    }
+    profiles.sort();
+
+    let mut generated =
+        String::from("pub const BUILT_IN_HARDWARE_PROFILES: &[(&str, &str)] = &[\n");
+    for path in profiles {
+        println!("cargo:rerun-if-changed={}", path.display());
+        let filename = path
+            .file_name()
+            .and_then(|filename| filename.to_str())
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "hardware profile filename is not valid UTF-8",
+                )
+            })?;
+        writeln!(
+            generated,
+            "    ({filename:?}, include_str!({path:?})),",
+            path = path.to_string_lossy()
+        )?;
+    }
+    generated.push_str("];\n");
+
+    let output = PathBuf::from(std::env::var("OUT_DIR")?).join("hardware_profiles.rs");
+    fs::write(output, generated)?;
     Ok(())
 }

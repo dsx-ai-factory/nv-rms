@@ -19,20 +19,39 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use nvue_client::cluster::{ClusterNodeServerAddresses, ClusterUpdate, InterfaceType};
 use nvue_client::revision::{RevisionCreate, RevisionUpdate};
 use nvue_client::system::{GnmiServerUpdate, UserPasswordPatch};
 use serde::Serialize;
+use tokio_util::sync::CancellationToken;
+use tracing::instrument::WithSubscriber;
+use tracing_subscriber::prelude::*;
 
 use super::*;
 use crate::domain::node::NodeType;
 use crate::domain::rack::{EndpointConfig, EndpointCredentials, NodeConfig};
+use crate::nodes::nvos;
+use crate::transport::ssh_client::SshUploadOptions;
 use wiremock::matchers::{body_json, header, method, path, query_param};
-use wiremock::{Mock, MockBuilder, MockServer, ResponseTemplate};
+use wiremock::{Mock, MockBuilder, MockServer, Respond, ResponseTemplate};
 
 type SshCommandLog = Arc<Mutex<Vec<String>>>;
 type SshCommandRecorder = Box<dyn Fn(&str) -> Result<String> + Send + Sync + 'static>;
+
+#[derive(Clone, Default)]
+struct TestLogWriter(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for TestLogWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        std::io::Write::write(&mut *self.0.lock().unwrap(), buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
 
 #[derive(Default, Serialize)]
 struct EmptyBody {}
@@ -340,6 +359,30 @@ fn endpoint_config_with_name(
     )
 }
 
+#[tokio::test]
+async fn host_credentials_rejects_explicit_empty_user_pass() {
+    // A host UserPass credential with both fields explicitly empty must be
+    // treated as absent, not as a present-but-blank credential: nothing
+    // upstream normalizes this case to `None` for host endpoints.
+    let server = MockServer::start().await;
+    let mut switch = SwitchGb200Nvidia::for_test(&server.uri());
+    switch.host_endpoint = Some(EndpointConfig::with_credentials(
+        Endpoint {
+            ip_address: "test-host".to_owned(),
+            mac_address: "00:00:00:00:00:00".to_owned(),
+            port: 443,
+            host_name: None,
+        },
+        Some(EndpointCredentials::new("", "")),
+        true,
+    ));
+
+    let err = switch.host_credentials().unwrap_err();
+
+    assert_eq!(err.code, ErrorCode::FailedPrecondition);
+    assert!(err.message.contains("switch host credentials are required"));
+}
+
 // ── System image uninstallation ──────────────────────────────
 
 /// Tests uninstall_system_image under normal circumstances, expecting
@@ -350,7 +393,7 @@ async fn uninstall_system_image_posts_correct_payload() {
     let expected_payload = serde_json::json!({
         "@uninstall": {
             "state": "start",
-            "parameters": {"force": true}
+            "parameters": {"force": false}
         }
     });
     let expected_path = "/nvue_v1/system/image";
@@ -1169,6 +1212,591 @@ async fn gnmi_service_errors_when_state_missing() {
     );
 }
 
+async fn mount_applied_nvue_revision_followthrough(server: &MockServer, revision_id: &str) {
+    mount_apply_revision(server, revision_id, None).await;
+    mount_revision_get(
+        server,
+        revision_id,
+        None,
+        ResponseTemplate::new(200).set_body_json(RevisionState { state: "applied" }),
+    )
+    .await;
+}
+
+async fn mount_applied_nvue_revision(server: &MockServer, revision_id: &str) {
+    mount_create_revision(server, revision_id, None).await;
+    mount_applied_nvue_revision_followthrough(server, revision_id).await;
+    mount_save_applied_revision(server, None).await;
+}
+
+struct SequentialJsonBodies {
+    bodies: Vec<serde_json::Value>,
+    next: AtomicUsize,
+}
+
+impl Respond for SequentialJsonBodies {
+    fn respond(&self, _: &wiremock::Request) -> ResponseTemplate {
+        let index = self.next.fetch_add(1, Ordering::SeqCst);
+        ResponseTemplate::new(200).set_body_json(self.bodies[index].clone())
+    }
+}
+
+async fn mount_create_revisions(server: &MockServer, revision_ids: &[&str]) {
+    Mock::given(method("POST"))
+        .and(path("/nvue_v1/revision"))
+        .and(body_json(RevisionCreate::default()))
+        .respond_with(SequentialJsonBodies {
+            bodies: revision_ids
+                .iter()
+                .map(|id| serde_json::json!(id))
+                .collect(),
+            next: AtomicUsize::new(0),
+        })
+        .expect(u64::try_from(revision_ids.len()).expect("revision count fits u64"))
+        .mount(server)
+        .await;
+}
+
+#[tokio::test]
+async fn capability_discovery_treats_gnmi_mtls_404_as_unsupported() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/nvue_v1/system/gnmi-server/mtls"))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let switch = SwitchGb200Nvidia::for_test(&server.uri());
+    let capabilities = nvos::GnmiClientCa::discover(&switch).await.unwrap();
+    assert!(!capabilities.is_supported());
+}
+
+#[tokio::test]
+async fn capability_discovery_fails_when_gnmi_mtls_probe_is_unavailable() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/nvue_v1/system/gnmi-server/mtls"))
+        .respond_with(ResponseTemplate::new(503))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let switch = SwitchGb200Nvidia::for_test(&server.uri());
+    let err = nvos::GnmiClientCa::discover(&switch).await.unwrap_err();
+    assert_eq!(err.code, ErrorCode::Unavailable);
+}
+
+#[tokio::test]
+async fn initialize_nvue_capabilities_classifies_once_and_reuses_the_session() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/nvue_v1/system/gnmi-server/mtls"))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let switch = SwitchGb200Nvidia::for_test(&server.uri());
+    let first = switch.initialize_nvue_capabilities().await.unwrap();
+    let second = switch.initialize_nvue_capabilities().await.unwrap();
+    assert_eq!(first, second);
+    assert!(!first.is_supported());
+}
+
+#[tokio::test]
+async fn gnmi_client_ca_discover_does_not_probe_secondary_cluster_node() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/nvue_v1/system/gnmi-server/mtls"))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/nvue_v1/cluster/node/secondary"))
+        .respond_with(ResponseTemplate::new(503))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let switch = SwitchGb200Nvidia::for_test(&server.uri());
+    let capabilities = nvos::GnmiClientCa::discover(&switch).await.unwrap();
+    assert!(!capabilities.is_supported());
+}
+
+#[tokio::test]
+async fn initialize_nvue_capabilities_ignores_unrelated_secondary_failure() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/nvue_v1/system/gnmi-server/mtls"))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/nvue_v1/cluster/node/secondary"))
+        .respond_with(ResponseTemplate::new(503))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let switch = SwitchGb200Nvidia::for_test(&server.uri());
+    let capabilities = switch.initialize_nvue_capabilities().await.unwrap();
+    assert!(!capabilities.is_supported());
+}
+
+#[tokio::test]
+async fn nvbridge_discover_treats_secondary_cluster_node_404_as_unsupported() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/nvue_v1/cluster/node/secondary"))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let switch = SwitchGb200Nvidia::for_test(&server.uri());
+    let capabilities = nvos::NvBridge::discover(&switch).await.unwrap();
+    assert!(!capabilities.is_supported());
+}
+
+#[tokio::test]
+async fn nvbridge_discover_treats_secondary_cluster_node_200_as_supported() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/nvue_v1/cluster/node/secondary"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let switch = SwitchGb200Nvidia::for_test(&server.uri());
+    let capabilities = nvos::NvBridge::discover(&switch).await.unwrap();
+    assert!(capabilities.is_supported());
+}
+
+#[tokio::test]
+async fn nvbridge_discover_fails_when_secondary_cluster_node_probe_is_unavailable() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/nvue_v1/cluster/node/secondary"))
+        .respond_with(ResponseTemplate::new(503))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let switch = SwitchGb200Nvidia::for_test(&server.uri());
+    let err = nvos::NvBridge::discover(&switch).await.unwrap_err();
+    assert_eq!(err.code, ErrorCode::Unavailable);
+}
+
+#[tokio::test]
+async fn bind_gnmi_commits_only_the_entity_certificate_when_mtls_is_unsupported() {
+    let server = MockServer::start().await;
+    let material = mtls::SwitchMtlsMaterialPaths::for_test();
+
+    Mock::given(method("GET"))
+        .and(path("/nvue_v1/system/gnmi-server/mtls"))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(1)
+        .mount(&server)
+        .await;
+    mount_applied_nvue_revision(&server, "42").await;
+    Mock::given(method("PATCH"))
+        .and(path("/nvue_v1/system/gnmi-server"))
+        .and(query_param("rev", "42"))
+        .and(body_json(serde_json::json!({
+            "certificate": material.entity_cert_id()
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(EmptyBody::default()))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path("/nvue_v1/system/gnmi-server/mtls"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(EmptyBody::default()))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let switch = SwitchGb200Nvidia::for_test(&server.uri());
+    switch
+        .bind_mtls_service(
+            &material,
+            mtls::SwitchMtlsService::ScaleUpFabricTelemetryInterface,
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn bind_gnmi_commits_entity_and_ca_in_one_revision_when_mtls_is_supported() {
+    let server = MockServer::start().await;
+    let material = mtls::SwitchMtlsMaterialPaths::for_test();
+
+    Mock::given(method("GET"))
+        .and(path("/nvue_v1/system/gnmi-server/mtls"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    mount_create_revisions(&server, &["42"]).await;
+    mount_applied_nvue_revision_followthrough(&server, "42").await;
+    Mock::given(method("PATCH"))
+        .and(path("/nvue_v1/system/gnmi-server"))
+        .and(query_param("rev", "42"))
+        .and(body_json(serde_json::json!({
+            "certificate": material.entity_cert_id()
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(EmptyBody::default()))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path("/nvue_v1/system/gnmi-server/mtls"))
+        .and(query_param("rev", "42"))
+        .and(body_json(serde_json::json!({
+            "ca-certificate": material.ca_cert_id()
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(EmptyBody::default()))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path("/nvue_v1/revision/applied"))
+        .and(body_json(RevisionUpdate::save_with_yes_prompt()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(EmptyBody::default()))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let switch = SwitchGb200Nvidia::for_test(&server.uri());
+    switch
+        .bind_mtls_service(
+            &material,
+            mtls::SwitchMtlsService::ScaleUpFabricTelemetryInterface,
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn bind_gnmi_ca_patch_404_discards_the_revision_before_apply() {
+    let server = MockServer::start().await;
+    let material = mtls::SwitchMtlsMaterialPaths::for_test();
+
+    Mock::given(method("GET"))
+        .and(path("/nvue_v1/system/gnmi-server/mtls"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    mount_create_revisions(&server, &["42"]).await;
+    Mock::given(method("PATCH"))
+        .and(path("/nvue_v1/system/gnmi-server"))
+        .and(query_param("rev", "42"))
+        .and(body_json(serde_json::json!({
+            "certificate": material.entity_cert_id()
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(EmptyBody::default()))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path("/nvue_v1/system/gnmi-server/mtls"))
+        .and(query_param("rev", "42"))
+        .and(body_json(serde_json::json!({
+            "ca-certificate": material.ca_cert_id()
+        })))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/nvue_v1/revision/42"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path("/nvue_v1/revision/42"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(EmptyBody::default()))
+        .expect(0)
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path("/nvue_v1/revision/applied"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(EmptyBody::default()))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let switch = SwitchGb200Nvidia::for_test(&server.uri());
+    let err = switch
+        .bind_mtls_service(
+            &material,
+            mtls::SwitchMtlsService::ScaleUpFabricTelemetryInterface,
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(err.code, ErrorCode::Internal);
+    assert!(
+        err.message
+            .contains("NVUE PATCH /nvue_v1/system/gnmi-server/mtls?rev=42")
+    );
+    assert!(err.message.contains("returned 404"));
+}
+
+#[tokio::test]
+async fn bind_gnmi_revision_apply_404_fails_the_bind() {
+    let server = MockServer::start().await;
+    let material = mtls::SwitchMtlsMaterialPaths::for_test();
+
+    Mock::given(method("GET"))
+        .and(path("/nvue_v1/system/gnmi-server/mtls"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    mount_create_revisions(&server, &["42"]).await;
+    Mock::given(method("PATCH"))
+        .and(path("/nvue_v1/system/gnmi-server"))
+        .and(query_param("rev", "42"))
+        .and(body_json(serde_json::json!({
+            "certificate": material.entity_cert_id()
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(EmptyBody::default()))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path("/nvue_v1/system/gnmi-server/mtls"))
+        .and(query_param("rev", "42"))
+        .and(body_json(serde_json::json!({
+            "ca-certificate": material.ca_cert_id()
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(EmptyBody::default()))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path("/nvue_v1/revision/42"))
+        .and(body_json(RevisionUpdate::apply_with_yes_prompt()))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path("/nvue_v1/revision/applied"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(EmptyBody::default()))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let switch = SwitchGb200Nvidia::for_test(&server.uri());
+    let err = switch
+        .bind_mtls_service(
+            &material,
+            mtls::SwitchMtlsService::ScaleUpFabricTelemetryInterface,
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(err.code, ErrorCode::NotFound);
+    assert!(err.message.contains("failed to apply revision 42"));
+}
+
+#[tokio::test]
+async fn verify_gnmi_reports_null_client_ca_when_mtls_is_unsupported() {
+    let server = MockServer::start().await;
+    let material = mtls::SwitchMtlsMaterialPaths::for_test();
+    let cert_id = material.entity_cert_id();
+    let ca_id = material.ca_cert_id();
+
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "/nvue_v1/system/security/certificate/{cert_id}"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "valid-to": "2999-01-01T00:00:00Z",
+            "installed": ["gnmi-server"]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "/nvue_v1/system/security/ca-certificate/{ca_id}"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(EmptyBody::default()))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/nvue_v1/system/gnmi-server/mtls"))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/nvue_v1/system/gnmi-server"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "certificate": cert_id
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let switch = SwitchGb200Nvidia::for_test(&server.uri());
+    let result = switch
+        .verify_mtls_services(
+            &material,
+            &[mtls::SwitchMtlsService::ScaleUpFabricTelemetryInterface],
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(result["gnmi_server"]["certificate"], cert_id);
+    assert!(result["gnmi_mtls"].is_null());
+    assert_eq!(
+        result["gnmi_client_authentication"],
+        mtls::GNMI_CLIENT_AUTHENTICATION_SERVER_CERTIFICATE_ONLY
+    );
+}
+
+#[tokio::test]
+async fn verify_gnmi_requires_client_ca_when_mtls_is_supported() {
+    let server = MockServer::start().await;
+    let material = mtls::SwitchMtlsMaterialPaths::for_test();
+    let cert_id = material.entity_cert_id();
+    let ca_id = material.ca_cert_id();
+
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "/nvue_v1/system/security/certificate/{cert_id}"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "valid-to": "2999-01-01T00:00:00Z",
+            "installed": ["gnmi-server"]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "/nvue_v1/system/security/ca-certificate/{ca_id}"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(EmptyBody::default()))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/nvue_v1/system/gnmi-server"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "certificate": cert_id
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/nvue_v1/system/gnmi-server/mtls"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "ca-certificate": ca_id
+        })))
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let switch = SwitchGb200Nvidia::for_test(&server.uri());
+    let result = switch
+        .verify_mtls_services(
+            &material,
+            &[mtls::SwitchMtlsService::ScaleUpFabricTelemetryInterface],
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(result["gnmi_server"]["certificate"], cert_id);
+    assert_eq!(result["gnmi_mtls"]["ca-certificate"], ca_id);
+    assert_eq!(
+        result["gnmi_client_authentication"],
+        mtls::GNMI_CLIENT_AUTHENTICATION_MTLS
+    );
+}
+
+#[tokio::test]
+async fn verify_gnmi_fails_when_supported_client_ca_disappears() {
+    let server = MockServer::start().await;
+    let material = mtls::SwitchMtlsMaterialPaths::for_test();
+    let cert_id = material.entity_cert_id();
+    let ca_id = material.ca_cert_id();
+
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "/nvue_v1/system/security/certificate/{cert_id}"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "valid-to": "2999-01-01T00:00:00Z",
+            "installed": ["gnmi-server"]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "/nvue_v1/system/security/ca-certificate/{ca_id}"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(EmptyBody::default()))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/nvue_v1/system/gnmi-server"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "certificate": cert_id
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    struct PresentThenMissing {
+        next: AtomicUsize,
+    }
+
+    impl Respond for PresentThenMissing {
+        fn respond(&self, _: &wiremock::Request) -> ResponseTemplate {
+            if self.next.fetch_add(1, Ordering::SeqCst) == 0 {
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({}))
+            } else {
+                ResponseTemplate::new(404)
+            }
+        }
+    }
+
+    Mock::given(method("GET"))
+        .and(path("/nvue_v1/system/gnmi-server/mtls"))
+        .respond_with(PresentThenMissing {
+            next: AtomicUsize::new(0),
+        })
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let switch = SwitchGb200Nvidia::for_test(&server.uri());
+    let err = switch
+        .verify_mtls_services(
+            &material,
+            &[mtls::SwitchMtlsService::ScaleUpFabricTelemetryInterface],
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(err.code, ErrorCode::FailedPrecondition);
+    assert!(err.message.contains("returned 404"));
+}
+
 async fn mock_sdn_reset_submit(server: &MockServer, response_body: serde_json::Value) {
     Mock::given(method("POST"))
         .and(path("/nvue_v1/sdn/factory-default"))
@@ -1474,6 +2102,20 @@ fn nmx_controller_unknown_readiness_response() -> serde_json::Value {
     serde_json::json!({
         "manager": {
             "state": "disabled"
+        }
+    })
+}
+
+/// NVUE view of an `nmx-controller` whose manager state has already converged
+/// while the app behind it is still starting: NVOS reports the app health check
+/// as failing and no control-plane state it recognizes, so the app cannot yet
+/// service a manager configuration callback.
+fn nmx_controller_starting_response() -> serde_json::Value {
+    serde_json::json!({
+        "status": "not ok",
+        "additional-info": "CONTROL_PLANE_STATE_UNDEFINED",
+        "manager": {
+            "state": "enabled"
         }
     })
 }
@@ -1914,7 +2556,7 @@ async fn enable_grpc_for_external_clients_starts_stopped_nmx_controller() {
 }
 
 #[tokio::test]
-async fn ensure_cluster_app_manager_action_ready_starts_stopped_nmx_controller() {
+async fn require_cluster_app_manager_action_ready_starts_stopped_nmx_controller() {
     let server = MockServer::start().await;
 
     Mock::given(method("GET"))
@@ -1950,7 +2592,151 @@ async fn ensure_cluster_app_manager_action_ready_starts_stopped_nmx_controller()
     let switch = SwitchGb200Nvidia::for_test(&server.uri());
 
     switch
-        .ensure_cluster_app_manager_action_ready("nmx-controller")
+        .require_cluster_app_manager_action_ready("nmx-controller")
+        .await
+        .unwrap();
+}
+
+/// A manager state can converge while the app behind it is still starting, so
+/// readiness has to be re-read rather than accepted from the first poll.
+#[tokio::test]
+async fn require_cluster_app_manager_action_ready_waits_for_a_starting_app() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/nvue_v1/cluster"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(cluster_ready_response("enabled")))
+        .named("ready GET /nvue_v1/cluster")
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/nvue_v1/cluster/apps/nmx-controller"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(nmx_controller_starting_response()))
+        .up_to_n_times(1)
+        .expect(1)
+        .named("starting GET /nvue_v1/cluster/apps/nmx-controller")
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/nvue_v1/cluster/apps/nmx-controller"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(nmx_controller_status_response("enabled")),
+        )
+        .expect(1)
+        .named("ready GET /nvue_v1/cluster/apps/nmx-controller")
+        .mount(&server)
+        .await;
+
+    let switch = SwitchGb200Nvidia::for_test(&server.uri());
+
+    switch
+        .require_cluster_app_manager_action_ready("nmx-controller")
+        .await
+        .unwrap();
+}
+
+/// A manager whose app never reports itself ready must fail on the bounded
+/// readiness wait rather than leaving the caller to submit a configuration
+/// update that the app cannot service.
+#[tokio::test]
+async fn require_cluster_app_manager_action_ready_errors_when_the_app_never_becomes_ready() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/nvue_v1/cluster"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(cluster_ready_response("enabled")))
+        .named("ready GET /nvue_v1/cluster")
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/nvue_v1/cluster/apps/nmx-controller"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(nmx_controller_starting_response()))
+        .expect(u64::from(config::MAX_RETRY_ATTEMPTS) + 1)
+        .named("starting GET /nvue_v1/cluster/apps/nmx-controller")
+        .mount(&server)
+        .await;
+
+    let switch = SwitchGb200Nvidia::for_test(&server.uri());
+
+    let err = switch
+        .require_cluster_app_manager_action_ready("nmx-controller")
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        err.message,
+        "cluster app nmx-controller did not become ready for manager configuration"
+    );
+}
+
+/// NVUE does not always report the app fields readiness is read from. That is a
+/// reporting gap rather than an unready app, so the caller proceeds and lets the
+/// manager update report any real failure itself.
+#[tokio::test]
+async fn require_cluster_app_manager_action_ready_proceeds_when_readiness_is_not_observable() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/nvue_v1/cluster"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(cluster_ready_response("enabled")))
+        .expect(1)
+        .named("ready GET /nvue_v1/cluster")
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/nvue_v1/cluster/apps/nmx-controller"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(nmx_controller_unknown_readiness_response()),
+        )
+        .expect(1)
+        .named("GET /nvue_v1/cluster/apps/nmx-controller without readiness fields")
+        .mount(&server)
+        .await;
+
+    let switch = SwitchGb200Nvidia::for_test(&server.uri());
+
+    switch
+        .require_cluster_app_manager_action_ready("nmx-controller")
+        .await
+        .unwrap();
+}
+
+/// An app that already reports `status: ok` accepts manager updates even when
+/// `nmxc-conn` is still down. Blocking on that connection exhausts the wait
+/// before V1/V2 bring the link up.
+#[tokio::test]
+async fn require_cluster_app_manager_action_ready_proceeds_when_app_is_ok_and_nmxc_conn_is_down() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/nvue_v1/cluster"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "state": "enabled",
+            "nmxc-conn": {"state": "down"}
+        })))
+        .expect(1)
+        .named("enabled cluster GET while ready app keeps nmxc-conn down")
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/nvue_v1/cluster/apps/nmx-controller"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(nmx_controller_status_response("enabled")),
+        )
+        .expect(1)
+        .named("ready GET /nvue_v1/cluster/apps/nmx-controller while nmxc-conn is down")
+        .mount(&server)
+        .await;
+
+    let switch = SwitchGb200Nvidia::for_test(&server.uri());
+
+    switch
+        .require_cluster_app_manager_action_ready("nmx-controller")
         .await
         .unwrap();
 }
@@ -2562,19 +3348,42 @@ async fn restart_cluster_app_propagates_stop_http_error() {
 
     Mock::given(method("POST"))
         .and(path(app_path))
-        .respond_with(ResponseTemplate::new(503))
+        .respond_with(ResponseTemplate::new(503).set_body_json(serde_json::json!({
+            "error": {
+                "message": "Cannot stop nmx-controller while a configuration is applying",
+                "token": "device-response-secret",
+            },
+        })))
         .expect(1)
         .mount(&server)
         .await;
 
     let switch = SwitchGb200Nvidia::for_test(&server.uri());
+
     let err = switch
         .restart_cluster_app("nmx-controller")
         .await
         .unwrap_err();
-    // nvue_run_action_payload wraps the transport error with action context.
+
     assert_eq!(err.code, ErrorCode::Internal);
     assert!(err.message.contains("@stop"), "message: {}", err.message);
+
+    assert!(
+        err.message
+            .contains("HTTP POST /nvue_v1/cluster/apps/nmx-controller returned 503"),
+        "message: {}",
+        err.message
+    );
+
+    assert!(
+        err.message
+            .contains("Cannot stop nmx-controller while a configuration is applying"),
+        "message: {}",
+        err.message
+    );
+
+    assert!(err.message.contains("XXXX"), "message: {}", err.message);
+    assert!(!err.message.contains("device-response-secret"));
 }
 
 /// Verifies restart fails when the `@start` NVUE POST returns an HTTP error,
@@ -2679,6 +3488,800 @@ async fn nvue_action_poll_returns_non_retryable_error_immediately() {
         .unwrap_err();
 
     assert_eq!(error.code, ErrorCode::Unauthenticated);
+}
+
+// ── NVOS installation verification ──────────────────────────────
+
+#[tokio::test]
+async fn verify_nvos_installation_skips_ssh_after_a_valid_nvue_response() {
+    for body in [
+        serde_json::json!({"status": "System is ready", "health-status": "OK"}),
+        serde_json::json!({"status": "System is booting", "health": {"status": "N/A"}}),
+        serde_json::json!({"status": "System is ready", "health": {"status": "FATAL"}}),
+    ] {
+        for allow_onie in [false, true] {
+            let server = MockServer::start().await;
+
+            Mock::given(method("GET"))
+                .and(path("/nvue_v1/system"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(&body))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let mut switch = SwitchGb200Nvidia::for_test(&server.uri())
+                .with_ssh_exec_for_test(|command| panic!("SSH must be skipped: {command}"));
+
+            switch.host_endpoint.as_mut().unwrap().credentials = None;
+
+            let onie_endpoint = endpoint_config("192.0.2.50", "", 22, "onie", "onie-password");
+
+            let state = switch
+                .verify_nvos_installation(allow_onie.then_some(&onie_endpoint))
+                .await
+                .expect("a valid NVUE response identifies NVOS without SSH credentials");
+
+            assert_eq!(state, NvosInstallationState::Installed);
+        }
+    }
+}
+
+#[tokio::test]
+async fn verify_nvos_installation_gates_ssh_fallback_on_recovery_for_rest_failures() {
+    for (response, expected_code) in [
+        (ResponseTemplate::new(401), ErrorCode::Unauthenticated),
+        (ResponseTemplate::new(403), ErrorCode::Internal),
+        (ResponseTemplate::new(503), ErrorCode::Unavailable),
+        (
+            ResponseTemplate::new(200).set_body_string("not JSON"),
+            ErrorCode::Internal,
+        ),
+        (
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({})),
+            ErrorCode::Internal,
+        ),
+        (
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({
+                    "status": "System is ready", "health-status": "OK"
+                }))
+                .set_delay(Duration::from_secs(6)),
+            ErrorCode::Timeout,
+        ),
+    ] {
+        for allow_onie in [false, true] {
+            let server = MockServer::start().await;
+
+            Mock::given(method("GET"))
+                .and(path("/nvue_v1/system"))
+                .respond_with(response.clone())
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let (commands, exec) = record_ssh_commands();
+            let switch = SwitchGb200Nvidia::for_test(&server.uri()).with_ssh_exec_for_test(exec);
+            let onie_endpoint = endpoint_config("192.0.2.50", "", 22, "onie", "onie-password");
+
+            let result = switch
+                .verify_nvos_installation(allow_onie.then_some(&onie_endpoint))
+                .await;
+
+            if allow_onie {
+                assert_eq!(result.unwrap(), NvosInstallationState::Installed);
+
+                assert_eq!(
+                    recorded_ssh_commands(&commands),
+                    vec!["nv show system version".to_owned()]
+                );
+            } else {
+                assert_eq!(result.unwrap_err().code, expected_code);
+                assert!(recorded_ssh_commands(&commands).is_empty());
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn verify_nvos_installation_gates_ssh_fallback_on_recovery_for_tls_rejection() {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+    let certificate = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+    let key = rustls::pki_types::PrivatePkcs8KeyDer::from(certificate.key_pair.serialize_der());
+
+    let tls_config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![certificate.cert.der().clone()], key.into())
+        .unwrap();
+
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls_config));
+
+    for allow_onie in [false, true] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+
+        let port = listener.local_addr().unwrap().port();
+        let (commands, exec) = record_ssh_commands();
+
+        let mut switch =
+            SwitchGb200Nvidia::for_test("http://127.0.0.1:9").with_ssh_exec_for_test(exec);
+
+        switch.nvue = Some(
+            NvueClient::new(NvueConnectConfig {
+                endpoint: NvueEndpoint::https("localhost", "127.0.0.1", port),
+                credentials: NvueCredentials::new("admin", "configured-password"),
+                dangerously_accept_invalid_certs: false,
+            })
+            .unwrap(),
+        );
+
+        let onie_endpoint = endpoint_config("192.0.2.50", "", 22, "onie", "onie-password");
+
+        let handshake = async {
+            let (connection, _) = listener.accept().await.unwrap();
+            acceptor.accept(connection).await
+        };
+
+        let (handshake, result) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(
+                handshake,
+                switch.verify_nvos_installation(allow_onie.then_some(&onie_endpoint))
+            )
+        })
+        .await
+        .expect("the untrusted NVUE certificate should be rejected promptly");
+
+        assert!(handshake.is_err());
+
+        if allow_onie {
+            assert_eq!(result.unwrap(), NvosInstallationState::Installed);
+
+            assert_eq!(
+                recorded_ssh_commands(&commands),
+                vec!["nv show system version".to_owned()]
+            );
+        } else {
+            let error = result.unwrap_err();
+
+            assert!(error.message.contains("/nvue_v1/system"));
+            assert!(recorded_ssh_commands(&commands).is_empty());
+        }
+    }
+}
+
+#[tokio::test]
+async fn verify_nvos_installation_skips_binary_and_onie_after_a_positive_version_probe() {
+    let (commands, exec) = record_ssh_commands();
+    let switch = SwitchGb200Nvidia::for_test("http://127.0.0.1:9").with_ssh_exec_for_test(exec);
+    let onie_endpoint = endpoint_config("192.0.2.50", "", 22, "onie", "onie-password");
+
+    let state = switch
+        .verify_nvos_installation(Some(&onie_endpoint))
+        .await
+        .expect("the successful NVOS version query should identify the installed operating system");
+
+    assert_eq!(state, NvosInstallationState::Installed);
+
+    assert_eq!(
+        recorded_ssh_commands(&commands),
+        vec!["nv show system version".to_owned()]
+    );
+}
+
+#[tokio::test]
+async fn verify_nvos_installation_keeps_binary_detection_when_the_version_query_fails() {
+    for code in [
+        ErrorCode::Internal,
+        ErrorCode::Timeout,
+        ErrorCode::Unauthenticated,
+    ] {
+        let commands = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&commands);
+
+        let switch = SwitchGb200Nvidia::for_test("http://127.0.0.1:9").with_ssh_exec_for_test(
+            move |command| {
+                recorded.lock().unwrap().push(command.to_owned());
+
+                match command {
+                    "nv show system version" => Err(RmsError::new(code, "version query failed")),
+                    "command -v nv >/dev/null 2>&1" => Ok(String::new()),
+                    unexpected => panic!("ONIE must be skipped when nv exists: {unexpected}"),
+                }
+            },
+        );
+
+        let onie_endpoint = endpoint_config("192.0.2.50", "", 22, "onie", "onie-password");
+
+        let state = switch
+            .verify_nvos_installation(Some(&onie_endpoint))
+            .await
+            .expect("a version query failure must not hide an installed NVOS binary");
+
+        assert_eq!(state, NvosInstallationState::Installed);
+
+        assert_eq!(
+            recorded_ssh_commands(&commands),
+            vec![
+                "nv show system version".to_owned(),
+                "command -v nv >/dev/null 2>&1".to_owned(),
+            ]
+        );
+    }
+}
+
+#[tokio::test]
+async fn verify_nvos_installation_preserves_the_rest_error_without_an_onie_endpoint() {
+    let switch =
+        SwitchGb200Nvidia::for_test("http://127.0.0.1:9").with_ssh_exec_for_test(|command| {
+            panic!("SSH detection requires ONIE recovery authorization: {command}")
+        });
+
+    let error = switch
+        .verify_nvos_installation(None)
+        .await
+        .expect_err("an NVOS failure without an ONIE endpoint must remain unknown");
+
+    assert_eq!(error.code, ErrorCode::ConnectionRefused);
+    assert!(error.message.contains("/nvue_v1/system"));
+}
+
+#[tokio::test]
+async fn verify_nvos_installation_returns_not_installed_after_a_positive_onie_probe() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/nvue_v1/system"))
+        .respond_with(ResponseTemplate::new(401))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let commands = Arc::new(Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&commands);
+
+    let exec = move |command: &str| {
+        recorded.lock().unwrap().push(command.to_owned());
+
+        match command {
+            "nv show system version" | "command -v nv >/dev/null 2>&1" => {
+                Err(RmsError::unauthenticated("NVOS credentials rejected"))
+            }
+            "onie-sysinfo -e" => Ok("AA:BB:CC:00:00:50\n".to_owned()),
+            unexpected => panic!("unexpected operating-system probe: {unexpected}"),
+        }
+    };
+
+    let mut switch = SwitchGb200Nvidia::for_test(&server.uri()).with_ssh_exec_for_test(exec);
+    switch.host_endpoint.as_mut().unwrap().endpoint.mac_address = "aa:bb:cc:00:00:50".to_owned();
+
+    let onie_endpoint = endpoint_config(
+        "192.0.2.50",
+        "aa:bb:cc:00:00:50",
+        22,
+        "private-onie-user",
+        "private-onie-password",
+    );
+
+    let writer = TestLogWriter::default();
+    let log_writer = writer.clone();
+
+    let subscriber = tracing_subscriber::registry().with(
+        crate::logging::logfmt::layer().with_writer(Arc::new(move || Box::new(log_writer.clone()))),
+    );
+
+    let state = switch
+        .verify_nvos_installation(Some(&onie_endpoint))
+        .with_subscriber(subscriber)
+        .await
+        .expect("a positive ONIE marker should identify recovery mode");
+
+    assert_eq!(state, NvosInstallationState::NotInstalled);
+
+    assert_eq!(
+        recorded_ssh_commands(&commands),
+        vec![
+            "nv show system version".to_owned(),
+            "command -v nv >/dev/null 2>&1".to_owned(),
+            "onie-sysinfo -e".to_owned(),
+        ]
+    );
+
+    let log = String::from_utf8(writer.0.lock().unwrap().clone()).unwrap();
+
+    assert!(
+        log.contains("ONIE identified on switch recovery endpoint"),
+        "{log}"
+    );
+
+    assert!(log.contains("node=test-switch"), "{log}");
+    assert!(log.contains("onie_host=192.0.2.50"), "{log}");
+    assert!(log.contains("onie_port=22"), "{log}");
+    assert!(!log.contains("private-onie-user"));
+    assert!(!log.contains("private-onie-password"));
+}
+
+#[tokio::test]
+async fn verify_nvos_installation_rejects_onie_without_an_expected_host_mac() {
+    let mut switch =
+        SwitchGb200Nvidia::for_test("http://127.0.0.1:9").with_ssh_exec_for_test(|command| {
+            panic!("ONIE must not be probed without an expected host MAC: {command}")
+        });
+
+    switch.host_endpoint = None;
+    let onie_endpoint = endpoint_config("192.0.2.50", "", 22, "onie", "onie-password");
+
+    let error = switch
+        .verify_nvos_installation(Some(&onie_endpoint))
+        .await
+        .expect_err("recovery requires an expected host MAC");
+
+    assert_eq!(error.code, ErrorCode::FailedPrecondition);
+    assert!(error.message.contains("host endpoint MAC address"));
+}
+
+#[tokio::test]
+async fn verify_nvos_installation_reports_both_probe_failures() {
+    let mut switch =
+        SwitchGb200Nvidia::for_test("http://127.0.0.1:9").with_ssh_exec_for_test(|command| {
+            match command {
+                "nv show system version" | "command -v nv >/dev/null 2>&1" => {
+                    Err(RmsError::unauthenticated("NVOS credentials rejected"))
+                }
+                "onie-sysinfo -e" => Err(RmsError::connection_refused("ONIE SSH unavailable")),
+                unexpected => panic!("unexpected operating-system probe: {unexpected}"),
+            }
+        });
+
+    switch.host_endpoint.as_mut().unwrap().endpoint.mac_address = "aa:bb:cc:00:00:50".to_owned();
+
+    let onie_endpoint = endpoint_config("192.0.2.50", "", 22, "onie", "onie-password");
+
+    let error = switch
+        .verify_nvos_installation(Some(&onie_endpoint))
+        .await
+        .expect_err("failure of both probes must leave the operating system unknown");
+
+    assert_eq!(error.code, ErrorCode::ConnectionRefused);
+    assert!(error.message.contains("NVOS credentials rejected"));
+    assert!(error.message.contains("ONIE SSH unavailable"));
+}
+
+#[tokio::test]
+async fn verify_nvos_installation_rejects_a_different_onie_management_mac() {
+    let mut switch =
+        SwitchGb200Nvidia::for_test("http://127.0.0.1:9").with_ssh_exec_for_test(|command| {
+            match command {
+                "nv show system version" | "command -v nv >/dev/null 2>&1" => {
+                    Err(RmsError::connection_refused("NVOS SSH unavailable"))
+                }
+                "onie-sysinfo -e" => Ok("aa:bb:cc:00:00:51\n".to_owned()),
+                unexpected => panic!("unexpected operating-system probe: {unexpected}"),
+            }
+        });
+
+    switch.host_endpoint.as_mut().unwrap().endpoint.mac_address = "aa:bb:cc:00:00:50".to_owned();
+
+    let onie_endpoint = endpoint_config("192.0.2.50", "", 22, "onie", "onie-password");
+
+    let error = switch
+        .verify_nvos_installation(Some(&onie_endpoint))
+        .await
+        .expect_err("a different switch must not be authorized for recovery");
+
+    assert_eq!(error.code, ErrorCode::FailedPrecondition);
+    assert!(error.message.contains("MAC does not match"));
+    assert!(error.message.contains("refusing recovery"));
+}
+
+#[tokio::test]
+async fn verify_nvos_installation_rejects_a_mismatched_supplied_onie_mac() {
+    let mut switch =
+        SwitchGb200Nvidia::for_test("http://127.0.0.1:9").with_ssh_exec_for_test(|command| {
+            match command {
+                "nv show system version" | "command -v nv >/dev/null 2>&1" => {
+                    Err(RmsError::connection_refused("NVOS SSH unavailable"))
+                }
+                unexpected => panic!("ONIE must not be probed with conflicting MACs: {unexpected}"),
+            }
+        });
+
+    switch.host_endpoint.as_mut().unwrap().endpoint.mac_address = "aa:bb:cc:00:00:50".to_owned();
+
+    let onie_endpoint = endpoint_config(
+        "192.0.2.50",
+        "aa:bb:cc:00:00:51",
+        22,
+        "onie",
+        "onie-password",
+    );
+
+    let error = switch
+        .verify_nvos_installation(Some(&onie_endpoint))
+        .await
+        .expect_err("conflicting endpoint MACs must fail before ONIE is probed");
+
+    assert_eq!(error.code, ErrorCode::FailedPrecondition);
+    assert!(error.message.contains("endpoint MAC does not match"));
+}
+
+#[tokio::test]
+async fn verify_nvos_installation_rejects_a_missing_or_invalid_host_mac() {
+    for host_mac in ["", "00:00:00:00:00:00", "01:00:5e:00:00:01", "not-a-mac"] {
+        let mut switch =
+            SwitchGb200Nvidia::for_test("http://127.0.0.1:9").with_ssh_exec_for_test(|command| {
+                match command {
+                    "nv show system version" | "command -v nv >/dev/null 2>&1" => {
+                        Err(RmsError::connection_refused("NVOS SSH unavailable"))
+                    }
+                    unexpected => {
+                        panic!("ONIE must not be probed without a valid host MAC: {unexpected}")
+                    }
+                }
+            });
+
+        switch.host_endpoint.as_mut().unwrap().endpoint.mac_address = host_mac.to_owned();
+
+        let onie_endpoint = endpoint_config("192.0.2.50", "", 22, "onie", "onie-password");
+
+        let error = switch
+            .verify_nvos_installation(Some(&onie_endpoint))
+            .await
+            .expect_err("recovery requires a valid host MAC");
+
+        assert_eq!(error.code, ErrorCode::FailedPrecondition);
+        assert!(error.message.contains("host endpoint MAC address"));
+    }
+}
+
+#[tokio::test]
+async fn verify_nvos_installation_rejects_an_invalid_onie_mac_output() {
+    let mut switch =
+        SwitchGb200Nvidia::for_test("http://127.0.0.1:9").with_ssh_exec_for_test(|command| {
+            match command {
+                "nv show system version" | "command -v nv >/dev/null 2>&1" => {
+                    Err(RmsError::connection_refused("NVOS SSH unavailable"))
+                }
+                "onie-sysinfo -e" => Ok("invalid-mac\n".to_owned()),
+                unexpected => panic!("unexpected operating-system probe: {unexpected}"),
+            }
+        });
+
+    switch.host_endpoint.as_mut().unwrap().endpoint.mac_address = "aa:bb:cc:00:00:50".to_owned();
+
+    let onie_endpoint = endpoint_config("192.0.2.50", "", 22, "onie", "onie-password");
+
+    let error = switch
+        .verify_nvos_installation(Some(&onie_endpoint))
+        .await
+        .expect_err("an invalid ONIE MAC must not authorize recovery");
+
+    assert_eq!(error.code, ErrorCode::FailedPrecondition);
+    assert!(error.message.contains("invalid management Ethernet MAC"));
+}
+
+#[tokio::test]
+async fn verify_nvos_installation_rejects_an_onie_endpoint_without_credentials() {
+    let commands = Arc::new(Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&commands);
+
+    let exec = move |command: &str| {
+        recorded.lock().unwrap().push(command.to_owned());
+        Err(RmsError::unauthenticated("NVOS credentials rejected"))
+    };
+
+    let switch = SwitchGb200Nvidia::for_test("http://127.0.0.1:9").with_ssh_exec_for_test(exec);
+
+    let onie_endpoint = EndpointConfig::new(Endpoint {
+        ip_address: "192.0.2.50".to_owned(),
+        mac_address: String::new(),
+        port: 22,
+        host_name: None,
+    });
+
+    let error = switch
+        .verify_nvos_installation(Some(&onie_endpoint))
+        .await
+        .expect_err("the ONIE probe requires explicit credentials");
+
+    assert_eq!(error.code, ErrorCode::InvalidArgument);
+    assert!(error.message.contains("username/password credentials"));
+
+    assert_eq!(
+        recorded_ssh_commands(&commands),
+        vec![
+            "nv show system version".to_owned(),
+            "command -v nv >/dev/null 2>&1".to_owned(),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn verify_nvos_installation_rejects_a_non_ssh_onie_port() {
+    let switch =
+        SwitchGb200Nvidia::for_test("http://127.0.0.1:9").with_ssh_exec_for_test(|command| {
+            assert!(matches!(
+                command,
+                "nv show system version" | "command -v nv >/dev/null 2>&1"
+            ));
+
+            Err(RmsError::unauthenticated("NVOS credentials rejected"))
+        });
+
+    let onie_endpoint = endpoint_config("192.0.2.50", "", 2222, "onie", "onie-password");
+
+    let error = switch
+        .verify_nvos_installation(Some(&onie_endpoint))
+        .await
+        .expect_err("the ONIE SSH client only supports port 22");
+
+    assert_eq!(error.code, ErrorCode::InvalidArgument);
+    assert!(error.message.contains("must use SSH port 22"));
+}
+
+#[tokio::test]
+async fn stage_nvos_recovery_image_uses_scp_with_the_onie_path() {
+    let directory = tempfile::tempdir().expect("create installer directory");
+    let local_path = directory.path().join("nvos-25.02.0.bin");
+
+    std::fs::write(
+        &local_path,
+        vec![0_u8; config::MIN_FIRMWARE_FILE_SIZE as usize],
+    )
+    .expect("create installer image");
+
+    let uploads = Arc::new(Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&uploads);
+
+    let switch = SwitchGb200Nvidia::for_test("http://127.0.0.1:9")
+        .with_host_credentials_for_test("admin", "requested-password")
+        .with_scp_upload_for_test(move |local_path, remote_path| {
+            recorded
+                .lock()
+                .unwrap()
+                .push((local_path.to_owned(), remote_path.to_owned()));
+
+            Ok(())
+        })
+        .with_ssh_exec_for_test(|command| {
+            assert_eq!(command, "wc -c < '/tmp/nvos-25.02.0.bin'");
+            Ok(config::MIN_FIRMWARE_FILE_SIZE.to_string())
+        });
+
+    let onie_endpoint = endpoint_config("192.0.2.50", "", 22, "onie", "onie-password");
+
+    switch
+        .stage_nvos_recovery_image(
+            &onie_endpoint,
+            local_path.to_str().expect("UTF-8 test path"),
+            "nvos-25.02.0.bin",
+            SshUploadOptions::default(),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("the recovery image should be staged through SCP");
+
+    assert_eq!(
+        uploads.lock().unwrap().as_slice(),
+        [(
+            local_path.to_str().expect("UTF-8 test path").to_owned(),
+            "/tmp/nvos-25.02.0.bin".to_owned(),
+        )]
+    );
+}
+
+#[tokio::test]
+async fn stage_nvos_recovery_image_rejects_an_undersized_installer() {
+    let directory = tempfile::tempdir().expect("create installer directory");
+    let local_path = directory.path().join("nvos-small.bin");
+
+    std::fs::write(&local_path, b"short").expect("create undersized installer");
+
+    let switch = SwitchGb200Nvidia::for_test("http://127.0.0.1:9")
+        .with_host_credentials_for_test("admin", "requested-password")
+        .with_scp_upload_for_test(|_, _| panic!("undersized installer must not be uploaded"));
+
+    let onie_endpoint = endpoint_config("192.0.2.50", "", 22, "onie", "onie-password");
+
+    let error = switch
+        .stage_nvos_recovery_image(
+            &onie_endpoint,
+            local_path.to_str().expect("UTF-8 test path"),
+            "nvos-small.bin",
+            SshUploadOptions::default(),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect_err("undersized installer must be rejected");
+
+    assert_eq!(error.code, ErrorCode::InvalidArgument);
+    assert!(error.message.contains("too small"));
+}
+
+#[tokio::test]
+async fn stage_nvos_recovery_image_rejects_a_truncated_remote_copy() {
+    let directory = tempfile::tempdir().expect("create installer directory");
+    let local_path = directory.path().join("nvos-25.02.0.bin");
+
+    std::fs::write(
+        &local_path,
+        vec![0_u8; config::MIN_FIRMWARE_FILE_SIZE as usize],
+    )
+    .expect("create installer image");
+
+    let switch = SwitchGb200Nvidia::for_test("http://127.0.0.1:9")
+        .with_host_credentials_for_test("admin", "requested-password")
+        .with_scp_upload_for_test(|_, _| Ok(()))
+        .with_ssh_exec_for_test(|command| {
+            assert_eq!(command, "wc -c < '/tmp/nvos-25.02.0.bin'");
+            Ok("512".to_owned())
+        });
+
+    let onie_endpoint = endpoint_config("192.0.2.50", "", 22, "onie", "onie-password");
+
+    let error = switch
+        .stage_nvos_recovery_image(
+            &onie_endpoint,
+            local_path.to_str().expect("UTF-8 test path"),
+            "nvos-25.02.0.bin",
+            SshUploadOptions::default(),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect_err("truncated ONIE copy must be rejected");
+
+    assert_eq!(error.code, ErrorCode::FailedPrecondition);
+
+    assert!(
+        error
+            .message
+            .contains("expected 1024 bytes, found 512 bytes")
+    );
+}
+
+#[tokio::test]
+async fn install_staged_nvos_image_waits_until_the_nvos_probe_succeeds() {
+    let commands = Arc::new(Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&commands);
+    let probe_count = Arc::new(AtomicUsize::new(0));
+    let probes = Arc::clone(&probe_count);
+
+    let mut switch = SwitchGb200Nvidia::for_test("http://127.0.0.1:9")
+        .with_host_credentials_for_test("admin", "requested-password")
+        .with_ssh_exec_for_test(move |command| {
+            recorded.lock().unwrap().push(command.to_owned());
+
+            if command.starts_with("rm -f '/tmp/rms-onie-nos-install.log'")
+                || command.starts_with("if [ -f '/tmp/rms-onie-nos-install.status'")
+            {
+                return Ok(String::new());
+            }
+
+            assert_eq!(command, "command -v nv >/dev/null 2>&1");
+
+            if probes.fetch_add(1, Ordering::SeqCst) < 2 {
+                Err(RmsError::connection_refused("NVOS SSH is still booting"))
+            } else {
+                Ok(String::new())
+            }
+        });
+
+    let onie_endpoint = endpoint_config("192.0.2.50", "", 22, "onie", "onie-password");
+
+    switch
+        .install_staged_nvos_image_and_wait(
+            &onie_endpoint,
+            "nvos-25.02.0.bin",
+            Duration::from_millis(100),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("NVOS recovery should complete after the NVOS probe succeeds");
+
+    let commands = recorded_ssh_commands(&commands);
+
+    assert_eq!(commands.len(), 6);
+    assert!(commands[0].contains("onie-nos-install '/tmp/nvos-25.02.0.bin'"));
+    assert_eq!(probe_count.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn install_staged_nvos_image_respects_the_recovery_timeout() {
+    let mut switch = SwitchGb200Nvidia::for_test("http://127.0.0.1:9")
+        .with_host_credentials_for_test("admin", "requested-password")
+        .with_ssh_exec_for_test(|command| {
+            if command.starts_with("rm -f '/tmp/rms-onie-nos-install.log'")
+                || command.starts_with("if [ -f '/tmp/rms-onie-nos-install.status'")
+            {
+                Ok(String::new())
+            } else if command.starts_with("tail -c ") {
+                Ok("installer did not finish".to_owned())
+            } else {
+                Err(RmsError::connection_refused("NVOS SSH is still booting"))
+            }
+        });
+
+    let onie_endpoint = endpoint_config("192.0.2.50", "", 22, "onie", "onie-password");
+
+    let error = tokio::time::timeout(
+        Duration::from_secs(1),
+        switch.install_staged_nvos_image_and_wait(
+            &onie_endpoint,
+            "nvos-25.02.0.bin",
+            Duration::from_millis(5),
+            &CancellationToken::new(),
+        ),
+    )
+    .await
+    .expect("configured ONIE recovery timeout should finish promptly")
+    .expect_err("an unreachable NVOS endpoint must time out");
+
+    assert_eq!(error.code, ErrorCode::Timeout);
+    assert!(error.message.contains("timed out waiting for NVOS"));
+    assert!(error.message.contains("installer did not finish"));
+}
+
+#[tokio::test]
+async fn install_staged_nvos_image_reports_failed_status_with_redacted_log_tail() {
+    let mut switch = SwitchGb200Nvidia::for_test("http://127.0.0.1:9")
+        .with_host_credentials_for_test("admin", "requested-password")
+        .with_ssh_exec_for_test(|command| {
+            if command.starts_with("rm -f '/tmp/rms-onie-nos-install.log'") {
+                Ok(String::new())
+            } else if command.starts_with("if [ -f '/tmp/rms-onie-nos-install.status'") {
+                Ok("1\n".to_owned())
+            } else if command.starts_with("tail -c ") {
+                Ok(format!(
+                    "password=onie-password failed with requested-password token=unknown {}",
+                    "diagnostic ".repeat(100)
+                ))
+            } else {
+                Err(RmsError::connection_refused("NVOS SSH is still booting"))
+            }
+        });
+
+    let onie_endpoint = endpoint_config("192.0.2.50", "", 22, "onie", "onie-password");
+
+    let error = switch
+        .install_staged_nvos_image_and_wait(
+            &onie_endpoint,
+            "nvos-25.02.0.bin",
+            Duration::from_secs(1),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect_err("failed installer status must stop recovery early");
+
+    assert_eq!(error.code, ErrorCode::Internal);
+    assert!(error.message.contains("exited with status 1"));
+    assert!(error.message.contains("password=XXXX"));
+    assert!(error.message.contains("token=XXXX"));
+    assert!(!error.message.contains("onie-password"));
+    assert!(!error.message.contains("requested-password"));
+    assert!(!error.message.contains("token=unknown"));
+    assert!(error.message.chars().count() < 600);
+}
+
+#[tokio::test]
+async fn stage_nvos_recovery_image_honors_preexisting_cancellation() {
+    let switch = SwitchGb200Nvidia::for_test("http://127.0.0.1:9")
+        .with_scp_upload_for_test(|_, _| panic!("cancelled recovery must not start SCP"));
+
+    let onie_endpoint = endpoint_config("192.0.2.50", "", 22, "onie", "onie-password");
+    let cancel = CancellationToken::new();
+
+    cancel.cancel();
+
+    let error = switch
+        .stage_nvos_recovery_image(
+            &onie_endpoint,
+            "/var/lib/rms/nvos-25.02.0.bin",
+            "nvos-25.02.0.bin",
+            SshUploadOptions::default(),
+            &cancel,
+        )
+        .await
+        .expect_err("preexisting cancellation should stop ONIE staging");
+
+    assert_eq!(error.code, ErrorCode::Cancelled);
 }
 
 // ── System image state normalization ──────────────────────────────
@@ -2841,6 +4444,7 @@ fn mk_status(state: &str, percent: i32, completed: bool, msg: &str) -> FirmwareT
         completed,
         status: String::new(),
         message: msg.into(),
+        rejection: None,
     }
 }
 
@@ -2929,6 +4533,7 @@ fn describe_install_poll_includes_all_fields() {
         message: "Installing image".into(),
         completed: false,
         percent: 42,
+        rejection: None,
     };
     let desc = describe_install_poll(&s);
     assert!(desc.contains("state=action_running"));
@@ -2966,6 +4571,48 @@ fn extract_action_issue_message_reads_nested_data_msg() {
         "issue": [{"data": {"msg": "disk full"}}],
     });
     assert_eq!(extract_action_issue_message(&resp), "disk full");
+}
+
+#[test]
+fn strict_action_poll_ignores_reboot_and_noop_hints() {
+    use nvue::NvueActionPoll;
+
+    let failed = |state: &str, message: &str| NvueActionPoll::Failed {
+        state: state.to_owned(),
+        message: message.to_owned(),
+    };
+
+    let cases = [
+        (
+            serde_json::json!({"state": "action_success"}),
+            NvueActionPoll::Succeeded,
+        ),
+        (
+            serde_json::json!({"state": "action_running", "status": "Reboot in progress"}),
+            NvueActionPoll::Running,
+        ),
+        (
+            serde_json::json!({"status": "action_success"}),
+            NvueActionPoll::Running,
+        ),
+        (serde_json::json!({}), NvueActionPoll::Running),
+        (
+            serde_json::json!({"state": "action_error", "detail": "system will reboot"}),
+            failed("action_error", "system will reboot"),
+        ),
+        (
+            serde_json::json!({"state": "action_error", "issue": ["Nothing to uninstall"]}),
+            failed("action_error", "Nothing to uninstall"),
+        ),
+        (
+            serde_json::json!({"state": "action_failed", "status": "power cycle required"}),
+            failed("action_failed", "power cycle required"),
+        ),
+    ];
+
+    for (response, expected) in cases {
+        assert_eq!(NvueActionPoll::strict(&response), expected, "{response}");
+    }
 }
 
 // ── Validation functions ────────────────────────────────────────
@@ -3727,6 +5374,38 @@ async fn password_rotation_no_config_diff_still_saves_applied_config() {
 }
 
 #[tokio::test]
+async fn password_rotation_applied_and_saved_still_saves_applied_config() {
+    let server = MockServer::start().await;
+
+    mount_create_revision(&server, "36", None).await;
+
+    mount_stage_password_success(&server, "36", "targetuser", "rotated-password", None).await;
+
+    mount_apply_revision(&server, "36", None).await;
+
+    mount_revision_get(
+        &server,
+        "36",
+        None,
+        ResponseTemplate::new(200).set_body_json(RevisionState {
+            state: "applied_and_saved",
+        }),
+    )
+    .await;
+
+    // Rotation saves unconditionally: the save doubles as the repair path for
+    // an earlier attempt that applied but failed to save.
+    mount_save_applied_revision(&server, None).await;
+
+    let mut switch = SwitchGb200Nvidia::for_test(&server.uri());
+
+    switch
+        .update_system_user_password_persisted("targetuser", "rotated-password")
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn password_rotation_active_user_no_config_diff_refreshes_before_save() {
     let server = MockServer::start().await;
 
@@ -4083,6 +5762,37 @@ async fn nvue_revision_can_finish_after_transport_handoff() {
 }
 
 #[tokio::test]
+async fn nvue_finish_config_revision_skips_save_when_nvue_already_saved() {
+    let server = MockServer::start().await;
+
+    mount_apply_revision(&server, "4", None).await;
+
+    mount_revision_get(
+        &server,
+        "4",
+        None,
+        ResponseTemplate::new(200).set_body_json(RevisionState {
+            state: "applied_and_saved",
+        }),
+    )
+    .await;
+
+    // NVUE already persisted the revision, so RMS must not save it again.
+    Mock::given(method("PATCH"))
+        .and(path("/nvue_v1/revision/applied"))
+        .and(body_json(RevisionUpdate::save_with_yes_prompt()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(EmptyBody::default()))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let switch = SwitchGb200Nvidia::for_test(&server.uri());
+
+    switch.nvue_start_config_revision("4").await.unwrap();
+    switch.nvue_finish_config_revision("4").await.unwrap();
+}
+
+#[tokio::test]
 async fn nvue_stage_config_patches_discards_candidate_on_patch_failure() {
     let server = MockServer::start().await;
 
@@ -4163,6 +5873,40 @@ async fn nvue_stage_config_patches_preserves_staging_error_when_discard_fails() 
         err.message
             .contains("NVUE PATCH /nvue_v1/system/api?rev=42")
     );
+}
+
+/// A secondary server 404 is not an empty address set. Treating only the
+/// applied read that way created a revision and then failed the revision read.
+#[tokio::test]
+async fn secondary_server_404_fails_before_creating_a_revision()
+-> std::result::Result<(), Box<dyn std::error::Error>> {
+    let server = MockServer::start().await;
+    let desired = ClusterNodeServerAddresses::from(["192.0.2.101".parse()?]);
+
+    Mock::given(method("GET"))
+        .and(path("/nvue_v1/cluster/node/secondary/server"))
+        .and(query_param("rev", "applied"))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/nvue_v1/revision"))
+        .respond_with(ResponseTemplate::new(200).set_body_json("42"))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let switch = SwitchGb200Nvidia::for_test(&server.uri());
+    let err = switch
+        .reconcile_node_ips(InterfaceType::Secondary, &desired)
+        .await
+        .unwrap_err();
+
+    assert_eq!(err.code, ErrorCode::NotFound);
+
+    Ok(())
 }
 
 #[tokio::test]
@@ -4461,7 +6205,9 @@ async fn disabling_cluster_clears_both_node_ip_interfaces_while_holding_operatio
     // The whole sequence runs under a single op_lock acquisition: the disable
     // step calls the `_unlocked` variant, so re-taking the lock (which would
     // deadlock) would hang this test.
-    switch.clear_node_ips_and_disable_cluster().await?;
+    switch
+        .clear_node_ips_and_disable_cluster(nvos::NvBridge::for_test(true))
+        .await?;
 
     // Disabling the cluster no longer shells into the switch.
     assert!(recorded_ssh_commands(&commands).is_empty());
@@ -4497,6 +6243,156 @@ async fn disabling_cluster_clears_both_node_ip_interfaces_while_holding_operatio
 
     assert!(primary_delete_position < state_read_position);
     assert!(secondary_delete_position < state_read_position);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn disabling_cluster_skips_secondary_node_ips_when_nvbridge_is_unsupported()
+-> std::result::Result<(), Box<dyn std::error::Error>> {
+    let server = MockServer::start().await;
+    let configured_payload = serde_json::json!({"192.0.2.101": {}});
+    let empty_payload = serde_json::json!({});
+
+    Mock::given(method("GET"))
+        .and(path("/nvue_v1/cluster/node/primary/server"))
+        .and(query_param("rev", "applied"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&configured_payload))
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/nvue_v1/cluster/node/primary/server"))
+        .and(query_param("rev", "applied"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&empty_payload))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/nvue_v1/revision"))
+        .and(body_json(RevisionCreate::default()))
+        .respond_with(ResponseTemplate::new(200).set_body_json("42"))
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/nvue_v1/revision"))
+        .and(body_json(RevisionCreate::default()))
+        .respond_with(ResponseTemplate::new(200).set_body_json("43"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/nvue_v1/cluster/node/primary/server"))
+        .and(query_param("rev", "42"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&configured_payload))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("DELETE"))
+        .and(path("/nvue_v1/cluster/node/primary"))
+        .and(query_param("rev", "42"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    mount_apply_revision(&server, "42", None).await;
+
+    mount_revision_get(
+        &server,
+        "42",
+        None,
+        ResponseTemplate::new(200).set_body_json(RevisionState { state: "applied" }),
+    )
+    .await;
+
+    Mock::given(method("PATCH"))
+        .and(path("/nvue_v1/cluster"))
+        .and(query_param("rev", "43"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(EmptyBody::default()))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    mount_apply_revision(&server, "43", None).await;
+
+    mount_revision_get(
+        &server,
+        "43",
+        None,
+        ResponseTemplate::new(200).set_body_json(RevisionState { state: "applied" }),
+    )
+    .await;
+
+    Mock::given(method("PATCH"))
+        .and(path("/nvue_v1/revision/applied"))
+        .and(body_json(RevisionUpdate::save_with_yes_prompt()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(EmptyBody::default()))
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/nvue_v1/cluster"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "state": "enabled"
+        })))
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/nvue_v1/cluster"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "state": "disabled"
+        })))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/nvue_v1/cluster/apps/nmx-controller"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "status": "not ok",
+            "reason": "starting"
+        })))
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/nvue_v1/cluster/apps/nmx-controller"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/nvue_v1/cluster/node/secondary/server"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&configured_payload))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("DELETE"))
+        .and(path("/nvue_v1/cluster/node/secondary"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let switch = SwitchGb200Nvidia::for_test(&server.uri());
+    switch
+        .clear_node_ips_and_disable_cluster(nvos::NvBridge::for_test(false))
+        .await?;
 
     Ok(())
 }
@@ -4590,28 +6486,6 @@ fn classify_switch_firmware_types() {
         classify_firmware_type_switch("unknown_thing"),
         FirmwareType::Unknown
     );
-}
-
-// ── Shell quoting ───────────────────────────────────────────────
-
-#[test]
-fn shell_quote_simple() {
-    assert_eq!(shell_quote("hello"), "'hello'");
-}
-
-#[test]
-fn shell_quote_with_single_quotes() {
-    assert_eq!(shell_quote("it's"), "'it'\\''s'");
-}
-
-#[test]
-fn shell_quote_empty() {
-    assert_eq!(shell_quote(""), "''");
-}
-
-#[test]
-fn shell_quote_spaces_and_special() {
-    assert_eq!(shell_quote("/path/to file"), "'/path/to file'");
 }
 
 // ── Config constants ────────────────────────────────────────────
@@ -4793,22 +6667,120 @@ fn get_info_omits_empty_host_mac() {
     assert_eq!(info["hostIp_0"], "192.168.1.1");
 }
 
-// ── Power state behavior ────────────────────────────────────────
+// ── NVOS readiness ──────────────────────────────────────────────
+
+async fn mount_system(server: &MockServer, body: serde_json::Value) {
+    Mock::given(method("GET"))
+        .and(path("/nvue_v1/system"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(body))
+        .mount(server)
+        .await;
+}
 
 #[tokio::test]
-async fn get_power_state_nvos_failure_without_bmc_returns_unknown() {
+async fn verify_nvos_ready_passes_when_ready_and_healthy() {
+    let server = MockServer::start().await;
+    mount_system(
+        &server,
+        serde_json::json!({
+            "hostname": "switch",
+            "status": "System is ready",
+            "health": {"status": "OK"},
+            "uptime": 11659
+        }),
+    )
+    .await;
+    let sw = SwitchGb200Nvidia::for_test(&server.uri());
+
+    sw.verify_nvos_ready().await.unwrap();
+}
+
+#[tokio::test]
+async fn verify_nvos_ready_fails_precondition_when_switch_reports_unhealthy() {
+    let server = MockServer::start().await;
+    mount_system(
+        &server,
+        serde_json::json!({ "status": "System is ready", "health": {"status": "Not OK"} }),
+    )
+    .await;
+    let sw = SwitchGb200Nvidia::for_test(&server.uri());
+
+    let error = sw.verify_nvos_ready().await.unwrap_err();
+
+    assert_eq!(error.code, ErrorCode::FailedPrecondition);
+    assert!(
+        error.message.contains("health=Not OK"),
+        "unexpected message: {}",
+        error.message
+    );
+}
+
+#[tokio::test]
+async fn verify_nvos_ready_stops_the_poll_on_a_failed_boot() {
+    let server = MockServer::start().await;
+    mount_system(
+        &server,
+        serde_json::json!({ "status": "System is not ready (failed)", "health": {"status": "OK"} }),
+    )
+    .await;
+    let sw = SwitchGb200Nvidia::for_test(&server.uri());
+
+    let error = sw.verify_nvos_ready().await.unwrap_err();
+
+    assert_eq!(error.code, ErrorCode::Aborted);
+    assert!(error.message.contains("(failed)"), "{}", error.message);
+}
+
+/// NVOS remediates a fatal ASIC state itself, so the poll keeps waiting.
+#[tokio::test]
+async fn verify_nvos_ready_keeps_polling_on_fatal_health() {
+    let server = MockServer::start().await;
+    mount_system(
+        &server,
+        serde_json::json!({ "status": "System is ready", "health": {"status": "FATAL"} }),
+    )
+    .await;
+    let sw = SwitchGb200Nvidia::for_test(&server.uri());
+
+    let error = sw.verify_nvos_ready().await.unwrap_err();
+
+    assert_eq!(error.code, ErrorCode::FailedPrecondition);
+    assert!(error.message.contains("health=FATAL"), "{}", error.message);
+}
+
+/// A health word outside the known set fails the decode. Its code is one the
+/// readiness poll retries, so a word a later NVOS adds waits out the budget.
+#[tokio::test]
+async fn verify_nvos_ready_reports_an_unknown_health_word_as_internal() {
+    let server = MockServer::start().await;
+    mount_system(
+        &server,
+        serde_json::json!({ "status": "System is ready", "health": {"status": "DEGRADED"} }),
+    )
+    .await;
+    let sw = SwitchGb200Nvidia::for_test(&server.uri());
+
+    let error = sw.verify_nvos_ready().await.unwrap_err();
+
+    assert_eq!(error.code, ErrorCode::Internal);
+}
+
+#[tokio::test]
+async fn verify_nvos_ready_keeps_transport_error_codes() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/nvue_v1/system"))
-        .respond_with(ResponseTemplate::new(401))
+        .respond_with(ResponseTemplate::new(503))
         .mount(&server)
         .await;
-
     let sw = SwitchGb200Nvidia::for_test(&server.uri());
 
-    let state = sw.get_power_state().await.unwrap();
-    assert_eq!(state, PowerState::Unknown);
+    let error = sw.verify_nvos_ready().await.unwrap_err();
+
+    assert_eq!(error.code, ErrorCode::Unavailable);
 }
+
+// ── Power state behavior ────────────────────────────────────────
 
 #[tokio::test]
 async fn get_power_state_uses_bmc_redfish_when_available() {
@@ -4872,7 +6844,7 @@ async fn set_power_state_rejects_non_power_cycle() {
         .await
         .unwrap_err();
     assert_eq!(err.code, ErrorCode::InvalidArgument);
-    assert!(err.message.contains("PowerCycle"));
+    assert!(err.message.contains("BMC Redfish power details"));
 }
 
 #[tokio::test]
@@ -4905,6 +6877,8 @@ async fn switch_from_config_with_bmc_and_host_endpoints_powers_off_via_bmc_redfi
             Some("switch.test.local"),
         )),
         expected_inventory: None,
+        recovery: None,
+        runtime_config: None,
     };
     let switch = SwitchGb200Nvidia::from_config(&config, "rack-01")?;
 
@@ -4940,6 +6914,8 @@ async fn switch_from_config_with_bmc_endpoint_reads_power_state_via_bmc_redfish(
         )),
         host_endpoint: None,
         expected_inventory: None,
+        recovery: None,
+        runtime_config: None,
     };
     let switch = SwitchGb200Nvidia::from_config(&config, "rack-01")?;
 
@@ -4965,6 +6941,8 @@ async fn switch_from_config_host_only_rejects_power_off() {
             Some("switch.test.local"),
         )),
         expected_inventory: None,
+        recovery: None,
+        runtime_config: None,
     };
     let Ok(switch) = SwitchGb200Nvidia::from_config(&config, "rack-01") else {
         panic!("expected host-only switch config to be accepted");
@@ -4978,7 +6956,7 @@ async fn switch_from_config_host_only_rejects_power_off() {
     };
 
     assert_eq!(err.code, ErrorCode::InvalidArgument);
-    assert!(err.message.contains("PowerCycle"));
+    assert!(err.message.contains("BMC Redfish power details"));
 }
 
 #[tokio::test]
@@ -4996,6 +6974,8 @@ async fn bmc_only_switch_rejects_nvue_system_image_read()
         )),
         host_endpoint: None,
         expected_inventory: None,
+        recovery: None,
+        runtime_config: None,
     };
     let switch = SwitchGb200Nvidia::from_config(&config, "rack-01")?;
 
@@ -5009,33 +6989,51 @@ async fn bmc_only_switch_rejects_nvue_system_image_read()
     Ok(())
 }
 
-#[tokio::test]
-async fn switch_power_cycle_uses_nvue_fallback_without_bmc_power_client()
--> std::result::Result<(), Box<dyn std::error::Error>> {
-    let server = MockServer::start().await;
+// ── Switch host endpoint selection ───────────────────────────────────────
 
+#[tokio::test]
+async fn gb_switches_keep_nvue_inventory_and_power_cycle_without_a_bmc() {
+    let host = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/nvue_v1/platform/firmware"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "BMC":{"actual-firmware":"88.1"}
+        })))
+        .expect(2)
+        .mount(&host)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/nvue_v1/system"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+        .expect(2)
+        .mount(&host)
+        .await;
     Mock::given(method("POST"))
         .and(path("/nvue_v1/system"))
-        .and(body_json(serde_json::json!({
-            "@power-cycle": {
-                "state": "start",
-                "parameters": {"force": true}
-            }
-        })))
+        .and(body_json(
+            serde_json::json!({"@power-cycle":{"state":"start","parameters":{"force":true}}}),
+        ))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
-        .expect(1)
-        .mount(&server)
+        .expect(2)
+        .mount(&host)
         .await;
-
-    let switch = SwitchGb200Nvidia::for_test(&server.uri());
-
-    switch
-        .set_power_state(PowerOp::PowerCycle, PowerTargetType::System)
-        .await?;
-    Ok(())
+    for node_type in [NodeType::SwitchGb200Nvidia, NodeType::SwitchGb300Nvidia] {
+        let mut switch = SwitchGb200Nvidia::for_test(&host.uri());
+        switch.node_type = node_type;
+        switch.bmc_endpoint = None;
+        let endpoint = &mut switch.host_endpoint.as_mut().unwrap().endpoint;
+        endpoint.ip_address = host.address().ip().to_string();
+        endpoint.port = host.address().port();
+        assert!(switch.redfish.is_none());
+        let inventory = switch.get_firmware_inventory().await.unwrap();
+        assert_eq!(inventory[0].version, "88.1");
+        assert_eq!(switch.get_power_state().await.unwrap(), PowerState::On);
+        switch
+            .set_power_state(PowerOp::PowerCycle, PowerTargetType::System)
+            .await
+            .unwrap();
+    }
 }
-
-// ── Switch host endpoint selection ───────────────────────────────────────
 
 #[test]
 fn switch_host_endpoint_uses_host_ip() {
@@ -5482,6 +7480,53 @@ async fn verify_sdn_fabric_state_succeeds_when_every_connection_is_healthy() {
         .verify_sdn_fabric_state(&expected_peers)
         .await
         .expect("every reported connection is healthy and every peer is present");
+}
+
+#[tokio::test]
+async fn verify_sdn_fabric_state_ignores_active_state_when_connection_and_keepalive_are_healthy() {
+    let report = r#"{
+        "statusUpdates": [
+            {
+                "nvbdUuid": "test-switch-01-eth1_1",
+                "connectionStatuses": [
+                    {
+                        "nvbsUuid": "test-peer-01",
+                        "nvbsAddress": "198.51.100.10:50000",
+                        "connectionState": "NMX_NVB_CONNECTION_STATE_CONNECTED",
+                        "kaState": "NMX_NVB_KA_STATE_OK",
+                        "activeState": "NMX_NVB_ACTIVE_STATE_ACTIVE"
+                    },
+                    {
+                        "nvbsUuid": "test-peer-02",
+                        "nvbsAddress": "198.51.100.11:50000",
+                        "connectionState": "NMX_NVB_CONNECTION_STATE_CONNECTED",
+                        "kaState": "NMX_NVB_KA_STATE_OK",
+                        "activeState": "NMX_NVB_ACTIVE_STATE_INACTIVE"
+                    },
+                    {
+                        "nvbsUuid": "test-peer-03",
+                        "nvbsAddress": "198.51.100.12:50000",
+                        "connectionState": "NMX_NVB_CONNECTION_STATE_CONNECTED",
+                        "kaState": "NMX_NVB_KA_STATE_OK"
+                    }
+                ]
+            }
+        ]
+    }"#;
+
+    let exec = sdn_state_report_ssh_exec(
+        "nmx-controller_nv-bridge-state-report_20260223_154714",
+        report,
+    );
+
+    let switch = SwitchGb200Nvidia::for_test("http://127.0.0.1:9").with_ssh_exec_for_test(exec);
+    let expected_peers =
+        sdn_state_expected_peers(&["198.51.100.10", "198.51.100.11", "198.51.100.12"]);
+
+    switch
+        .verify_sdn_fabric_state(&expected_peers)
+        .await
+        .expect("ACTIVE, INACTIVE, and omitted active states are role metadata, not health");
 }
 
 #[tokio::test]

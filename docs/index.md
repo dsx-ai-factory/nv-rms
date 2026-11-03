@@ -17,13 +17,14 @@ asynchronous jobs that clients poll to completion.
 | | **Run & Operate RMS** | **Integrate with RMS** | **Evaluate RMS** |
 | --- | --- | --- | --- |
 | **Who** | Operators deploying and running RMS against real racks | Platform engineers building on the RMS gRPC API | Architects evaluating RMS for their stack |
-| **Start here** | [Getting Started: Prerequisites](getting-started/prerequisites.md) | [Architecture](architecture/external_view.md) | [Overview](overview.md) |
-| **Then** | [Deployment](deployment/prerequisites.md) | [Operations (RPC reference)](operations/overview.md) | [Hardware Compatibility List](reference/hcl.md) |
-| **Then** | [Configuration](configuration/configuring-rms.md) | [Development](reference/development.md) | [Glossary](reference/glossary.md) |
+| **Start here** | [Getting Started: Prerequisites](getting-started/prerequisites.md) | [gRPC API reference](api-reference/index.md) | [Overview](overview.md) |
+| **Then** | [Deployment](deployment/prerequisites.md) | [Operations](operations/overview.md) | [Hardware Compatibility List](reference/hcl.md) |
+| **Then** | [Configuration](configuration/configuring-rms.md) | [Architecture](architecture/external_view.md) | [Glossary](reference/glossary.md) |
 
 ## Quick Links
 
 - [Hardware Compatibility List](reference/hcl.md) - Supported racks, trays, and power shelves
 - [Configuration Reference](configuration/configuring-rms.md) - Every `config.toml` key and its Helm value
-- [Operations](operations/overview.md) - The `RackManager` gRPC RPCs
+- [gRPC API Reference](api-reference/index.md) - Every RPC with its request, response, and execution mode
+- [Operations](operations/overview.md) - How the RPCs behave, by capability
 - [GitHub](https://github.com/dsx-ai-factory/nv-rms)

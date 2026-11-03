@@ -25,6 +25,7 @@ mod util;
 
 pub mod action;
 pub mod cluster;
+pub mod interface;
 pub mod platform;
 pub mod revision;
 pub mod sdn;

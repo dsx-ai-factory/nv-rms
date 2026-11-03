@@ -141,6 +141,29 @@
         "switchClient": { "$ref": "#/definitions/certificateGroup" }
       }
     },
+    "nvssvt": {
+      "type": "object",
+      "description": "NVSSVT scan launcher, colocated with the API server so RMS reaches it on loopback.",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Run the NVSSVT launcher as a sidecar in the API server pod. When false, every node in a StartSystemValidation request fails to launch because nothing is listening on 127.0.0.1:8000."
+        },
+        "image": {
+          "type": "object",
+          "properties": {
+            "repository": { "type": "string", "minLength": 1 },
+            "tag": { "type": "string", "minLength": 1 },
+            "pullPolicy": {
+              "type": "string",
+              "enum": ["", "Always", "IfNotPresent", "Never"],
+              "description": "Defaults to IfNotPresent; the NVSSVT image is versioned independently of RMS."
+            }
+          }
+        },
+        "resources": { "type": "object" }
+      }
+    },
     "apiServer": {
       "type": "object",
       "properties": {
@@ -155,6 +178,18 @@
               "description": "Empty string inherits global.image.pullPolicy."
             }
           }
+        },
+        "terminationGracePeriodSeconds": {
+          "type": ["integer", "null"],
+          "minimum": 300,
+          "description": "Pod termination grace covering the 300-second RMS job drain, trace flush, and margin."
+        },
+        "podAnnotations": {
+          "type": ["object", "null"],
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Extra RMS Pod annotations. checksum/config is reserved by the chart."
         },
         "firmwarePersistentVolumeClaim": {
           "type": "string",
@@ -181,6 +216,48 @@
           "type": "integer",
           "minimum": 1,
           "description": "Retention period for completed and failed job records, in seconds (config.toml [workflows] terminal_job_ttl_seconds). Must be greater than 0."
+        },
+        "firmwareTaskTimeoutSeconds": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Upper bound in seconds on polling one firmware task for completion (config.toml [workflows] firmware_task_timeout_seconds). Must be greater than 0."
+        },
+        "firmwareTaskPollIntervalSeconds": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Delay in seconds between polls of an in-flight firmware task (config.toml [workflows] firmware_task_poll_interval_seconds). Must be greater than 0 and <= firmwareTaskTimeoutSeconds."
+        },
+        "firmwareTaskTransientErrorTimeoutSeconds": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "How long in seconds to tolerate consecutive firmware task-status read failures before failing the update (config.toml [workflows] firmware_task_transient_error_timeout_seconds). Must be greater than 0."
+        },
+        "computePowerOnTimeoutSeconds": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "How long in seconds a compute firmware update waits for the tray to report power On after the power-on that opens the flow (config.toml [workflows] compute_power_on_timeout_seconds). Must be greater than 0. The power-on step that reads it arrives in a following change. Until then RMS validates and stores the value and nothing reads it."
+        },
+        "computePowerOnPollIntervalSeconds": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Delay in seconds between power-state reads during that wait (config.toml [workflows] compute_power_on_poll_interval_seconds). Must be greater than 0 and <= computePowerOnTimeoutSeconds. The power-on step that reads it arrives in a following change. Until then RMS validates and stores the value and nothing reads it."
+        },
+        "artifactRequireSha256": {
+          "type": "boolean",
+          "description": "When true, HTTP(S) firmware artifacts must include a SHA-256 digest (config.toml [workflows] artifact_require_sha256)."
+        },
+        "artifactHttpsHosts": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": ".*\\S.*"
+          },
+          "description": "HTTP(S) firmware artifact host allow-list (config.toml [workflows] artifact_https_hosts). Empty allows any host. Pattern and RPC scope: docs/configuration/configuring-rms.md#artifact-download-policy."
+        },
+        "artifactAllowPrivateTargets": {
+          "type": "boolean",
+          "description": "When false, reject loopback/private/link-local HTTP(S) artifact targets including redirects (config.toml [workflows] artifact_allow_private_targets)."
         },
         "expectedInventoryProfiles": {
           "type": "object",
@@ -240,6 +317,87 @@
         "enableTimestamps": {
           "type": "boolean",
           "description": "Assuming a logging collector is adding its own timestamps, so this is disabled by default to prevent duplicate timestamp fields. If no logging collector is being used, set true to output timestamps natively (config.toml [logging] enable_timestamps)."
+        },
+        "tls": {
+          "type": "object",
+          "properties": {
+            "certReloadIntervalSeconds": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "How often RMS re-reads the gRPC server certificate and key, in seconds (config.toml [tls] cert_reload_interval_seconds). Must be greater than 0. The client CA is not reloaded."
+            }
+          }
+        },
+        "tracing": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "properties": {
+            "endpoint": {
+              "type": "string",
+              "maxLength": 2048,
+              "description": "Explicit OTLP Collector URL. Requires HTTPS with a certificate trusted by RMS unless the host is a loopback IP address (127.0.0.0/8 or ::1), which may use plaintext http. Empty disables remote export."
+            },
+            "protocol": {
+              "type": "string",
+              "enum": ["grpc", "http_protobuf"],
+              "description": "OTLP protocol over TLS: grpc or HTTP/protobuf over HTTPS."
+            },
+            "samplingRatio": {
+              "type": "number",
+              "exclusiveMinimum": 0,
+              "maximum": 1
+            },
+            "maxQueueSize": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 65536
+            },
+            "maxExportBatchSize": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 4096
+            },
+            "scheduledDelayMs": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 60000
+            },
+            "exportAttemptTimeoutMs": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 60000
+            },
+            "exportTimeoutMs": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 120000
+            },
+            "shutdownTimeoutMs": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 30000
+            },
+            "maxRetries": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 10
+            },
+            "retryInitialDelayMs": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 60000
+            },
+            "retryMaxDelayMs": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 60000
+            },
+            "retryJitterMs": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 60000
+            }
+          }
         }
       }
     }

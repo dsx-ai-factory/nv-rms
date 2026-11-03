@@ -29,8 +29,9 @@ use librms::protos::rack_manager as rm;
 
 use crate::api::grpc::conversions::failed_node_results;
 use crate::api::grpc::server::RackManagerServiceImpl;
+use crate::api::grpc::switch_scope::request_switch_scopes;
 use crate::nodes::SwitchScaleUpManagement;
-use crate::orchestrator::job_lifecycle::{JobError, JobFailure};
+use crate::orchestrator::job_lifecycle::{JobError, JobFailure, JobScope};
 use crate::orchestrator::job_tracker::{JobTracker, JobType, RmsJobHandle};
 
 type BatchResetResponse = std::result::Result<
@@ -69,6 +70,9 @@ struct SdnResetTarget {
     tls_server_name: String,
     rack_id: String,
     node_id: String,
+
+    /// Preserve supplied management aliases until the worker admits every scope.
+    request_scopes: Vec<JobScope>,
 }
 
 /// Pending child job and its target payload.
@@ -98,8 +102,12 @@ async fn run_switch_sdn_factory_default_reset_job(
         nvue_client,
         request_domain,
         tls_server_name,
+        request_scopes,
         ..
     } = target;
+
+    let rack_id = switch.rack_id().to_owned();
+    let node_id = switch.id().to_owned();
 
     job.progress("Initializing switch NVUE client for SDN factory-default reset");
 
@@ -119,6 +127,20 @@ async fn run_switch_sdn_factory_default_reset_job(
         return;
     }
 
+    if let Err(error) = service
+        .admit_switch_job_scopes(
+            &job,
+            nvue_client.as_ref(),
+            &rack_id,
+            &node_id,
+            request_scopes,
+        )
+        .await
+    {
+        job.fail(error);
+        return;
+    }
+
     job.progress("Resetting switch SDN factory-default through NVUE");
 
     // `reset_sdn_factory_default` returns only after the switch-side runtime
@@ -129,7 +151,7 @@ async fn run_switch_sdn_factory_default_reset_job(
             // The action ID is folded into the completion description (rather
             // than a separate log) so it survives in the guaranteed `job
             // completed` chokepoint log for switch-side audit/correlation.
-            job.complete(
+            job.complete_verified(
                 format!("SDN factory-default reset completed (action_id={action_id})"),
                 "",
             );
@@ -150,6 +172,7 @@ fn prepare_sdn_reset_targets(
     devices: Vec<rm::NodeInfo>,
     request_domain: Option<&str>,
     batch: &mut rm::NodeBatchResponse,
+    insecure_bmc: bool,
 ) -> (Vec<SdnResetTarget>, u32) {
     let mut targets = Vec::new();
     let mut skipped = 0_u32;
@@ -223,8 +246,10 @@ fn prepare_sdn_reset_targets(
 
         // Build the switch after validation so malformed targets do not touch
         // backend discovery or NVUE client setup.
-        let ephemeral = match super::build_ephemeral_switch(&device) {
-            Ok(ephemeral) => ephemeral,
+        let (ephemeral, request_scopes) = match super::build_ephemeral_switch(&device, insecure_bmc)
+            .and_then(|ephemeral| request_switch_scopes(&device).map(|scopes| (ephemeral, scopes)))
+        {
+            Ok(target) => target,
             Err(e) => {
                 tracing::warn!(
                     node = %node_id,
@@ -256,6 +281,7 @@ fn prepare_sdn_reset_targets(
             tls_server_name,
             rack_id,
             node_id,
+            request_scopes,
         });
     }
 
@@ -368,7 +394,8 @@ impl RackManagerServiceImpl {
 
         // Request validation is intentionally synchronous so callers get
         // deterministic feedback for malformed targets and duplicates.
-        let (targets, skipped) = prepare_sdn_reset_targets(devices, request_domain, &mut batch);
+        let (targets, skipped) =
+            prepare_sdn_reset_targets(devices, request_domain, &mut batch, self.insecure_bmc);
         if targets.is_empty() {
             batch.message = "no switch SDN factory-default reset jobs created".into();
             return finish_batch(batch, total_nodes, 0, skipped);

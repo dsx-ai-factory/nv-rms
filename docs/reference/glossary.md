@@ -42,12 +42,16 @@ Terms used throughout the RMS documentation.
   `[switches] insecure_switch = true` - RMS drops outbound switch client mTLS (unverified NVUE HTTPS, plaintext NMX-C). Dev/test only.
 </ParamField>
 
+<ParamField path="Insecure BMC">
+  `[bmc] insecure_bmc = true` - RMS skips BMC/Redfish HTTPS server certificate verification. Historical default for self-signed BMC certificates. Set `false` after BMC certificates are CA-verifiable.
+</ParamField>
+
 <ParamField path="Job">
   An asynchronous unit of long-running work (firmware update, switch system-image install) tracked by ID. Clients poll job status until it reaches a terminal state.
 </ParamField>
 
 <ParamField path="JobTracker">
-  The orchestrator component that owns job lifecycle: creation, status, retention (`max_tracked_jobs`), and TTL-based cleanup of terminal jobs (`terminal_job_ttl_seconds`).
+  The orchestrator component that owns job lifecycle: creation, status, retention (`max_tracked_jobs`), and monotonic TTL-based cleanup of terminal jobs (`terminal_job_ttl_seconds`).
 </ParamField>
 
 <ParamField path="librms">

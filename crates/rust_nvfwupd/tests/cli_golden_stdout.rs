@@ -147,6 +147,22 @@ async fn mount_powershelf_update_mock(server: &MockServer) {
 }
 
 #[test]
+fn help_lists_lp30_servertype() {
+    let tmp = tempfile::tempdir().unwrap();
+    let output = run_nvfwupd(&["help".to_string()], tmp.path());
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let server_types = stdout
+        .split_once("Supported servertype values:")
+        .expect("help should list supported servertype values")
+        .1
+        .split("\n\n")
+        .next()
+        .unwrap();
+    assert!(server_types.contains("LP30"));
+}
+
+#[test]
 fn golden_stdout_for_missing_target_command_paths() {
     let tmp = tempfile::tempdir().unwrap();
     let cases: &[&[&str]] = &[
@@ -227,6 +243,15 @@ fn show_pkg_content_invalid_fwpkg_exits_nonzero() {
 #[test]
 fn golden_stdout_for_flint_update_dispatch_path() {
     let tmp = tempfile::tempdir().unwrap();
+    let connection_refused_errno = if cfg!(target_os = "macos") { 61 } else { 111 };
+
+    let expected_stdout = format!(
+        "Starting MST service...\n\
+         Failed to start MST service. MST services may not be installed, or the OS may be unreachable. \
+         Command execution error: SSH connect failed: Connection refused (os error {connection_refused_errno})\n\
+         Error Code: 1\n",
+    );
+
     let args = vec![
         "-o".to_string(),
         "ip=127.0.0.1".to_string(),
@@ -238,16 +263,10 @@ fn golden_stdout_for_flint_update_dispatch_path() {
         "-t".to_string(),
         "1".to_string(),
     ];
+
     let output = run_nvfwupd(&args, tmp.path());
 
-    assert_stdout(
-        &output,
-        1,
-        "Starting MST service...\n\
-         Failed to start MST service. MST services may not be installed, or the OS may be unreachable. \
-         Command execution error: SSH connect failed: Connection refused (os error 111)\n\
-         Error Code: 1\n",
-    );
+    assert_stdout(&output, 1, &expected_stdout);
 }
 
 #[tokio::test]
@@ -340,6 +359,63 @@ async fn golden_stdout_for_show_version_mock_path() {
             "AP Name", "Sys Version", "-------", "-----------", "BMC", "1.0.0"
         )
     );
+}
+
+#[tokio::test]
+async fn json_show_version_warns_for_unparsed_package_metadata() {
+    let server = MockServer::start().await;
+    mount_powershelf_chassis_mock(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/redfish/v1/UpdateService/FirmwareInventory"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "Members": [{"@odata.id": "/redfish/v1/UpdateService/FirmwareInventory/BMC"}]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/redfish/v1/UpdateService/FirmwareInventory/BMC"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "Version": "1.0.0"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let package = tmp.path().join("unknown-image.bin");
+    std::fs::write(&package, b"not a recognized firmware package").expect("write test package");
+
+    let mut args = powershelf_target_args(&server);
+    args.extend([
+        "show_version".to_string(),
+        "-p".to_string(),
+        package.to_string_lossy().to_string(),
+        "-j".to_string(),
+    ]);
+    let output = run_nvfwupd(&args, tmp.path());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "unexpected exit status: stdout={stdout}, stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stdout).expect("stdout should be valid JSON only");
+    assert_eq!(parsed["Error Code"], 0);
+    assert_eq!(
+        parsed["Warnings"][0],
+        "Unable to parse package metadata for version comparison: unknown-image.bin"
+    );
+    assert_eq!(parsed["Packages"], "N/A");
+    let devices = parsed["Firmware Devices"]
+        .as_array()
+        .expect("firmware devices should be an array");
+    assert_eq!(devices[0]["Pkg Version"], "N/A");
+    assert_eq!(devices[0]["Up-To-Date"], "N/A");
 }
 
 #[tokio::test]
@@ -516,6 +592,10 @@ async fn golden_stdout_for_background_copy_mock_path() {
     Mock::given(method("POST"))
         .and(path(
             "/redfish/v1/UpdateService/Actions/Oem/NvidiaUpdateService.CommitImage",
+        ))
+        .and(body_string_contains("\"Targets\""))
+        .and(body_string_contains(
+            "/redfish/v1/UpdateService/FirmwareInventory/BMC",
         ))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "Task": "BackgroundCopy"

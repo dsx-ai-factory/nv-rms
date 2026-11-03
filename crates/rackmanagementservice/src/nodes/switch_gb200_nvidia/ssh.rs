@@ -26,12 +26,12 @@ use crate::utilities::error::Result;
 impl SwitchGb200Nvidia {
     pub(crate) fn ssh_endpoint(&self) -> Result<SshEndpoint> {
         let host_endpoint = self.require_host_endpoint()?;
-        let credentials = self.require_host_credentials()?;
+        let (username, password) = self.require_host_credentials()?;
 
         Ok(SshEndpoint::new(
             &host_endpoint.ip_address,
-            &credentials.username,
-            credentials.password.expose_secret(),
+            username,
+            password.expose_secret(),
         ))
     }
 }

@@ -101,9 +101,17 @@ pub(super) enum SshError {
         output_context: String,
     },
 
-    /// The local file needed for an SFTP upload could not be opened.
+    /// The local file needed for an SSH upload could not be opened.
     #[error("cannot open local file {path}: {details}")]
     LocalFileOpenFailed { path: String, details: String },
+
+    /// An SCP operation failed after the local file and session were available.
+    #[error("SCP {operation} failed for {path}: {details}")]
+    ScpOperationFailed {
+        operation: &'static str,
+        path: String,
+        details: String,
+    },
 
     /// An SFTP operation failed after the local file and session were available.
     #[error("SFTP {operation} failed for {path}: {details}")]
@@ -161,6 +169,7 @@ impl SshError {
             | Self::CommandTerminatedBySignal { .. }
             | Self::CommandMissingExitStatus { .. }
             | Self::CommandFailed { .. }
+            | Self::ScpOperationFailed { .. }
             | Self::SftpOperationFailed { .. }
             | Self::PasswordRecoveryFailed { .. } => ErrorCode::Internal,
         }

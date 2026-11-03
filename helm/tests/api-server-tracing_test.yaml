@@ -1,0 +1,38 @@
+suite: API server tracing lifecycle
+templates:
+  - templates/api-server-deployment.yaml
+tests:
+  - it: reserves time for job drain and trace flush
+    set:
+      global.image.tag: test
+    documentSelector:
+      path: kind
+      value: Deployment
+    asserts:
+      - equal:
+          path: spec.template.spec.terminationGracePeriodSeconds
+          value: 330
+
+  - it: allows a longer termination grace period
+    set:
+      global.image.tag: test
+      apiServer.terminationGracePeriodSeconds: 600
+    documentSelector:
+      path: kind
+      value: Deployment
+    asserts:
+      - equal:
+          path: spec.template.spec.terminationGracePeriodSeconds
+          value: 600
+
+  - it: defaults termination grace for reused legacy values
+    set:
+      global.image.tag: test
+      apiServer.terminationGracePeriodSeconds: null
+    documentSelector:
+      path: kind
+      value: Deployment
+    asserts:
+      - equal:
+          path: spec.template.spec.terminationGracePeriodSeconds
+          value: 330

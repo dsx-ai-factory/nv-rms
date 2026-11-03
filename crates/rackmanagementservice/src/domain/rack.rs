@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use secrecy::{ExposeSecret, SecretString};
 
-use crate::domain::node::{ExpectedInventoryPolicy, Node, NodeType};
+use super::node::{ExpectedInventoryPolicy, Node, NodeRuntimeConfig, NodeType, RecoveryProfile};
 use crate::utilities::error::Result;
 
 pub(crate) const RACK_POWER_BUSY_MESSAGE: &str = "rack power operation in progress";
@@ -38,17 +38,41 @@ pub struct Endpoint {
     pub host_name: Option<String>,
 }
 
-/// Username/password pair used for endpoint authentication.
+/// Credentials used for endpoint authentication.
 #[derive(Debug, Clone)]
-pub struct EndpointCredentials {
-    pub username: String,
-    pub password: SecretString,
+pub enum EndpointCredentials {
+    /// Username/password authentication.
+    UserPass {
+        username: String,
+        password: SecretString,
+    },
+
+    /// Redfish session-token authentication for BMC endpoints.
+    BmcSessionToken(SecretString),
 }
 
 impl PartialEq for EndpointCredentials {
     fn eq(&self, other: &Self) -> bool {
-        self.username == other.username
-            && self.password.expose_secret() == other.password.expose_secret()
+        match (self, other) {
+            (
+                Self::UserPass {
+                    username: left_username,
+                    password: left_password,
+                },
+                Self::UserPass {
+                    username: right_username,
+                    password: right_password,
+                },
+            ) => {
+                left_username == right_username
+                    && left_password.expose_secret() == right_password.expose_secret()
+            }
+            (Self::BmcSessionToken(left), Self::BmcSessionToken(right)) => {
+                left.expose_secret() == right.expose_secret()
+            }
+            (Self::UserPass { .. }, Self::BmcSessionToken(_))
+            | (Self::BmcSessionToken(_), Self::UserPass { .. }) => false,
+        }
     }
 }
 
@@ -57,10 +81,53 @@ impl Eq for EndpointCredentials {}
 impl EndpointCredentials {
     /// Create endpoint credentials from a username and password.
     pub fn new(username: impl Into<String>, password: impl Into<String>) -> Self {
-        Self {
+        Self::UserPass {
             username: username.into(),
             password: SecretString::from(password.into()),
         }
+    }
+
+    /// Create BMC credentials that authenticate Redfish requests with a session token.
+    pub fn from_session_token(token: impl Into<String>) -> Self {
+        Self::BmcSessionToken(SecretString::from(token.into()))
+    }
+
+    /// Return credential mode name for credential-safe logs.
+    pub fn auth_type(&self) -> &'static str {
+        match self {
+            Self::UserPass { .. } => "user_pass",
+            Self::BmcSessionToken(_) => "session_token",
+        }
+    }
+
+    /// Return whether the credential carries complete, usable authentication material.
+    pub fn has_auth_material(&self) -> bool {
+        match self {
+            Self::UserPass { username, password } => {
+                !username.is_empty() && !password.expose_secret().is_empty()
+            }
+            Self::BmcSessionToken(token) => !token.expose_secret().is_empty(),
+        }
+    }
+
+    /// Return username/password credentials, excluding BMC session tokens.
+    pub fn user_pass(&self) -> Option<(&str, &str)> {
+        let Self::UserPass { username, password } = self else {
+            return None;
+        };
+
+        (!username.is_empty() && !password.expose_secret().is_empty())
+            .then_some((username, password.expose_secret()))
+    }
+
+    /// Return username/password credentials without exposing the password.
+    pub(crate) fn user_pass_secret(&self) -> Option<(&str, &SecretString)> {
+        let Self::UserPass { username, password } = self else {
+            return None;
+        };
+
+        (!username.is_empty() && !password.expose_secret().is_empty())
+            .then_some((username.as_str(), password))
     }
 }
 
@@ -104,6 +171,13 @@ pub struct NodeConfig {
     pub bmc_endpoint: Option<EndpointConfig>,
     pub host_endpoint: Option<EndpointConfig>,
     pub expected_inventory: Option<ExpectedInventoryPolicy>,
+    /// The recovery profile bound to this node, still the opaque table. The
+    /// node type parses it in `from_config`; `None` leaves detection off.
+    pub recovery: Option<RecoveryProfile>,
+    /// Optional profile-derived parameters for the concrete implementation.
+    /// Production request parsing populates these from the immutable startup
+    /// hardware-profile catalog; node-type dispatch remains code-defined.
+    pub runtime_config: Option<NodeRuntimeConfig>,
 }
 
 impl NodeConfig {
@@ -120,6 +194,8 @@ impl NodeConfig {
             })),
             host_endpoint: None,
             expected_inventory: None,
+            recovery: None,
+            runtime_config: None,
         }
     }
 }
@@ -188,5 +264,18 @@ mod tests {
         assert!(debug.contains("admin"));
         assert!(debug.contains("[REDACTED]"));
         assert!(!debug.contains("secret"));
+    }
+
+    #[test]
+    fn endpoint_session_token_is_redacted_and_not_exposed_as_user_pass() {
+        let credentials = EndpointCredentials::from_session_token("session-secret");
+
+        let debug = format!("{credentials:?}");
+
+        assert_eq!(credentials.auth_type(), "session_token");
+        assert!(credentials.has_auth_material());
+        assert!(credentials.user_pass().is_none());
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains("session-secret"));
     }
 }

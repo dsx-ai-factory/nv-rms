@@ -73,7 +73,7 @@ pub(super) fn build_nvue_api(config: NvueConnectConfig) -> Result<SharedNvueClie
     NvueClient::new(config).map_err(Into::into)
 }
 
-fn rms_http_status_code(status: u16) -> ErrorCode {
+pub(super) fn rms_http_status_code(status: u16) -> ErrorCode {
     match status {
         401 => ErrorCode::Unauthenticated,
         404 => ErrorCode::NotFound,
@@ -81,6 +81,62 @@ fn rms_http_status_code(status: u16) -> ErrorCode {
         409 => ErrorCode::AlreadyExists,
         503 => ErrorCode::Unavailable,
         _ => ErrorCode::Internal,
+    }
+}
+
+/// One NVUE action status read.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum NvueActionPoll {
+    Running,
+    Succeeded,
+    Failed { state: String, message: String },
+}
+
+impl NvueActionPoll {
+    /// Reads only the reported `state`: `action_success` succeeds,
+    /// `action_error` and `action_failed` fail, and anything else is still
+    /// running.
+    pub(super) fn strict(response: &Value) -> Self {
+        let state = response
+            .get("state")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+
+        match state {
+            "action_success" => Self::Succeeded,
+            "action_error" | "action_failed" => {
+                let mut message = super::firmware::extract_action_issue_message(response);
+
+                for field in ["detail", "status"] {
+                    if message.is_empty() {
+                        message = response
+                            .get(field)
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned();
+                    }
+                }
+
+                Self::Failed {
+                    state: state.to_owned(),
+                    message,
+                }
+            }
+            _ => Self::Running,
+        }
+    }
+
+    fn from_firmware(status: crate::domain::node::FirmwareTaskStatus) -> Self {
+        if !status.completed {
+            Self::Running
+        } else if status.state == "action_success" || status.percent == 100 {
+            Self::Succeeded
+        } else {
+            Self::Failed {
+                state: status.state,
+                message: status.message,
+            }
+        }
     }
 }
 
@@ -128,10 +184,13 @@ fn revision_poll_decision(
 ) -> Result<RevisionPollDecision> {
     match response.apply_status(revision_id) {
         RevisionApplyStatus::Applied => Ok(RevisionPollDecision::Complete {
-            no_config_diff: false,
+            outcome: RevisionApplyOutcome::AppliedNeedsSave,
+        }),
+        RevisionApplyStatus::AppliedAndSaved => Ok(RevisionPollDecision::Complete {
+            outcome: RevisionApplyOutcome::AppliedAndSaved,
         }),
         RevisionApplyStatus::NoConfigDiff => Ok(RevisionPollDecision::Complete {
-            no_config_diff: true,
+            outcome: RevisionApplyOutcome::NoConfigDiff,
         }),
         RevisionApplyStatus::Failed { state, issue } => Err(revision_apply_failure(
             revision_id,
@@ -161,8 +220,28 @@ fn is_candidate_revision_poll_error(err: &RmsError) -> bool {
     is_http_unauthorized_error(err) || is_retryable_nvue_transport_error(err)
 }
 
+/// Successful terminal outcome of an NVUE revision apply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RevisionApplyOutcome {
+    /// NVUE applied the revision; the running config still needs a save.
+    AppliedNeedsSave,
+
+    /// NVUE applied the revision and already persisted it to startup config.
+    AppliedAndSaved,
+
+    /// NVUE reported an idempotent apply with no config diff.
+    NoConfigDiff,
+}
+
+impl RevisionApplyOutcome {
+    /// True when RMS must still persist the running config itself.
+    pub(crate) fn needs_save(self) -> bool {
+        matches!(self, Self::AppliedNeedsSave)
+    }
+}
+
 enum RevisionPollDecision {
-    Complete { no_config_diff: bool },
+    Complete { outcome: RevisionApplyOutcome },
     Pending { observed_state: Option<String> },
 }
 
@@ -397,7 +476,7 @@ impl SwitchGb200Nvidia {
         revision_id: &str,
         timeout: Duration,
         candidate_nvue: Option<&SharedNvueClient>,
-    ) -> Result<bool> {
+    ) -> Result<RevisionApplyOutcome> {
         if let Some(candidate_nvue) = candidate_nvue {
             return self
                 .wait_for_revision_with_candidate_credentials(revision_id, timeout, candidate_nvue)
@@ -412,7 +491,7 @@ impl SwitchGb200Nvidia {
         &self,
         revision_id: &str,
         timeout: Duration,
-    ) -> Result<bool> {
+    ) -> Result<RevisionApplyOutcome> {
         let deadline = std::time::Instant::now() + timeout;
         let mut last_retryable_error = None;
         let mut last_observed_state = None;
@@ -430,12 +509,12 @@ impl SwitchGb200Nvidia {
             {
                 Ok(response) => {
                     let decision = revision_poll_decision(&response, revision_id, None)?;
-                    if let Some(no_config_diff) = self.note_revision_poll_decision(
+                    if let Some(outcome) = self.note_revision_poll_decision(
                         revision_id,
                         decision,
                         &mut last_observed_state,
                     ) {
-                        return Ok(no_config_diff);
+                        return Ok(outcome);
                     }
                 }
                 Err(e) if is_retryable_nvue_transport_error(&e) => {
@@ -466,7 +545,7 @@ impl SwitchGb200Nvidia {
         revision_id: &str,
         timeout: Duration,
         candidate_nvue: &SharedNvueClient,
-    ) -> Result<bool> {
+    ) -> Result<RevisionApplyOutcome> {
         let deadline = std::time::Instant::now() + timeout;
         let mut last_retryable_error = None;
         let mut last_observed_state = None;
@@ -487,12 +566,12 @@ impl SwitchGb200Nvidia {
                         Some("candidate credentials"),
                     )?;
 
-                    if let Some(no_config_diff) = self.note_revision_poll_decision(
+                    if let Some(outcome) = self.note_revision_poll_decision(
                         revision_id,
                         decision,
                         &mut last_observed_state,
                     ) {
-                        return Ok(no_config_diff);
+                        return Ok(outcome);
                     }
                 }
                 Err(e) if is_candidate_revision_poll_error(&e) => {
@@ -551,20 +630,30 @@ impl SwitchGb200Nvidia {
         revision_id: &str,
         decision: RevisionPollDecision,
         last_observed_state: &mut Option<String>,
-    ) -> Option<bool> {
+    ) -> Option<RevisionApplyOutcome> {
         match decision {
-            RevisionPollDecision::Complete { no_config_diff } => {
-                if no_config_diff {
-                    tracing::info!(
-                        node = %self.id,
-                        revision = %revision_id,
-                        "revision apply reported no config diff"
-                    );
-                } else {
-                    tracing::info!(node = %self.id, revision = %revision_id, "revision reached applied state");
+            RevisionPollDecision::Complete { outcome } => {
+                match outcome {
+                    RevisionApplyOutcome::AppliedNeedsSave => {
+                        tracing::info!(node = %self.id, revision = %revision_id, "revision reached applied state");
+                    }
+                    RevisionApplyOutcome::AppliedAndSaved => {
+                        tracing::info!(
+                            node = %self.id,
+                            revision = %revision_id,
+                            "revision reached applied and saved state; skipping redundant save"
+                        );
+                    }
+                    RevisionApplyOutcome::NoConfigDiff => {
+                        tracing::info!(
+                            node = %self.id,
+                            revision = %revision_id,
+                            "revision apply reported no config diff"
+                        );
+                    }
                 }
 
-                Some(no_config_diff)
+                Some(outcome)
             }
             RevisionPollDecision::Pending { observed_state } => {
                 if let Some(state) = observed_state {
@@ -623,6 +712,14 @@ impl SwitchGb200Nvidia {
                 // diagnostics when candidate auth is rejected.
                 Ok(CandidateRevisionDiagnostic::Continue {
                     observed_state: Some("current credentials state=applied".to_owned()),
+                    retryable_error: None,
+                })
+            }
+            RevisionApplyStatus::AppliedAndSaved => {
+                // Same as `applied`: a terminal success read through the old
+                // credentials does not prove the new password is usable.
+                Ok(CandidateRevisionDiagnostic::Continue {
+                    observed_state: Some("current credentials state=applied_and_saved".to_owned()),
                     retryable_error: None,
                 })
             }
@@ -751,7 +848,32 @@ impl SwitchGb200Nvidia {
         })
     }
 
+    /// Waits for an NVUE action, accepting the firmware workflow's reboot and
+    /// no-op hints as completion.
     pub(crate) async fn wait_for_nvue_action_completion(&self, action_id: &str) -> Result<()> {
+        self.wait_for_nvue_action(action_id, false).await
+    }
+
+    /// Waits for an NVUE action to report `action_success`.
+    ///
+    /// Diagnostic text never overrides the reported state, so a running action
+    /// stays running until it succeeds, fails, or the wait times out.
+    pub(crate) async fn wait_for_nvue_action_success(&self, action_id: &str) -> Result<()> {
+        self.wait_for_nvue_action(action_id, true).await
+    }
+
+    async fn poll_nvue_action_state(&self, action_id: &str) -> Result<NvueActionPoll> {
+        let response = self
+            .nvue_http_get(
+                &format!("/nvue_v1/action/{action_id}"),
+                HttpClient::DEFAULT_TIMEOUT,
+            )
+            .await?;
+
+        Ok(NvueActionPoll::strict(&response))
+    }
+
+    async fn wait_for_nvue_action(&self, action_id: &str, strict: bool) -> Result<()> {
         let timeout = Duration::from_secs(config::REVISION_APPLY_TIMEOUT_SECONDS);
         let deadline = std::time::Instant::now() + timeout;
         let mut last_retryable_error = None;
@@ -759,24 +881,29 @@ impl SwitchGb200Nvidia {
         while std::time::Instant::now() < deadline {
             // The action POST already succeeded, so retry only this read-only
             // status poll when NVUE briefly drops its HTTPS connection.
-            match self.poll_nvue_action_task(action_id).await {
-                Ok(status) if status.completed => {
-                    if status.state == "action_success" || status.percent == 100 {
-                        return Ok(());
-                    }
+            let poll = if strict {
+                self.poll_nvue_action_state(action_id).await
+            } else {
+                self.poll_nvue_action_task(action_id)
+                    .await
+                    .map(NvueActionPoll::from_firmware)
+            };
+
+            match poll {
+                Ok(NvueActionPoll::Succeeded) => return Ok(()),
+                Ok(NvueActionPoll::Failed { state, message }) => {
                     // Always embed a stable "failed with state" marker (with any
                     // switch-provided detail appended) so callers can reliably
                     // tell a definitively failed action job apart from a
                     // transport blip.
-                    let mut message =
-                        format!("NVUE action {action_id} failed with state {}", status.state);
-                    if !status.message.is_empty() {
-                        message.push_str(": ");
-                        message.push_str(&status.message);
+                    let mut text = format!("NVUE action {action_id} failed with state {state}");
+                    if !message.is_empty() {
+                        text.push_str(": ");
+                        text.push_str(&message);
                     }
-                    return Err(RmsError::internal(message));
+                    return Err(RmsError::internal(text));
                 }
-                Ok(_) => {}
+                Ok(NvueActionPoll::Running) => {}
                 Err(error) if is_retryable_nvue_transport_error(&error) => {
                     tracing::warn!(
                         node = %self.id,
@@ -844,8 +971,18 @@ impl SwitchGb200Nvidia {
     }
 
     pub(crate) async fn nvue_apply_config_patches(&self, patches: &[(&str, Value)]) -> Result<()> {
+        self.nvue_apply_config_patches_with_outcome(patches)
+            .await
+            .map(|_| ())
+    }
+
+    /// Applies and persists a revision while retaining its no-diff outcome.
+    pub(crate) async fn nvue_apply_config_patches_with_outcome(
+        &self,
+        patches: &[(&str, Value)],
+    ) -> Result<RevisionApplyOutcome> {
         if patches.is_empty() {
-            return Ok(());
+            return Ok(RevisionApplyOutcome::NoConfigDiff);
         }
 
         let revision_id = self.nvue_stage_config_patches(patches).await?;
@@ -902,18 +1039,23 @@ impl SwitchGb200Nvidia {
         }
     }
 
-    pub(crate) async fn nvue_finish_config_revision(&self, revision_id: &str) -> Result<()> {
-        let no_config_diff = self
+    pub(crate) async fn nvue_finish_config_revision(
+        &self,
+        revision_id: &str,
+    ) -> Result<RevisionApplyOutcome> {
+        let outcome = self
             .wait_for_revision_applied_or_no_config_diff(
                 revision_id,
                 Duration::from_secs(config::REVISION_APPLY_TIMEOUT_SECONDS),
                 None,
             )
             .await?;
-        if !no_config_diff {
+
+        if outcome.needs_save() {
             self.save_applied_revision(revision_id).await?;
         }
-        Ok(())
+
+        Ok(outcome)
     }
 
     async fn nvue_get_system_hello(&self) -> Result<()> {
@@ -924,6 +1066,41 @@ impl SwitchGb200Nvidia {
 
     pub(crate) async fn verify_nvue_api_hello(&self) -> Result<()> {
         self.nvue_get_system_hello().await
+    }
+
+    /// One short probe of NVUE, for a poll that only asks whether the API
+    /// answers yet. The short timeout keeps a dead switch from costing 30 s
+    /// per probe; the body is ignored.
+    pub(crate) async fn probe_nvue_reachable(&self) -> Result<()> {
+        const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+        self.nvue_http_get("/nvue_v1/system", PROBE_TIMEOUT)
+            .await
+            .map(|_| ())
+    }
+
+    /// Confirms the switch reports itself booted and healthy.
+    ///
+    /// A switch that answers but is not yet ready fails with
+    /// `FailedPrecondition`, the code a readiness poll retries on. A switch
+    /// that reports a failed boot fails with `Aborted`, so the poll stops:
+    /// waiting will not change that answer. Transport and decode failures
+    /// keep their own codes, so callers can tell "not yet" from "not
+    /// reachable"; a body without the readiness fields is a decode failure.
+    pub(crate) async fn verify_nvos_ready(&self) -> Result<()> {
+        let system = self.nvue_client()?.get_system(NVUE_DEFAULT_TIMEOUT).await?;
+
+        if system.is_ready() {
+            tracing::debug!(node = %self.id, %system, "NVOS ready and healthy");
+            Ok(())
+        } else if system.is_failed() {
+            Err(RmsError::aborted(format!(
+                "NVOS reports a failed boot: {system}"
+            )))
+        } else {
+            Err(RmsError::failed_precondition(format!(
+                "NVOS not ready: {system}"
+            )))
+        }
     }
 
     /// True when a short NVUE connectivity retry may succeed.

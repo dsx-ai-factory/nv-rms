@@ -17,12 +17,13 @@
 
 //! PowerShelfRFTarget implementation for LiteOn/Delta/Megmeet/Flex power shelf platforms.
 //!
-//! Supports both PLDM and tar update methods. BMC resets during update
-//! so task monitoring is not possible after upload.
+//! Supports firmware uploads through HttpPushUri and LiteOn OEM actions.
+//! VR LiteOn all-PSU recovery advances one bounded step per status poll so the
+//! caller retains control of cancellation, poll intervals, and the deadline.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use reqwest::Url;
@@ -36,6 +37,10 @@ use crate::rf_target::{
 use crate::util::{BailAction, Util};
 use crate::utils::Util as NvUtils;
 
+mod liteon_recovery;
+mod pmc_reconciliation;
+use liteon_recovery::LiteonAllPsuTask;
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -48,6 +53,7 @@ const LITEON_PSU_UPDATE_URI: &str =
 const LITEON_PSU_SERIAL_COMPLETE_TASK_ID: &str = "liteon-psu-serial-complete";
 #[cfg(not(test))]
 const LITEON_PSU_SERIAL_SETTLE_SECS: u64 = 30;
+const LITEON_PSU_UPDATE_TIMEOUT: Duration = Duration::from_secs(3600);
 #[cfg(not(test))]
 const LITEON_PSU_SERIAL_MONITOR_TIMEOUT_SECS: u64 = 1800;
 #[cfg(test)]
@@ -74,7 +80,6 @@ const LITEON_PSU_ALL_TARGET_SETTLE_TIMEOUT_SECS: u64 = 1;
 const LITEON_PSU_ALL_TARGET_SETTLE_POLL_INTERVAL_SECS: u64 = 15;
 #[cfg(test)]
 const LITEON_PSU_ALL_TARGET_SETTLE_POLL_INTERVAL_SECS: u64 = 1;
-const POWERSHELF_ON_RESET_UPLOAD_RESPONSE_TIMEOUT_SECS: u64 = 60;
 #[cfg(not(test))]
 const POWERSHELF_RESET_RECOVERY_ATTEMPTS: u32 = 24;
 #[cfg(test)]
@@ -88,7 +93,37 @@ const POWERSHELF_RESET_RECOVERY_PROBE_TIMEOUT_SECS: u64 = 5;
 #[cfg(test)]
 const POWERSHELF_RESET_RECOVERY_PROBE_TIMEOUT_SECS: u64 = 1;
 
-static LITEON_PSU_ALL_TASK_UPDATE_FILES: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+static LITEON_PSU_ALL_TASKS: OnceLock<Mutex<HashMap<String, Arc<LiteonAllPsuTask>>>> =
+    OnceLock::new();
+
+/// LiteOn models whose direct OEM per-PSU updates do not take effect.
+///
+/// PF-1114-1RD (VR NVL72) exposes the OEM `PowerUnits` inventory at its fixed
+/// URI even though Redfish discovery does not link to it. Direct OEM PSU
+/// updates do not take effect, so inventory availability must not enable them.
+const LITEON_UNSUPPORTED_OEM_PSU_UPDATE_MODELS: &[&str] = &["pf-1114-1rd"];
+
+/// Return whether `model` must use HttpPushUri instead of OEM per-PSU updates.
+///
+/// This restriction is independent of OEM inventory access. Initial LiteOn PSU
+/// requests resolve the shelf model before selecting an update path.
+fn liteon_oem_psu_update_unsupported(model: &str) -> bool {
+    let model_lower = model.trim().to_ascii_lowercase();
+    LITEON_UNSUPPORTED_OEM_PSU_UPDATE_MODELS
+        .iter()
+        .any(|excluded| model_lower.starts_with(excluded))
+}
+
+/// Return whether `model` is a LiteOn shelf with OEM `PowerUnits` inventory.
+///
+/// Probe the fixed URI, including on PF-1114-1RD where discovery omits it.
+/// This identifies readable inventory, not support for OEM firmware updates.
+pub(crate) fn liteon_oem_powerunits_shelf(model: &str) -> bool {
+    let model_lower = model.trim().to_ascii_lowercase();
+    model_lower.contains("liteon")
+        || model_lower.starts_with("pf-1333")
+        || model_lower.starts_with("pf-1114")
+}
 
 // ---------------------------------------------------------------------------
 // PowerShelfRFTarget
@@ -242,7 +277,98 @@ fn task_id_from_task_member_uri(uri: &str) -> Option<String> {
     Some(task_id.to_string())
 }
 
+/// Attempts at reading the shelf model before a LiteOn PSU update gives up.
+const SHELF_MODEL_ATTEMPTS: u32 = 3;
+#[cfg(not(test))]
+const SHELF_MODEL_RETRY_DELAY: Duration = Duration::from_secs(3);
+#[cfg(test)]
+const SHELF_MODEL_RETRY_DELAY: Duration = Duration::from_millis(20);
+
+enum ShelfModelLookup {
+    Found(String),
+    /// The shelf is identified wrongly (several or no shelves, empty model).
+    Rejected,
+    /// A read failed and may succeed on a retry.
+    Failed,
+}
+
 impl PowerShelfRFTarget {
+    /// Select the shelf chassis, never a manager or an individual PSU's model.
+    ///
+    /// LiteOn shelves expose exactly one `powershelf*` chassis with a populated
+    /// `Model`. Zero or several `powershelf*` members or an empty `Model` yield
+    /// `None` at once. A GET that fails (transport error, timeout, non-success
+    /// status, unreadable body) is retried a few times in case it is transient
+    /// and also yields `None` if it keeps failing. A LiteOn PSU update then fails
+    /// before any upload instead of guessing the shelf type.
+    async fn resolve_shelf_model(&self) -> Option<String> {
+        if !self.bmc_access.model.trim().is_empty()
+            && !self.bmc_access.model.eq_ignore_ascii_case("N/A")
+        {
+            return Some(self.bmc_access.model.clone());
+        }
+        for attempt in 1..=SHELF_MODEL_ATTEMPTS {
+            match self.lookup_shelf_model_once().await {
+                ShelfModelLookup::Found(model) => return Some(model),
+                ShelfModelLookup::Rejected => return None,
+                ShelfModelLookup::Failed if attempt < SHELF_MODEL_ATTEMPTS => {
+                    tokio::time::sleep(SHELF_MODEL_RETRY_DELAY).await;
+                }
+                ShelfModelLookup::Failed => {}
+            }
+        }
+        None
+    }
+
+    async fn lookup_shelf_model_once(&self) -> ShelfModelLookup {
+        let lookup = tokio::time::timeout(Duration::from_secs(60), async {
+            let Some(collection) = self.get_chassis_json("/redfish/v1/Chassis").await else {
+                return ShelfModelLookup::Failed;
+            };
+            let Some(members) = collection.get("Members").and_then(Value::as_array) else {
+                return ShelfModelLookup::Rejected;
+            };
+            let mut shelves = members
+                .iter()
+                .filter_map(|member| member.get("@odata.id")?.as_str())
+                .filter(|uri| {
+                    uri.trim_end_matches('/')
+                        .rsplit('/')
+                        .next()
+                        .is_some_and(|id| id.to_ascii_lowercase().starts_with("powershelf"))
+                });
+            let (Some(uri), None) = (shelves.next(), shelves.next()) else {
+                return ShelfModelLookup::Rejected;
+            };
+            let Some(shelf) = self.get_chassis_json(uri).await else {
+                return ShelfModelLookup::Failed;
+            };
+            match shelf
+                .get("Model")
+                .and_then(Value::as_str)
+                .filter(|model| !model.trim().is_empty() && !model.eq_ignore_ascii_case("N/A"))
+            {
+                Some(model) => ShelfModelLookup::Found(model.to_owned()),
+                None => ShelfModelLookup::Rejected,
+            }
+        })
+        .await;
+        lookup.unwrap_or(ShelfModelLookup::Failed)
+    }
+
+    /// GET a chassis resource as JSON; `None` for any transport or read failure.
+    async fn get_chassis_json(&self, uri: &str) -> Option<Value> {
+        let response = self
+            .bmc_access
+            .dispatch_get_response(uri, Duration::from_secs(60))
+            .await
+            .ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        response.json().await.ok()
+    }
+
     pub fn new(bmc_access: BmcAccess, config_dict: Option<Value>) -> Self {
         Self {
             bmc_access,
@@ -377,8 +503,8 @@ impl PowerShelfRFTarget {
         is_powershelf_on_reset_handoff_task(task)
     }
 
-    fn liteon_psu_all_task_registry() -> &'static Mutex<HashMap<String, String>> {
-        LITEON_PSU_ALL_TASK_UPDATE_FILES.get_or_init(|| Mutex::new(HashMap::new()))
+    fn liteon_psu_all_task_registry() -> &'static Mutex<HashMap<String, Arc<LiteonAllPsuTask>>> {
+        LITEON_PSU_ALL_TASKS.get_or_init(|| Mutex::new(HashMap::new()))
     }
 
     fn liteon_psu_all_task_registry_key(&self, task_id: &str) -> String {
@@ -389,14 +515,45 @@ impl PowerShelfRFTarget {
         )
     }
 
-    fn register_liteon_psu_all_task_for_repair(&self, task_id: &str, update_file: &str) {
+    /// Drop every retained recovery entry for this shelf.
+    ///
+    /// RMS serializes updates per node, so a new upload supersedes earlier
+    /// recovery state. PMC task IDs restart after a reboot; a stale entry keyed
+    /// by the same ID would otherwise capture a later PMC or PSU task and
+    /// replay its cached terminal result.
+    fn clear_liteon_psu_all_tasks_for_shelf(&self) {
+        let prefix = format!("{}|", self.bmc_access.base_url.trim_end_matches('/'));
+        if let Ok(mut registry) = Self::liteon_psu_all_task_registry().lock() {
+            registry.retain(|key, _| !key.starts_with(&prefix));
+        }
+    }
+
+    fn register_liteon_psu_all_task_for_repair(
+        &self,
+        task_id: &str,
+        update_file: &str,
+        started: Instant,
+    ) {
         let key = self.liteon_psu_all_task_registry_key(task_id);
         if let Ok(mut registry) = Self::liteon_psu_all_task_registry().lock() {
-            registry.insert(key, update_file.to_string());
+            registry.insert(
+                key,
+                Arc::new(LiteonAllPsuTask::new(
+                    update_file,
+                    &self.bmc_access.model,
+                    task_id,
+                    started,
+                )),
+            );
         }
     }
 
     fn liteon_psu_all_task_update_file(&self, task_id: &str) -> Option<String> {
+        self.liteon_psu_all_task(task_id)
+            .map(|task| task.update_file.clone())
+    }
+
+    fn liteon_psu_all_task(&self, task_id: &str) -> Option<Arc<LiteonAllPsuTask>> {
         let key = self.liteon_psu_all_task_registry_key(task_id);
         Self::liteon_psu_all_task_registry()
             .lock()
@@ -441,24 +598,32 @@ impl PowerShelfRFTarget {
             && !Self::liteon_psu_status_is_failure(task.get("TaskStatus").and_then(Value::as_str))
     }
 
-    /// Return existing TaskService entries that already look like OnReset handoff.
-    async fn on_reset_handoff_tasks(&self) -> Vec<(String, Value)> {
+    /// Read complete TaskService membership. Baselines retain all IDs, including
+    /// tasks that have not reached handoff yet. A failed read is not an empty set.
+    async fn on_reset_handoff_tasks(&self, require_handoff: bool) -> Option<Vec<(String, Value)>> {
         let (status, tasks) = self
             .target_access()
             .dispatch_request("GET", "/redfish/v1/TaskService/Tasks", None, None)
             .await;
         if !status {
-            return Vec::new();
+            return None;
         }
 
         let Some(members) = tasks.get("Members").and_then(Value::as_array) else {
-            return Vec::new();
+            return None;
         };
+        if tasks.get("Members@odata.nextLink").is_some()
+            || tasks
+                .get("Members@odata.count")
+                .is_some_and(|count| count.as_u64() != Some(members.len() as u64))
+        {
+            return None;
+        }
 
         let mut handoff_tasks = Vec::new();
         for member in members {
             let Some(raw_uri) = member.get("@odata.id").and_then(Value::as_str) else {
-                continue;
+                return None;
             };
             let Ok(uri) = Self::same_origin_redfish_path(
                 &self.bmc_access.base_url,
@@ -469,20 +634,23 @@ impl PowerShelfRFTarget {
                     "Ignoring unsafe PowerShelf TaskService member URI: {}",
                     NvUtils::sanitize_log(raw_uri.trim())
                 );
-                continue;
+                return None;
             };
             let Some(task_id) = task_id_from_task_member_uri(&uri) else {
-                continue;
+                return None;
             };
             let (task_ok, task) = self
                 .target_access()
                 .dispatch_request("GET", &uri, None, None)
                 .await;
-            if task_ok && Self::is_on_reset_handoff_task(&task) {
+            if !task_ok {
+                return None;
+            }
+            if !require_handoff || Self::is_on_reset_handoff_task(&task) {
                 handoff_tasks.push((task_id, task));
             }
         }
-        handoff_tasks
+        Some(handoff_tasks)
     }
 
     /// Find the handoff task created by the current upload attempt.
@@ -490,8 +658,8 @@ impl PowerShelfRFTarget {
         &self,
         existing_task_ids: &HashSet<String>,
     ) -> Option<(String, Value)> {
-        self.on_reset_handoff_tasks()
-            .await
+        self.on_reset_handoff_tasks(true)
+            .await?
             .into_iter()
             .rev()
             .find(|(task_id, _)| !existing_task_ids.contains(task_id))
@@ -553,10 +721,7 @@ impl PowerShelfRFTarget {
 
     /// Return whether the target should probe the LiteOn-only PowerUnits tree.
     fn liteon_powerunits_inventory_supported(model: &str) -> bool {
-        let model_lower = model.to_ascii_lowercase();
-        model_lower.contains("liteon")
-            || model_lower.starts_with("pf-1333")
-            || model_lower.starts_with("pf-1114")
+        liteon_oem_powerunits_shelf(model)
     }
 
     /// Check if a PLDM package contains the Delta PMC UUID by inspecting
@@ -884,13 +1049,22 @@ impl PowerShelfRFTarget {
     }
 
     /// Infer PSU intent from LiteOn package naming when no explicit targets exist.
+    ///
+    /// LiteOn PSU packages are named after the PSU model (`SP-2552-7RD...`,
+    /// `SP_2183_1RD...`) and carry a `D2DApp` image marker. Both the hyphen and
+    /// underscore spellings ship, so both must be recognized; otherwise a PSU
+    /// package silently takes the PMC push path.
     fn looks_like_liteon_psu_package(update_file: &str) -> bool {
         Path::new(update_file)
             .file_name()
             .and_then(|name| name.to_str())
             .map(|name| {
                 let name = name.to_ascii_lowercase();
-                name.starts_with("sp-") || name.contains("liteon-psu") || name.contains("_psu")
+                name.starts_with("sp-")
+                    || name.starts_with("sp_")
+                    || name.contains("liteon-psu")
+                    || name.contains("_psu")
+                    || name.contains(".d2dapp")
             })
             .unwrap_or(false)
     }
@@ -926,9 +1100,23 @@ impl PowerShelfRFTarget {
     }
 
     /// Extract the expected PSU version pair from package names like `..._F6F8_...`.
+    ///
+    /// The hyphenated naming (`SP-2552-7RD_F1F1_...`) keeps the model in its
+    /// first `_` token, so the first four-character hex token is the version.
+    /// The fully underscore-separated naming
+    /// (`SP_2183_1RD_Security_Bootloader_0707_...`) spreads the model over the
+    /// leading `SP`, model-number, and revision tokens; those are skipped so the
+    /// model digits (`2183`) are never read as the version (`0707`).
     fn liteon_psu_package_target_version(update_file: &str) -> Option<(u8, u8)> {
+        const UNDERSCORE_MODEL_TOKENS: usize = 3;
+
         let filename = Path::new(update_file).file_name()?.to_str()?;
-        filename.split('_').find_map(|part| {
+        let skip = if filename.to_ascii_lowercase().starts_with("sp_") {
+            UNDERSCORE_MODEL_TOKENS
+        } else {
+            0
+        };
+        filename.split('_').skip(skip).find_map(|part| {
             if part.len() == 4 && part.chars().all(|ch| ch.is_ascii_hexdigit()) {
                 Some((
                     u8::from_str_radix(&part[0..2], 16).ok()?,
@@ -1889,6 +2077,21 @@ impl PowerShelfRFTarget {
 
 #[async_trait::async_trait]
 impl RFTarget for PowerShelfRFTarget {
+    async fn get_firmware_inventory(
+        &self,
+        trace: crate::util::TraceFlags,
+        json_output: Option<&mut Value>,
+        model: Option<&str>,
+    ) -> (bool, i32, serde_json::Map<String, Value>) {
+        let resolved = match model.filter(|model| !model.trim().is_empty()) {
+            Some(model) => Some(model.to_owned()),
+            None => self.resolve_shelf_model().await,
+        };
+        self.bmc_access
+            .get_firmware_inventory(trace, json_output, resolved.as_deref())
+            .await
+    }
+
     // ------------------------------------------------------------------
     // Accessors
     // ------------------------------------------------------------------
@@ -2065,9 +2268,7 @@ impl RFTarget for PowerShelfRFTarget {
         };
         let post_result = self
             .bmc_access
-            .client
-            .post(&full_url)
-            .basic_auth(&self.bmc_access.user, Some(&self.bmc_access.password))
+            .apply_auth(self.bmc_access.client.post(&full_url))
             .header("Content-Type", "application/json")
             .json(&body)
             .timeout(Duration::from_secs(30))
@@ -2348,6 +2549,20 @@ impl RFTarget for PowerShelfRFTarget {
             return (status, response_dict);
         }
 
+        if let Some(task) = self.liteon_psu_all_task(task_id) {
+            // RMS builds a fresh, model-less target for each poll. Use the
+            // identity captured at upload, never the first arbitrary chassis.
+            if liteon_oem_psu_update_unsupported(&task.model) {
+                let result = self.poll_liteon_all_psu_recovery(task_id, &task).await;
+                if let Some(ref mut pj) = print_json {
+                    if let Some(output) = pj.get_mut("Output").and_then(Value::as_array_mut) {
+                        output.push(NvUtils::redact_secret_json_value(&result.1));
+                    }
+                }
+                return result;
+            }
+        }
+
         let task_service_uri = self.get_task_service_uri(task_id);
         let (status, response_dict) = self
             .target_access()
@@ -2356,6 +2571,10 @@ impl RFTarget for PowerShelfRFTarget {
 
         if status {
             if Self::redfish_task_failed_for_liteon_psu_repair(&response_dict) {
+                if liteon_oem_psu_update_unsupported(&self.bmc_access.model) {
+                    self.clear_liteon_psu_all_task_for_repair(task_id);
+                    return (status, response_dict);
+                }
                 if let Some(update_file) = self.liteon_psu_all_task_update_file(task_id) {
                     let repaired_details = self
                         .repair_failed_liteon_all_psu_task(task_id, &update_file, print_json)
@@ -2406,9 +2625,11 @@ impl RFTarget for PowerShelfRFTarget {
 
     /// Perform firmware update for power shelf platforms.
     ///
-    /// - LiteOn PSU with explicit `LiteOnPowerDeviceId`: direct OEM single-PSU update.
+    /// - PF-1114-1RD: all-PSU HttpPushUri updates; reject OEM per-PSU updates.
+    /// - Other LiteOn shelves with explicit `LiteOnPowerDeviceId`: direct OEM single-PSU update.
     /// - Standard tar/push-URI: sets ApplyTime, then uploads via push URI. If this
-    ///   fails for a LiteOn PSU request, fallback updates each PSU serially.
+    ///   fails for a LiteOn PSU request, fallback updates each PSU serially only
+    ///   on models supporting the OEM update action.
     /// - PLDM: uses multipart upload.
     async fn update_component(
         &mut self,
@@ -2419,8 +2640,47 @@ impl RFTarget for PowerShelfRFTarget {
         mut json_dict: Option<&mut Value>,
         parallel_update: bool,
     ) -> Option<String> {
+        let update_started = Instant::now();
+        self.clear_liteon_psu_all_tasks_for_shelf();
+        let liteon_device_id = Self::get_liteon_device_id(cmd_args).await;
+        let is_liteon_psu_request =
+            liteon_device_id.is_some() || Self::is_liteon_psu_update_request(cmd_args, update_file);
+
+        if is_liteon_psu_request {
+            let Some(model) = self.resolve_shelf_model().await else {
+                Self::record_json_error(
+                    json_dict.as_deref_mut(),
+                    "Cannot identify the power shelf model for a LiteOn PSU update",
+                    None,
+                );
+                return None;
+            };
+            self.bmc_access.model = model;
+        }
+
+        // OEM inventory exists on PF-1114-1RD, but its direct OEM PSU updates
+        // do not take effect. All-PSU requests continue through HttpPushUri;
+        // only explicit OEM per-PSU selectors are rejected.
+        if liteon_device_id.is_some() && liteon_oem_psu_update_unsupported(&self.bmc_access.model) {
+            let message = format!(
+                "Error: per-PSU firmware update is not supported on power shelf model '{}'. \
+                 The LiteOn OEM PowerUnits inventory is available, but direct OEM PSU updates \
+                 do not take effect. Use an all-PSU update through UpdateService.HttpPushUri instead.",
+                self.bmc_access.model
+            );
+            Self::record_json_error(json_dict.as_deref_mut(), &message, None);
+            Util::bail_nvfwupd_threadsafe(
+                1,
+                &message,
+                BailAction::DoNothing,
+                json_dict.as_deref(),
+                parallel_update,
+            );
+            return None;
+        }
+
         // Check for LiteOn PSU update path
-        if let Some(device_id) = Self::get_liteon_device_id(cmd_args).await {
+        if let Some(device_id) = liteon_device_id {
             return self
                 .update_liteon_psu(
                     update_file,
@@ -2468,24 +2728,46 @@ impl RFTarget for PowerShelfRFTarget {
             return None;
         }
 
-        let is_liteon_psu_request = Self::is_liteon_psu_update_request(cmd_args, update_file);
         let is_on_reset_request = apply_time.eq_ignore_ascii_case("OnReset");
-        let existing_on_reset_handoff_task_ids: HashSet<String> =
-            if is_on_reset_request && !is_liteon_psu_request {
-                self.on_reset_handoff_tasks()
-                    .await
-                    .into_iter()
-                    .map(|(task_id, _)| task_id)
-                    .collect()
-            } else {
-                HashSet::new()
-            };
-        let upload_timeout = if is_on_reset_request && !is_liteon_psu_request {
-            time_out.min(POWERSHELF_ON_RESET_UPLOAD_RESPONSE_TIMEOUT_SECS)
+        let pmc_before = if is_on_reset_request && !is_liteon_psu_request {
+            self.legacy_pmc_snapshot().await
         } else {
-            time_out
+            None
         };
-        let (status, response_dict) = if is_liteon_psu_request {
+        let existing_on_reset_handoff_task_ids: Option<HashSet<String>> =
+            if is_on_reset_request && !is_liteon_psu_request {
+                self.on_reset_handoff_tasks(false)
+                    .await
+                    .map(|tasks| tasks.into_iter().map(|(task_id, _)| task_id).collect())
+            } else {
+                None
+            };
+        // The HTTP deadline covers streaming the entire package, not just waiting
+        // for the response. Large PMC images need the caller's upload budget even
+        // for OnReset; task reconciliation below still handles a lost response.
+        let upload_timeout = time_out;
+        let (status, response_dict) = if is_liteon_psu_request
+            && liteon_oem_psu_update_unsupported(&self.bmc_access.model)
+        {
+            // One deadline includes the initial upload and every later re-push.
+            // Do not replay an uncertain initial POST through the legacy retry helper.
+            let remaining = LITEON_PSU_UPDATE_TIMEOUT.saturating_sub(update_started.elapsed());
+            if remaining.is_zero() {
+                (
+                    false,
+                    json!({"error": "All-PSU update exceeded its one-hour deadline"}),
+                )
+            } else {
+                tokio::time::timeout(
+                    remaining,
+                    self.target_access().dispatch_file_upload(
+                        update_uri, update_file, upload_timeout, None, parallel_update, None,
+                    ),
+                ).await.unwrap_or_else(|_| (false, json!({
+                    "error": "All-PSU update exceeded its one-hour deadline during upload; outcome unknown"
+                })))
+            }
+        } else if is_liteon_psu_request {
             self.dispatch_liteon_psu_update_post_with_retry(
                 update_uri,
                 update_file,
@@ -2507,8 +2789,35 @@ impl RFTarget for PowerShelfRFTarget {
                 .await
         };
 
+        // A lost response (or a successful response with no task) can leave a
+        // staged image behind. Preserve the known task-based handoff first.
+        if is_on_reset_request
+            && !is_liteon_psu_request
+            && (!status || task_id_from_update_response(&response_dict).is_none())
+        {
+            if let Some(existing_ids) = existing_on_reset_handoff_task_ids.as_ref() {
+                if let Some((task_id, task)) = self.new_on_reset_handoff_task(existing_ids).await {
+                    Self::push_on_reset_handoff_task_json(
+                        json_dict.as_deref_mut(),
+                        &task_id,
+                        &task,
+                    );
+                    return Some(task_id);
+                }
+            }
+            if let Some(before) = pmc_before.as_ref() {
+                let recovery = self.reconcile_legacy_pmc_upload(before).await;
+                let message = "PMC upload returned no task; activation readiness is unproven. \
+                    Firmware may be staged: stop without rebooting or replaying the upload.";
+                let details = json!({"recovery": recovery, "upload_response": response_dict});
+                Self::record_json_error(json_dict.as_deref_mut(), message, Some(&details));
+                tracing::warn!("{message}");
+                return None;
+            }
+        }
+
         if !status {
-            if is_liteon_psu_request {
+            if is_liteon_psu_request && !liteon_oem_psu_update_unsupported(&self.bmc_access.model) {
                 if let Some(task_id) = self
                     .update_liteon_psus_serial(
                         update_file,
@@ -2532,28 +2841,16 @@ impl RFTarget for PowerShelfRFTarget {
                 return None;
             }
 
-            if is_on_reset_request {
-                if let Some((task_id, task)) = self
-                    .new_on_reset_handoff_task(&existing_on_reset_handoff_task_ids)
-                    .await
-                {
-                    Self::push_on_reset_handoff_task_json(
-                        json_dict.as_deref_mut(),
-                        &task_id,
-                        &task,
-                    );
-                    return Some(task_id);
-                }
-            }
-
+            let message = format!(
+                "File upload failed with error {:?}",
+                NvUtils::redact_secret_json_value(&response_dict)
+            );
+            Self::record_json_error(json_dict.as_deref_mut(), &message, Some(&response_dict));
             Util::bail_nvfwupd_threadsafe(
                 1,
-                &format!(
-                    "File upload failed with error {:?}",
-                    NvUtils::redact_secret_json_value(&response_dict)
-                ),
+                &message,
                 BailAction::DoNothing,
-                None,
+                json_dict.as_deref(),
                 parallel_update,
             );
             return None;
@@ -2568,7 +2865,7 @@ impl RFTarget for PowerShelfRFTarget {
         let task_id = task_id_from_update_response(&response_dict);
         if is_liteon_psu_request {
             if let Some(task_id) = task_id.as_deref() {
-                self.register_liteon_psu_all_task_for_repair(task_id, update_file);
+                self.register_liteon_psu_all_task_for_repair(task_id, update_file, update_started);
             }
         }
         task_id
@@ -2700,7 +2997,7 @@ impl RFTarget for PowerShelfRFTarget {
     async fn get_identifier_from_chassis(&self, ap_inv_uri: &str) -> Option<String> {
         let (status, fw_inv_dict) = self
             .target_access()
-            .dispatch_request("GET", ap_inv_uri, None, None)
+            .dispatch_request_full("GET", ap_inv_uri, None, None, 30, true, None)
             .await;
         if !status {
             return None;
@@ -2720,7 +3017,7 @@ impl RFTarget for PowerShelfRFTarget {
 
         let (ok, related_dict) = self
             .target_access()
-            .dispatch_request("GET", related_uri, None, None)
+            .dispatch_request_full("GET", related_uri, None, None, 30, true, None)
             .await;
         if !ok {
             return None;
@@ -2872,6 +3169,109 @@ mod tests {
         assert!(PowerShelfRFTarget::liteon_powerunits_inventory_supported(
             "LiteOn PowerShelf"
         ));
+    }
+
+    #[test]
+    fn pf_1114_1rd_inventory_is_independent_of_psu_update_support() {
+        // The undiscoverable OEM inventory is readable, but its presence does
+        // not establish support for the OEM PSU update action.
+        for model in ["PF-1114-1RD", "pf-1114-1rd", "  PF-1114-1RD  "] {
+            assert!(
+                liteon_oem_powerunits_shelf(model),
+                "model {model} must expose the LiteOn OEM inventory"
+            );
+            assert!(PowerShelfRFTarget::liteon_powerunits_inventory_supported(
+                model
+            ));
+            assert!(liteon_oem_psu_update_unsupported(model));
+        }
+
+        // Existing OEM-generation shelves keep the OEM path.
+        for model in [
+            "PF-1333-7R",
+            "PF-1333-13RD",
+            "PF-1114-1R",
+            "LiteOn PowerShelf",
+        ] {
+            assert!(
+                liteon_oem_powerunits_shelf(model),
+                "model {model} must keep the LiteOn OEM path"
+            );
+            assert!(!liteon_oem_psu_update_unsupported(model));
+        }
+
+        // Non-LiteOn shelves are unaffected.
+        for model in [
+            "NVD-P-0000ADT00",
+            "AHE50V2200A",
+            "MPSC8000-MCU",
+            "",
+            "unknown",
+        ] {
+            assert!(!liteon_oem_powerunits_shelf(model));
+            assert!(!liteon_oem_psu_update_unsupported(model));
+        }
+    }
+
+    #[tokio::test]
+    async fn pf_1114_1rd_reads_psu_model_from_undiscoverable_oem_inventory() {
+        let server = MockServer::start().await;
+        let powerunit_uri = format!("{LITEON_POWERUNITS_URI}/powerdevice1");
+        Mock::given(method("GET"))
+            .and(path(LITEON_POWERUNITS_URI))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "Members": [{"@odata.id": powerunit_uri}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(&powerunit_uri))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "Model": "SP-2183-1RD"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut access = BmcAccess::mock_with_base_url(server.uri(), "mock-vr-liteon");
+        access.model = "PF-1114-1RD".to_string();
+        let target = PowerShelfRFTarget::new(access, None);
+
+        assert_eq!(
+            target
+                .get_liteon_model_from_inventory("powerdevice1")
+                .await
+                .as_deref(),
+            Some("SP-2183-1RD")
+        );
+    }
+
+    #[test]
+    fn liteon_psu_package_naming_covers_hyphen_and_underscore_spellings() {
+        for package in [
+            "SP-2552-7RD_F1F1_Bootloader_20250611.D2DAppA.tar",
+            "SP_2183_1RD_Security_Bootloader_0707_20260814.D2DAppA.fwpkg",
+            "LiteOnPSUPackages/SP-2552-7RD_F1F1_Bootloader_20250611.D2DAppA.tar",
+            "liteon-psu-image.tar",
+        ] {
+            assert!(
+                PowerShelfRFTarget::looks_like_liteon_psu_package(package),
+                "package {package} must be recognized as a PSU package"
+            );
+        }
+
+        // PMC packages must keep taking the push-URI path.
+        for package in [
+            "cm14mp2rd-r1.3.9-rc1.tar",
+            "LiteOnPMCImages/cm14mp2rd-r1.3.9-rc1.tar",
+            "nvfw_DGX_0009_250101.1.0.fwpkg",
+        ] {
+            assert!(
+                !PowerShelfRFTarget::looks_like_liteon_psu_package(package),
+                "package {package} must not be treated as a PSU package"
+            );
+        }
     }
 
     #[tokio::test]
@@ -3365,6 +3765,19 @@ mod tests {
             ),
             Some((0x06, 0x08))
         );
+        // Underscore-separated naming: the model digits `2183` are not the version.
+        assert_eq!(
+            PowerShelfRFTarget::liteon_psu_package_target_version(
+                "SP_2183_1RD_Security_Bootloader_0707_20260814.D2DAppA.fwpkg"
+            ),
+            Some((0x07, 0x07))
+        );
+        assert_eq!(
+            PowerShelfRFTarget::liteon_psu_package_target_version(
+                "SP_2183_1RD_Security_Bootloader_20260814.D2DAppA.fwpkg"
+            ),
+            None
+        );
         assert_eq!(
             PowerShelfRFTarget::parse_liteon_psu_version_pair("0xf6 / 0xf8"),
             Some((0xf6, 0xf8))
@@ -3570,6 +3983,260 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn explicit_oem_psu_update_is_rejected_on_pf_1114_1rd() {
+        let server = MockServer::start().await;
+        // Neither the PMC push URI nor the OEM PSU action may be touched.
+        Mock::given(method("POST"))
+            .and(path("/redfish/v1/UpdateService/update"))
+            .respond_with(ResponseTemplate::new(202).set_body_json(json!({})))
+            .expect(0)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(
+                "/redfish/v1/Chassis/powershelf/Power/Oem/LiteOn/PowerUnits/Actions/UpdateService/",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let update_file = tmp
+            .path()
+            .join("SP_2183_1RD_Security_Bootloader_0707_20260814.D2DAppA.fwpkg");
+        tokio::fs::write(&update_file, b"liteon psu firmware")
+            .await
+            .unwrap();
+
+        let mut bmc_access = BmcAccess::mock_with_base_url(server.uri(), "mock-vr-liteon");
+        bmc_access.model = "PF-1114-1RD".to_string();
+        let mut target = PowerShelfRFTarget::new(bmc_access, None);
+        let mut output = json!({
+            "Output": [],
+            "Error": [],
+            "Error Code": 0
+        });
+
+        let task_id = target
+            .update_component(
+                &cmd_args(Some(vec![json!({"LiteOnPowerDeviceId": "1"}).to_string()])),
+                "/redfish/v1/UpdateService/update",
+                update_file.to_str().unwrap(),
+                30,
+                Some(&mut output),
+                false,
+            )
+            .await;
+
+        assert!(task_id.is_none());
+        let error = output["Error"][0].as_str().unwrap();
+        assert!(
+            error.contains("per-PSU firmware update is not supported"),
+            "unexpected error: {error}"
+        );
+        assert!(error.contains("PF-1114-1RD"), "unexpected error: {error}");
+        assert!(
+            error.contains("OEM PowerUnits inventory is available"),
+            "unexpected error: {error}"
+        );
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn pf_1114_1rd_all_psu_updates_use_http_push_uri_without_oem_fallback() {
+        for (upload_status, task_status, task_state) in [
+            (202, 200, "Completed"),
+            (400, 200, "Exception"),
+            (202, 200, "Exception"),
+            (202, 404, "Exception"),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("PATCH"))
+                .and(path("/redfish/v1/UpdateService"))
+                .and(body_string_contains("Immediate"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/redfish/v1/UpdateService/update"))
+                .and(body_string_contains("liteon psu firmware"))
+                .respond_with(ResponseTemplate::new(upload_status).set_body_json(
+                    if upload_status == 202 {
+                        json!({"@odata.id": "/redfish/v1/TaskService/Tasks/Task-AllPsu"})
+                    } else {
+                        json!({"error": {"code": "Base.1.0.GeneralError"}})
+                    },
+                ))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/redfish/v1/TaskService/Tasks/Task-AllPsu"))
+                .respond_with(ResponseTemplate::new(task_status).set_body_json(json!({
+                    "Id": "Task-AllPsu",
+                    "TaskState": task_state,
+                    "TaskStatus": if task_state == "Completed" { "OK" } else { "Critical" },
+                    "PercentComplete": 100
+                })))
+                .expect(if upload_status == 202 { 1 } else { 0 })
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/redfish/v1/TaskService/Tasks"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({"Members": []})))
+                .expect(if upload_status == 202 && task_status == 404 {
+                    1
+                } else {
+                    0
+                })
+                .mount(&server)
+                .await;
+            let members: Vec<Value> = (1..=6)
+                .map(|id| json!({"@odata.id": format!("{LITEON_POWERUNITS_URI}/powerdevice{id}")}))
+                .collect();
+            let inventory_reads = if task_state == "Completed" { 1 } else { 0 };
+            Mock::given(method("GET"))
+                .and(path(LITEON_POWERUNITS_URI))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({"Members": members})))
+                .expect(inventory_reads)
+                .mount(&server)
+                .await;
+            for id in 1..=6 {
+                Mock::given(method("GET"))
+                    .and(path(format!("{LITEON_POWERUNITS_URI}/powerdevice{id}")))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                        "Version": "0x6 / 0x6",
+                        "state": "Standby",
+                        "status": "OK",
+                        "updateProgress": 0
+                    })))
+                    .expect(inventory_reads)
+                    .mount(&server)
+                    .await;
+            }
+            Mock::given(method("POST"))
+                .and(path(LITEON_PSU_UPDATE_URI))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(0)
+                .mount(&server)
+                .await;
+
+            let tmp = tempfile::tempdir().unwrap();
+            let update_file = tmp
+                .path()
+                .join("SP-2183-1RD_Bootloader_0606_20260713.fwpkg");
+            tokio::fs::write(&update_file, b"liteon psu firmware")
+                .await
+                .unwrap();
+            let mut access = BmcAccess::mock_with_base_url(server.uri(), "mock-vr-liteon");
+            access.model = "PF-1114-1RD".to_string();
+            let mut target = PowerShelfRFTarget::new(access, None);
+            let mut output = json!({"Output": [], "Error": [], "Error Code": 0});
+            let task_id = target
+                .update_component(
+                    &cmd_args(None),
+                    "/redfish/v1/UpdateService/update",
+                    update_file.to_str().unwrap(),
+                    30,
+                    Some(&mut output),
+                    false,
+                )
+                .await;
+
+            if upload_status == 202 {
+                assert_eq!(task_id.as_deref(), Some("Task-AllPsu"));
+                let (ok, task) = target
+                    .query_job_status("Task-AllPsu", Some(&mut output))
+                    .await;
+                assert!(ok);
+                assert_eq!(task["TaskState"], "Running");
+                if task_state == "Completed" {
+                    let (ok, task) = target
+                        .query_job_status("Task-AllPsu", Some(&mut output))
+                        .await;
+                    assert!(ok);
+                    assert_eq!(task["TaskState"], "Completed");
+                    let validation = output["Output"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|entry| entry["stage"] == "liteon_psu_all_validation")
+                        .expect("all six PSU versions must be validated after task completion");
+                    assert_eq!(validation["devices"].as_array().unwrap().len(), 6);
+                }
+            } else {
+                assert!(task_id.is_none());
+                assert!(output["Error"][0]
+                    .as_str()
+                    .unwrap()
+                    .contains("File upload failed"));
+            }
+            target.clear_liteon_psu_all_task_for_repair("Task-AllPsu");
+            assert!(server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .all(|request| {
+                    request.method == wiremock::http::Method::Get
+                        || matches!(
+                            request.url.path(),
+                            "/redfish/v1/UpdateService" | "/redfish/v1/UpdateService/update"
+                        )
+                }));
+        }
+    }
+
+    #[tokio::test]
+    async fn pmc_package_still_pushes_on_pf_1114_1rd() {
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/redfish/v1/UpdateService"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/redfish/v1/UpdateService/update"))
+            .and(body_string_contains("pmc firmware"))
+            .respond_with(ResponseTemplate::new(202).set_body_json(json!({
+                "@odata.id": "/redfish/v1/TaskService/Tasks/Task-PMC"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let update_file = tmp.path().join("cm14mp3rd-r1.0.0.tar");
+        tokio::fs::write(&update_file, b"pmc firmware")
+            .await
+            .unwrap();
+
+        let mut bmc_access = BmcAccess::mock_with_base_url(server.uri(), "mock-vr-liteon");
+        bmc_access.model = "PF-1114-1RD".to_string();
+        let mut target = PowerShelfRFTarget::new(bmc_access, None);
+        let mut output = json!({
+            "Output": [],
+            "Error": [],
+            "Error Code": 0
+        });
+
+        let task_id = target
+            .update_component(
+                &cmd_args(None),
+                "/redfish/v1/UpdateService/update",
+                update_file.to_str().unwrap(),
+                30,
+                Some(&mut output),
+                false,
+            )
+            .await;
+
+        assert_eq!(task_id.as_deref(), Some("Task-PMC"));
+    }
+
+    #[tokio::test]
     async fn liteon_update_posts_to_oem_uri_with_device_header() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -3592,7 +4259,10 @@ mod tests {
             .unwrap();
 
         let mut target = PowerShelfRFTarget::new(
-            BmcAccess::mock_with_base_url(server.uri(), "mock-powershelf"),
+            BmcAccess {
+                model: "PF-1333-1AD".to_owned(),
+                ..BmcAccess::mock_with_base_url(server.uri(), "mock-powershelf")
+            },
             None,
         );
         let mut output = json!({
@@ -3687,7 +4357,10 @@ mod tests {
             .unwrap();
 
         let mut target = PowerShelfRFTarget::new(
-            BmcAccess::mock_with_base_url(server.uri(), "mock-powershelf"),
+            BmcAccess {
+                model: "PF-1333-1AD".to_owned(),
+                ..BmcAccess::mock_with_base_url(server.uri(), "mock-powershelf")
+            },
             None,
         );
         let mut output = json!({
@@ -3755,7 +4428,10 @@ mod tests {
             .unwrap();
 
         let mut target = PowerShelfRFTarget::new(
-            BmcAccess::mock_with_base_url(server.uri(), "mock-powershelf"),
+            BmcAccess {
+                model: "PF-1333-1AD".to_owned(),
+                ..BmcAccess::mock_with_base_url(server.uri(), "mock-powershelf")
+            },
             None,
         );
         let mut output = json!({
@@ -3861,7 +4537,10 @@ mod tests {
             .unwrap();
 
         let mut target = PowerShelfRFTarget::new(
-            BmcAccess::mock_with_base_url(server.uri(), "mock-powershelf"),
+            BmcAccess {
+                model: "PF-1333-1AD".to_owned(),
+                ..BmcAccess::mock_with_base_url(server.uri(), "mock-powershelf")
+            },
             None,
         );
         let mut output = json!({
@@ -4041,7 +4720,10 @@ mod tests {
             .unwrap();
 
         let mut target = PowerShelfRFTarget::new(
-            BmcAccess::mock_with_base_url(server.uri(), "mock-powershelf"),
+            BmcAccess {
+                model: "PF-1333-1AD".to_owned(),
+                ..BmcAccess::mock_with_base_url(server.uri(), "mock-powershelf")
+            },
             None,
         );
         let mut output = json!({
@@ -4179,7 +4861,10 @@ mod tests {
             .unwrap();
 
         let mut target = PowerShelfRFTarget::new(
-            BmcAccess::mock_with_base_url(server.uri(), "mock-powershelf"),
+            BmcAccess {
+                model: "PF-1333-1AD".to_owned(),
+                ..BmcAccess::mock_with_base_url(server.uri(), "mock-powershelf")
+            },
             None,
         );
         let mut output = json!({
@@ -4253,6 +4938,7 @@ mod tests {
         target.register_liteon_psu_all_task_for_repair(
             "Task-AllPsu",
             "/tmp/SP-2183-1RD_Bootloader_C6C6_20260511.fwpkg",
+            Instant::now(),
         );
         assert!(target
             .liteon_psu_all_task_update_file("Task-AllPsu")
@@ -4370,7 +5056,10 @@ mod tests {
             .unwrap();
 
         let mut target = PowerShelfRFTarget::new(
-            BmcAccess::mock_with_base_url(server.uri(), "mock-powershelf"),
+            BmcAccess {
+                model: "PF-1333-1AD".to_owned(),
+                ..BmcAccess::mock_with_base_url(server.uri(), "mock-powershelf")
+            },
             None,
         );
         let mut output = json!({
@@ -4476,7 +5165,10 @@ mod tests {
             .unwrap();
 
         let mut target = PowerShelfRFTarget::new(
-            BmcAccess::mock_with_base_url(server.uri(), "mock-powershelf"),
+            BmcAccess {
+                model: "PF-1333-1AD".to_owned(),
+                ..BmcAccess::mock_with_base_url(server.uri(), "mock-powershelf")
+            },
             None,
         );
         let mut output = json!({
@@ -4824,6 +5516,58 @@ mod tests {
             output["Error"][0],
             "Error: Could not set Redfish Powershelf ApplyTime to 'Immediate'"
         );
+    }
+
+    #[tokio::test]
+    async fn on_reset_upload_preserves_caller_deadline_beyond_sixty_seconds() {
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/redfish/v1/UpdateService"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/redfish/v1/TaskService/Tasks"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"Members": []})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // Exercise the real HTTP timeout path. The former 60-second cap aborted
+        // this single POST even though the caller allowed 90 seconds.
+        Mock::given(method("POST"))
+            .and(path("/redfish/v1/UpdateService/update"))
+            .and(body_string_contains("pmc firmware"))
+            .respond_with(
+                ResponseTemplate::new(202)
+                    .set_delay(Duration::from_secs(61))
+                    .set_body_json(json!({"@odata.id": "/redfish/v1/TaskService/Tasks/PMC"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let tmp = tempfile::tempdir().unwrap();
+        let update_file = tmp.path().join("cm14mp1r-r1.3.7_to_r1.3.8.tar");
+        tokio::fs::write(&update_file, b"pmc firmware")
+            .await
+            .unwrap();
+        let mut target = PowerShelfRFTarget::new(
+            BmcAccess::mock_with_base_url(server.uri(), "mock-powershelf"),
+            None,
+        );
+        let mut output = json!({"Output": [], "Error": [], "Error Code": 0});
+        let task_id = target
+            .update_component(
+                &cmd_args(Some(vec![json!({"ApplyTime": "OnReset"}).to_string()])),
+                "/redfish/v1/UpdateService/update",
+                update_file.to_str().unwrap(),
+                90,
+                Some(&mut output),
+                true,
+            )
+            .await;
+        assert_eq!(task_id.as_deref(), Some("PMC"));
+        assert_eq!(output["Error"], json!([]));
     }
 
     #[tokio::test]

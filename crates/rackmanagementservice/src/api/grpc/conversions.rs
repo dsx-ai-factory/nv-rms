@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 
+use crate::api::grpc::bmc_tls::apply_bmc_redfish_tls_policy;
 use crate::domain::node::{NodeType as DomainNodeType, PowerOp, PowerState};
 use crate::domain::rack::{Endpoint, EndpointConfig, EndpointCredentials};
 use crate::orchestrator::job_lifecycle::{JobError, JobState};
@@ -22,11 +23,11 @@ use crate::orchestrator::job_tracker::{JobInfo, RejectedBatchTarget};
 use crate::utilities::error::{Result as RmsResult, RmsError};
 use chrono::{DateTime, Utc};
 use librms::protos::rack_manager as pb;
-use secrecy::{ExposeSecret, SecretString};
 use thiserror::Error;
 
-// ── Batch node results ──
+const SUPPLEMENTAL_HOST_SSH_PORT: u32 = 22;
 
+// Batch node results
 /// Keys each device of a batch request by its `(rack_id, node_id)` for
 /// [`JobTracker::create_batch_jobs`](crate::orchestrator::job_tracker::JobTracker::create_batch_jobs),
 /// which hands the device back with the job it reserves.
@@ -54,8 +55,7 @@ pub(crate) fn failed_node_results(
     })
 }
 
-// ── Power conversions ──
-
+// Power conversions
 /// Error returned when a protobuf power operation cannot map to a domain operation.
 #[derive(Debug, Clone, Copy, Error, PartialEq, Eq)]
 pub enum PowerOperationConversionError {
@@ -92,8 +92,7 @@ pub fn power_state_to_string(state: PowerState) -> &'static str {
     }
 }
 
-// ── Node type conversions ──
-
+// Node type conversions
 pub fn proto_node_type_to_domain(nt: i32) -> Option<DomainNodeType> {
     match pb::NodeType::try_from(nt).ok()? {
         pb::NodeType::ComputeGb200Nvidia => Some(DomainNodeType::ComputeGb200Nvidia),
@@ -114,9 +113,11 @@ pub fn proto_node_type_to_domain(nt: i32) -> Option<DomainNodeType> {
 pub fn domain_node_type_to_proto(node_type: DomainNodeType) -> pb::NodeType {
     match node_type {
         DomainNodeType::ComputeGb200Nvidia => pb::NodeType::ComputeGb200Nvidia,
-        // Wiwynn GB200 is descriptor-only on the wire. Returning Unspecified
+        // Wiwynn and Dell GB200 are descriptor-only on the wire. Returning Unspecified
         // keeps the descriptor authoritative without extending the protobuf enum.
-        DomainNodeType::ComputeGb200Wiwynn => pb::NodeType::Unspecified,
+        DomainNodeType::ComputeGb200Wiwynn | DomainNodeType::ComputeGb200Dell => {
+            pb::NodeType::Unspecified
+        }
         DomainNodeType::PowershelfGb200Liteon => pb::NodeType::PowershelfGb200Liteon,
         DomainNodeType::SwitchGb200Nvidia => pb::NodeType::SwitchGb200Nvidia,
         DomainNodeType::PowershelfGb200Delta => pb::NodeType::PowershelfGb200Delta,
@@ -131,6 +132,14 @@ pub fn domain_node_type_to_proto(node_type: DomainNodeType) -> pb::NodeType {
         DomainNodeType::ComputeGb300Supermicro => pb::NodeType::Unspecified,
         DomainNodeType::ComputeVrnvl72Nvidia => pb::NodeType::ComputeVrnvl72Nvidia,
         DomainNodeType::SwitchVrnvl72Nvidia => pb::NodeType::SwitchVrnvl72Nvidia,
+        // The VR LiteOn power shelf is descriptor-only on the wire. Returning
+        // Unspecified keeps the descriptor authoritative without adding a
+        // protobuf enum value.
+        DomainNodeType::PowershelfVrnvl72Liteon => pb::NodeType::Unspecified,
+        // The VR Delta power shelf is descriptor-only on the wire for the same
+        // reason: the descriptor stays authoritative without a protobuf enum
+        // value.
+        DomainNodeType::PowershelfVrnvl72Delta => pb::NodeType::Unspecified,
     }
 }
 
@@ -141,33 +150,16 @@ pub fn proto_node_type_to_string(nt: i32) -> Option<&'static str> {
     }
 }
 
-// ── NodeInfo / NodeUpdateInfo flattening ──
-
+// NodeInfo / NodeUpdateInfo flattening
 /// Flattened endpoint values used by legacy `NodeConfig` construction.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FlatEndpointConfig {
     pub ip_address: String,
     pub mac_address: String,
     pub host_name: Option<String>,
     pub port: u32,
-    pub username: String,
-    pub password: SecretString,
-    pub dangerously_accept_invalid_certs: bool,
+    pub credentials: Option<EndpointCredentials>,
 }
-
-impl PartialEq for FlatEndpointConfig {
-    fn eq(&self, other: &Self) -> bool {
-        self.ip_address == other.ip_address
-            && self.mac_address == other.mac_address
-            && self.host_name == other.host_name
-            && self.port == other.port
-            && self.username == other.username
-            && self.password.expose_secret() == other.password.expose_secret()
-            && self.dangerously_accept_invalid_certs == other.dangerously_accept_invalid_certs
-    }
-}
-
-impl Eq for FlatEndpointConfig {}
 
 // Flattened view of a NodeInfo's endpoint fields. The BMC and host endpoint
 // configs stay separate so switch NVUE/NVOS calls do not accidentally inherit
@@ -183,22 +175,29 @@ impl FlatEndpoint {
     ///
     /// Missing BMC is valid for host-only switch calls. A present BMC endpoint
     /// requires an IP address, but its MAC address is optional because switch
-    /// BMC Redfish operations do not use it.
-    pub fn optional_bmc_endpoint(&self) -> RmsResult<Option<EndpointConfig>> {
+    /// BMC Redfish operations do not use it. TLS verification is the RMS
+    /// `[bmc] insecure_bmc` policy, not a request field.
+    pub fn optional_bmc_endpoint(&self, insecure_bmc: bool) -> RmsResult<Option<EndpointConfig>> {
         let Some(endpoint) = self.bmc.as_ref() else {
             return Ok(None);
         };
 
-        Self::endpoint_from_config("BMC", endpoint, false).map(Some)
+        Ok(Some(apply_bmc_redfish_tls_policy(
+            Self::endpoint_from_config(EndpointKind::Bmc, endpoint, false)?,
+            insecure_bmc,
+        )))
     }
 
-    /// Return the required BMC endpoint.
-    pub fn bmc_endpoint(&self) -> RmsResult<EndpointConfig> {
+    /// Return the required BMC endpoint with RMS BMC TLS policy applied.
+    pub fn bmc_endpoint(&self, insecure_bmc: bool) -> RmsResult<EndpointConfig> {
         let Some(endpoint) = self.bmc.as_ref() else {
             return Err(RmsError::invalid_argument("missing BMC endpoint"));
         };
 
-        Self::endpoint_from_config("BMC", endpoint, true)
+        Ok(apply_bmc_redfish_tls_policy(
+            Self::endpoint_from_config(EndpointKind::Bmc, endpoint, true)?,
+            insecure_bmc,
+        ))
     }
 
     /// Return the required host endpoint.
@@ -210,7 +209,7 @@ impl FlatEndpoint {
             return Err(RmsError::invalid_argument("missing host endpoint"));
         };
 
-        Self::endpoint_from_config("host", endpoint, false)
+        Self::endpoint_from_config(EndpointKind::Host, endpoint, false)
     }
 
     /// Return the optional host endpoint when the request provided one.
@@ -222,7 +221,7 @@ impl FlatEndpoint {
             return Ok(None);
         };
 
-        Self::endpoint_from_config("host", endpoint, false).map(Some)
+        Self::endpoint_from_config(EndpointKind::Host, endpoint, false).map(Some)
     }
 
     /// Return the optional compute host endpoint used by SSH-based workflows.
@@ -237,7 +236,8 @@ impl FlatEndpoint {
         if endpoint.port == 0 {
             endpoint.port = 22;
         }
-        Self::endpoint_from_config("host", &endpoint, false).map(Some)
+
+        Self::endpoint_from_config(EndpointKind::Host, &endpoint, false).map(Some)
     }
 
     /// Return the required switch host endpoint for NVUE/HTTPS management.
@@ -265,7 +265,7 @@ impl FlatEndpoint {
     ///
     /// Switches authenticate to NVUE/NVOS via their host endpoint; everyone
     /// else talks Redfish on the BMC. Returns `None` when the selected endpoint
-    /// or either credential field is missing.
+    /// is absent, has no credentials, or uses session-token authentication.
     pub fn creds_for_node_type(&self, node_type: DomainNodeType) -> Option<(&str, &str)> {
         let endpoint = if node_type.uses_host_management_endpoint() {
             self.host.as_ref()
@@ -273,30 +273,22 @@ impl FlatEndpoint {
             self.bmc.as_ref()
         }?;
 
-        if endpoint.username.is_empty() || endpoint.password.expose_secret().is_empty() {
-            return None;
-        }
-
-        Some((
-            endpoint.username.as_str(),
-            endpoint.password.expose_secret(),
-        ))
+        endpoint.credentials.as_ref()?.user_pass()
     }
 
-    /// Return the TLS validation override for the endpoint used by a node type.
-    pub fn dangerously_accept_invalid_certs_for_node_type(
-        &self,
-        node_type: DomainNodeType,
-    ) -> bool {
-        let endpoint = if node_type.uses_host_management_endpoint() {
-            self.host.as_ref()
-        } else {
-            self.bmc.as_ref()
-        };
+    /// Return whether the node's management endpoint has complete credentials.
+    ///
+    /// Switch management requires host username/password credentials. BMC
+    /// management also accepts a non-empty Redfish session token.
+    pub fn has_credentials_for_node_type(&self, node_type: DomainNodeType) -> bool {
+        if node_type.uses_host_management_endpoint() {
+            return self.creds_for_node_type(node_type).is_some();
+        }
 
-        endpoint
-            .map(|e| e.dangerously_accept_invalid_certs)
-            .unwrap_or(false)
+        self.bmc
+            .as_ref()
+            .and_then(|endpoint| endpoint.credentials.as_ref())
+            .is_some_and(EndpointCredentials::has_auth_material)
     }
 
     /// Resolve the endpoint port used by the given node type.
@@ -373,12 +365,14 @@ impl FlatEndpoint {
         })
     }
 
-    fn switch_management_port(port: u16) -> u16 {
+    /// Switch inventories may specify SSH port 22 in the shared host endpoint.
+    /// NVUE uses HTTPS, so its connection and reservation use port 443 instead.
+    pub(crate) fn switch_management_port(port: u16) -> u16 {
         if port == 22 { 443 } else { port }
     }
 
     fn endpoint_from_config(
-        name: &str,
+        endpoint_kind: EndpointKind,
         endpoint: &FlatEndpointConfig,
         require_mac_address: bool,
     ) -> RmsResult<EndpointConfig> {
@@ -386,6 +380,8 @@ impl FlatEndpoint {
         // rather than an opaque "missing fields". Requiredness is
         // context-dependent (see `flat_endpoint_config`): ip is always
         // required here, mac only when `require_mac_address` is set.
+        let name = endpoint_kind.label();
+
         if endpoint.ip_address.is_empty() {
             return Err(RmsError::invalid_argument(format!(
                 "missing {name} endpoint ip_address"
@@ -397,16 +393,6 @@ impl FlatEndpoint {
             )));
         }
 
-        let credentials =
-            if endpoint.username.is_empty() || endpoint.password.expose_secret().is_empty() {
-                None
-            } else {
-                Some(EndpointCredentials::new(
-                    endpoint.username.clone(),
-                    endpoint.password.expose_secret().to_owned(),
-                ))
-            };
-
         Ok(EndpointConfig::with_credentials(
             Endpoint {
                 ip_address: endpoint.ip_address.clone(),
@@ -414,8 +400,11 @@ impl FlatEndpoint {
                 port: Self::resolve_port(endpoint.port)?,
                 host_name: endpoint.host_name.clone(),
             },
-            credentials,
-            endpoint.dangerously_accept_invalid_certs,
+            endpoint.credentials.clone(),
+            // Host/NVUE always verifies. BMC skip-verify is applied in
+            // `bmc_endpoint` / `optional_bmc_endpoint` from `[bmc]
+            // insecure_bmc`; request fields cannot change that policy.
+            false,
         ))
     }
 
@@ -428,38 +417,93 @@ impl FlatEndpoint {
         node_type: DomainNodeType,
     ) -> RmsResult<u16> {
         let port = self.resolve_port_for_node_type(node_type)?;
-        if node_type.uses_host_management_endpoint() && port == 22 {
-            Ok(443)
+
+        if node_type.uses_host_management_endpoint() {
+            Ok(Self::switch_management_port(port))
         } else {
             Ok(port)
         }
     }
 }
 
-fn extract_user_pass(
-    endpoint_name: &str,
+/// Endpoint role, used to decide which auth modes are valid -- not just to
+/// label error messages. Keeping this as a type (rather than a `&str`
+/// compared against a literal) means renaming a display label can never
+/// silently change which endpoints accept session-token auth.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EndpointKind {
+    Bmc,
+    Host,
+
+    /// Request-scoped host whose purpose is defined by the consuming RPC.
+    SupplementalHost,
+}
+
+impl EndpointKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Bmc => "BMC",
+            Self::Host => "host",
+            Self::SupplementalHost => "additional host",
+        }
+    }
+
+    /// Only BMC endpoints support Redfish session-token auth; NVUE/SSH host
+    /// endpoints require username/password.
+    fn supports_session_token(self) -> bool {
+        matches!(self, Self::Bmc)
+    }
+}
+
+fn extract_endpoint_credentials(
+    endpoint_kind: EndpointKind,
     credentials: Option<&pb::Credentials>,
-) -> RmsResult<(String, SecretString)> {
+) -> RmsResult<Option<EndpointCredentials>> {
     let Some(auth) = credentials.and_then(|c| c.auth.as_ref()) else {
-        return Ok(Default::default());
+        return Ok(None);
     };
 
     match auth {
-        pb::credentials::Auth::UserPass(up) => {
-            Ok((up.username.clone(), SecretString::from(up.password.clone())))
+        // Reject only the asymmetric case (exactly one field set): a fully empty
+        // pair is "no credentials provided" and is returned as None below so it
+        // never reaches the transport layer as a (bogus) empty Basic auth header.
+        // A half-empty pair is never valid Basic auth.
+        pb::credentials::Auth::UserPass(up) if up.username.is_empty() != up.password.is_empty() => {
+            Err(RmsError::invalid_argument(
+                "user_pass credentials must include both a non-empty username and password",
+            ))
+        }
+        pb::credentials::Auth::UserPass(up) if up.username.is_empty() && up.password.is_empty() => {
+            Ok(None)
+        }
+        pb::credentials::Auth::UserPass(up) => Ok(Some(EndpointCredentials::new(
+            up.username.clone(),
+            up.password.clone(),
+        ))),
+        pb::credentials::Auth::SessionToken(token)
+            if endpoint_kind.supports_session_token() && !token.is_empty() =>
+        {
+            Ok(Some(EndpointCredentials::from_session_token(token.clone())))
+        }
+        pb::credentials::Auth::SessionToken(_) if endpoint_kind.supports_session_token() => {
+            Err(RmsError::invalid_argument(format!(
+                "{} endpoint session_token must not be empty",
+                endpoint_kind.label()
+            )))
         }
         pb::credentials::Auth::SessionToken(_) => Err(RmsError::invalid_argument(format!(
-            "{endpoint_name} endpoint credentials use unsupported session_token auth; use user_pass credentials"
+            "{} endpoint does not support session token auth; use basic auth (user/pass credentials) instead",
+            endpoint_kind.label()
         ))),
     }
 }
 
 fn flat_endpoint_config(
-    endpoint_name: &str,
+    endpoint_kind: EndpointKind,
     endpoint: &pb::Endpoint,
 ) -> RmsResult<FlatEndpointConfig> {
     let iface = endpoint.interface.as_ref();
-    let (username, password) = extract_user_pass(endpoint_name, endpoint.credentials.as_ref())?;
+    let credentials = extract_endpoint_credentials(endpoint_kind, endpoint.credentials.as_ref())?;
 
     Ok(FlatEndpointConfig {
         // Absent IP/MAC default to empty here and are validated later by
@@ -475,30 +519,65 @@ fn flat_endpoint_config(
             .and_then(|i| i.host_name.clone())
             .filter(|name| !name.is_empty()),
         port: endpoint.port,
-        username,
-        password,
-        // TLS validation policy is owned by RMS for each management target.
-        dangerously_accept_invalid_certs: false,
+        credentials,
     })
+}
+
+/// Convert one supplemental host endpoint into request-scoped SSH settings.
+///
+/// Supplemental host endpoints use port 22 when the protobuf port is omitted
+/// and reject other ports because the current SSH transport connects only to
+/// port 22. They require username/password credentials because the switch image
+/// recovery skeleton does not support Redfish session tokens or unauthenticated
+/// access.
+pub(crate) fn additional_host_ssh_endpoint(endpoint: &pb::Endpoint) -> RmsResult<EndpointConfig> {
+    if endpoint.port != 0 && endpoint.port != SUPPLEMENTAL_HOST_SSH_PORT {
+        return Err(RmsError::invalid_argument(format!(
+            "additional host SSH endpoint port must be 22 when specified, got {}",
+            endpoint.port
+        )));
+    }
+
+    let mut flattened = flat_endpoint_config(EndpointKind::SupplementalHost, endpoint)?;
+
+    if flattened.port == 0 {
+        flattened.port = SUPPLEMENTAL_HOST_SSH_PORT;
+    }
+
+    let endpoint =
+        FlatEndpoint::endpoint_from_config(EndpointKind::SupplementalHost, &flattened, false)?;
+
+    if endpoint
+        .credentials
+        .as_ref()
+        .and_then(EndpointCredentials::user_pass_secret)
+        .is_none()
+    {
+        return Err(RmsError::invalid_argument(
+            "additional host endpoint requires non-empty username/password credentials",
+        ));
+    }
+
+    Ok(endpoint)
 }
 
 /// Flatten endpoint fields from a protobuf `NodeInfo`.
 ///
 /// # Errors
 ///
-/// Returns an `InvalidArgument` error when an endpoint uses an unsupported
-/// credential auth type.
+/// Returns an `InvalidArgument` error when a host endpoint uses token auth or
+/// when a BMC session token is empty.
 pub fn flatten_node_info(ni: &pb::NodeInfo) -> RmsResult<FlatEndpoint> {
     Ok(FlatEndpoint {
         bmc: ni
             .bmc_endpoint
             .as_ref()
-            .map(|endpoint| flat_endpoint_config("BMC", endpoint))
+            .map(|endpoint| flat_endpoint_config(EndpointKind::Bmc, endpoint))
             .transpose()?,
         host: ni
             .host_endpoint
             .as_ref()
-            .map(|endpoint| flat_endpoint_config("host", endpoint))
+            .map(|endpoint| flat_endpoint_config(EndpointKind::Host, endpoint))
             .transpose()?,
     })
 }
@@ -633,8 +712,7 @@ mod tests {
         assert_eq!(status.updated_at.unwrap().seconds, 2_000);
     }
 
-    // ── flatten_node_info credential source ────────────────────────
-
+    // flatten_node_info credential source
     fn user_pass_creds(u: &str, p: &str) -> pb::Credentials {
         pb::Credentials {
             auth: Some(pb::credentials::Auth::UserPass(pb::UsernamePassword {
@@ -642,6 +720,105 @@ mod tests {
                 password: p.into(),
             })),
         }
+    }
+
+    #[test]
+    fn additional_host_ssh_endpoint_uses_ssh_default_and_preserves_credentials() -> RmsResult<()> {
+        let endpoint = pb::Endpoint {
+            interface: Some(pb::NetworkInterface {
+                ip_address: "192.0.2.50".to_owned(),
+                mac_address: "aa:bb:cc:00:00:50".to_owned(),
+                host_name: Some("onie-switch.example.com".to_owned()),
+            }),
+            port: 0,
+            credentials: Some(user_pass_creds("onie", "recovery-password")),
+        };
+
+        let endpoint = additional_host_ssh_endpoint(&endpoint)?;
+
+        assert_eq!(endpoint.endpoint.ip_address, "192.0.2.50");
+        assert_eq!(endpoint.endpoint.port, 22);
+
+        assert_eq!(
+            endpoint
+                .credentials
+                .as_ref()
+                .and_then(EndpointCredentials::user_pass),
+            Some(("onie", "recovery-password"))
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn additional_host_ssh_endpoint_requires_username_password_credentials() {
+        let endpoint = pb::Endpoint {
+            interface: Some(pb::NetworkInterface {
+                ip_address: "192.0.2.50".to_owned(),
+                ..Default::default()
+            }),
+            port: 22,
+            credentials: None,
+        };
+
+        let result = additional_host_ssh_endpoint(&endpoint);
+
+        let Err(error) = result else {
+            panic!("missing ONIE credentials should be rejected");
+        };
+
+        assert_eq!(error.code, ErrorCode::InvalidArgument);
+        assert!(error.message.contains("additional host endpoint"));
+        assert!(error.message.contains("username/password"));
+    }
+
+    #[test]
+    fn additional_host_ssh_endpoint_rejects_session_token_credentials() {
+        let endpoint = pb::Endpoint {
+            interface: Some(pb::NetworkInterface {
+                ip_address: "192.0.2.50".to_owned(),
+                ..Default::default()
+            }),
+            port: 0,
+            credentials: Some(pb::Credentials {
+                auth: Some(pb::credentials::Auth::SessionToken("token".to_owned())),
+            }),
+        };
+
+        let result = additional_host_ssh_endpoint(&endpoint);
+
+        let Err(error) = result else {
+            panic!("supplemental SSH endpoint must reject session-token credentials");
+        };
+
+        assert_eq!(error.code, ErrorCode::InvalidArgument);
+
+        assert!(
+            error
+                .message
+                .contains("additional host endpoint does not support session token auth")
+        );
+    }
+
+    #[test]
+    fn additional_host_ssh_endpoint_rejects_unsupported_port() {
+        let endpoint = pb::Endpoint {
+            interface: Some(pb::NetworkInterface {
+                ip_address: "192.0.2.50".to_owned(),
+                ..Default::default()
+            }),
+            port: 2222,
+            credentials: Some(user_pass_creds("onie", "recovery-password")),
+        };
+
+        let result = additional_host_ssh_endpoint(&endpoint);
+
+        let Err(error) = result else {
+            panic!("unsupported ONIE SSH port should be rejected");
+        };
+
+        assert_eq!(error.code, ErrorCode::InvalidArgument);
+        assert!(error.message.contains("port must be 22"));
     }
 
     #[test]
@@ -674,32 +851,59 @@ mod tests {
         let flat = flatten_node_info(&ni)?;
 
         assert_eq!(
-            flat.bmc.as_ref().map(|e| e.username.as_str()),
-            Some("bmc_user")
-        );
-        assert_eq!(
-            flat.bmc.as_ref().map(|e| e.password.expose_secret()),
-            Some("bmc_pass")
-        );
-        assert_eq!(
-            flat.host.as_ref().map(|e| e.username.as_str()),
-            Some("host_user")
-        );
-        assert_eq!(
-            flat.host.as_ref().map(|e| e.password.expose_secret()),
-            Some("host_pass")
-        );
-        assert_eq!(
             flat.bmc
                 .as_ref()
-                .map(|e| e.dangerously_accept_invalid_certs),
-            Some(false)
+                .and_then(|endpoint| endpoint.credentials.as_ref())
+                .and_then(EndpointCredentials::user_pass),
+            Some(("bmc_user", "bmc_pass"))
         );
+
         assert_eq!(
             flat.host
                 .as_ref()
-                .map(|e| e.dangerously_accept_invalid_certs),
-            Some(false)
+                .and_then(|endpoint| endpoint.credentials.as_ref())
+                .and_then(EndpointCredentials::user_pass),
+            Some(("host_user", "host_pass"))
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn flatten_from_proto_bmc_skips_verify_and_switch_host_does_not() -> RmsResult<()> {
+        let ni = pb::NodeInfo {
+            node_id: "sw-01".into(),
+            rack_id: "r".into(),
+            r#type: Some(pb::NodeType::SwitchGb200Nvidia as i32),
+            bmc_endpoint: Some(pb::Endpoint {
+                interface: Some(pb::NetworkInterface {
+                    ip_address: "10.0.0.1".into(),
+                    mac_address: "aa:bb:cc:00:00:11".into(),
+                    host_name: None,
+                }),
+                port: 443,
+                credentials: Some(user_pass_creds("bmc_user", "bmc_pass")),
+            }),
+            host_endpoint: Some(pb::Endpoint {
+                interface: Some(pb::NetworkInterface {
+                    ip_address: "10.0.1.1".into(),
+                    mac_address: "aa:bb:cc:00:01:11".into(),
+                    host_name: None,
+                }),
+                port: 22,
+                credentials: Some(user_pass_creds("host_user", "host_pass")),
+            }),
+            ..Default::default()
+        };
+
+        let flat = flatten_node_info(&ni)?;
+
+        assert!(flat.bmc_endpoint(true)?.dangerously_accept_invalid_certs);
+        assert!(!flat.bmc_endpoint(false)?.dangerously_accept_invalid_certs);
+        assert!(
+            !flat
+                .switch_host_management_endpoint()?
+                .dangerously_accept_invalid_certs
         );
 
         Ok(())
@@ -761,13 +965,13 @@ mod tests {
         };
 
         assert_eq!(err.code, ErrorCode::InvalidArgument);
-        assert!(err.message.contains("host endpoint credentials"));
-        assert!(err.message.contains("session_token"));
-        assert!(err.message.contains("user_pass"));
+        assert!(err.message.contains("host endpoint"));
+        assert!(err.message.contains("session token"));
+        assert!(err.message.contains("basic auth"));
     }
 
     #[test]
-    fn flatten_rejects_bmc_session_token_credentials() {
+    fn flatten_accepts_bmc_session_token_credentials() -> RmsResult<()> {
         let ni = pb::NodeInfo {
             node_id: "cn-01".into(),
             rack_id: "r".into(),
@@ -787,28 +991,121 @@ mod tests {
             ..Default::default()
         };
 
-        let result = flatten_node_info(&ni);
-        let Err(err) = result else {
-            panic!("expected session_token credentials to be rejected");
+        let flat = flatten_node_info(&ni)?;
+
+        assert!(flat.has_credentials_for_node_type(DomainNodeType::ComputeGb200Nvidia));
+
+        let endpoint = flat.bmc_endpoint(true)?;
+
+        assert!(endpoint.dangerously_accept_invalid_certs);
+
+        let Some(credentials) = endpoint.credentials.as_ref() else {
+            panic!("BMC credentials should be preserved");
         };
 
-        assert_eq!(err.code, ErrorCode::InvalidArgument);
-        assert!(err.message.contains("BMC endpoint credentials"));
-        assert!(err.message.contains("session_token"));
-        assert!(err.message.contains("user_pass"));
+        let EndpointCredentials::BmcSessionToken(token) = credentials else {
+            panic!("BMC session token should be preserved");
+        };
+
+        assert_eq!(secrecy::ExposeSecret::expose_secret(token), "token");
+
+        Ok(())
+    }
+
+    #[test]
+    fn flatten_rejects_empty_bmc_session_token_credentials() {
+        let ni = pb::NodeInfo {
+            node_id: "cn-01".into(),
+            rack_id: "r".into(),
+            r#type: Some(pb::NodeType::ComputeGb200Nvidia as i32),
+            bmc_endpoint: Some(pb::Endpoint {
+                interface: Some(pb::NetworkInterface {
+                    ip_address: "10.0.0.1".into(),
+                    mac_address: "aa:bb:cc:00:00:11".into(),
+                    host_name: None,
+                }),
+                port: 443,
+                credentials: Some(pb::Credentials {
+                    auth: Some(pb::credentials::Auth::SessionToken(String::new())),
+                }),
+            }),
+            host_endpoint: None,
+            ..Default::default()
+        };
+
+        let Err(error) = flatten_node_info(&ni) else {
+            panic!("empty BMC session token should be rejected");
+        };
+
+        assert_eq!(error.code, ErrorCode::InvalidArgument);
+        assert!(error.message.contains("must not be empty"));
+    }
+
+    #[test]
+    fn flatten_rejects_user_pass_credentials_with_empty_username() {
+        // An empty-username UserPass credential must be rejected outright, not
+        // silently accepted and later reinterpreted as session-token auth by a
+        // downstream consumer.
+        let ni = pb::NodeInfo {
+            node_id: "cn-01".into(),
+            rack_id: "r".into(),
+            r#type: Some(pb::NodeType::ComputeGb200Nvidia as i32),
+            bmc_endpoint: Some(pb::Endpoint {
+                interface: Some(pb::NetworkInterface {
+                    ip_address: "10.0.0.1".into(),
+                    mac_address: "aa:bb:cc:00:00:11".into(),
+                    host_name: None,
+                }),
+                port: 443,
+                credentials: Some(user_pass_creds("", "secret")),
+            }),
+            host_endpoint: None,
+            ..Default::default()
+        };
+
+        let Err(error) = flatten_node_info(&ni) else {
+            panic!("empty-username user_pass credentials should be rejected");
+        };
+
+        assert_eq!(error.code, ErrorCode::InvalidArgument);
+        assert!(error.message.contains("non-empty username"));
+    }
+
+    #[test]
+    fn flatten_treats_fully_empty_user_pass_credentials_as_absent() {
+        // A fully empty username/password pair means "no credentials provided"
+        // and must resolve to None, not a UserPass credential that would later
+        // send an unauthenticated (empty) Basic auth header over the wire.
+        let ni = pb::NodeInfo {
+            node_id: "cn-01".into(),
+            rack_id: "r".into(),
+            r#type: Some(pb::NodeType::ComputeGb200Nvidia as i32),
+            bmc_endpoint: Some(pb::Endpoint {
+                interface: Some(pb::NetworkInterface {
+                    ip_address: "10.0.0.1".into(),
+                    mac_address: "aa:bb:cc:00:00:11".into(),
+                    host_name: None,
+                }),
+                port: 443,
+                credentials: Some(user_pass_creds("", "")),
+            }),
+            host_endpoint: None,
+            ..Default::default()
+        };
+
+        let flat = flatten_node_info(&ni).expect("fully empty user_pass should not be rejected");
+        assert!(flat.bmc.expect("bmc endpoint").credentials.is_none());
     }
 
     #[test]
     fn flat_endpoint_debug_redacts_passwords() {
         let flat = FlatEndpoint {
             bmc: Some(FlatEndpointConfig {
-                username: "bmc_user".into(),
-                password: "bmc-secret".into(),
+                credentials: Some(EndpointCredentials::new("bmc_user", "bmc-secret")),
                 ..Default::default()
             }),
             host: Some(FlatEndpointConfig {
-                username: "host_user".into(),
-                password: "host-secret".into(),
+                credentials: Some(EndpointCredentials::new("host_user", "host-secret")),
                 ..Default::default()
             }),
         };
@@ -826,13 +1123,11 @@ mod tests {
     fn creds_for_node_type_picks_host_for_switch_bmc_otherwise() {
         let flat = FlatEndpoint {
             bmc: Some(FlatEndpointConfig {
-                username: "bmc_user".into(),
-                password: "bmc_pass".into(),
+                credentials: Some(EndpointCredentials::new("bmc_user", "bmc_pass")),
                 ..Default::default()
             }),
             host: Some(FlatEndpointConfig {
-                username: "host_user".into(),
-                password: "host_pass".into(),
+                credentials: Some(EndpointCredentials::new("host_user", "host_pass")),
                 ..Default::default()
             }),
         };
@@ -971,45 +1266,6 @@ mod tests {
     }
 
     #[test]
-    fn tls_override_for_switch_prefers_explicit_host_endpoint() {
-        let flat = FlatEndpoint {
-            bmc: Some(FlatEndpointConfig {
-                dangerously_accept_invalid_certs: true,
-                ..Default::default()
-            }),
-            host: Some(FlatEndpointConfig {
-                dangerously_accept_invalid_certs: false,
-                ..Default::default()
-            }),
-        };
-
-        assert!(
-            !flat.dangerously_accept_invalid_certs_for_node_type(DomainNodeType::SwitchGb200Nvidia)
-        );
-        assert!(
-            flat.dangerously_accept_invalid_certs_for_node_type(DomainNodeType::ComputeGb200Nvidia)
-        );
-    }
-
-    #[test]
-    fn tls_override_for_switch_does_not_fallback_to_bmc() {
-        let flat = FlatEndpoint {
-            bmc: Some(FlatEndpointConfig {
-                dangerously_accept_invalid_certs: true,
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-
-        assert!(
-            !flat.dangerously_accept_invalid_certs_for_node_type(DomainNodeType::SwitchGb200Nvidia)
-        );
-        assert!(
-            flat.dangerously_accept_invalid_certs_for_node_type(DomainNodeType::ComputeGb200Nvidia)
-        );
-    }
-
-    #[test]
     fn optional_bmc_endpoint_accepts_missing_mac_address() {
         let flat = FlatEndpoint {
             bmc: Some(FlatEndpointConfig {
@@ -1020,13 +1276,21 @@ mod tests {
             ..Default::default()
         };
 
-        let result = flat.optional_bmc_endpoint();
+        let result = flat.optional_bmc_endpoint(true);
         let Ok(Some(endpoint)) = result else {
             panic!("expected optional BMC endpoint without MAC to be accepted");
         };
 
         assert_eq!(endpoint.endpoint.ip_address, "10.0.0.1");
         assert_eq!(endpoint.endpoint.mac_address, "");
+        assert!(endpoint.dangerously_accept_invalid_certs);
+        assert!(
+            !flat
+                .optional_bmc_endpoint(false)
+                .expect("verify-mode optional BMC")
+                .expect("present")
+                .dangerously_accept_invalid_certs
+        );
     }
 
     #[test]
@@ -1040,7 +1304,7 @@ mod tests {
         };
 
         let err = flat
-            .optional_bmc_endpoint()
+            .optional_bmc_endpoint(true)
             .expect_err("expected missing BMC endpoint ip_address error");
 
         assert_eq!(err.code, ErrorCode::InvalidArgument);
@@ -1058,7 +1322,7 @@ mod tests {
         };
 
         let err = flat
-            .bmc_endpoint()
+            .bmc_endpoint(true)
             .expect_err("expected required BMC endpoint to require a MAC address");
 
         assert_eq!(err.code, ErrorCode::InvalidArgument);
@@ -1290,13 +1554,13 @@ mod tests {
 
         assert!(flat.bmc.is_none());
         assert!(flat.host.is_some());
+
         assert_eq!(
-            flat.host.as_ref().map(|e| e.username.as_str()),
-            Some("host_user")
-        );
-        assert_eq!(
-            flat.host.as_ref().map(|e| e.password.expose_secret()),
-            Some("host_pass")
+            flat.host
+                .as_ref()
+                .and_then(|endpoint| endpoint.credentials.as_ref())
+                .and_then(EndpointCredentials::user_pass),
+            Some(("host_user", "host_pass"))
         );
         assert_eq!(flat.host.as_ref().map(|e| e.port), Some(22));
         assert_eq!(
@@ -1445,6 +1709,38 @@ mod tests {
         assert_eq!(
             domain_node_type_to_proto(DomainNodeType::SwitchVrnvl72Nvidia),
             pb::NodeType::SwitchVrnvl72Nvidia
+        );
+    }
+
+    #[test]
+    fn vr_liteon_power_shelf_has_no_proto_enum_value() {
+        assert_eq!(
+            domain_node_type_to_proto(DomainNodeType::PowershelfVrnvl72Liteon),
+            pb::NodeType::Unspecified
+        );
+        assert_eq!(
+            proto_node_type_to_domain(pb::NodeType::Unspecified as i32),
+            None
+        );
+        assert!(
+            pb::NodeType::from_str_name("POWERSHELF_VRNVL72_LITEON").is_none(),
+            "adding a proto enum value requires wiring proto_node_type_to_domain"
+        );
+    }
+
+    #[test]
+    fn vr_delta_power_shelf_has_no_proto_enum_value() {
+        assert_eq!(
+            domain_node_type_to_proto(DomainNodeType::PowershelfVrnvl72Delta),
+            pb::NodeType::Unspecified
+        );
+        assert!(
+            pb::NodeType::from_str_name("POWERSHELF_VRNVL72_DELTA").is_none(),
+            "adding a proto enum value requires wiring proto_node_type_to_domain"
+        );
+        assert_eq!(
+            DomainNodeType::PowershelfVrnvl72Delta.as_str(),
+            "powershelf_vrnvl72_delta"
         );
     }
 }

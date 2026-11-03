@@ -465,7 +465,9 @@ fn hgxb100_get_component_version(pldm_version_dict: &Value, ap_name: &str) -> Op
 
 /// GH-style `get_identifier_from_chassis` via `RelatedItem[0]` -> `SKU`.
 async fn gh_get_identifier_from_chassis(bmc: &BmcAccess, ap_inv_uri: &str) -> Option<String> {
-    let (status, fw_inv_dict) = bmc.dispatch_request("GET", ap_inv_uri, None, None).await;
+    let (status, fw_inv_dict) = bmc
+        .dispatch_request_full("GET", ap_inv_uri, None, None, 30, true, None)
+        .await;
     if !status {
         return None;
     }
@@ -477,7 +479,9 @@ async fn gh_get_identifier_from_chassis(bmc: &BmcAccess, ap_inv_uri: &str) -> Op
         .and_then(|item| item.get("@odata.id"))
         .and_then(|v| v.as_str())?;
 
-    let (status2, chassis_dict) = bmc.dispatch_request("GET", chassis_uri, None, None).await;
+    let (status2, chassis_dict) = bmc
+        .dispatch_request_full("GET", chassis_uri, None, None, 30, true, None)
+        .await;
     if !status2 {
         return None;
     }

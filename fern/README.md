@@ -15,6 +15,8 @@ To develop the Fern docs, install the following tools:
 - Node.js v22 or later
 - [Fern CLI](https://buildwithfern.com/learn/cli-api-reference/cli-reference/overview#install-fern-cli)
 - [pnpm](https://pnpm.io/installation)
+- [buf](https://buf.build/docs/installation), which Fern uses to build the gRPC API reference from
+  `proto/`
 
 ## Local Development
 
@@ -41,37 +43,50 @@ export NODE_OPTIONS="--experimental-sqlite"
 
 ## Continuous Integration
 
-Four workflows cover the docs site, each following the reference workflow Fern
+CI runs [`scripts/docs-lint.sh`](../scripts/docs-lint.sh), the same checks as
+`just docs-lint`. Previews and publication follow the reference workflows Fern
 publishes under
 [Preview changes](https://buildwithfern.com/learn/docs/preview-publish/preview-changes#preview-links)
-or
-[Publishing your docs](https://buildwithfern.com/learn/docs/preview-publish/publishing-your-docs).
-
-| Workflow | Trigger | Purpose |
-| --- | --- | --- |
-| [`lint-docs.yaml`](../.github/workflows/lint-docs.yaml) | Push to `main` or `pull-request/<number>` | Runs [`scripts/docs-lint.sh`](../scripts/docs-lint.sh), the same checks as `just docs-lint` |
-| [`preview-docs.yaml`](../.github/workflows/preview-docs.yaml) | `pull_request` against `main`, touching `docs/` or `fern/` | Publishes a preview and upserts a pull request comment with the URL plus deep links to every changed page |
-| [`cleanup-preview.yaml`](../.github/workflows/cleanup-preview.yaml) | `pull_request` closed, touching `docs/` or `fern/` | Deletes the preview when the pull request closes |
-| [`publish-docs.yaml`](../.github/workflows/publish-docs.yaml) | Push to `main`, or manual dispatch | Validates the site, then publishes it live |
+and
+[Publishing your docs](https://buildwithfern.com/learn/docs/preview-publish/publishing-your-docs),
+and authenticate to Fern with the `FERN_TOKEN` repository secret.
 
 Previews are keyed on the head branch name, so every push to a pull request
-updates the same URL and `cleanup-preview.yaml` deletes it under that same id when
-the pull request closes. Fern previews never expire on their own, which is why the cleanup
-workflow exists.
-
-`fern/docs.yml` declares a single instance, so `publish-docs.yaml` publishes
-straight to production with no `--instance` flag and no staging site. It can be
-re-run by hand from the Actions tab.
-
-Every workflow except `lint-docs.yaml` authenticates to Fern with the
-`FERN_TOKEN` repository secret. Because `pull_request` does not expose secrets
-to forks, the preview and cleanup workflows skip pull requests opened from a
-fork; linting still runs on those through the mirrored
-`pull-request/<number>` branch.
+updates the same URL, and they are deleted when the pull request closes because
+Fern previews never expire on their own. Pull requests from forks cannot read
+the token, so they get no preview. `fern/docs.yml` declares a single instance,
+so publication goes straight to production with no `--instance` flag and no
+staging site.
 
 ## Layout
 
 | Path | Purpose |
 | --- | --- |
 | `docs.yml` | Site instance, title, theme, navbar configuration, and navigation tree |
+| `generators.yml` | Points Fern at `proto/` to render the Protobuf Reference |
+| `proto/` | Vendored copy of the librms protos and the `LIBRMS_REV` file that records their source revision and a SHA-256 digest of each proto |
 | `components/` | Custom React components (footer, badge links). Currently unused. |
+
+## gRPC API reference
+
+The API Reference tab combines two kinds of content:
+
+- **Protobuf Reference** is rendered by Fern from the protos in `proto/`.
+- The overview, getting-started, conventions, and async-jobs pages are handwritten in
+  [`../docs/api-reference`](../docs/api-reference). The RPC catalog, the per-category pages, and
+  the message type pages in `../docs/api-reference/generated` are generated.
+
+The protos come from the `librms` crate, which RMS pins by revision in `Cargo.toml`. The generator
+reads the vendored protos plus [`../docs/api-reference/rpc-metadata.toml`](../docs/api-reference/rpc-metadata.toml),
+which records what the protos can't express: whether an RPC is synchronous or asynchronous, which RPC
+polls its job, and the target mode.
+
+| Command | Purpose |
+| --- | --- |
+| `just api-ref-sync` | Copies the protos from the pinned `librms` checkout into `proto/` and updates `LIBRMS_REV` |
+| `just api-ref-gen` | Regenerates the pages in `../docs/api-reference/generated` |
+| `just api-ref-check` | Runs the generator tests, then fails if the vendored protos differ from the `Cargo.toml` pin or were edited by hand, if the metadata is inconsistent, or if the generated pages are stale |
+
+When you bump the `librms` revision, run `just api-ref-sync` and `just api-ref-gen`. If the protos
+added an RPC, the check fails until you add the RPC to `rpc-metadata.toml`. `just docs-lint` runs
+`just api-ref-check`.

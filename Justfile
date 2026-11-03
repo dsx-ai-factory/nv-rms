@@ -64,9 +64,22 @@ docker-build-builder image="rms-builder" context=".":
 docs-api:
     RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 
-# Docs-site checks; same script CI's Lint Docs workflow runs.
+# Docs-site checks (includes the gRPC API reference drift check); same script CI runs.
 docs-lint:
     ./scripts/docs-lint.sh
+
+# Copy the librms protos pinned in Cargo.toml into fern/proto.
+api-ref-sync:
+    python3 ci/generate_api_reference.py sync
+
+# Regenerate the gRPC API reference pages in docs/api-reference/generated.
+api-ref-gen:
+    python3 ci/generate_api_reference.py generate
+
+# Test the generator and fail if the vendored protos, metadata, or generated pages are stale.
+api-ref-check:
+    PYTHONDONTWRITEBYTECODE=1 python3 ci/test_generate_api_reference.py
+    PYTHONDONTWRITEBYTECODE=1 python3 ci/generate_api_reference.py check
 
 # Serve the docs site locally (see fern/README.md for pnpm caveats).
 docs-live: docs-lint
