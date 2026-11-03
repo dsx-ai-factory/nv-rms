@@ -647,7 +647,8 @@ jobs:
       - name: Run TruffleHog Scan
         uses: dsx-ai-factory/dsx-github-actions/.github/actions/trufflehog-scan@9a9ce3a7770a8b53d2726afa920be3276bc3ddd7
         with:
-          extra-args: '--results=verified,unknown --only-verified'
+          # Skip the nvfwupd third-party source archive; it bundles upstream crate test keys.
+          extra-args: '--results=verified,unknown --only-verified --exclude-paths=/tmp/.github/trufflehog-exclude-paths.txt'
           post-pr-comment: 'false'
           fail-on-findings: 'true'
 
