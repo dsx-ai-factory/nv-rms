@@ -352,7 +352,7 @@ impl SwitchMtlsService {
 /// callers need to know which services converged, not how NVOS was driven.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MtlsUnsetStatus {
-    /// The binding was cleared.
+    /// The binding was cleared or the persist step's desired state already holds.
     Cleared,
 
     /// The cluster is disabled, so the app could not have been running mTLS.
@@ -391,6 +391,9 @@ impl MtlsUnsetStatus {
             StepStatus::Benign {
                 reason: BenignReason::GnmiMtlsSchemaAbsent,
             } => Self::Unsupported,
+            StepStatus::Benign {
+                reason: BenignReason::ConfigAlreadyApplied,
+            } => Self::Cleared,
             StepStatus::Failed { .. } => Self::Failed,
             StepStatus::NotAttempted => Self::NotAttempted,
         }
@@ -2606,6 +2609,32 @@ mod tests {
             &commands,
             &[
                 "nv action restore cluster apps nmx-controller manager encryption",
+                "nv config apply --assume-yes",
+                "nv config save",
+            ],
+        );
+    }
+
+    #[tokio::test]
+    async fn unset_mtls_services_saves_and_reports_already_applied_configuration() {
+        let (switch, commands) = recording_switch(&[(
+            "nv config apply --assume-yes",
+            "Revision 'applied' has already been applied.",
+        )]);
+
+        let report = switch
+            .unset_mtls_services(&[SwitchMtlsService::NvueApi], &no_cancel())
+            .await
+            .unwrap();
+
+        assert_eq!(service_statuses(&report), vec![("nvue-api", "cleared")]);
+        assert_eq!(persist_statuses(&report), PERSIST_COMPLETED);
+        assert_eq!(report.failure, None);
+        assert!(!report.cancelled);
+        assert_recorded_commands(
+            &commands,
+            &[
+                "nv unset system api mtls ca-certificate",
                 "nv config apply --assume-yes",
                 "nv config save",
             ],
