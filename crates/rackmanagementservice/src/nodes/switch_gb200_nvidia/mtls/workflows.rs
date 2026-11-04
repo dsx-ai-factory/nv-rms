@@ -2281,9 +2281,20 @@ mod tests {
 
         mount_enabled_cluster_and_manager(&server).await;
 
+        // Force the enable path even when the mock's HTTP port is reachable.
+        Mock::given(method("GET"))
+            .and(path("/nvue_v1/cluster/apps/nmx-controller/manager"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "state": "disabled" })))
+            .up_to_n_times(1)
+            .expect(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+
         Mock::given(method("POST"))
             .and(path("/nvue_v1/cluster/apps/nmx-controller/manager"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .expect(1)
             .named("POST @update /nvue_v1/cluster/apps/nmx-controller/manager")
             .mount(&server)
             .await;
