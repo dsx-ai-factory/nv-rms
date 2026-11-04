@@ -46,6 +46,10 @@ pub enum BenignReason {
     /// This NVOS build has no gNMI mTLS schema, so the service is already
     /// insecure and there is nothing to clear.
     GnmiMtlsSchemaAbsent,
+
+    /// NVOS has no pending revision after the bindings were cleared; the
+    /// selected `applied` revision already holds the requested configuration.
+    ConfigAlreadyApplied,
 }
 
 impl BenignReason {
@@ -57,6 +61,7 @@ impl BenignReason {
         match self {
             Self::ClusterNotEnabled => &["cluster is not enabled"],
             Self::GnmiMtlsSchemaAbsent => &["'mtls' is not one of", "\"mtls\" is not one of"],
+            Self::ConfigAlreadyApplied => &["Revision 'applied' has already been applied"],
         }
     }
 }
@@ -288,6 +293,8 @@ impl CommandFlow {
     ///
     /// Restoring a cluster app's manager encryption is likewise benign when the
     /// cluster is disabled: the app cannot be running mTLS.
+    /// If applying the cleared bindings reports that the `applied` revision
+    /// was already applied, continue to save that configuration.
     ///
     /// An empty `services` slice produces an empty flow. Falling through to the
     /// persist steps would apply and save the switch's running configuration on
@@ -341,8 +348,16 @@ impl CommandFlow {
 
         let persist_steps =
             [NvConfigOperation::ApplyAssumeYes, NvConfigOperation::Save].map(|operation| {
-                FlowStep::new(NvCommand::config(operation))
-                    .with_subject(StepSubject::Persist(operation))
+                let step = FlowStep::new(NvCommand::config(operation))
+                    .with_subject(StepSubject::Persist(operation));
+                if operation == NvConfigOperation::ApplyAssumeYes {
+                    step.with_benign_failure(BenignFailure::new(
+                        BenignReason::ConfigAlreadyApplied,
+                        BenignOutcome::Continue,
+                    ))
+                } else {
+                    step
+                }
             });
 
         Ok(unset_steps

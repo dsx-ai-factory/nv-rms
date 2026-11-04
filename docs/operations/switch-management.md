@@ -369,6 +369,11 @@ job.
 | `UpdateSwitchSystemPassword` | Async → `GetJobStatus` | Rotate an NVOS system-user password on one or more switches. Per-node results report **job admission only**. Passwords are kept task-local and scrubbed from all status and logs. | `username`, `password`, `nodes` | `NodeBatchResponse` (parent `job_id`) |
 | `BatchCollectSwitchSpdmAttestationEvidence` | Sync | Collect targets concurrently; per target, discover NVUE SPDM components, generate fresh nonce-bound measurements serially, and fetch each component's signed measurements and certificate chain. RMS collects but does not appraise the evidence, and holds no lock or persisted state across calls. | `targets[]`, 32-byte `nonce`, `domain?` | Batch status and one result per target with per-component status, evidence, and a collection timestamp |
 
+During mTLS disable, NVOS can report that revision `applied` has already been
+applied when the bindings are already clear. RMS records that `config_apply`
+step as `cleared` and still runs `config_save`. Other apply errors, and all
+save errors, fail the job.
+
 Before installing a switch certificate, RMS retries a failed NVUE readiness
 check with verified mTLS. If both attempts fail server certificate validation,
 it uses unverified mTLS for bootstrap while still presenting its client
