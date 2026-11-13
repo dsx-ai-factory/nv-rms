@@ -84,6 +84,26 @@ Credentials secret name for DB: standalone postgres secret, or external database
 {{- end }}
 
 {{/*
+Effective firmware PVC name: apiServer.firmwarePersistentVolumeClaim when set,
+otherwise "<fullname>-firmware" (only used when the chart creates the PVC).
+*/}}
+{{- define "rack-manager.firmwarePvcName" -}}
+{{- .Values.apiServer.firmwarePersistentVolumeClaim | default "" | trim | default (printf "%s-firmware" (include "rack-manager.fullname" .)) -}}
+{{- end -}}
+
+{{/*
+True when the firmware volume should be backed by a PVC rather than hostPath:
+either the chart is creating one (apiServer.firmwarePvc.create) or an existing
+claim name was supplied (apiServer.firmwarePersistentVolumeClaim).
+*/}}
+{{- define "rack-manager.firmwareUsePvc" -}}
+{{- $pvc := .Values.apiServer.firmwarePvc | default dict -}}
+{{- if or $pvc.create (.Values.apiServer.firmwarePersistentVolumeClaim | default "" | trim) -}}
+true
+{{- end -}}
+{{- end -}}
+
+{{/*
 Image pull secrets: global.imagePullSecrets (legacy apiServer.imagePullSecrets accepted).
 Use inline: {{ $s := .Values.global.imagePullSecrets | default .Values.apiServer.imagePullSecrets }}
 */}}
@@ -271,6 +291,53 @@ Validate bounded tracing settings that depend on more than one value.
 {{- end -}}
 {{- if lt $terminationGrace $requiredGrace -}}
 {{- fail (printf "apiServer.terminationGracePeriodSeconds must be at least %d for the RMS job drain, tracing shutdown timeout, and margin" $requiredGrace) -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Validate apiServer.strategy: Kubernetes rejects a Deployment that sets
+rollingUpdate alongside type: Recreate, or one that can neither surge nor
+replace pods (maxSurge 0 with maxUnavailable 0). Included only from the
+api-server Deployment template so Helm attributes the render error
+deterministically.
+*/}}
+{{- define "rack-manager.validateStrategyOptions" -}}
+{{- $strategy := .Values.apiServer.strategy | default dict -}}
+{{- if and $strategy.rollingUpdate (eq ($strategy.type | default "") "Recreate") -}}
+{{- fail "apiServer.strategy.rollingUpdate is not allowed when apiServer.strategy.type is Recreate; Kubernetes rejects that Deployment strategy combination" -}}
+{{- end -}}
+{{- $ru := $strategy.rollingUpdate | default dict -}}
+{{- if and (has ($ru.maxSurge | toString) (list "0" "0%")) (has ($ru.maxUnavailable | toString) (list "0" "0%")) -}}
+{{- fail "apiServer.strategy.rollingUpdate cannot set both maxSurge and maxUnavailable to 0; Kubernetes rejects that Deployment strategy combination" -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Validate the chart-created firmware PVC's ReadWriteOncePod constraints, which
+Kubernetes otherwise only rejects (or deadlocks on) after apply: the mode must
+be the sole accessModes entry, only one pod may mount the claim, and the
+rollout must delete the old pod before creating its replacement (strategy.type
+Recreate, or a RollingUpdate with maxSurge 0). Included only from the firmware
+PVC template so Helm attributes the render error deterministically.
+*/}}
+{{- define "rack-manager.validateFirmwarePvcOptions" -}}
+{{- $pvc := .Values.apiServer.firmwarePvc | default dict -}}
+{{- if and .Values.apiServer.enabled $pvc.create -}}
+{{- $accessModes := $pvc.accessModes | default (list "ReadWriteOnce") -}}
+{{- if and (has "ReadWriteOncePod" $accessModes) (gt (len $accessModes) 1) -}}
+{{- fail "apiServer.firmwarePvc.accessModes cannot combine ReadWriteOncePod with other access modes; Kubernetes requires it to be the only access mode" -}}
+{{- end -}}
+{{- if has "ReadWriteOncePod" $accessModes -}}
+{{- $replicas := .Values.apiServer.replicaCount | int -}}
+{{- if gt $replicas 1 -}}
+{{- fail (printf "apiServer.firmwarePvc.accessModes ReadWriteOncePod allows only one pod to mount the claim; set apiServer.replicaCount to 1 (got %d)" $replicas) -}}
+{{- end -}}
+{{- $strategy := .Values.apiServer.strategy | default dict -}}
+{{- $deleteFirst := or (eq ($strategy.type | default "") "Recreate") (has (($strategy.rollingUpdate | default dict).maxSurge | toString) (list "0" "0%")) -}}
+{{- if not $deleteFirst -}}
+{{- fail "apiServer.firmwarePvc.accessModes ReadWriteOncePod requires a delete-before-create rollout; set apiServer.strategy.type: Recreate or apiServer.strategy.rollingUpdate.maxSurge: 0" -}}
+{{- end -}}
+{{- end -}}
 {{- end -}}
 {{- end -}}
 
