@@ -1,4 +1,11 @@
 {{- if and .Values.dropDatabaseOnUninstall (not (include "rack-manager.useMemoryPersistence" .)) }}
+{{- /* Validate the secret keys here only when the api-server Deployment — the
+     validator's primary home — does not render (apiServer.enabled: false), so
+     the fail stays attributable to a single deterministic template while this
+     pre-delete hook still rejects bad overrides at render time. */ -}}
+{{- if not .Values.apiServer.enabled }}
+{{- include "rack-manager.validateDbSecretKeys" . -}}
+{{- end }}
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -31,13 +38,13 @@ spec:
               valueFrom:
                 secretKeyRef:
                   name: {{ include "rack-manager.databaseCredentialsSecret" . }}
-                  key: username
+                  key: {{ include "rack-manager.dbUsernameKey" . | quote }}
                   optional: true
             - name: PGPASSWORD
               valueFrom:
                 secretKeyRef:
                   name: {{ include "rack-manager.databaseCredentialsSecret" . }}
-                  key: password
+                  key: {{ include "rack-manager.dbPasswordKey" . | quote }}
                   optional: true
             - name: DB_NAME
               value: {{ .Values.database.name | quote }}

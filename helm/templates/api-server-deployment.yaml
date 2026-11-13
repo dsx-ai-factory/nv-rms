@@ -3,6 +3,7 @@
 {{- include "rack-manager.validateFirmwareTaskOptions" . -}}
 {{- include "rack-manager.validateComputePowerOnOptions" . -}}
 {{- include "rack-manager.validateTracingOptions" . -}}
+{{- include "rack-manager.validateDbSecretKeys" . -}}
 {{- $firmwarePersistentVolumeClaim := .Values.apiServer.firmwarePersistentVolumeClaim | default "" | trim }}
 apiVersion: apps/v1
 kind: Deployment
@@ -67,12 +68,12 @@ spec:
               valueFrom:
                 secretKeyRef:
                   name: {{ include "rack-manager.databaseCredentialsSecret" . }}
-                  key: username
+                  key: {{ include "rack-manager.dbUsernameKey" . | quote }}
             - name: PGPASSWORD
               valueFrom:
                 secretKeyRef:
                   name: {{ include "rack-manager.databaseCredentialsSecret" . }}
-                  key: password
+                  key: {{ include "rack-manager.dbPasswordKey" . | quote }}
             - name: DB_NAME
               valueFrom:
                 configMapKeyRef:
@@ -170,12 +171,12 @@ spec:
             - name: DB_USER
               valueFrom:
                 secretKeyRef:
-                  key: username
+                  key: {{ include "rack-manager.dbUsernameKey" . | quote }}
                   name: {{ include "rack-manager.databaseCredentialsSecret" . }}
             - name: DB_PASSWORD
               valueFrom:
                 secretKeyRef:
-                  key: password
+                  key: {{ include "rack-manager.dbPasswordKey" . | quote }}
                   name: {{ include "rack-manager.databaseCredentialsSecret" . }}
             - name: DATABASE_URL
               value: "postgres://$(DB_USER):$(DB_PASSWORD)@$(DB_HOST):$(DB_PORT)/$(DB_NAME)?sslmode={{ .Values.database.sslMode }}"
