@@ -920,6 +920,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn already_applied_mtls_clear_still_saves_configuration() {
+        let transport = ScriptedTransport::new().reply(
+            CONFIG_APPLY,
+            Err(TestFailure::new(
+                "Revision 'applied' has already been applied.",
+            )),
+        );
+        let handler = NvSwitchCliHandler::new(transport);
+
+        let report = handler
+            .run_flow(&unset_mtls_flow(&[MtlsService::NvueApi]))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcomes(&report),
+            vec![
+                (Some("nvue-api"), &SUCCEEDED),
+                (
+                    Some("config-apply"),
+                    &StepStatus::Benign {
+                        reason: BenignReason::ConfigAlreadyApplied,
+                    }
+                ),
+                (Some("config-save"), &SUCCEEDED),
+            ]
+        );
+        assert_eq!(
+            handler.transport().recorded(),
+            vec![
+                "nv unset system api mtls ca-certificate",
+                CONFIG_APPLY,
+                CONFIG_SAVE
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn already_applied_tolerance_is_limited_to_apply_of_the_applied_revision() {
+        for (command, message, expected_stage) in [
+            (
+                "nv unset system api mtls ca-certificate",
+                "Revision 'applied' has already been applied.",
+                "nvue-api",
+            ),
+            (
+                CONFIG_SAVE,
+                "Revision 'applied' has already been applied.",
+                "config-save",
+            ),
+            (
+                CONFIG_APPLY,
+                "Revision 'pending' has already been applied.",
+                "config-apply",
+            ),
+            (CONFIG_APPLY, "permission denied", "config-apply"),
+        ] {
+            let handler = NvSwitchCliHandler::new(
+                ScriptedTransport::new().reply(command, Err(TestFailure::new(message))),
+            );
+            let failure = handler
+                .run_flow(&unset_mtls_flow(&[MtlsService::NvueApi]))
+                .await
+                .unwrap_err();
+            assert_eq!(
+                failure
+                    .report
+                    .failed_step()
+                    .and_then(StepReport::subject)
+                    .map(StepSubject::label),
+                Some(expected_stage),
+            );
+            assert_eq!(
+                handler.transport().recorded().last().map(String::as_str),
+                Some(command)
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn run_flow_falls_back_to_the_alternate_command_form() {
         let transport = ScriptedTransport::new().reply(
             GNMI_UNSET,
