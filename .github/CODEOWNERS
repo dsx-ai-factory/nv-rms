@@ -6,14 +6,5 @@
 # Default owners for everything in the repo
 * @dsx-ai-factory/rms-sw-contributors
 
-# GitHub process and automation files
-/.github/ @dsx-ai-factory/rms-sw-admins
-
 # CODEOWNERS file itself - requires admin approval
 /.github/CODEOWNERS @dsx-ai-factory/rms-sw-admins
-
-# Helm charts
-/helm/ @dsx-ai-factory/rms-sw-admins
-
-# Security policy
-/SECURITY.md @dsx-ai-factory/rms-sw-admins
