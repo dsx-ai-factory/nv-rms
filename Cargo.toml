@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/common",
+    "crates/librms",
     "crates/nvdebug_cli",
     "crates/nvdebug_probe",
     "crates/nvssvt",
@@ -10,6 +11,7 @@ members = [
     "crates/redfish_client",
     "crates/redfish_test_support",
     "crates/rust_nvfwupd",
+    "crates/tonic-client-wrapper",
 ]
 default-members = ["crates/rackmanagementservice"]
 resolver = "3"
@@ -36,7 +38,7 @@ http-body = "1"
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio", "server-auto", "client-legacy"] }
 indexmap = { version = "2", features = ["serde"] }
-librms = { git = "https://github.com/dsx-ai-factory/nv-rms-client", rev = "7bed078b55673ff2a3c8546c63e9554dc19951d3", default-features = false }
+librms = { path = "crates/librms", default-features = false }
 macaddr = "1.0.1"
 mimalloc = { version = "0.1", features = ["override"] }
 nix = "0.31"

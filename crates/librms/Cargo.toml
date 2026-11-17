@@ -47,7 +47,7 @@ serde = ["dep:chrono", "dep:serde"]
 # Optional dependencies are enabled by the feature lists above. Shared protobuf
 # dependencies stay non-optional because all feature combinations need the wire
 # model types generated from `rack_manager.proto`.
-tonic-client-wrapper = { path = "tonic-client-wrapper", default-features = false, optional = true, version = "1.1.0" }
+tonic-client-wrapper = { path = "../tonic-client-wrapper", default-features = false, optional = true, version = "1.1.0" }
 
 tokio = { version = "1", features = ["full", "tracing"], optional = true }
 tonic = "0.14"
@@ -76,7 +76,7 @@ hyper = { version = "1", features = ["server", "http2"] }
 serde_json = "1"
 
 [build-dependencies]
-tonic-client-wrapper = { path = "tonic-client-wrapper", default-features = false, features = ["codegen"], optional = true }
+tonic-client-wrapper = { path = "../tonic-client-wrapper", default-features = false, features = ["codegen"], optional = true }
 tonic-prost-build = "0.14"
 
 [lints.clippy]

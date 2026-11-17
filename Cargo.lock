@@ -2318,12 +2318,12 @@ dependencies = [
 
 [[package]]
 name = "librms"
-version = "0.10.2"
-source = "git+https://github.com/dsx-ai-factory/nv-rms-client?rev=7bed078b55673ff2a3c8546c63e9554dc19951d3#7bed078b55673ff2a3c8546c63e9554dc19951d3"
+version = "0.11.0"
 dependencies = [
  "async-trait",
  "chrono",
  "eyre",
+ "http-body-util",
  "hyper 1.8.1",
  "hyper-rustls",
  "hyper-timeout",
@@ -2333,6 +2333,7 @@ dependencies = [
  "rustls",
  "rustls-pemfile",
  "serde",
+ "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "tonic 0.14.6",
@@ -5419,7 +5420,6 @@ dependencies = [
 [[package]]
 name = "tonic-client-wrapper"
 version = "1.1.0"
-source = "git+https://github.com/dsx-ai-factory/nv-rms-client?rev=7bed078b55673ff2a3c8546c63e9554dc19951d3#7bed078b55673ff2a3c8546c63e9554dc19951d3"
 dependencies = [
  "async-trait",
  "heck",
