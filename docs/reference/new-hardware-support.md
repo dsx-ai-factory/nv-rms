@@ -66,7 +66,7 @@ as the API contract and `src/domain/node.rs` as the domain source of truth.
 
 Expected changes:
 
-- Update the `NodeType` enum in `crates/librms/proto/rack_manager.proto`.
+- Update the `NodeType` enum in `crates/librms/proto/rack_manager.proto` (from the repository root).
 - Add the matching domain variant in `src/domain/node.rs`.
 - Add the stable config string in `NodeType::as_str()`.
 - Add the role in `NodeType::kind()`.

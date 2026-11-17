@@ -31,8 +31,8 @@ Or directly with Cargo:
 cargo build --release --workspace
 ```
 
-Optimized binaries land under `target/release/` and match what the container
-image ships:
+Optimized binaries land under `target/release/`. The container image ships
+these two, built with `--exclude librms --exclude tonic-client-wrapper`:
 
 ```text
 target/release/rackmanagementservice

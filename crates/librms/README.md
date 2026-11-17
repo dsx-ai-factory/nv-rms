@@ -24,10 +24,10 @@ Run the feature matrix before publishing changes that touch generated protobuf,
 client, server, or serde support:
 
 ```bash
-cargo test --no-default-features
-cargo test --no-default-features --features client
-cargo test --no-default-features --features server
-cargo test --all-features
+cargo test -p librms --no-default-features
+cargo test -p librms --no-default-features --features client
+cargo test -p librms --no-default-features --features server
+cargo test -p librms --all-features
 ```
 
 ## License

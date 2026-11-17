@@ -22,6 +22,10 @@ RMS release. The files are in the `crates/librms/proto` directory:
 - `rack_manager.proto` defines the `RackManager` service.
 - `rack_manager_v2.proto` defines the `RackManagerV2` service and imports `rack_manager.proto`.
 
+Releases that pin `librms` by Git revision in `Cargo.toml` don't have `crates/librms`. For those,
+use the `proto` directory of [`nv-rms-client`](https://github.com/dsx-ai-factory/nv-rms-client) at
+the pinned revision, and pass that directory to `-import-path`.
+
 ## Call an RPC with grpcurl
 
 Set the address and the common `grpcurl` flags once. The examples in this reference use these two
@@ -29,7 +33,7 @@ variables. They assume a Bash shell.
 
 ```bash
 export RMS_ADDR=rms.example.com:8801
-export RMS_GRPCURL_FLAGS="-import-path ./proto -proto rack_manager.proto -proto rack_manager_v2.proto \
+export RMS_GRPCURL_FLAGS="-import-path ./crates/librms/proto -proto rack_manager.proto -proto rack_manager_v2.proto \
   -cacert ca.pem -cert client.pem -key client.key"
 ```
 

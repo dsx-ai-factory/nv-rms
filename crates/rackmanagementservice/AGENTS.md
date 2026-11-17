@@ -67,7 +67,7 @@ Inspect both `src/api/grpc/conversions.rs` and
 outgoing-descriptor tests.
 
 If the public API needs an exact new enum value, update the authoritative
-`librms` protobuf source or version and regenerate bindings before adding the
+`librms` protobuf source and regenerate bindings before adding the
 Rust conversion. Do not invent a crate-local protobuf identity.
 
 If protobuf has no exact platform value, keep the platform descriptor-only:

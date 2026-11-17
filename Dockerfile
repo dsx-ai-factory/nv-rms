@@ -64,8 +64,9 @@ COPY . .
 ARG VERGEN_GIT_SHA
 ARG VERGEN_GIT_DESCRIBE
 
-# librms builds only as a dependency here: as a selected member, its default
-# client feature would unify into the shipped binaries' dependency graph.
+# librms and tonic-client-wrapper build only as dependencies here: as selected
+# members, their default features (librms `client`, tonic-client-wrapper
+# `tls-ring`) would unify into the shipped binaries' dependency graph.
 RUN sed -i '/fuse-ld=lld/d' .cargo/config.toml \
     && cargo build --release --workspace --exclude librms --exclude tonic-client-wrapper
 

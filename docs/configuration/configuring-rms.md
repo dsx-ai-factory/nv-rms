@@ -644,7 +644,8 @@ spans between backends.
 
 Complete [Collector setup](#collector-configuration) first. Install `grpcurl`
 and point `RMS_PROTO_DIR` at the `crates/librms/proto` directory of the RMS
-release you run. Set `RMS_API_ADDR` to the RMS API's
+release you run. For a release that pins `librms` by Git revision, use the
+`proto` directory of `nv-rms-client` at that revision. Set `RMS_API_ADDR` to the RMS API's
 certificate-matching hostname and port, and supply its API CA and authorized
 client certificate/key paths. These are API credentials, separate from the
 Collector's trust configuration.
