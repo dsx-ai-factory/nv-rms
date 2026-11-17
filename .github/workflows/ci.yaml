@@ -101,7 +101,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Build builder image (amd64)
-        uses: dsx-ai-factory/dsx-github-actions/.github/actions/docker-build@911d86017e6e0715cef26cb3105d66c2fcd985fb # reviewed commit 911d860 (upstream #94, pending merge)
+        uses: dsx-ai-factory/dsx-github-actions/.github/actions/docker-build@a86675cddd27de0cc3182d2a33db75a26c20bb90 # v1.35.1
         with:
           image: rms-builder
           tags: ${{ needs.prepare.outputs.version }}-amd64
@@ -123,7 +123,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Build builder image (arm64)
-        uses: dsx-ai-factory/dsx-github-actions/.github/actions/docker-build@911d86017e6e0715cef26cb3105d66c2fcd985fb # reviewed commit 911d860 (upstream #94, pending merge)
+        uses: dsx-ai-factory/dsx-github-actions/.github/actions/docker-build@a86675cddd27de0cc3182d2a33db75a26c20bb90 # v1.35.1
         with:
           image: rms-builder
           tags: ${{ needs.prepare.outputs.version }}-arm64
