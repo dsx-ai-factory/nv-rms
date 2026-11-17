@@ -66,7 +66,5 @@ When running RMS against real hardware:
 ## The librms proto definitions
 
 The gRPC service definitions (`rack_manager.proto` and related types) are
-provided by the [`librms`](https://github.com/dsx-ai-factory/nv-rms-client) crate, pinned
-by `rev` in [`Cargo.toml`](https://github.com/dsx-ai-factory/nv-rms/blob/main/Cargo.toml).
-Cargo fetches it automatically during the build - no submodule init step is
-required.
+provided by the `librms` crate in `crates/librms`, which Cargo builds as part
+of the workspace - no submodule init step is required.

@@ -6,9 +6,8 @@ returns a job ID that you poll.
 
 ## Services
 
-The RMS API consists of two gRPC services, both defined in the
-[`librms`](https://github.com/dsx-ai-factory/nv-rms-client) protobuf package that RMS pins at build
-time. RMS serves both on the same port (default `8801`).
+The RMS API consists of two gRPC services, both defined in the `librms` protobuf files in
+`crates/librms/proto`. RMS serves both on the same port (default `8801`).
 
 | Service | Protobuf package | Proto file | Scope |
 | --- | --- | --- | --- |

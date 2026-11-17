@@ -1,0 +1,15 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+syntax = "proto3";
+
+package nested_test;
+
+service NestedService {
+  rpc Ping(PingRequest) returns (PingResponse) {}
+}
+
+message PingRequest {}
+message PingResponse {}

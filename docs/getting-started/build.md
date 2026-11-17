@@ -9,8 +9,8 @@ git clone https://github.com/dsx-ai-factory/nv-rms.git
 cd nv-rms
 ```
 
-The `librms` gRPC definitions are fetched automatically by Cargo (pinned by `rev`
-in `Cargo.toml`) on the first build - there is no submodule to initialize.
+The `librms` gRPC definitions are built from `crates/librms` in the workspace -
+there is no submodule to initialize.
 
 ## Building the binaries
 
@@ -31,8 +31,8 @@ Or directly with Cargo:
 cargo build --release --workspace
 ```
 
-Optimized binaries land under `target/release/` and match what the container
-image ships:
+Optimized binaries land under `target/release/`. The container image ships
+these two, built with `--exclude librms --exclude tonic-client-wrapper`:
 
 ```text
 target/release/rackmanagementservice

@@ -55,7 +55,7 @@ Terms used throughout the RMS documentation.
 </ParamField>
 
 <ParamField path="librms">
-  The external crate ([`nv-rms-client`](https://github.com/dsx-ai-factory/nv-rms-client)) providing the `rack_manager.proto` gRPC service definitions, pinned by `rev` and fetched by Cargo.
+  The workspace crate (`crates/librms`) providing the `rack_manager.proto` gRPC service definitions.
 </ParamField>
 
 <ParamField path="MNNVLink topology">

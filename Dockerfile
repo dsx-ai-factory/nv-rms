@@ -21,7 +21,7 @@
 # Builder dependencies are installed without apt-get: some CI runners (notably
 # aarch64) fail apt metadata verification with "invalid signature" errors.
 
-FROM rust:1.96-bookworm AS builder
+FROM rust:1.96-bookworm AS production-build
 
 ARG TARGETARCH
 ARG PROTOC_VERSION=28.3
@@ -64,10 +64,15 @@ COPY . .
 ARG VERGEN_GIT_SHA
 ARG VERGEN_GIT_DESCRIBE
 
-# Pre-compile test and benchmark binaries so the CI run-tests and run-benchmarks jobs don't need to recompile
+# librms and tonic-client-wrapper build only as dependencies here: as selected
+# members, their default features (librms `client`, tonic-client-wrapper
+# `tls-ring`) would unify into the shipped binaries' dependency graph.
 RUN sed -i '/fuse-ld=lld/d' .cargo/config.toml \
-    && cargo build --release --workspace \
-    && cargo test --workspace --release --no-run \
+    && cargo build --release --workspace --exclude librms --exclude tonic-client-wrapper
+
+# Pre-compile test and benchmark binaries so the CI run-tests and run-benchmarks jobs don't need to recompile
+FROM production-build AS builder
+RUN cargo test --workspace --release --no-run \
     && cargo bench --workspace --no-run
 
 
@@ -82,8 +87,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ipmitool \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /app/target/release/rackmanagementservice /usr/local/bin/
-COPY --from=builder /app/target/release/nvfwupd /usr/local/bin/
+COPY --from=production-build /app/target/release/rackmanagementservice /usr/local/bin/
+COPY --from=production-build /app/target/release/nvfwupd /usr/local/bin/
 
 EXPOSE 8801
 

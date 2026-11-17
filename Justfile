@@ -68,7 +68,7 @@ docs-api:
 docs-lint:
     ./scripts/docs-lint.sh
 
-# Copy the librms protos pinned in Cargo.toml into fern/proto.
+# Copy the librms protos from crates/librms/proto into fern/proto.
 api-ref-sync:
     python3 ci/generate_api_reference.py sync
 

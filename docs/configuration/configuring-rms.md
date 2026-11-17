@@ -643,8 +643,9 @@ spans between backends.
 ### Follow a read-only request
 
 Complete [Collector setup](#collector-configuration) first. Install `grpcurl`
-and point `RMS_PROTO_DIR` at the `proto/` directory from the `nv-rms-client`
-revision pinned in RMS's `Cargo.toml`. Set `RMS_API_ADDR` to the RMS API's
+and point `RMS_PROTO_DIR` at the `crates/librms/proto` directory of the RMS
+release you run. For a release that pins `librms` by Git revision, use the
+`proto` directory of `nv-rms-client` at that revision. Set `RMS_API_ADDR` to the RMS API's
 certificate-matching hostname and port, and supply its API CA and authorized
 client certificate/key paths. These are API credentials, separate from the
 Collector's trust configuration.
@@ -934,8 +935,8 @@ Test parent IDs, error outcomes, cancellation, and any verified-success claim.
 
 Job span names and their export catalog share the exhaustive `job_spans!` table
 in `job_tracker.rs`; add new job types there. RPC catalog tests compare request
-names with the pinned `librms` protobuf descriptors and fail if a client-library
-update adds an RPC missing from the catalog.
+names with the `librms` protobuf descriptors and fail if a protobuf change adds
+an RPC missing from the catalog.
 
 #### RPC convention coverage
 

@@ -1,0 +1,5 @@
+# Clippy uses this file instead of the workspace clippy.toml for this crate.
+# librms is consumed outside this repository, so lints must not suggest
+# breaking changes to its exported API.
+avoid-breaking-exported-api = true
+enum-variant-name-threshold = 2

@@ -36,9 +36,9 @@ use x509_parser::prelude::FromDer;
 
 const MAX_LOG_VALUE_CHARS: usize = 1_024;
 const MAX_TRACEPARENT_BYTES: usize = 512;
-// Finite catalog of the service RPCs in the pinned librms protobufs. librms does
+// Finite catalog of the service RPCs in the librms protobufs. librms does
 // not expose its descriptor set, so the list is maintained here and
-// `rpc_catalog_matches_pinned_protobuf_descriptors` fails when they differ.
+// `rpc_catalog_matches_protobuf_descriptors` fails when they differ.
 // Unknown paths are deliberately collapsed to `_OTHER`.
 const RACK_MANAGER_SERVICE: &str = "rack_manager.RackManager";
 const RACK_MANAGER_V2_SERVICE: &str = "rack_manager_v2.RackManagerV2";
@@ -716,14 +716,14 @@ mod tests {
 
     #[test]
     #[allow(clippy::result_large_err, reason = "required by Figment's test API")]
-    fn rpc_catalog_matches_pinned_protobuf_descriptors() {
+    fn rpc_catalog_matches_protobuf_descriptors() {
         use prost::Message as _;
         use std::process::Command;
 
         // Config tests clear the process environment under Figment's lock.
         figment::Jail::expect_with(|_| {
             // librms generates but does not expose its descriptor bytes. Resolve
-            // its pinned sources through Cargo instead of guessing a cache path.
+            // its sources through Cargo instead of guessing a cache path.
             let rustc = Command::new(
                 std::env::var_os("RUSTC").unwrap_or_else(|| std::ffi::OsString::from("rustc")),
             )
@@ -744,7 +744,7 @@ mod tests {
                 .arg("--manifest-path")
                 .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"))
                 .output()
-                .expect("run Cargo metadata for the pinned librms sources");
+                .expect("run Cargo metadata for the librms sources");
             assert!(
                 metadata.status.success(),
                 "Cargo metadata failed: {}",

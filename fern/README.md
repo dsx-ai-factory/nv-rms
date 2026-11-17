@@ -64,7 +64,7 @@ staging site.
 | --- | --- |
 | `docs.yml` | Site instance, title, theme, navbar configuration, and navigation tree |
 | `generators.yml` | Points Fern at `proto/` to render the Protobuf Reference |
-| `proto/` | Vendored copy of the librms protos and the `LIBRMS_REV` file that records their source revision and a SHA-256 digest of each proto |
+| `proto/` | Vendored copy of the librms protos from `../crates/librms/proto` |
 | `components/` | Custom React components (footer, badge links). Currently unused. |
 
 ## gRPC API reference
@@ -76,17 +76,17 @@ The API Reference tab combines two kinds of content:
   [`../docs/api-reference`](../docs/api-reference). The RPC catalog, the per-category pages, and
   the message type pages in `../docs/api-reference/generated` are generated.
 
-The protos come from the `librms` crate, which RMS pins by revision in `Cargo.toml`. The generator
+The protos come from the `librms` crate in [`../crates/librms/proto`](../crates/librms/proto). The generator
 reads the vendored protos plus [`../docs/api-reference/rpc-metadata.toml`](../docs/api-reference/rpc-metadata.toml),
 which records what the protos can't express: whether an RPC is synchronous or asynchronous, which RPC
 polls its job, and the target mode.
 
 | Command | Purpose |
 | --- | --- |
-| `just api-ref-sync` | Copies the protos from the pinned `librms` checkout into `proto/` and updates `LIBRMS_REV` |
+| `just api-ref-sync` | Copies the protos from `../crates/librms/proto` into `proto/` |
 | `just api-ref-gen` | Regenerates the pages in `../docs/api-reference/generated` |
-| `just api-ref-check` | Runs the generator tests, then fails if the vendored protos differ from the `Cargo.toml` pin or were edited by hand, if the metadata is inconsistent, or if the generated pages are stale |
+| `just api-ref-check` | Runs the generator tests, then fails if the vendored protos differ from `../crates/librms/proto`, if the metadata is inconsistent, or if the generated pages are stale |
 
-When you bump the `librms` revision, run `just api-ref-sync` and `just api-ref-gen`. If the protos
+When you change the `librms` protos, run `just api-ref-sync` and `just api-ref-gen`. If the protos
 added an RPC, the check fails until you add the RPC to `rpc-metadata.toml`. `just docs-lint` runs
 `just api-ref-check`.
