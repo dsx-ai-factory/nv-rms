@@ -66,7 +66,7 @@ as the API contract and `src/domain/node.rs` as the domain source of truth.
 
 Expected changes:
 
-- Update the `NodeType` enum in the `nv-rms-client` protobuf/client source, then bump the `src/api/grpc/proto/nv-rms-client` submodule pointer in RMS.
+- Update the `NodeType` enum in `crates/librms/proto/rack_manager.proto`.
 - Add the matching domain variant in `src/domain/node.rs`.
 - Add the stable config string in `NodeType::as_str()`.
 - Add the role in `NodeType::kind()`.
@@ -204,6 +204,9 @@ explicit `NodeType` matches. Use this tree as the quick review map:
 
 ```text
 crates/
+├── librms/
+│   └── proto/
+│       └── rack_manager.proto                  # Protobuf NodeType source
 ├── rackmanagementservice/
 │   ├── src/
 │   │   ├── domain/
@@ -231,8 +234,7 @@ crates/
 │   │       ├── switch_security_handlers.rs     # Switch security and credential flows
 │   │       ├── switch_certificate_handlers.rs  # Switch certificate flows
 │   │       ├── scaleupfabricmanager_handlers.rs # Scale-up FM flows
-│   │       ├── node_recovery.rs                # Node recovery flows
-│   │       └── proto/nv-rms-client/            # Protobuf/client NodeType source
+│   │       └── node_recovery.rs                # Node recovery flows
 │   └── tests/
 │       ├── client/src/main.rs                  # Admin/test client node-type parsing
 │       └── grpc_e2e.rs                         # End-to-end API coverage

@@ -16,9 +16,8 @@ control power, update firmware, and operate on nodes that RMS doesn't store.
 
 ## Get the protobuf files
 
-Clone the [`nv-rms-client`](https://github.com/dsx-ai-factory/nv-rms-client) repository and check
-out the revision that your RMS release pins as `librms` in its `Cargo.toml`. The files are in the
-`proto` directory:
+Clone the [RMS repository](https://github.com/dsx-ai-factory/nv-rms) and check out the tag of your
+RMS release. The files are in the `crates/librms/proto` directory:
 
 - `rack_manager.proto` defines the `RackManager` service.
 - `rack_manager_v2.proto` defines the `RackManagerV2` service and imports `rack_manager.proto`.

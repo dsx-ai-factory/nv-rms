@@ -12,7 +12,7 @@ helm/*.tgz
 
 # Local-only Python gRPC client (hand-run dev tooling, not part of the build).
 # Kept on disk, deliberately untracked: it carries its own copies of the protos,
-# which drift from the real ones in nv-rms-client the moment either changes.
+# which drift from the real ones in crates/librms/proto the moment either changes.
 scripts/python-client/
 
 # NVSSVT release bundles for docker/nvssvt/Dockerfile. Too large for git;

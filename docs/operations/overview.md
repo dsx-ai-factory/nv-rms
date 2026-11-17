@@ -1,8 +1,7 @@
 # Operations Overview
 
 RMS exposes two gRPC services, **`RackManager`** and **`RackManagerV2`**, whose
-service definitions come from the external
-[`librms`](https://github.com/dsx-ai-factory/nv-rms-client) crate.
+service definitions come from the `librms` crate in `crates/librms`.
 The RPCs are documented by capability across the pages in this section:
 [Power Control](power-control.md), [Inventory](inventory.md),
 [Firmware](firmware.md), [Switch Management](switch-management.md),
