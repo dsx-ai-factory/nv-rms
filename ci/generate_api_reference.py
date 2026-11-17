@@ -3,12 +3,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """Generate and verify the RMS gRPC API reference pages.
 
-The RMS API is defined by the `librms` crate (nv-rms-client). This tool keeps
-the public documentation in step with it:
+The RMS API is defined by the protos in the `librms` crate
+(``crates/librms/proto``). This tool keeps the public documentation in step
+with it:
 
 ``sync``
-    Copy the protos from the `librms` revision pinned in ``Cargo.toml`` into
-    ``fern/proto`` and record the revision in ``fern/proto/LIBRMS_REV``.
+    Copy the protos from ``crates/librms/proto`` into ``fern/proto``.
 ``generate``
     Build the pages under ``docs/api-reference/generated`` from the vendored
     protos (shapes and descriptions) plus ``docs/api-reference/rpc-metadata.toml``
@@ -24,7 +24,6 @@ found on ``PATH`` or run through ``npx @bufbuild/buf``.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import re
 import shutil
@@ -40,10 +39,9 @@ import tomllib  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 PROTO_DIR = REPO_ROOT / "fern" / "proto"
-REV_FILE = PROTO_DIR / "LIBRMS_REV"
+LIBRMS_PROTO_DIR = REPO_ROOT / "crates" / "librms" / "proto"
 METADATA_FILE = REPO_ROOT / "docs" / "api-reference" / "rpc-metadata.toml"
 OUTPUT_DIR = REPO_ROOT / "docs" / "api-reference" / "generated"
-CARGO_TOML = REPO_ROOT / "Cargo.toml"
 
 # Pinned so `npx` fallbacks stay reproducible.
 BUF_NPM_PACKAGE = "@bufbuild/buf@1.70.0"
@@ -548,48 +546,22 @@ def check_metadata(model: Model, metadata: dict) -> list[str]:
     return problems
 
 
-def pinned_librms_rev() -> str:
-    with CARGO_TOML.open("rb") as handle:
-        cargo = tomllib.load(handle)
-    dependency = cargo["workspace"]["dependencies"]["librms"]
-    rev = dependency.get("rev") if isinstance(dependency, dict) else None
-    if not rev:
-        raise ApiReferenceError("Cargo.toml does not pin `librms` by `rev`.")
-    return rev
-
-
-def proto_digests() -> dict[str, str]:
-    """SHA-256 of each vendored proto, keyed by file name."""
-    return {
-        path.name: hashlib.sha256(path.read_bytes()).hexdigest()
-        for path in sorted(PROTO_DIR.glob("*.proto"))
-    }
-
-
-def render_rev_file(rev: str) -> str:
-    """LIBRMS_REV holds the revision, then one `<file>:<sha256>` line per proto."""
-    digests = "".join(f"{name}:{digest}\n" for name, digest in proto_digests().items())
-    return f"{rev}\n{digests}"
-
-
-def check_vendored_revision() -> list[str]:
-    if not REV_FILE.exists():
-        return ["fern/proto/LIBRMS_REV is missing. Run `just api-ref-sync`."]
-    lines = REV_FILE.read_text().split()
-    vendored = lines[0] if lines else ""
-    pinned = pinned_librms_rev()
-    if vendored != pinned:
-        return [
-            f"fern/proto is vendored from librms {vendored}, but Cargo.toml pins "
-            f"{pinned}. Run `just api-ref-sync`, then `just api-ref-gen`."
-        ]
-    recorded = dict(line.split(":", 1) for line in lines[1:] if ":" in line)
-    actual = proto_digests()
+def check_vendored_protos() -> list[str]:
+    sources = {path.name: path for path in LIBRMS_PROTO_DIR.glob("*.proto")}
+    if not sources:
+        return [f"No .proto files found in {LIBRMS_PROTO_DIR}."]
+    vendored = {path.name: path for path in PROTO_DIR.glob("*.proto")}
     problems = []
-    for name in sorted(set(recorded) | set(actual)):
-        if recorded.get(name) != actual.get(name):
+    for name in sorted(set(sources) | set(vendored)):
+        if name not in sources:
             problems.append(
-                f"fern/proto/{name} differs from what `just api-ref-sync` vendored. "
+                f"fern/proto/{name} is not in crates/librms/proto. Run `just api-ref-sync`."
+            )
+        elif name not in vendored:
+            problems.append(f"fern/proto/{name} is missing. Run `just api-ref-sync`.")
+        elif vendored[name].read_bytes() != sources[name].read_bytes():
+            problems.append(
+                f"fern/proto/{name} differs from crates/librms/proto/{name}. "
                 "Don't edit the vendored protos by hand; run `just api-ref-sync`."
             )
     return problems
@@ -963,63 +935,27 @@ def cmd_generate(_: argparse.Namespace) -> int:
     return 0
 
 
-def librms_source_dir() -> tuple[Path, str]:
-    """Locate the pinned librms checkout through `cargo metadata`."""
-    result = subprocess.run(
-        ["cargo", "metadata", "--format-version", "1"],
-        capture_output=True,
-        text=True,
-        check=False,
-        cwd=REPO_ROOT,
-    )
-    if result.returncode != 0:
-        raise ApiReferenceError(f"cargo metadata failed:\n{result.stderr.strip()}")
-    for package in json.loads(result.stdout)["packages"]:
-        if package["name"] == "librms":
-            source = package.get("source") or ""
-            match = re.search(r"#([0-9a-f]{40})$", source)
-            if not match:
-                raise ApiReferenceError(f"Cannot read the librms revision from {source!r}.")
-            return Path(package["manifest_path"]).parent / "proto", match.group(1)
-    raise ApiReferenceError("librms is not in the dependency graph.")
-
-
 def cmd_sync(args: argparse.Namespace) -> int:
-    source, rev = librms_source_dir()
-    pinned = pinned_librms_rev()
-    if rev != pinned:
-        raise ApiReferenceError(
-            f"Cargo resolved librms {rev}, but Cargo.toml pins {pinned}. "
-            "Run `cargo update -p librms`."
-        )
-    sources = sorted(source.glob("*.proto"))
+    sources = sorted(LIBRMS_PROTO_DIR.glob("*.proto"))
     if not sources:
-        raise ApiReferenceError(f"No .proto files found in {source}.")
+        raise ApiReferenceError(f"No .proto files found in {LIBRMS_PROTO_DIR}.")
     if args.verify:
-        problems = []
-        for path in sources:
-            vendored = PROTO_DIR / path.name
-            if not vendored.exists() or vendored.read_bytes() != path.read_bytes():
-                problems.append(f"fern/proto/{path.name} differs from librms {rev[:12]}.")
-        for vendored in PROTO_DIR.glob("*.proto"):
-            if vendored.name not in {p.name for p in sources}:
-                problems.append(f"fern/proto/{vendored.name} is not in librms {rev[:12]}.")
+        problems = check_vendored_protos()
         if problems:
-            raise ApiReferenceError("\n".join(problems) + "\nRun `just api-ref-sync`.")
-        print(f"fern/proto matches librms {rev[:12]}")
+            raise ApiReferenceError("\n".join(problems))
+        print("fern/proto matches crates/librms/proto")
         return 0
     PROTO_DIR.mkdir(parents=True, exist_ok=True)
     for vendored in PROTO_DIR.glob("*.proto"):
         vendored.unlink()
     for path in sources:
         (PROTO_DIR / path.name).write_bytes(path.read_bytes())
-    REV_FILE.write_text(render_rev_file(rev), newline="\n")
-    print(f"Vendored {len(sources)} protos from librms {rev[:12]}")
+    print(f"Vendored {len(sources)} protos from crates/librms/proto")
     return 0
 
 
-def cmd_check(args: argparse.Namespace) -> int:
-    problems = check_vendored_revision()
+def cmd_check(_: argparse.Namespace) -> int:
+    problems = check_vendored_protos()
     model = build_model(build_image())
     metadata = load_metadata()
     problems += check_metadata(model, metadata)
@@ -1037,8 +973,6 @@ def cmd_check(args: argparse.Namespace) -> int:
             problems.append(
                 f"docs/api-reference/generated/{extra} is stale. Run `just api-ref-gen`."
             )
-    if args.verify_source and not problems:
-        cmd_sync(argparse.Namespace(verify=True))
     if problems:
         print("API reference check failed:", file=sys.stderr)
         for problem in problems:
@@ -1052,15 +986,10 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("generate", help="write generated pages").set_defaults(func=cmd_generate)
-    sync = sub.add_parser("sync", help="vendor protos from the pinned librms")
+    sync = sub.add_parser("sync", help="vendor protos from crates/librms/proto")
     sync.add_argument("--verify", action="store_true", help="compare only; do not write")
     sync.set_defaults(func=cmd_sync)
     check = sub.add_parser("check", help="verify protos, metadata, and pages")
-    check.add_argument(
-        "--verify-source",
-        action="store_true",
-        help="also compare fern/proto with the librms checkout (needs cargo)",
-    )
     check.set_defaults(func=cmd_check)
     args = parser.parse_args(argv)
     try:

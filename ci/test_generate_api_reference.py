@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import shutil
 import tempfile
 import unittest
@@ -380,103 +379,52 @@ class RenderTests(unittest.TestCase):
 
 
 class SyncTests(unittest.TestCase):
-    REV = "a" * 40
-
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         root = Path(self.tmp.name)
-        self.cargo = root / "Cargo.toml"
-        self.cargo.write_text(
-            "[workspace.dependencies]\n"
-            f'librms = {{ git = "https://example.invalid/librms", rev = "{self.REV}" }}\n'
-        )
         self.vendored = root / "fern" / "proto"
         self.vendored.mkdir(parents=True)
-        self.rev_file = self.vendored / "LIBRMS_REV"
-        self.source = root / "librms" / "proto"
+        self.source = root / "crates" / "librms" / "proto"
         self.source.mkdir(parents=True)
         (self.source / "a.proto").write_text("syntax = \"proto3\";\n")
         for name, value in (
-            ("CARGO_TOML", self.cargo),
             ("PROTO_DIR", self.vendored),
-            ("REV_FILE", self.rev_file),
+            ("LIBRMS_PROTO_DIR", self.source),
         ):
             patcher = mock.patch.object(gen, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
 
-    def metadata_result(self, rev: str) -> mock.Mock:
-        package = {
-            "name": "librms",
-            "source": f"git+https://example.invalid/librms?rev={rev}#{rev}",
-            "manifest_path": str(self.source.parent / "Cargo.toml"),
-        }
-        return mock.Mock(returncode=0, stdout=json.dumps({"packages": [package]}))
-
-    def test_pinned_revision_is_read_from_cargo_toml(self) -> None:
-        self.assertEqual(gen.pinned_librms_rev(), self.REV)
-
-    def test_missing_pin_is_an_error(self) -> None:
-        self.cargo.write_text('[workspace.dependencies]\nlibrms = "1"\n')
-        with self.assertRaises(gen.ApiReferenceError):
-            gen.pinned_librms_rev()
-
-    def test_revision_check_reports_missing_and_stale_files(self) -> None:
-        self.assertIn("missing", gen.check_vendored_revision()[0])
-        self.rev_file.write_text("b" * 40 + "\n")
-        self.assertIn("pins", gen.check_vendored_revision()[0])
-        self.rev_file.write_text(gen.render_rev_file(self.REV))
-        self.assertEqual(gen.check_vendored_revision(), [])
-
-    def test_revision_check_detects_hand_edited_and_unrecorded_protos(self) -> None:
-        (self.vendored / "a.proto").write_text("syntax = \"proto3\";\n")
-        self.rev_file.write_text(gen.render_rev_file(self.REV))
+    def test_check_reports_missing_hand_edited_and_extra_protos(self) -> None:
+        self.assertIn("a.proto is missing", gen.check_vendored_protos()[0])
         (self.vendored / "a.proto").write_text("edited\n")
-        problems = gen.check_vendored_revision()
+        problems = gen.check_vendored_protos()
         self.assertEqual(len(problems), 1)
         self.assertIn("a.proto differs", problems[0])
         (self.vendored / "a.proto").write_text("syntax = \"proto3\";\n")
+        self.assertEqual(gen.check_vendored_protos(), [])
         (self.vendored / "extra.proto").write_text("added\n")
-        self.assertIn("extra.proto differs", gen.check_vendored_revision()[0])
-        (self.vendored / "extra.proto").unlink()
-        (self.vendored / "a.proto").unlink()
-        self.assertIn("a.proto differs", gen.check_vendored_revision()[0])
+        self.assertIn("extra.proto is not in", gen.check_vendored_protos()[0])
 
-    def test_revision_check_rejects_legacy_file_without_digests(self) -> None:
-        (self.vendored / "a.proto").write_text("syntax = \"proto3\";\n")
-        self.rev_file.write_text(self.REV + "\n")
-        self.assertIn("a.proto differs", gen.check_vendored_revision()[0])
+    def test_check_requires_librms_protos(self) -> None:
+        (self.source / "a.proto").unlink()
+        self.assertIn("No .proto files found", gen.check_vendored_protos()[0])
 
-    def test_sync_copies_protos_and_records_revision(self) -> None:
+    def test_sync_copies_protos_and_removes_stale_ones(self) -> None:
         (self.vendored / "stale.proto").write_text("old")
-        with mock.patch.object(
-            gen.subprocess, "run", return_value=self.metadata_result(self.REV)
-        ):
-            self.assertEqual(gen.cmd_sync(argparse.Namespace(verify=False)), 0)
+        self.assertEqual(gen.cmd_sync(argparse.Namespace(verify=False)), 0)
         self.assertEqual(
             sorted(p.name for p in self.vendored.glob("*.proto")), ["a.proto"]
         )
-        self.assertEqual(self.rev_file.read_text(), gen.render_rev_file(self.REV))
-        self.assertEqual(gen.check_vendored_revision(), [])
-        self.assertTrue(self.rev_file.read_text().startswith(self.REV + "\na.proto:"))
+        self.assertEqual(gen.check_vendored_protos(), [])
 
-    def test_sync_verify_detects_drift(self) -> None:
+    def test_sync_verify_detects_drift_without_writing(self) -> None:
         (self.vendored / "a.proto").write_text("changed")
-        with mock.patch.object(
-            gen.subprocess, "run", return_value=self.metadata_result(self.REV)
-        ):
-            with self.assertRaises(gen.ApiReferenceError) as raised:
-                gen.cmd_sync(argparse.Namespace(verify=True))
+        with self.assertRaises(gen.ApiReferenceError) as raised:
+            gen.cmd_sync(argparse.Namespace(verify=True))
         self.assertIn("a.proto differs", str(raised.exception))
-
-    def test_sync_rejects_cargo_resolution_that_differs_from_pin(self) -> None:
-        with mock.patch.object(
-            gen.subprocess, "run", return_value=self.metadata_result("c" * 40)
-        ):
-            with self.assertRaises(gen.ApiReferenceError) as raised:
-                gen.cmd_sync(argparse.Namespace(verify=False))
-        self.assertIn("cargo update -p librms", str(raised.exception))
+        self.assertEqual((self.vendored / "a.proto").read_text(), "changed")
 
 
 @unittest.skipUnless(
@@ -494,8 +442,8 @@ class RepositoryTests(unittest.TestCase):
             self.assertTrue(path.exists(), f"{name} is missing")
             self.assertEqual(path.read_text(), content, f"{name} is stale")
 
-    def test_vendored_revision_matches_cargo_pin(self) -> None:
-        self.assertEqual(gen.check_vendored_revision(), [])
+    def test_vendored_protos_match_librms(self) -> None:
+        self.assertEqual(gen.check_vendored_protos(), [])
 
 
 if __name__ == "__main__":

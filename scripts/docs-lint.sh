@@ -30,8 +30,8 @@ if ! command -v buf >/dev/null 2>&1; then
     export PATH
 fi
 
-# Fail when the generated gRPC API reference drifts from the protos, the
-# metadata, or the librms revision pinned in Cargo.toml.
+# Fail when the generated gRPC API reference drifts from the protos or the
+# metadata, or when fern/proto differs from crates/librms/proto.
 python3 ci/test_generate_api_reference.py
 python3 ci/generate_api_reference.py check
 
