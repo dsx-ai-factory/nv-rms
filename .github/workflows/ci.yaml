@@ -590,7 +590,7 @@ jobs:
           fetch-depth: 0
 
       - name: Package and push Helm chart to NGC
-        uses: dsx-ai-factory/dsx-github-actions/.github/actions/helm-package-push@911d86017e6e0715cef26cb3105d66c2fcd985fb # reviewed commit 911d860 (upstream #94, pending merge)
+        uses: dsx-ai-factory/dsx-github-actions/.github/actions/helm-package-push@fdbbb35c9f44819507caaa62ee472e9dad61f7e0 # v1.35.2
         with:
           chart-path: helm
           chart-version: ${{ needs.prepare.outputs.helm_version }}-OSS
