@@ -3,7 +3,9 @@
 {{- include "rack-manager.validateFirmwareTaskOptions" . -}}
 {{- include "rack-manager.validateComputePowerOnOptions" . -}}
 {{- include "rack-manager.validateTracingOptions" . -}}
-{{- $firmwarePersistentVolumeClaim := .Values.apiServer.firmwarePersistentVolumeClaim | default "" | trim }}
+{{- include "rack-manager.validateStrategyOptions" . -}}
+{{- $firmwareUsePvc := eq (include "rack-manager.firmwareUsePvc" .) "true" }}
+{{- $firmwarePvcName := include "rack-manager.firmwarePvcName" . }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -17,6 +19,26 @@ spec:
     matchLabels:
       app: rms-api-server
   replicas: {{ .Values.apiServer.replicaCount }}
+  {{- /* Rendered field by field (not toYaml passthrough) so null sub-keys are
+       skipped like unset; kindIs guards (not `with`) keep maxSurge/maxUnavailable
+       renderable at 0, which is falsy but meaningful. Constraint checks live in
+       rack-manager.validateStrategyOptions. */}}
+  {{- $strategy := .Values.apiServer.strategy | default dict }}
+  {{- if or $strategy.type $strategy.rollingUpdate }}
+  strategy:
+    {{- with $strategy.type }}
+    type: {{ . }}
+    {{- end }}
+    {{- with $strategy.rollingUpdate }}
+    rollingUpdate:
+      {{- if not (kindIs "invalid" .maxSurge) }}
+      maxSurge: {{ .maxSurge }}
+      {{- end }}
+      {{- if not (kindIs "invalid" .maxUnavailable) }}
+      maxUnavailable: {{ .maxUnavailable }}
+      {{- end }}
+    {{- end }}
+  {{- end }}
   template:
     metadata:
       labels:
@@ -203,9 +225,9 @@ spec:
           configMap:
             name: rms-api-config
         - name: firmware-storage
-          {{- if $firmwarePersistentVolumeClaim }}
+          {{- if $firmwareUsePvc }}
           persistentVolumeClaim:
-            claimName: {{ $firmwarePersistentVolumeClaim | quote }}
+            claimName: {{ $firmwarePvcName | quote }}
           {{- else }}
           hostPath:
             path: {{ .Values.apiServer.firmwareStoragePath }}

@@ -1,0 +1,20 @@
+# Site override for firmware download storage backed by a chart-created PVC.
+# Layer on top of helm/values.yaml; the chart creates and owns the claim
+# (named "<fullname>-firmware", or apiServer.firmwarePersistentVolumeClaim
+# when set) and the Deployment mounts it instead of the hostPath.
+#
+# Install:
+#   helm upgrade --install rack ./helm \
+#     -f helm/values.yaml \
+#     -f helm/examples/overrides/firmware-pvc-create-values.yaml \
+#     --set global.image.tag=<APP_TAG> \
+#     -n rack-manager --create-namespace
+
+apiServer:
+  firmwarePvc:
+    create: true
+    # keep: true          # default; the claim survives helm uninstall
+    # size: 20Gi
+    # storageClass: ""    # "" = cluster default, "-" = disable dynamic provisioning
+    # accessModes:
+    #   - ReadWriteOnce
