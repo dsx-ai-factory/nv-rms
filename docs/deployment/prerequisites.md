@@ -210,5 +210,12 @@ kubectl create secret generic rms-postgres-auth \
   --from-literal=POSTGRES_PASSWORD=<password>
 ```
 
+By default the chart reads the credentials from the `username` and `password`
+keys. Operators that publish them under other key names — for example Crunchy
+Data writes the role name under `user` — can map them with
+`database.credentialsSecretKeys.{username,password}` instead of re-creating the
+Secret; see the [Helm chart README](https://github.com/dsx-ai-factory/nv-rms/blob/main/helm/README.md)
+for details.
+
 Keep credentials, database URLs, TLS keys, client certificates, and artifact
 tokens out of source control - prefer secret managers or Kubernetes Secrets.

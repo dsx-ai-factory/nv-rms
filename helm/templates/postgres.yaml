@@ -1,4 +1,11 @@
 {{- if eq (include "rack-manager.useStandalonePostgres" .) "true" }}
+{{- /* Validate the secret keys here only when this StatefulSet consumes a
+     configured key (postgres.auth.existingSecret) and neither the api-server
+     Deployment nor the drop-database job renders, keeping the fail
+     attributable to exactly one template per configuration. */ -}}
+{{- if and (ne (include "rack-manager.chartWritesDbCredentials" .) "true") (not .Values.apiServer.enabled) (not .Values.dropDatabaseOnUninstall) }}
+{{- include "rack-manager.validateDbSecretKeys" . -}}
+{{- end }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -12,6 +19,17 @@ data:
   POSTGRES_HOST_AUTH_METHOD: trust
 ---
 {{- $pgSecret := include "rack-manager.databaseCredentialsSecret" . }}
+{{- /* The StatefulSet bootstrap password keeps the historical POSTGRES_PASSWORD
+     key: the chart-generated Secret carries it, and operator secrets created
+     before database.credentialsSecretKeys relied on it. The StatefulSet
+     follows a remapped password key only when it is configured to a
+     non-default name, so existing installs keep rendering as before and
+     remapping stays opt-in. */ -}}
+{{- $dbPasswordKey := include "rack-manager.dbPasswordKey" . -}}
+{{- $pgPasswordKey := "POSTGRES_PASSWORD" -}}
+{{- if ne $dbPasswordKey "password" -}}
+{{- $pgPasswordKey = $dbPasswordKey -}}
+{{- end }}
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -54,7 +72,7 @@ spec:
               valueFrom:
                 secretKeyRef:
                   name: {{ $pgSecret }}
-                  key: POSTGRES_PASSWORD
+                  key: {{ $pgPasswordKey | quote }}
             - name: POSTGRES_HOST_AUTH_METHOD
               valueFrom:
                 configMapKeyRef:
